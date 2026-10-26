@@ -78,6 +78,8 @@ namespace SwitchCenter
             tray.Visible = true;
             timer.Tick += (_, _) => { usage.Sample(); RefreshCpu(); };
             timer.Start();
+            // Application.Exit (the control center updating itself) skips ExitThreadCore; do not leave a dead icon.
+            Application.ApplicationExit += (_, _) => tray.Visible = false;
             usage.Sample();
             RefreshCpu();
             if (openWindowAtStart) OpenWindow();

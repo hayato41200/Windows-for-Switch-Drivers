@@ -65,7 +65,7 @@ namespace SwitchCenter
     sealed class DriverRow
     {
         public string Name, HardwareId, Instance, Service, State, Installed, Running;
-        public bool Ok;
+        public bool Ok, ReinstallPending;     // ReinstallPending: marked to get a new driver at the next boot
     }
 
     static class DriverStatus
@@ -117,7 +117,7 @@ namespace SwitchCenter
                         row.Ok = (status & DN_STARTED) != 0 && (status & DN_HAS_PROBLEM) == 0;
                         row.State = row.Ok ? T("正常", "OK")
                                   : (status & DN_HAS_PROBLEM) != 0 ? T($"エラー（コード {problem}）", $"error (code {problem})")
-                                  : T("止まっている", "not started");
+                                  : T("停止中", "stopped");
                     }
                     else
                     {
@@ -125,6 +125,7 @@ namespace SwitchCenter
                     }
                     using (RegistryKey dk = Registry.LocalMachine.OpenSubKey($@"SYSTEM\CurrentControlSet\Enum\{id}"))
                     {
+                        row.ReinstallPending = dk?.GetValue("ConfigFlags") is int flags && (flags & Updater.CONFIGFLAG_REINSTALL) != 0;
                         if (dk?.GetValue("Driver") is string cls)
                         {
                             using RegistryKey ck = Registry.LocalMachine.OpenSubKey($@"SYSTEM\CurrentControlSet\Control\Class\{cls}");
@@ -135,7 +136,8 @@ namespace SwitchCenter
                             row.Installed = T("ドライバー無し", "no driver");
                         }
                     }
-                    row.Running = DriverTrace.Get(k.Service, "DriverVersion") is int v ? "v" + v : "—";
+                    // The I2C driver keeps one trace for all controllers, with I2C_ names.
+                    row.Running = (DriverTrace.Get(k.Service, "DriverVersion") ?? DriverTrace.Get(k.Service, "I2C_0000_DriverVersion")) is int v ? "v" + v : "—";
                     rows.Add(row);
                 }
             }

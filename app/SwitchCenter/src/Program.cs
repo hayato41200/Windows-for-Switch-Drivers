@@ -9,7 +9,8 @@ namespace SwitchCenter
     static class Program
     {
         /// <param name="args">--open: show the control center window right away.
-        /// --install-drivers &lt;tag&gt; &lt;service,...&gt;: the elevated driver installer.</param>
+        /// --install-drivers &lt;tag&gt; &lt;service,...&gt;: the elevated driver installer.
+        /// --self-update &lt;folder&gt; &lt;pid&gt;: an unpacked new version replacing the one in folder.</param>
         [STAThread]
         static void Main(string[] args)
         {
@@ -24,11 +25,19 @@ namespace SwitchCenter
                 Environment.ExitCode = form.Result;
                 return;
             }
+            if (args.Length == 3 && args[0] == "--self-update" && int.TryParse(args[2], out int pid))
+            {
+                // Unpacked new version replacing the installed one (Updater.StartSelfUpdate).
+                Lang.Load();
+                Updater.ApplySelfUpdate(args[1], pid);
+                return;
+            }
             using var single = new Mutex(true, @"Local\SwitchWOA.SwitchCenter", out bool created);
             if (!created) return;
             Application.EnableVisualStyles();
             Application.SetHighDpiMode(HighDpiMode.SystemAware);
             Lang.Load();
+            Updater.CleanUpdates();
             Application.Run(new TrayApp(Array.IndexOf(args, "--open") >= 0));
         }
     }

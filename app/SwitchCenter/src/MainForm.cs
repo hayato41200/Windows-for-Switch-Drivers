@@ -8,6 +8,7 @@ using System.Collections.Generic;
 using System.ComponentModel;
 using System.Drawing;
 using System.Drawing.Drawing2D;
+using System.Linq;
 using System.Windows.Forms;
 using static SwitchCenter.Lang;
 
@@ -294,8 +295,10 @@ namespace SwitchCenter
         readonly ListView driverList = new ListView { Dock = DockStyle.Fill, View = View.Details, FullRowSelect = true, HeaderStyle = ColumnHeaderStyle.Nonclickable, ShowItemToolTips = true };
         readonly Button checkButton = new Button { Width = 160, Height = 40 };
         readonly Button installButton = new Button { Width = 200, Height = 40, Enabled = false };
-        readonly Label updateStatus = new Label { AutoSize = true, MaximumSize = new Size(520, 0) };
-        readonly LinkLabel releaseLink = new LinkLabel { AutoSize = true, MaximumSize = new Size(520, 0), Visible = false };
+        readonly Button appButton = new Button { Width = 370, Height = 40, Visible = false, Margin = new Padding(3, 8, 3, 3) };
+        readonly Label updateStatus = new Label { AutoSize = true, MaximumSize = new Size(520, 0), Margin = new Padding(3, 8, 3, 3) };
+        // Kept away from the buttons (a tap meant for them opened it), at the bottom.
+        readonly LinkLabel releaseLink = new LinkLabel { AutoSize = true, MaximumSize = new Size(520, 0), Visible = false, Margin = new Padding(3, 24, 3, 3) };
         Release latest;                       // set by "Check for updates"
         List<UpdateRow> updates;
 
@@ -307,28 +310,43 @@ namespace SwitchCenter
             driverList.Columns.Add(T("入っている版", "Installed"), 90);
             driverList.Columns.Add(T("動作中", "Running"), 60);
             driverList.Columns.Add(T("最新", "Latest"), 100);
-            var bottom = new FlowLayoutPanel { Dock = DockStyle.Bottom, Height = 170, FlowDirection = FlowDirection.TopDown, WrapContents = false };
+            var bottom = new FlowLayoutPanel { Dock = DockStyle.Bottom, Height = 250, FlowDirection = FlowDirection.TopDown, WrapContents = false };
             var reload = new Button { Text = T("再読み込み", "Reload"), Width = 120, Height = 40 };
             reload.Click += (_, _) => LoadDrivers();
             checkButton.Text = T("更新を確認", "Check for updates");
             checkButton.Click += async (_, _) => await CheckUpdates();
             installButton.Text = T("更新する", "Update");
             installButton.Click += async (_, _) => await InstallUpdates();
-            releaseLink.LinkClicked += (_, _) =>
-            {
-                if (latest != null) System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(latest.PageUrl) { UseShellExecute = true });
-            };
+            appButton.Click += async (_, _) => await UpdateApp();
+            releaseLink.Text = T("リリースのページを開く", "Open the release page");
+            releaseLink.LinkClicked += (_, _) => { if (latest != null) OpenInBrowser(latest.PageUrl); };
             var buttons = new FlowLayoutPanel { AutoSize = true };
             buttons.Controls.Add(reload);
             buttons.Controls.Add(checkButton);
             buttons.Controls.Add(installButton);
             bottom.Controls.Add(buttons);
+            bottom.Controls.Add(appButton);
             bottom.Controls.Add(updateStatus);
             bottom.Controls.Add(releaseLink);
             updateStatus.Text = T("「更新を確認」で、GitHub の最新のリリースと比べます。", "\"Check for updates\" compares with the latest release on GitHub.");
             page.Controls.Add(driverList);
             page.Controls.Add(bottom);
             return page;
+        }
+
+        /// <summary>Edge if it is installed: the default browser of this Windows is still IE11, which GitHub no longer supports.</summary>
+        static void OpenInBrowser(string url)
+        {
+            foreach (Environment.SpecialFolder f in new[] { Environment.SpecialFolder.ProgramFilesX86, Environment.SpecialFolder.ProgramFiles })
+            {
+                string edge = System.IO.Path.Combine(Environment.GetFolderPath(f), @"Microsoft\Edge\Application\msedge.exe");
+                if (System.IO.File.Exists(edge))
+                {
+                    System.Diagnostics.Process.Start(edge, url)?.Dispose();
+                    return;
+                }
+            }
+            System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(url) { UseShellExecute = true })?.Dispose();
         }
 
         void LoadDrivers()
@@ -341,13 +359,14 @@ namespace SwitchCenter
             {
                 UpdateRow u = updates?.Find(x => x.Item.Hwid.Equals(d.HardwareId, StringComparison.OrdinalIgnoreCase));
                 // Per instance: of the three I2C controllers only the ones with an older driver are marked.
-                bool rowUpdate = u is { Update: true } &&
+                bool rowUpdate = u is { Update: true } && !d.ReinstallPending &&
                                  (!Version.TryParse(d.Installed, out Version have) || have < Version.Parse(u.Item.Version));
-                string newest = u == null ? "" : u.UefiTooOld ? T($"要 UEFI {u.Item.MinUefi}", $"needs {u.Item.MinUefi}")
+                string newest = d.ReinstallPending ? T("再起動待ち", "after restart")
+                              : u == null ? "" : u.UefiTooOld ? T($"要 UEFI {u.Item.MinUefi}", $"needs {u.Item.MinUefi}")
                               : rowUpdate ? u.Item.Version + " ↑" : u.Item.Version;
                 var item = new ListViewItem(new[] { d.Name, d.State, d.Installed, d.Running, newest })
                 {
-                    ForeColor = !d.Ok ? Color.Firebrick : rowUpdate ? Color.RoyalBlue : SystemColors.WindowText,
+                    ForeColor = !d.Ok ? Color.Firebrick : rowUpdate || d.ReinstallPending ? Color.RoyalBlue : SystemColors.WindowText,
                     ToolTipText = d.Instance,
                 };
                 driverList.Items.Add(item);
@@ -368,17 +387,19 @@ namespace SwitchCenter
                 latest = await Updater.FetchAsync(null);
                 LoadDrivers();
                 int count = updates.FindAll(x => x.Update).Count;
+                int pending = updates.Sum(x => x.Pending);
                 int uefi = Updater.EstimateUefi();
                 updateStatus.Text =
                     T($"最新のリリース: {latest.Tag}", $"Latest release: {latest.Tag}") + "\n" +
                     (count > 0 ? T($"更新できるドライバー: {count} 件（青い行）", $"Driver updates: {count} (blue rows)")
                                : T("ドライバーはすべて最新です。", "All drivers are up to date.")) + "\n" +
+                    (pending > 0 ? T($"再起動を待っているデバイス: {pending} 個\n", $"Devices waiting for a restart: {pending}\n") : "") +
                     T($"UEFI: R{uefi} 以降（DSDT のデバイスからの推定）", $"UEFI: R{uefi} or later (estimated from the DSDT devices)");
+                bool newApp = Updater.AppIsOlder(latest) && latest.AppUrl != null;
+                appButton.Visible = newApp;
+                appButton.Enabled = true;
+                appButton.Text = T($"コントロールセンターを {latest.AppVersion} に更新", $"Update the control center to {latest.AppVersion}");
                 releaseLink.Visible = true;
-                releaseLink.Text = Updater.AppIsOlder(latest)
-                    ? T($"コントロールセンターの新しい版 {latest.AppVersion} があります（リリースのページを開く）",
-                        $"Control center {latest.AppVersion} is available (open the release page)")
-                    : T("リリースのページを開く", "Open the release page");
             }
             catch (Exception e) when (e is System.Net.Http.HttpRequestException || e is System.Threading.Tasks.TaskCanceledException ||
                                       e is System.Text.Json.JsonException || e is System.IO.InvalidDataException || e is KeyNotFoundException)
@@ -393,10 +414,15 @@ namespace SwitchCenter
         {
             List<UpdateRow> todo = updates?.FindAll(x => x.Update);
             if (latest == null || todo == null || todo.Count == 0) return;
-            string list = string.Join("\n", todo.ConvertAll(u => $"・{u.Item.Service}: {u.Installed ?? T("無し", "none")} → {u.Item.Version}"));
+            string list = string.Join("\n", todo.ConvertAll(u => $"・{u.Item.Service}: {u.Installed ?? T("無し", "none")} → {u.Item.Version}" +
+                                                               (u.AtNextBoot ? T("（次の起動のとき）", " (at the next boot)") : "")));
+            string bootNote = todo.Exists(u => u.AtNextBoot)
+                ? T("\n\nGPIO と I2C は、ほかのドライバーが使っているので、今は Windows に登録だけして、次に起動したときに入れ替えます。",
+                    "\n\nGPIO and I2C are used by the other drivers, so they are only added now and replaced at the next boot.")
+                : "";
             if (MessageBox.Show(this,
-                    T($"{latest.Tag} から、次のドライバーを入れます。\n\n{list}\n\n管理者の確認が出ます。入れる前に、SHA-256 と署名を確かめます。",
-                      $"Install these drivers from {latest.Tag}?\n\n{list}\n\nWindows will ask for administrator approval. SHA-256 and signatures are checked first."),
+                    T($"{latest.Tag} から、次のドライバーを入れます。\n\n{list}\n\n管理者の確認が出ます。入れる前に、SHA-256 と署名を確かめます。{bootNote}",
+                      $"Install these drivers from {latest.Tag}?\n\n{list}\n\nWindows will ask for administrator approval. SHA-256 and signatures are checked first.{bootNote}"),
                     T("ドライバーの更新", "Driver update"), MessageBoxButtons.OKCancel, MessageBoxIcon.Question) != DialogResult.OK) return;
 
             installButton.Enabled = checkButton.Enabled = false;
@@ -411,6 +437,32 @@ namespace SwitchCenter
             };
             checkButton.Enabled = true;
             LoadDrivers();
+        }
+
+        async System.Threading.Tasks.Task UpdateApp()
+        {
+            if (latest == null) return;
+            if (MessageBox.Show(this,
+                    T($"コントロールセンターを {Application.ProductVersion} から {latest.AppVersion} に更新します。\n\nダウンロードして SHA-256 を確かめたあと、いったん終了して、新しい版で起動し直します。",
+                      $"Update the control center from {Application.ProductVersion} to {latest.AppVersion}?\n\nIt is downloaded and its SHA-256 checked; then the control center exits and starts again as the new version."),
+                    T("コントロールセンターの更新", "Control center update"), MessageBoxButtons.OKCancel, MessageBoxIcon.Question) != DialogResult.OK) return;
+            appButton.Enabled = checkButton.Enabled = installButton.Enabled = false;
+            updateStatus.ForeColor = SystemColors.ControlText;
+            updateStatus.Text = T($"{latest.AppFile} をダウンロードしています…", $"Downloading {latest.AppFile}...");
+            try
+            {
+                string exe = await Updater.DownloadAppAsync(latest);
+                Updater.StartSelfUpdate(exe);
+                Application.Exit();
+            }
+            catch (Exception e) when (e is System.Net.Http.HttpRequestException || e is System.Threading.Tasks.TaskCanceledException ||
+                                      e is System.IO.IOException || e is UnauthorizedAccessException || e is System.ComponentModel.Win32Exception)
+            {
+                updateStatus.ForeColor = Color.Firebrick;
+                updateStatus.Text = T("コントロールセンターを更新できませんでした: ", "Could not update the control center: ") + e.Message;
+                appButton.Enabled = checkButton.Enabled = true;
+                LoadDrivers();
+            }
         }
 
         readonly TextBox reportBox = new TextBox
