@@ -291,29 +291,41 @@ namespace SwitchCenter
                     $"Could not save (error {e}). Running as administrator may help.");
         }
 
-        readonly ListView driverList = new ListView { Dock = DockStyle.Fill, View = View.Details, FullRowSelect = true, HeaderStyle = ColumnHeaderStyle.Nonclickable };
+        readonly ListView driverList = new ListView { Dock = DockStyle.Fill, View = View.Details, FullRowSelect = true, HeaderStyle = ColumnHeaderStyle.Nonclickable, ShowItemToolTips = true };
+        readonly Button checkButton = new Button { Width = 160, Height = 40 };
+        readonly Button installButton = new Button { Width = 200, Height = 40, Enabled = false };
+        readonly Label updateStatus = new Label { AutoSize = true, MaximumSize = new Size(520, 0) };
+        readonly LinkLabel releaseLink = new LinkLabel { AutoSize = true, MaximumSize = new Size(520, 0), Visible = false };
+        Release latest;                       // set by "Check for updates"
+        List<UpdateRow> updates;
 
         TabPage BuildDrivers()
         {
             var page = new TabPage(T("ドライバー", "Drivers")) { Padding = new Padding(10) };
-            driverList.Columns.Add(T("デバイス", "Device"), 170);
-            driverList.Columns.Add(T("状態", "State"), 130);
-            driverList.Columns.Add(T("入っている版", "Installed"), 100);
-            driverList.Columns.Add(T("動作中", "Running"), 70);
-            var bottom = new FlowLayoutPanel { Dock = DockStyle.Bottom, Height = 110, FlowDirection = FlowDirection.TopDown, WrapContents = false };
-            var reload = new Button { Text = T("再読み込み", "Reload"), Width = 160, Height = 40 };
+            driverList.Columns.Add(T("デバイス", "Device"), 150);
+            driverList.Columns.Add(T("状態", "State"), 110);
+            driverList.Columns.Add(T("入っている版", "Installed"), 90);
+            driverList.Columns.Add(T("動作中", "Running"), 60);
+            driverList.Columns.Add(T("最新", "Latest"), 100);
+            var bottom = new FlowLayoutPanel { Dock = DockStyle.Bottom, Height = 170, FlowDirection = FlowDirection.TopDown, WrapContents = false };
+            var reload = new Button { Text = T("再読み込み", "Reload"), Width = 120, Height = 40 };
             reload.Click += (_, _) => LoadDrivers();
-            var update = new Button { Text = T("更新を確認", "Check for updates"), Width = 160, Height = 40, Enabled = false };
+            checkButton.Text = T("更新を確認", "Check for updates");
+            checkButton.Click += async (_, _) => await CheckUpdates();
+            installButton.Text = T("更新する", "Update");
+            installButton.Click += async (_, _) => await InstallUpdates();
+            releaseLink.LinkClicked += (_, _) =>
+            {
+                if (latest != null) System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(latest.PageUrl) { UseShellExecute = true });
+            };
             var buttons = new FlowLayoutPanel { AutoSize = true };
             buttons.Controls.Add(reload);
-            buttons.Controls.Add(update);
+            buttons.Controls.Add(checkButton);
+            buttons.Controls.Add(installButton);
             bottom.Controls.Add(buttons);
-            bottom.Controls.Add(new Label
-            {
-                AutoSize = true, MaximumSize = new Size(520, 0),
-                Text = T("更新の確認（OTA）は、ドライバー用のリポジトリができたら使えるようになります。",
-                         "Update checks (OTA) become available once the driver repository is set up."),
-            });
+            bottom.Controls.Add(updateStatus);
+            bottom.Controls.Add(releaseLink);
+            updateStatus.Text = T("「更新を確認」で、GitHub の最新のリリースと比べます。", "\"Check for updates\" compares with the latest release on GitHub.");
             page.Controls.Add(driverList);
             page.Controls.Add(bottom);
             return page;
@@ -321,18 +333,81 @@ namespace SwitchCenter
 
         void LoadDrivers()
         {
+            List<DriverRow> rows = DriverStatus.Read();
+            if (latest != null) updates = Updater.Compare(latest, rows, Updater.EstimateUefi());
             driverList.BeginUpdate();
             driverList.Items.Clear();
-            foreach (DriverRow d in DriverStatus.Read())
+            foreach (DriverRow d in rows)
             {
-                var item = new ListViewItem(new[] { d.Name, d.State, d.Installed, d.Running })
+                UpdateRow u = updates?.Find(x => x.Item.Hwid.Equals(d.HardwareId, StringComparison.OrdinalIgnoreCase));
+                string newest = u == null ? "" : u.UefiTooOld ? T($"要 UEFI {u.Item.MinUefi}", $"needs {u.Item.MinUefi}")
+                              : u.Update ? u.Item.Version + " ↑" : u.Item.Version;
+                var item = new ListViewItem(new[] { d.Name, d.State, d.Installed, d.Running, newest })
                 {
-                    ForeColor = d.Ok ? SystemColors.WindowText : Color.Firebrick,
+                    ForeColor = !d.Ok ? Color.Firebrick : u is { Update: true } ? Color.RoyalBlue : SystemColors.WindowText,
                     ToolTipText = d.Instance,
                 };
                 driverList.Items.Add(item);
             }
             driverList.EndUpdate();
+            int count = updates?.FindAll(x => x.Update).Count ?? 0;
+            installButton.Enabled = count > 0;
+            installButton.Text = count > 0 ? T($"更新する（{count} 件）", $"Update ({count})") : T("更新する", "Update");
+        }
+
+        async System.Threading.Tasks.Task CheckUpdates()
+        {
+            checkButton.Enabled = false;
+            updateStatus.ForeColor = SystemColors.ControlText;
+            updateStatus.Text = T("GitHub を確認しています…", "Checking GitHub...");
+            try
+            {
+                latest = await Updater.FetchAsync(null);
+                LoadDrivers();
+                int count = updates.FindAll(x => x.Update).Count;
+                int uefi = Updater.EstimateUefi();
+                updateStatus.Text =
+                    T($"最新のリリース: {latest.Tag}", $"Latest release: {latest.Tag}") + "\n" +
+                    (count > 0 ? T($"更新できるドライバー: {count} 件（青い行）", $"Driver updates: {count} (blue rows)")
+                               : T("ドライバーはすべて最新です。", "All drivers are up to date.")) + "\n" +
+                    T($"UEFI: R{uefi} 以降（DSDT のデバイスからの推定）", $"UEFI: R{uefi} or later (estimated from the DSDT devices)");
+                releaseLink.Visible = true;
+                releaseLink.Text = Updater.AppIsOlder(latest)
+                    ? T($"コントロールセンターの新しい版 {latest.AppVersion} があります（リリースのページを開く）",
+                        $"Control center {latest.AppVersion} is available (open the release page)")
+                    : T("リリースのページを開く", "Open the release page");
+            }
+            catch (Exception e) when (e is System.Net.Http.HttpRequestException || e is System.Threading.Tasks.TaskCanceledException ||
+                                      e is System.Text.Json.JsonException || e is System.IO.InvalidDataException || e is KeyNotFoundException)
+            {
+                updateStatus.ForeColor = Color.Firebrick;
+                updateStatus.Text = T("確認できませんでした: ", "Could not check: ") + e.Message;
+            }
+            checkButton.Enabled = true;
+        }
+
+        async System.Threading.Tasks.Task InstallUpdates()
+        {
+            List<UpdateRow> todo = updates?.FindAll(x => x.Update);
+            if (latest == null || todo == null || todo.Count == 0) return;
+            string list = string.Join("\n", todo.ConvertAll(u => $"・{u.Item.Service}: {u.Installed ?? T("無し", "none")} → {u.Item.Version}"));
+            if (MessageBox.Show(this,
+                    T($"{latest.Tag} から、次のドライバーを入れます。\n\n{list}\n\n管理者の確認が出ます。入れる前に、SHA-256 と署名を確かめます。",
+                      $"Install these drivers from {latest.Tag}?\n\n{list}\n\nWindows will ask for administrator approval. SHA-256 and signatures are checked first."),
+                    T("ドライバーの更新", "Driver update"), MessageBoxButtons.OKCancel, MessageBoxIcon.Question) != DialogResult.OK) return;
+
+            installButton.Enabled = checkButton.Enabled = false;
+            int? code = await Updater.RunElevatedAsync(latest.Tag, todo.ConvertAll(u => u.Item.Service));
+            updateStatus.ForeColor = code is 0 or Updater.ExitReboot ? Color.DarkGreen : Color.Firebrick;
+            updateStatus.Text = code switch
+            {
+                null => T("管理者の確認がキャンセルされました。", "Administrator approval was cancelled."),
+                0 => T("更新しました。", "Updated."),
+                Updater.ExitReboot => T("更新しました。再起動すると新しいドライバーになります。", "Updated. Restart to finish."),
+                _ => T("更新できませんでした。理由は、更新の画面に出ています。", "The update failed; the update window shows why."),
+            };
+            checkButton.Enabled = true;
+            LoadDrivers();
         }
 
         readonly TextBox reportBox = new TextBox
