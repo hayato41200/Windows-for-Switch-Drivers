@@ -5,15 +5,45 @@
     out\<Version>\SwitchDrivers-<Version>.zip      kits\Switch-* with the built .sys/.cat/.inf
     out\<Version>\SwitchCenter-<app>-arm64.zip     the control center (self-contained, win-arm64)
     out\<Version>\manifest.json                    versions, hardware IDs, minimum UEFI, SHA-256
-  Upload the three files to a release tagged drivers-<Version>.
+  Upload the three files to a release tagged drivers-<Version>, or pass -Publish
+  to have the GitHub CLI (gh, logged in with `gh auth login`) create the release.
+  -PublishOnly publishes files that an earlier run already made.
 
   Needs (on the PC): LLVM, the WDK 10.0.19041 + 10.0.26100 headers, the .NET SDK,
   and the test-signing certificate in the certificate store (see tools\Build-Driver.ps1).
 
 .EXAMPLE
-  .\release\Make-Release.ps1 -Version 2026.10.26
+  .\release\Make-Release.ps1 -Version 2026.10.26 -Publish
 #>
-param([Parameter(Mandatory = $true)][ValidatePattern('^\d{4}\.\d{1,2}\.\d{1,2}(\.\d+)?$')][string]$Version)
+param(
+  [Parameter(Mandatory = $true)][ValidatePattern('^\d{4}\.\d{1,2}\.\d{1,2}(\.\d+)?$')][string]$Version,
+  [switch]$Publish,
+  [switch]$PublishOnly
+)
+
+$Repo = 'hayato41200/Windows-for-Switch-Drivers'
+
+function Publish-Release([string]$dir) {
+  $gh = (Get-Command gh -ErrorAction SilentlyContinue).Source
+  if (-not $gh) { $gh = Join-Path $env:ProgramFiles 'GitHub CLI\gh.exe' }
+  if (-not (Test-Path $gh)) { throw 'GitHub CLI (gh) not found. Install it with: winget install GitHub.cli' }
+  & $gh auth status 2>&1 | Out-Null
+  if ($LASTEXITCODE -ne 0) { throw 'gh is not logged in. Run: gh auth login' }
+  $m = Get-Content (Join-Path $dir 'manifest.json') -Raw | ConvertFrom-Json
+  $notes = @("Drivers $Version", '', '| Driver | Version | Device | Needs UEFI |', '|---|---|---|---|')
+  $notes += $m.drivers.items | ForEach-Object { "| $($_.service) | $($_.version) | $($_.hwid) | $($_.minUefi) |" }
+  $notes += '', "Control center: $($m.app.version) ($($m.app.file))", '', 'SHA-256 values are in manifest.json.'
+  $notesFile = Join-Path $dir 'release-notes.md'
+  $notes -join "`n" | Set-Content $notesFile -Encoding utf8
+  $files = Get-ChildItem $dir -File | Where-Object { $_.Name -ne 'release-notes.md' } | ForEach-Object FullName
+  & $gh release create "drivers-$Version" @files --repo $Repo --title "Drivers $Version" --notes-file $notesFile
+  if ($LASTEXITCODE -ne 0) { throw 'gh release create failed' }
+}
+
+if ($PublishOnly) {
+  Publish-Release (Join-Path (Split-Path -Parent $PSScriptRoot) "out\$Version")
+  return
+}
 
 $ErrorActionPreference = 'Stop'
 $Root = Split-Path -Parent $PSScriptRoot
@@ -97,4 +127,8 @@ Remove-Item $Stage -Recurse -Force
 Write-Host ''
 Write-Host "Release files in ${Out}:"
 Get-ChildItem $Out | ForEach-Object { Write-Host ('  {0}  {1:N1} MB' -f $_.Name, ($_.Length / 1MB)) }
-Write-Host "Create a GitHub release tagged drivers-$Version and attach these three files."
+if ($Publish) {
+  Publish-Release $Out
+} else {
+  Write-Host "Create a GitHub release tagged drivers-$Version and attach these three files (or rerun with -PublishOnly)."
+}

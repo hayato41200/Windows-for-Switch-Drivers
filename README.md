@@ -63,6 +63,8 @@ Nintendo Switch. Install from the release ZIPs; build with `release/Make-Release
 
 GitHub でリリースを作って（タグは `drivers-<版>`）、この3つを付ける。
 
+GitHub CLI（`gh auth login` 済み）があれば、`-Publish` を付けるとリリースの作成とアップロードまで自動で行う。すでに作ったファイルをあとから公開するときは、`-PublishOnly` を使う。
+
 ## OTA（コントロールセンターからの更新）
 
 設計は `docs/Design-DriverRepo-OTA-ja.md`。コントロールセンターは、このリポジトリの最新のリリースの `manifest.json` を読んで、入っているドライバーと版を比べる。更新を入れる前に、次の3つを確かめる。
