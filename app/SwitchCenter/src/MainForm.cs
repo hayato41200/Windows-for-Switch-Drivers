@@ -340,11 +340,14 @@ namespace SwitchCenter
             foreach (DriverRow d in rows)
             {
                 UpdateRow u = updates?.Find(x => x.Item.Hwid.Equals(d.HardwareId, StringComparison.OrdinalIgnoreCase));
+                // Per instance: of the three I2C controllers only the ones with an older driver are marked.
+                bool rowUpdate = u is { Update: true } &&
+                                 (!Version.TryParse(d.Installed, out Version have) || have < Version.Parse(u.Item.Version));
                 string newest = u == null ? "" : u.UefiTooOld ? T($"要 UEFI {u.Item.MinUefi}", $"needs {u.Item.MinUefi}")
-                              : u.Update ? u.Item.Version + " ↑" : u.Item.Version;
+                              : rowUpdate ? u.Item.Version + " ↑" : u.Item.Version;
                 var item = new ListViewItem(new[] { d.Name, d.State, d.Installed, d.Running, newest })
                 {
-                    ForeColor = !d.Ok ? Color.Firebrick : u is { Update: true } ? Color.RoyalBlue : SystemColors.WindowText,
+                    ForeColor = !d.Ok ? Color.Firebrick : rowUpdate ? Color.RoyalBlue : SystemColors.WindowText,
                     ToolTipText = d.Instance,
                 };
                 driverList.Items.Add(item);
