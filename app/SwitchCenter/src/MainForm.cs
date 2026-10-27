@@ -43,11 +43,14 @@ namespace SwitchCenter
         readonly Timer brightnessApply = new Timer { Interval = 150 };
         bool updatingBar;
 
+        /// <summary>This control center's version, e.g. 0.5.3 (shown in the title and on the Drivers tab).</summary>
+        static string AppVersion => Application.ProductVersion.Split('+')[0];
+
         public MainForm(Func<int, bool> chooseProfile, SystemUsage usage)
         {
             this.chooseProfile = chooseProfile;
             this.usage = usage;
-            Text = T("Switch コントロールセンター", "Switch Control Center");
+            Text = T("Switch コントロールセンター", "Switch Control Center") + " " + AppVersion;
             Font = bodyFont;
             AutoScaleMode = AutoScaleMode.Dpi;
             StartPosition = FormStartPosition.CenterScreen;
@@ -328,7 +331,8 @@ namespace SwitchCenter
             bottom.Controls.Add(appButton);
             bottom.Controls.Add(updateStatus);
             bottom.Controls.Add(releaseLink);
-            updateStatus.Text = T("「更新を確認」で、GitHub の最新のリリースと比べます。", "\"Check for updates\" compares with the latest release on GitHub.");
+            updateStatus.Text = T($"コントロールセンター {AppVersion}。「更新を確認」で、GitHub の最新のリリースと比べます。",
+                                  $"Control center {AppVersion}. \"Check for updates\" compares with the latest release on GitHub.");
             page.Controls.Add(driverList);
             page.Controls.Add(bottom);
             return page;
@@ -391,6 +395,7 @@ namespace SwitchCenter
                 int uefi = Updater.EstimateUefi();
                 updateStatus.Text =
                     T($"最新のリリース: {latest.Tag}", $"Latest release: {latest.Tag}") + "\n" +
+                    T($"コントロールセンター: 今 {AppVersion} / 最新 {latest.AppVersion}", $"Control center: {AppVersion} installed / {latest.AppVersion} latest") + "\n" +
                     (count > 0 ? T($"更新できるドライバー: {count} 件（青い行）", $"Driver updates: {count} (blue rows)")
                                : T("ドライバーはすべて最新です。", "All drivers are up to date.")) + "\n" +
                     (pending > 0 ? T($"再起動を待っているデバイス: {pending} 個\n", $"Devices waiting for a restart: {pending}\n") : "") +
