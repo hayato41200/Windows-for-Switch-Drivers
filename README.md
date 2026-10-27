@@ -51,6 +51,15 @@ Windows のイメージとライセンスは、各自で用意してください
    - 電源の設定
    - ドライバーの一覧
 
+## SwitchPatcher（PC で SD に入れる道具）
+
+Switch の SD を PC に挿して、SD の Windows にドライバー、テストモード、コントロールセンターを入れる道具。ARM64 の Windows のイメージを、SD に入れ直すこともできる。
+
+- **入手:** リリースの `SwitchPatcher-<版>-x64.zip`
+- **使い方:** `kits/Switch-Patcher/README-ja.md`
+- **設計:** `docs/Design-SwitchPatcher-ja.md`
+- **状態:** 試験中。仮想ディスクでは最後まで動いたが、本物の SD ではまだ試していない。
+
 ## ビルド（PC）
 
 必要なもの:
@@ -102,6 +111,8 @@ GPIO と I2C は、ほかのドライバーが使っているので、その場�
 | `drivers/` | 各ドライバーのソースと INF |
 | `kits/` | Switch で使う導入スクリプトと README（バイナリはリリースの ZIP に入る） |
 | `app/SwitchCenter/` | コントロールセンター（.NET 8、WinForms、win-arm64） |
+| `app/SwitchPatcher/` | SwitchPatcher（.NET 8、WinForms、win-x64、PC 用） |
+| `app/Shared/` | 両方で使う、リリースの読み込みと確かめ |
 | `tools/` | `Build-Driver.ps1`（clang-cl + lld-link で KMDF をビルドし、テスト署名する）、テスト証明書の公開鍵 |
 | `release/` | `Make-Release.ps1` |
 | `docs/` | 設計のメモ |

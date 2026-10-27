@@ -4,6 +4,7 @@
   GitHub release:
     out\<Version>\SwitchDrivers-<Version>.zip      kits\Switch-* with the built .sys/.cat/.inf
     out\<Version>\SwitchCenter-<app>-arm64.zip     the control center (self-contained, win-arm64)
+    out\<Version>\SwitchPatcher-<app>-x64.zip     the PC tool that patches a Switch SD (self-contained, win-x64)
     out\<Version>\manifest.json                    versions, hardware IDs, minimum UEFI, SHA-256
   Upload the three files to a release tagged drivers-<Version>, or pass -Publish
   to have the GitHub CLI (gh, logged in with `gh auth login`) create the release.
@@ -32,7 +33,9 @@ function Publish-Release([string]$dir) {
   $m = Get-Content (Join-Path $dir 'manifest.json') -Raw | ConvertFrom-Json
   $notes = @("Drivers $Version", '', '| Driver | Version | Device | Needs UEFI |', '|---|---|---|---|')
   $notes += $m.drivers.items | ForEach-Object { "| $($_.service) | $($_.version) | $($_.hwid) | $($_.minUefi) |" }
-  $notes += '', "Control center: $($m.app.version) ($($m.app.file))", '', 'SHA-256 values are in manifest.json.'
+  $notes += '', "Control center: $($m.app.version) ($($m.app.file))"
+  if ($m.patcher) { $notes += "SwitchPatcher (PC): $($m.patcher.version) ($($m.patcher.file))" }
+  $notes += '', 'SHA-256 values are in manifest.json.'
   $notesFile = Join-Path $dir 'release-notes.md'
   $notes -join "`n" | Set-Content $notesFile -Encoding utf8
   $files = Get-ChildItem $dir -File | Where-Object { $_.Name -ne 'release-notes.md' } | ForEach-Object FullName
@@ -115,12 +118,23 @@ Copy-Item (Join-Path $Root 'kits\Switch-Center\README-ja.md') $appStage
 $appZip = Join-Path $Out "SwitchCenter-$appVersion-arm64.zip"
 Compress-Archive -Path $appStage -DestinationPath $appZip -CompressionLevel Optimal
 
+# ---------------------------------------------------------- patcher (PC)
+$pcsproj = Join-Path $Root 'app\SwitchPatcher\src\SwitchPatcher.csproj'
+$patcherVersion = ([xml](Get-Content $pcsproj)).Project.PropertyGroup.Version | Where-Object { $_ } | Select-Object -First 1
+$patcherStage = Join-Path $Stage 'SwitchPatcher'
+Write-Host "=== SwitchPatcher $patcherVersion"
+& dotnet publish $pcsproj -c Release -o $patcherStage | Out-Host
+if ($LASTEXITCODE -ne 0) { throw 'dotnet publish (SwitchPatcher) failed' }
+$patcherZip = Join-Path $Out "SwitchPatcher-$patcherVersion-x64.zip"
+Compress-Archive -Path (Join-Path $patcherStage 'SwitchPatcher.exe'), (Join-Path $Root 'kits\Switch-Patcher\README-ja.md') -DestinationPath $patcherZip -CompressionLevel Optimal
+
 # ------------------------------------------------------------ manifest
 $manifest = [ordered]@{
   release   = "drivers-$Version"
   created   = (Get-Date).ToString('yyyy-MM-ddTHH:mm:ssK')
   signer    = 'A9E1F054DFCC96F43010918892C3C30D5A522712'
   app       = [ordered]@{ version = $appVersion; file = (Split-Path $appZip -Leaf); sha256 = (Sha256 $appZip) }
+  patcher   = [ordered]@{ version = $patcherVersion; file = (Split-Path $patcherZip -Leaf); sha256 = (Sha256 $patcherZip) }
   drivers   = [ordered]@{ file = (Split-Path $driversZip -Leaf); sha256 = (Sha256 $driversZip); items = $manifestDrivers }
 }
 $manifest | ConvertTo-Json -Depth 6 | Set-Content (Join-Path $Out 'manifest.json') -Encoding utf8

@@ -1,0 +1,52 @@
+# SwitchPatcher
+
+PC で動く道具です。Switch の SD を PC に挿して、SD の Windows に次のものを入れます。
+
+- Switch のドライバー
+- テストモードとテスト証明書
+- コントロールセンター
+
+Windows のイメージ（ARM64）を、SD に入れ直すこともできます。設計は `docs/Design-SwitchPatcher-ja.md`。
+
+## 使い方
+
+1. **SD のバックアップを取る。** 「Windows を入れる」では、SD の Windows の区画が消えます。
+2. **起動する。** `SwitchPatcher.exe` を起動する。管理者の確認が出る。
+3. **SD を選ぶ。** 「SD カード」と「Windows の区画」を選ぶ。SD は、Switch の SD のように、GPT で ESP と NTFS の区画があるものに限る。
+4. **することを選ぶ。**
+   - **入っている Windows にパッチを当てる:** 今の Windows はそのまま。
+   - **Windows のイメージを入れる:** ISO、WIM、ESD と、ARM64 のエディションを選ぶ。Windows の区画をフォーマットして入れ直す。
+5. **入れるものを選んで、「開始」を押す。**
+   - 確認の画面が出る。
+   - イメージを入れるときは、区画の大きさを入力する画面も出る。
+6. **SD を外して、Switch で起動する。** 終わったら、SD を「安全に取り外す」から外す。
+
+## 入れるもの
+
+- **ドライバー:** GitHub の最新のリリースから取ってくる。入れる前に、次を確かめる。
+  - ZIP の SHA-256
+  - 各 .sys
+  - 署名
+- **テストモード:**
+  - 証明書を、起動していない Windows の「信頼されたルート証明機関」と「信頼された発行元」に入れる。
+  - ESP の BCD で `testsigning on` にする。
+- **コントロールセンター:**
+  - `C:\SwitchWOA\SwitchCenter\` に置く。
+  - ログインしたときに起動する（`HKLM\...\Run`）。
+- **Windows を入れたときだけ:**
+  - 初回起動で、Microsoft アカウントとネットワークを求めないようにする（unattend.xml、BypassNRO）。
+  - アカウントは、初回起動の画面で自分で作る。
+
+ESP の起動ファイル（BCD など）は、書き換える前に `ドキュメント\SwitchPatcher\backup-<日時>\` に保存します。
+
+Windows のイメージとライセンスは、各自で用意してください。
+
+## 試したこと
+
+- **仮想ディスク（VHDX、Switch の SD と同じ GPT・ESP・NTFS の形）での試験（2026-10-27）:** ARM64 の WinPE（10.0.26100）を相手に、「Windows を入れる」と「パッチ」を最後まで通した。
+  - 展開と bcdboot（ESP のバックアップを含む）
+  - 証明書（ROOT、TrustedPublisher）、自動起動、BypassNRO
+  - 8つのドライバーの登録（`dism /Get-Drivers` で確かめた）
+  - テストモード（`testsigning Yes`）
+  - コントロールセンターの配置
+- **本物の SD と Switch:** まだ試していない。

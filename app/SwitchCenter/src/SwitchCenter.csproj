@@ -18,4 +18,9 @@
     <IncludeSourceRevisionInInformationalVersion>false</IncludeSourceRevisionInInformationalVersion>
   </PropertyGroup>
 
+  <ItemGroup>
+    <!-- Release reading and checking, shared with SwitchPatcher. -->
+    <Compile Include="..\..\Shared\*.cs" />
+  </ItemGroup>
+
 </Project>
