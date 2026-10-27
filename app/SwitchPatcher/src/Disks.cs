@@ -129,7 +129,15 @@ ConvertTo-Json -InputObject $list -Depth 5 -Compress");
             await Tools.PowerShell($@"
 $d = Get-Disk -Number {n}
 if ($d.PartitionStyle -ne 'RAW') {{ Clear-Disk -Number {n} -RemoveData -RemoveOEM -Confirm:$false }}
-Initialize-Disk -Number {n} -PartitionStyle GPT");
+# A removable SD is often left initialized (MBR) after Clear-Disk instead of RAW.
+Update-Disk -Number {n}
+$d = Get-Disk -Number {n}
+if ($d.PartitionStyle -eq 'RAW') {{ Initialize-Disk -Number {n} -PartitionStyle GPT }}
+elseif ($d.PartitionStyle -ne 'GPT') {{ Set-Disk -Number {n} -PartitionStyle GPT }}
+Update-Disk -Number {n}
+$d = Get-Disk -Number {n}
+if ($d.PartitionStyle -ne 'GPT') {{ throw ""disk {n} is $($d.PartitionStyle), not GPT"" }}
+if (@(Get-Partition -DiskNumber {n} -ErrorAction SilentlyContinue | Where-Object {{ $_.Type -ne 'Reserved' }}).Count) {{ throw ""disk {n} still has partitions"" }}");
             log(T("ESP（FAT32、260 MB）と Windows の区画（NTFS）を作っています…", "Creating the ESP (FAT32, 260 MB) and the Windows partition (NTFS)..."));
             await Tools.PowerShell($@"
 $esp = New-Partition -DiskNumber {n} -Size 260MB
