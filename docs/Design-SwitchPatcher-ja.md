@@ -19,7 +19,10 @@ Windows そのものは配らない。イメージとライセンスは、利用
 - Switch の UEFI は、ESP の `EFI\Boot\bootaa64.efi` から Windows のブートマネージャーを起動する。
 - テストモードは、ESP の `EFI\Microsoft\Boot\BCD` の `{default}` に `testsigning on` を書いて有効にする。Switch の上からは書けないので、PC から書く。
 
-区画を作ったり、ESP をフォーマットしたりはしない。Windows を入れるときは、Windows の区画だけを NTFS でフォーマットし直す。
+- **今ある SD:** 区画は作らない。ESP もフォーマットしない。Windows を入れるときは、Windows の区画だけを NTFS でフォーマットし直す。
+- **新しい SD（0.2.0）:** SD 全体を消して、GPT・ESP・NTFS を作る。
+  - ESP は、最初はデータの区画として作り、FAT32 でフォーマットしてから種類を ESP に変える。Windows は、ESP の種類の区画を Format-Volume で開かせないため。
+  - 消す前に、ダウンロードと確かめを全部終える。
 
 ## 安全のための決まり
 
@@ -66,6 +69,6 @@ Windows そのものは配らない。イメージとライセンスは、利用
 
 ## まだやらないこと
 
-- 区画の作成と、hekate の設定（`hekate_ipl.ini`、ペイロード）
+- hekate の設定（`hekate_ipl.ini`、ペイロード）と、hekate の区画と並べること
 - MBR の SD
 - すでに入っているドライバーの入れ替え（コントロールセンターの OTA で行う）

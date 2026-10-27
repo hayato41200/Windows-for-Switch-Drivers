@@ -112,6 +112,32 @@ ConvertTo-Json -InputObject $list -Depth 5 -Compress");
             catch (InvalidOperationException) { }
         }
 
+        /// <summary>
+        /// Erases the whole disk and makes the Switch SD layout: GPT, an ESP
+        /// (FAT32, 260 MB) and an NTFS partition for Windows on the rest. Only for
+        /// SD / USB card readers (and virtual disks, for testing). The ESP is made
+        /// as a data partition first and retyped after formatting, because
+        /// Windows does not let Format-Volume open a partition that is already an ESP.
+        /// </summary>
+        public static async Task InitializeSd(DiskInfo disk, Action<string> log)
+        {
+            if (!disk.LooksLikeSd && disk.Bus != "File Backed Virtual")
+                throw new InvalidOperationException(T($"このディスクの接続は {disk.Bus} です。SD カード以外は初期化しません。", $"This disk is on {disk.Bus}; only SD cards are initialized."));
+            await CheckNotSystemDisk(disk.Number);
+            int n = disk.Number;
+            log(T($"ディスク {n} を消しています…", $"Erasing disk {n}..."));
+            await Tools.PowerShell($@"
+$d = Get-Disk -Number {n}
+if ($d.PartitionStyle -ne 'RAW') {{ Clear-Disk -Number {n} -RemoveData -RemoveOEM -Confirm:$false }}
+Initialize-Disk -Number {n} -PartitionStyle GPT");
+            log(T("ESP（FAT32、260 MB）と Windows の区画（NTFS）を作っています…", "Creating the ESP (FAT32, 260 MB) and the Windows partition (NTFS)..."));
+            await Tools.PowerShell($@"
+$esp = New-Partition -DiskNumber {n} -Size 260MB
+$esp | Format-Volume -FileSystem FAT32 -NewFileSystemLabel ESP -Confirm:$false | Out-Null
+Set-Partition -DiskNumber {n} -PartitionNumber $esp.PartitionNumber -GptType '{PartInfo.EspType}'
+New-Partition -DiskNumber {n} -UseMaximumSize | Format-Volume -FileSystem NTFS -NewFileSystemLabel Windows -Confirm:$false | Out-Null");
+        }
+
         /// <summary>Quick NTFS format of the Windows partition only (never the ESP; checked again here).</summary>
         public static async Task FormatWindowsPartition(int disk, PartInfo part, string letter)
         {

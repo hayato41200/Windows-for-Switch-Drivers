@@ -16,6 +16,7 @@ namespace SwitchPatcher
     {
         public DiskInfo Disk;
         public PartInfo Windows;
+        public bool InitializeDisk;       // erase the whole SD and make GPT + ESP + NTFS first (implies InstallImage)
         public bool InstallImage;         // format the Windows partition and apply ImagePath / Index first
         public string ImagePath;          // .iso, .wim or .esd
         public int ImageIndex;
@@ -34,10 +35,6 @@ namespace SwitchPatcher
             try
             {
                 await Disks.CheckNotSystemDisk(o.Disk.Number);
-                PartInfo espPart = o.Disk.Esp ?? throw new InvalidOperationException(T("この SD に ESP（EFI システム区画）がありません。", "This SD has no EFI system partition."));
-                string win = await Disks.EnsureLetter(o.Disk.Number, o.Windows, assigned) + @":\";
-                string esp = await Disks.EnsureLetter(o.Disk.Number, espPart, assigned) + @":\";
-                log(T($"Windows の区画: {win}  ESP: {esp}", $"Windows partition: {win}  ESP: {esp}"));
 
                 // ---- release: download and check everything before touching the SD
                 log(T("GitHub の最新のリリースを読んでいます…", "Reading the latest release from GitHub..."));
@@ -74,6 +71,21 @@ namespace SwitchPatcher
                     if (!File.Exists(Path.Combine(appSource, "SwitchCenter.exe"))) throw new InvalidDataException("SwitchCenter.exe");
                 }
                 log(T("ダウンロードしたものは、すべて確かめました。", "Everything downloaded has been checked."));
+
+                // ---- a new SD: erase it and make the partitions, then read its layout again
+                if (o.InitializeDisk)
+                {
+                    await Disks.InitializeSd(o.Disk, log);
+                    o.Disk = (await Disks.ListAsync()).Find(x => x.Number == o.Disk.Number)
+                             ?? throw new InvalidOperationException(T("初期化したディスクが見つかりません。", "The initialized disk has gone."));
+                    o.Windows = o.Disk.Partitions.Where(p => !p.IsEsp && p.FileSystem == "NTFS").OrderByDescending(p => p.Size).First();
+                    o.InstallImage = true;
+                }
+
+                PartInfo espPart = o.Disk.Esp ?? throw new InvalidOperationException(T("この SD に ESP（EFI システム区画）がありません。", "This SD has no EFI system partition."));
+                string win = await Disks.EnsureLetter(o.Disk.Number, o.Windows, assigned) + @":\";
+                string esp = await Disks.EnsureLetter(o.Disk.Number, espPart, assigned) + @":\";
+                log(T($"Windows の区画: {win}  ESP: {esp}", $"Windows partition: {win}  ESP: {esp}"));
 
                 // ---- Windows image
                 string backup = null;

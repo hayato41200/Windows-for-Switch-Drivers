@@ -17,6 +17,7 @@ namespace SwitchPatcher
         readonly Label diskNote = new Label { AutoSize = true, MaximumSize = new Size(640, 0), ForeColor = Color.DarkOrange };
         readonly RadioButton patchRadio = new RadioButton { AutoSize = true, Checked = true };
         readonly RadioButton installRadio = new RadioButton { AutoSize = true };
+        readonly RadioButton newSdRadio = new RadioButton { AutoSize = true };
         readonly TextBox imagePath = new TextBox { Width = 430, ReadOnly = true };
         readonly Button browse = new Button { Width = 84, Height = 28 };
         readonly ComboBox editionBox = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = 520 };
@@ -42,7 +43,9 @@ namespace SwitchPatcher
             diskBox.SelectedIndexChanged += (_, _) => ShowPartitions();
             patchRadio.Text = T("入っている Windows にパッチを当てる", "Patch the Windows on the SD");
             installRadio.Text = T("Windows のイメージを入れる（Windows の区画を消して入れ直す）", "Install a Windows image (erases the Windows partition)");
+            newSdRadio.Text = T("新しい SD に Windows を入れる（SD 全体を消して、区画を作る）", "Install Windows on a new SD (erases the whole SD and makes the partitions)");
             patchRadio.CheckedChanged += (_, _) => UpdateEnabled();
+            installRadio.CheckedChanged += (_, _) => UpdateEnabled();
             browse.Text = T("選ぶ…", "Browse...");
             browse.Click += async (_, _) => await ChooseImage();
             drivers.Text = T("Switch のドライバー（最新のリリース）", "Switch drivers (latest release)");
@@ -63,6 +66,7 @@ namespace SwitchPatcher
             top.Controls.Add(Caption(T("2. すること", "2. What to do")));
             top.Controls.Add(patchRadio);
             top.Controls.Add(installRadio);
+            top.Controls.Add(newSdRadio);
             var imageRow = new FlowLayoutPanel { AutoSize = true, Margin = new Padding(20, 0, 0, 0) };
             imageRow.Controls.Add(imagePath);
             imageRow.Controls.Add(browse);
@@ -111,8 +115,9 @@ namespace SwitchPatcher
         void UpdateEnabled()
         {
             bool idle = !running;
-            imagePath.Enabled = browse.Enabled = editionBox.Enabled = idle && installRadio.Checked;
-            diskBox.Enabled = partBox.Enabled = patchRadio.Enabled = installRadio.Enabled = idle;
+            imagePath.Enabled = browse.Enabled = editionBox.Enabled = idle && !patchRadio.Checked;
+            diskBox.Enabled = patchRadio.Enabled = installRadio.Enabled = newSdRadio.Enabled = idle;
+            partBox.Enabled = idle && !newSdRadio.Checked;      // a new SD gets its partitions made
             drivers.Enabled = testMode.Enabled = controlCenter.Enabled = start.Enabled = idle;
         }
 
@@ -148,6 +153,8 @@ namespace SwitchPatcher
             if (!d.LooksLikeSd) notes.Add(T($"注意: このディスクの接続は {d.Bus} です。SD カードか、もう一度確かめてください。", $"Note: this disk is on {d.Bus}. Make sure it is the SD card."));
             if (d.Style != "GPT") notes.Add(T("この SD は GPT ではありません。今の版は GPT の SD だけに対応しています。", "This SD is not GPT; this version supports GPT SD cards only."));
             if (d.Esp == null) notes.Add(T("この SD には ESP（EFI システム区画）がありません。", "This SD has no EFI system partition."));
+            if (d.Style != "GPT" || d.Esp == null)
+                notes.Add(T("新しい SD なら、「新しい SD に Windows を入れる」を選んでください。", "For a new SD, choose \"Install Windows on a new SD\"."));
             diskNote.Text = string.Join("\n", notes);
         }
 
@@ -187,14 +194,16 @@ namespace SwitchPatcher
 
         async Task Run()
         {
-            if (diskBox.SelectedItem is not DiskInfo disk || partBox.SelectedItem is not PartInfo part)
+            bool newSd = newSdRadio.Checked;
+            if (diskBox.SelectedItem is not DiskInfo disk || (!newSd && partBox.SelectedItem is not PartInfo))
             {
                 MessageBox.Show(this, T("SD カードと Windows の区画を選んでください。", "Choose the SD card and its Windows partition."), Text);
                 return;
             }
+            var part = partBox.SelectedItem as PartInfo;
             var o = new PatchOptions
             {
-                Disk = disk, Windows = part, InstallImage = installRadio.Checked,
+                Disk = disk, Windows = part, InitializeDisk = newSd, InstallImage = !patchRadio.Checked,
                 Drivers = drivers.Checked, TestMode = testMode.Checked, ControlCenter = controlCenter.Checked,
             };
             if (o.InstallImage)
@@ -207,27 +216,33 @@ namespace SwitchPatcher
                 o.ImagePath = imagePath.Text;
                 o.ImageIndex = e.Index;
             }
-            if (disk.Esp == null || disk.Style != "GPT")
+            if (!newSd && (disk.Esp == null || disk.Style != "GPT"))
             {
                 MessageBox.Show(this, diskNote.Text, Text);
                 return;
             }
 
             var steps = new List<string>();
-            if (o.InstallImage)
+            if (newSd)
+            {
+                steps.Add(T($"・SD 全体（{disk.Size / 1e9:0.0} GB）を消して、GPT・ESP（260 MB）・Windows の区画（NTFS、残り全部）を作る",
+                            $"- Erase the whole SD ({disk.Size / 1e9:0.0} GB) and make GPT, an ESP (260 MB) and a Windows partition (NTFS, the rest)"));
+                steps.Add(T($"・次を入れる: {editionBox.SelectedItem}", $"- Install: {editionBox.SelectedItem}"));
+            }
+            else if (o.InstallImage)
             {
                 steps.Add(T($"・Windows の区画（#{part.Number}、{part.Size / 1e9:0.0} GB）を消して、次を入れる: {editionBox.SelectedItem}",
                             $"- Erase the Windows partition (#{part.Number}, {part.Size / 1e9:0.0} GB) and install: {editionBox.SelectedItem}"));
                 steps.Add(T("・ESP の起動ファイルを PC に保存してから、起動の設定を作り直す（bcdboot）", "- Save the ESP boot files to the PC, then rebuild the boot files (bcdboot)"));
-                steps.Add(T("・初回起動で Microsoft アカウントとネットワークを求めないようにする", "- First boot without a Microsoft account or network"));
             }
+            if (o.InstallImage) steps.Add(T("・初回起動で Microsoft アカウントとネットワークを求めないようにする", "- First boot without a Microsoft account or network"));
             if (o.Drivers) steps.Add(T("・Switch のドライバーを入れる", "- Add the Switch drivers"));
             if (o.TestMode) steps.Add(T("・テスト証明書を入れて、テストモードを有効にする（BCD は先に PC に保存する）", "- Add the test certificate and turn on test signing (the BCD is saved to the PC first)"));
             if (o.ControlCenter) steps.Add(T("・コントロールセンターを C:\\SwitchWOA\\SwitchCenter に置く", "- Put the control center in C:\\SwitchWOA\\SwitchCenter"));
             if (steps.Count == 0) return;
             if (MessageBox.Show(this, $"{disk}\n\n" + string.Join("\n", steps) + T("\n\n始めますか？", "\n\nStart?"), Text,
                                 MessageBoxButtons.OKCancel, o.InstallImage ? MessageBoxIcon.Warning : MessageBoxIcon.Question) != DialogResult.OK) return;
-            if (o.InstallImage && !ConfirmErase(part)) return;
+            if (newSd ? !ConfirmErase(disk.Size, T("SD 全体", "the whole SD")) : o.InstallImage && !ConfirmErase(part.Size, T("Windows の区画", "the Windows partition"))) return;
 
             running = true;
             UpdateEnabled();
@@ -251,10 +266,10 @@ namespace SwitchPatcher
             }
         }
 
-        /// <summary>Formatting needs the partition's size typed back, so a wrong choice is hard to confirm by accident.</summary>
-        bool ConfirmErase(PartInfo part)
+        /// <summary>Erasing needs the size typed back, so a wrong choice is hard to confirm by accident.</summary>
+        bool ConfirmErase(long size, string what)
         {
-            string expected = $"{part.Size / 1e9:0.0}";
+            string expected = $"{size / 1e9:0.0}";
             using var f = new Form
             {
                 Text = Text, FormBorderStyle = FormBorderStyle.FixedDialog, StartPosition = FormStartPosition.CenterParent,
@@ -263,8 +278,8 @@ namespace SwitchPatcher
             var label = new Label
             {
                 AutoSize = true, MaximumSize = new Size(430, 0), Location = new Point(12, 12),
-                Text = T($"Windows の区画の中身は、すべて消えます。\n消してよければ、区画の大きさ「{expected}」（GB）を入力してください。",
-                         $"Everything on the Windows partition will be erased.\nType its size \"{expected}\" (GB) to continue."),
+                Text = T($"{what}の中身は、すべて消えます。\n消してよければ、大きさ「{expected}」（GB）を入力してください。",
+                         $"Everything on {what} will be erased.\nType its size \"{expected}\" (GB) to continue."),
             };
             var box = new TextBox { Location = new Point(12, 70), Width = 160 };
             var ok = new Button { Text = "OK", DialogResult = DialogResult.OK, Location = new Point(260, 104), Width = 90 };
