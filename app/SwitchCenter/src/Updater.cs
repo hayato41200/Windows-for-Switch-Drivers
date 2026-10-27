@@ -9,7 +9,14 @@
 // GPIO and I2C carry the other Switch drivers. Replacing them while they run
 // stops those drivers, and on the Switch PnP hung restarting I2C1. So they are
 // only added to the driver store and their devices marked for reinstall at
-// the next boot (CONFIGFLAG_REINSTALL), before anything uses them.
+// the next boot (CONFIGFLAG_REINSTALL), before anything uses them. The
+// manifest says which drivers those are ("installAt": "boot"); releases made
+// before that field existed fall back to the list in AtNextBoot.
+//
+// The devices to look at come from the manifest too, so a driver for a new
+// DSDT device installs without a new control center. A device that is present
+// in the DSDT proves the UEFI is new enough for it; minUefi only explains why
+// a device is missing.
 //
 // The control center updates itself as the normal user: the new ZIP (SHA-256
 // checked) is unpacked under %LOCALAPPDATA%, and that copy, started with
@@ -39,7 +46,8 @@ namespace SwitchCenter
 {
     sealed class ManifestDriver
     {
-        public string Service, Inf, Hwid, Version, MinUefi, SysSha256;
+        public string Service, Inf, Hwid, Version, MinUefi, SysSha256, NameJa, NameEn;
+        public bool AtNextBoot;           // replaced at the next boot instead of live (GPIO, I2C)
     }
 
     sealed class Release
@@ -53,7 +61,8 @@ namespace SwitchCenter
     {
         public ManifestDriver Item;
         public string Installed;          // lowest installed version over the device's instances, null = no driver
-        public bool DevicePresent, UefiTooOld, Update, AtNextBoot;
+        public bool DevicePresent, UefiTooOld, Update;
+        public bool AtNextBoot => Item.AtNextBoot;
         public int Pending;               // instances already marked for reinstall at the next boot
     }
 
@@ -64,8 +73,9 @@ namespace SwitchCenter
         public const string Signer = "A9E1F054DFCC96F43010918892C3C30D5A522712";
         static readonly Regex TagPattern = new Regex(@"^drivers-\d{4}\.\d{1,2}\.\d{1,2}(\.\d+)?$");
         static readonly Regex ServicePattern = new Regex(@"^[a-z0-9]{1,32}$");
-        /// <summary>Drivers that other Switch drivers depend on; replaced at the next boot, not live.</summary>
-        public static readonly string[] AtNextBoot = { "tegra210gpio", "tegra210i2c" };
+        /// <summary>Drivers replaced at the next boot when the manifest has no "installAt" (releases up to drivers-2026.10.27).</summary>
+        static readonly string[] AtNextBoot = { "tegra210gpio", "tegra210i2c" };
+        static readonly Regex HwidPattern = new Regex(@"^ACPI\\[A-Z0-9]{4,8}$");
         static readonly TimeSpan PnputilTimeout = TimeSpan.FromMinutes(2);
 
         static HttpClient NewClient()
@@ -120,8 +130,12 @@ namespace SwitchCenter
                     Version = i.GetProperty("version").GetString(),
                     MinUefi = i.GetProperty("minUefi").GetString(),
                     SysSha256 = i.GetProperty("sysSha256").GetString().ToLowerInvariant(),
+                    NameJa = i.TryGetProperty("nameJa", out JsonElement ja) ? ja.GetString() : null,
+                    NameEn = i.TryGetProperty("nameEn", out JsonElement en) ? en.GetString() : null,
                 };
-                if (!ServicePattern.IsMatch(d.Service) || !System.Version.TryParse(d.Version, out _)) throw new InvalidDataException("bad manifest entry " + d.Service);
+                d.AtNextBoot = i.TryGetProperty("installAt", out JsonElement at) ? at.GetString() == "boot" : Array.IndexOf(AtNextBoot, d.Service) >= 0;
+                if (!ServicePattern.IsMatch(d.Service) || !System.Version.TryParse(d.Version, out _) || !HwidPattern.IsMatch(d.Hwid))
+                    throw new InvalidDataException("bad manifest entry " + d.Service);
                 r.Drivers.Add(d);
             }
             return r;
@@ -156,7 +170,7 @@ namespace SwitchCenter
             var rows = new List<UpdateRow>();
             foreach (ManifestDriver d in release.Drivers)
             {
-                var row = new UpdateRow { Item = d, UefiTooOld = UefiNumber(d.MinUefi) > uefi, AtNextBoot = Array.IndexOf(AtNextBoot, d.Service) >= 0 };
+                var row = new UpdateRow { Item = d };
                 Version lowest = null;
                 bool missingDriver = false;
                 foreach (DriverRow i in installed.Where(i => i.HardwareId.Equals(d.Hwid, StringComparison.OrdinalIgnoreCase) && i.Instance != ""))
@@ -167,7 +181,9 @@ namespace SwitchCenter
                     else missingDriver = true;
                 }
                 row.Installed = missingDriver ? null : lowest?.ToString();
-                row.Update = row.DevicePresent && !row.UefiTooOld && (missingDriver || (lowest != null && lowest < System.Version.Parse(d.Version)));
+                // The device being in the DSDT shows the UEFI has it; minUefi only explains a missing device.
+                row.UefiTooOld = !row.DevicePresent && UefiNumber(d.MinUefi) > uefi;
+                row.Update = row.DevicePresent && (missingDriver || (lowest != null && lowest < System.Version.Parse(d.Version)));
                 rows.Add(row);
             }
             return rows;
@@ -207,14 +223,14 @@ namespace SwitchCenter
 
             log(T($"リリース {tag} を GitHub から読んでいます…", $"Reading release {tag} from GitHub..."));
             Release release = await FetchAsync(tag);
-            int uefi = EstimateUefi();
+            List<DriverRow> devices = DriverStatus.Read(release);
             var chosen = new List<ManifestDriver>();
             foreach (ManifestDriver d in release.Drivers)               // manifest order = install order (GPIO, I2C, ...)
             {
                 if (Array.IndexOf(services, d.Service) < 0) continue;
-                if (UefiNumber(d.MinUefi) > uefi)
-                    throw new InvalidOperationException(T($"{d.Service} には UEFI {d.MinUefi} 以降が必要です（今は R{uefi} 相当）。",
-                                                          $"{d.Service} needs UEFI {d.MinUefi} or later (this one looks like R{uefi})."));
+                if (!devices.Exists(r => r.HardwareId.Equals(d.Hwid, StringComparison.OrdinalIgnoreCase) && r.Instance != ""))
+                    throw new InvalidOperationException(T($"{d.Service} のデバイス（{d.Hwid}）がありません。UEFI {d.MinUefi} 以降が必要です。",
+                                                          $"There is no {d.Hwid} device for {d.Service}; it needs UEFI {d.MinUefi} or later."));
                 chosen.Add(d);
             }
             if (chosen.Count == 0) throw new InvalidOperationException(T("入れるドライバーがありません。", "Nothing to install."));
@@ -255,14 +271,14 @@ namespace SwitchCenter
                 {
                     ManifestDriver d = chosen[n];
                     string inf = Path.Combine(files, d.Inf);
-                    if (Array.IndexOf(AtNextBoot, d.Service) >= 0)
+                    if (d.AtNextBoot)
                     {
                         log(T($"{d.Service} を Windows に登録しています（入れ替えは次の起動のとき）…", $"Adding {d.Service} to the driver store (replaced at the next boot)..."));
                         int? code = await Pnputil($"/add-driver \"{inf}\"", log);
                         if (code == null) { leaveFiles = true; return Stopped(chosen, n, log); }
                         if (code != 0 && code != ExitReboot)
                             throw new InvalidOperationException(T($"pnputil が失敗しました（{code}）。", $"pnputil failed ({code})."));
-                        int marked = MarkForReinstall(d);
+                        int marked = MarkForReinstall(d, release);
                         log(T($"  {marked} 個のデバイスを、次の起動で新しいドライバーにするようにしました。", $"  {marked} device(s) will get the new driver at the next boot."));
                         reboot = true;
                     }
@@ -325,11 +341,11 @@ namespace SwitchCenter
         public const int CONFIGFLAG_REINSTALL = 0x20;
 
         /// <summary>Marks each instance of the driver's device that has an older driver. Returns how many.</summary>
-        static int MarkForReinstall(ManifestDriver d)
+        static int MarkForReinstall(ManifestDriver d, Release release)
         {
             Version target = System.Version.Parse(d.Version);
             int marked = 0;
-            foreach (DriverRow r in DriverStatus.Read())
+            foreach (DriverRow r in DriverStatus.Read(release))
             {
                 if (!r.HardwareId.Equals(d.Hwid, StringComparison.OrdinalIgnoreCase) || r.Instance == "" || r.ReinstallPending) continue;
                 if (System.Version.TryParse(r.Installed, out Version v) && v >= target) continue;

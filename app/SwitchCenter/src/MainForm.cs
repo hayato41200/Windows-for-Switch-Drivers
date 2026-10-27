@@ -351,7 +351,7 @@ namespace SwitchCenter
 
         void LoadDrivers()
         {
-            List<DriverRow> rows = DriverStatus.Read();
+            List<DriverRow> rows = DriverStatus.Read(latest);
             if (latest != null) updates = Updater.Compare(latest, rows, Updater.EstimateUefi());
             driverList.BeginUpdate();
             driverList.Items.Clear();

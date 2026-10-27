@@ -53,16 +53,17 @@ if (Test-Path $Out) { throw "$Out already exists; use a new version." }
 New-Item -ItemType Directory -Force $Stage | Out-Null
 
 $Spb = '$Kits\Include\10.0.19041.0\km\spb\1.0', '$Kits\Include\10.0.26100.0\shared'
-# Dir, driver name, source, libraries, extra includes, kit folder, hardware ID, minimum UEFI
+# Dir, driver name, source, libraries, extra includes, kit folder, hardware ID, minimum UEFI,
+# display names, and Boot = replaced at the next boot by the control center (other drivers sit on it)
 $Drivers = @(
-  @{ Dir = 'Tegra210Gpio';      Name = 'tegra210gpio';  Src = 'tegra210gpio.c';  Libs = @('msgpioclxstub.lib');          Inc = @();  Kit = 'Switch-Stage1';      Hwid = 'ACPI\SWOA0101'; MinUefi = 'R367' }
-  @{ Dir = 'Tegra210I2c';       Name = 'tegra210i2c';   Src = 'tegra210i2c.c';   Libs = @('spb\1.0\spbcxstubs.lib');     Inc = $Spb; Kit = 'Switch-Stage3';      Hwid = 'ACPI\SWOA0201'; MinUefi = 'R370' }
-  @{ Dir = 'SwitchBattery';     Name = 'switchbattery'; Src = 'switchbattery.c'; Libs = @('battc.lib');                  Inc = $Spb; Kit = 'Switch-Battery';     Hwid = 'ACPI\SWOA0301'; MinUefi = 'R371' }
-  @{ Dir = 'SwitchFan';         Name = 'switchfan';     Src = 'switchfan.c';     Libs = @();                             Inc = $Spb; Kit = 'Switch-Fan';         Hwid = 'ACPI\SWOA0401'; MinUefi = 'R372' }
-  @{ Dir = 'SwitchTouch';       Name = 'switchtouch';   Src = 'switchtouch.c';   Libs = @('vhfkm.lib', 'libcntpr.lib');  Inc = $Spb; Kit = 'Switch-Touch';       Hwid = 'ACPI\SWOA0501'; MinUefi = 'R373' }
-  @{ Dir = 'SwitchPowerButton'; Name = 'switchpwrbtn';  Src = 'switchpwrbtn.c';  Libs = @('vhfkm.lib', 'libcntpr.lib');  Inc = $Spb; Kit = 'Switch-PowerButton'; Hwid = 'ACPI\SWOA0601'; MinUefi = 'R374' }
-  @{ Dir = 'SwitchCpuClock';    Name = 'switchcpu';     Src = 'switchcpu.c';     Libs = @();                             Inc = $Spb; Kit = 'Switch-CpuClock';    Hwid = 'ACPI\SWOA0701'; MinUefi = 'R375' }
-  @{ Dir = 'SwitchRtc';         Name = 'switchrtc';     Src = 'switchrtc.c';     Libs = @();                             Inc = $Spb; Kit = 'Switch-Rtc';         Hwid = 'ACPI\SWOA0801'; MinUefi = 'R377' }
+  @{ Dir = 'Tegra210Gpio';      Name = 'tegra210gpio';  Src = 'tegra210gpio.c';  Libs = @('msgpioclxstub.lib');          Inc = @();  Kit = 'Switch-Stage1';      Hwid = 'ACPI\SWOA0101'; MinUefi = 'R367'; Ja = 'GPIO コントローラー'; En = 'GPIO controller'; Boot = $true }
+  @{ Dir = 'Tegra210I2c';       Name = 'tegra210i2c';   Src = 'tegra210i2c.c';   Libs = @('spb\1.0\spbcxstubs.lib');     Inc = $Spb; Kit = 'Switch-Stage3';      Hwid = 'ACPI\SWOA0201'; MinUefi = 'R370'; Ja = 'I2C コントローラー'; En = 'I2C controller'; Boot = $true }
+  @{ Dir = 'SwitchBattery';     Name = 'switchbattery'; Src = 'switchbattery.c'; Libs = @('battc.lib');                  Inc = $Spb; Kit = 'Switch-Battery';     Hwid = 'ACPI\SWOA0301'; MinUefi = 'R371'; Ja = 'バッテリー・USB-C'; En = 'Battery, USB-C'; Boot = $false }
+  @{ Dir = 'SwitchFan';         Name = 'switchfan';     Src = 'switchfan.c';     Libs = @();                             Inc = $Spb; Kit = 'Switch-Fan';         Hwid = 'ACPI\SWOA0401'; MinUefi = 'R372'; Ja = 'ファン・バックライト'; En = 'Fan, backlight'; Boot = $false }
+  @{ Dir = 'SwitchTouch';       Name = 'switchtouch';   Src = 'switchtouch.c';   Libs = @('vhfkm.lib', 'libcntpr.lib');  Inc = $Spb; Kit = 'Switch-Touch';       Hwid = 'ACPI\SWOA0501'; MinUefi = 'R373'; Ja = 'タッチパネル'; En = 'Touch screen'; Boot = $false }
+  @{ Dir = 'SwitchPowerButton'; Name = 'switchpwrbtn';  Src = 'switchpwrbtn.c';  Libs = @('vhfkm.lib', 'libcntpr.lib');  Inc = $Spb; Kit = 'Switch-PowerButton'; Hwid = 'ACPI\SWOA0601'; MinUefi = 'R374'; Ja = '電源ボタン'; En = 'Power button'; Boot = $false }
+  @{ Dir = 'SwitchCpuClock';    Name = 'switchcpu';     Src = 'switchcpu.c';     Libs = @();                             Inc = $Spb; Kit = 'Switch-CpuClock';    Hwid = 'ACPI\SWOA0701'; MinUefi = 'R375'; Ja = 'CPU のクロック'; En = 'CPU clock'; Boot = $false }
+  @{ Dir = 'SwitchRtc';         Name = 'switchrtc';     Src = 'switchrtc.c';     Libs = @();                             Inc = $Spb; Kit = 'Switch-Rtc';         Hwid = 'ACPI\SWOA0801'; MinUefi = 'R377'; Ja = '時計（RTC）'; En = 'Clock (RTC)'; Boot = $false }
   @{ Dir = 'SwoaDiag';          Name = 'swoadiag';      Src = 'swoadiag.c';      Libs = @();                             Inc = @();  Kit = 'Switch-UsbDiag';     Hwid = '';              MinUefi = '' }
   @{ Dir = 'SwoaHello';         Name = 'SwoaHello';     Src = 'hello.c';         Libs = @();                             Inc = @();  Kit = 'Switch-Stage0';      Hwid = '';              MinUefi = '' }
 )
@@ -95,6 +96,7 @@ foreach ($d in $Drivers) {
     $manifestDrivers += [ordered]@{
       service = $d.Name; kit = $d.Kit; inf = "$($d.Kit)/$($d.Name).inf"; hwid = $d.Hwid
       version = $ver; minUefi = $d.MinUefi; sysSha256 = (Sha256 (Join-Path $build "$($d.Name).sys"))
+      nameJa = $d.Ja; nameEn = $d.En; installAt = $(if ($d.Boot) { 'boot' } else { 'live' })
     }
   }
 }

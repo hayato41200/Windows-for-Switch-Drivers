@@ -87,10 +87,19 @@ namespace SwitchCenter
             ("SWOA0801", "switchrtc",     "時計（RTC）",         "Clock (RTC)"),
         };
 
-        public static List<DriverRow> Read()
+        /// <summary>The known devices, plus any other device the release has a driver for (named from the manifest).</summary>
+        public static List<DriverRow> Read(Release release = null)
         {
+            var devices = new List<(string Hwid, string Service, string Ja, string En)>(Known);
+            if (release != null)
+                foreach (ManifestDriver d in release.Drivers)
+                {
+                    string hwid = d.Hwid.Substring(d.Hwid.IndexOf('\\') + 1);
+                    if (!devices.Exists(x => x.Hwid.Equals(hwid, StringComparison.OrdinalIgnoreCase)))
+                        devices.Add((hwid, d.Service, d.NameJa ?? d.Service, d.NameEn ?? d.Service));
+                }
             var rows = new List<DriverRow>();
-            foreach (var k in Known)
+            foreach (var k in devices)
             {
                 string name = T(k.Ja, k.En);
                 using RegistryKey enumKey = Registry.LocalMachine.OpenSubKey($@"SYSTEM\CurrentControlSet\Enum\ACPI\{k.Hwid}");
