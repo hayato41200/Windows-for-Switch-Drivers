@@ -7,6 +7,7 @@ UEFI と DSDT は [Windows-for-Switch](https://github.com/hayato41200/Windows-fo
 English summary: KMDF drivers (GPIO, I2C, battery + USB-C role, fan + backlight, touch screen,
 power button, CPU clock, RTC) and a tray / control-center app for Windows 10 ARM64 on the
 Nintendo Switch. Install from the release ZIPs; build with `release/Make-Release.ps1`.
+Tested on Windows 10 IoT Enterprise LTSC 2021 (19044) ARM64; bring your own Windows image and license.
 
 ## ドライバー
 
@@ -21,6 +22,12 @@ Nintendo Switch. Install from the release ZIPs; build with `release/Make-Release
 | `switchcpu` | ACPI\SWOA0701 | R375 | CPU のクロックのプロファイル（614〜1766 MHz）、温度による制限 |
 | `switchrtc` | ACPI\SWOA0801 | R377 | 時計（MAX77620 の RTC を読み、ずれを覚えて時刻を合わせる） |
 | `swoadiag` | —（読み込んだときだけ） | — | USB（XUSB）のレジスタを読むだけの診断用 |
+
+## 動作を確かめた OS
+
+- Windows 10 IoT Enterprise LTSC 2021（ビルド 19044）ARM64
+
+Windows のイメージとライセンスは、各自で用意してください。このリポジトリには、Windows は含まれていません。
 
 ## 入れ方
 
