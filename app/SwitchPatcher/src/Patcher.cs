@@ -119,6 +119,13 @@ namespace SwitchPatcher
                     throw new InvalidOperationException(T($"{win} に Windows がありません。", $"There is no Windows on {win}."));
                 }
 
+                // ---- offline registry: the SD drivers load at every boot (needed to boot from the Switch's SD)
+                await Offline.WithHive(win, "SYSTEM", system =>
+                {
+                    foreach (string line in Offline.LoadSdDriversAtBoot(system)) log("  " + line);
+                }, log);
+                log(T("SD のドライバー（sdbus、sdstor）を、起動のときに必ず読み込むようにしました。", "The SD drivers (sdbus, sdstor) now load at every boot."));
+
                 // ---- offline registry: certificate, autostart, first boot without network
                 if (o.TestMode || o.ControlCenter || o.InstallImage)
                 {

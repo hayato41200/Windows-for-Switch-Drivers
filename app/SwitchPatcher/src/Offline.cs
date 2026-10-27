@@ -13,18 +13,21 @@ namespace SwitchPatcher
 {
     static class Offline
     {
-        const string MountName = "SWOA_PATCH_SOFTWARE";
-
         /// <summary>Loads the offline SOFTWARE hive, runs body on it, and always unloads it.</summary>
-        public static async Task WithSoftwareHive(string windows, Action<RegistryKey> body, Action<string> log)
+        public static Task WithSoftwareHive(string windows, Action<RegistryKey> body, Action<string> log) =>
+            WithHive(windows, "SOFTWARE", body, log);
+
+        /// <summary>Loads the offline hive (SOFTWARE, SYSTEM) as HKLM\SWOA_PATCH_name, runs body on it, and always unloads it.</summary>
+        public static async Task WithHive(string windows, string name, Action<RegistryKey> body, Action<string> log)
         {
-            string hive = Path.Combine(windows, @"Windows\System32\config\SOFTWARE");
+            string mount = "SWOA_PATCH_" + name;
+            string hive = Path.Combine(windows, @"Windows\System32\config\" + name);
             if (!File.Exists(hive)) throw new FileNotFoundException(hive);
-            if (await Tools.Run(Tools.System32("reg.exe"), $"load HKLM\\{MountName} \"{hive}\"", log) != 0)
-                throw new InvalidOperationException(T("レジストリ（SOFTWARE）を読み込めませんでした。", "Could not load the SOFTWARE hive."));
+            if (await Tools.Run(Tools.System32("reg.exe"), $"load HKLM\\{mount} \"{hive}\"", log) != 0)
+                throw new InvalidOperationException(T($"レジストリ（{name}）を読み込めませんでした。", $"Could not load the {name} hive."));
             try
             {
-                using RegistryKey k = Registry.LocalMachine.OpenSubKey(MountName, true);
+                using RegistryKey k = Registry.LocalMachine.OpenSubKey(mount, true);
                 body(k);
             }
             finally
@@ -34,12 +37,37 @@ namespace SwitchPatcher
                 {
                     GC.Collect();
                     GC.WaitForPendingFinalizers();
-                    if (await Tools.Run(Tools.System32("reg.exe"), $"unload HKLM\\{MountName}", log) == 0) break;
-                    if (attempt == 4) throw new InvalidOperationException(T("レジストリ（SOFTWARE）を閉じられませんでした。PC を再起動してから SD を外してください。",
-                                                                           "Could not unload the SOFTWARE hive. Restart the PC before removing the SD."));
+                    if (await Tools.Run(Tools.System32("reg.exe"), $"unload HKLM\\{mount}", log) == 0) break;
+                    if (attempt == 4) throw new InvalidOperationException(T($"レジストリ（{name}）を閉じられませんでした。PC を再起動してから SD を外してください。",
+                                                                           $"Could not unload the {name} hive. Restart the PC before removing the SD."));
                     Thread.Sleep(1000);
                 }
             }
+        }
+
+        /// <summary>
+        /// Loads the SD host and SD storage drivers at every boot (Start = 0), in every control set.
+        /// The Switch UEFI hands Windows the SD as a vendor device path, so winload does not see
+        /// an SD boot and skips drivers that only load for one (BootFlags 0x8):
+        /// without this a fresh image stops with INACCESSIBLE_BOOT_DEVICE.
+        /// Returns "service: old -> 0" lines.
+        /// </summary>
+        public static System.Collections.Generic.List<string> LoadSdDriversAtBoot(RegistryKey system)
+        {
+            var changes = new System.Collections.Generic.List<string>();
+            foreach (string cs in system.GetSubKeyNames())
+            {
+                if (!cs.StartsWith("ControlSet", StringComparison.OrdinalIgnoreCase)) continue;
+                foreach (string svc in new[] { "sdbus", "sdstor" })
+                {
+                    using RegistryKey k = system.OpenSubKey($@"{cs}\Services\{svc}", true);
+                    if (k == null) throw new InvalidOperationException($@"{cs}\Services\{svc} not found");
+                    object old = k.GetValue("Start");
+                    k.SetValue("Start", 0, RegistryValueKind.DWord);
+                    changes.Add($@"{cs}\{svc}: Start {old ?? "-"} -> 0");
+                }
+            }
+            return changes;
         }
 
         /// <summary>
