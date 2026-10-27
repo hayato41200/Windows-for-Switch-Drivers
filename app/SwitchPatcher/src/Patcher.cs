@@ -105,8 +105,12 @@ namespace SwitchPatcher
                         throw new InvalidOperationException(T("dism /Apply-Image が失敗しました。", "dism /Apply-Image failed."));
                     backup = Offline.BackupEsp(esp);
                     log(T($"ESP の起動ファイルを保存しました: {backup}", $"Saved the ESP boot files: {backup}"));
-                    if (await Tools.Run(Tools.System32("bcdboot.exe"), $"{win}Windows /s {esp.TrimEnd('\\')} /f UEFI", log) != 0)
-                        throw new InvalidOperationException(T("bcdboot が失敗しました。", "bcdboot failed."));
+                    if (await Tools.Run(Tools.System32("bcdboot.exe"), $"{win}Windows /s {esp.TrimEnd('\\')} /f UEFI /v", log) != 0)
+                    {
+                        log(T("bcdboot が失敗したので、起動ファイルのコピーと BCD の作成を自分で行います…", "bcdboot failed; copying the boot files and building the BCD directly..."));
+                        await Offline.MakeBootFiles(win, esp, log);
+                        log(T("起動ファイルと BCD を作りました。", "Created the boot files and the BCD."));
+                    }
                     Offline.WriteUnattend(win);
                     log(T("初回起動の設定（unattend.xml）を置きました。", "Wrote the first-boot answers (unattend.xml)."));
                 }

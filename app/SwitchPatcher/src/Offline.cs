@@ -130,5 +130,66 @@ namespace SwitchPatcher
             Directory.CreateDirectory(backup);
             return backup;
         }
+
+        /// <summary>
+        /// What bcdboot /f UEFI does, by hand: copy Windows\Boot\EFI to the ESP and build a fresh BCD.
+        /// Used when the PC's bcdboot refuses another build's ARM64 boot files (seen with 22621 on a 26100 PC: exit 193).
+        /// </summary>
+        public static async Task MakeBootFiles(string windows, string esp, Action<string> log)
+        {
+            string w = windows.TrimEnd('\\'), s = esp.TrimEnd('\\');
+            string boot = Path.Combine(esp, @"EFI\Microsoft\Boot");
+            string mgr = Path.Combine(windows, @"Windows\Boot\EFI\bootmgfw.efi");
+            if (!File.Exists(mgr)) throw new FileNotFoundException(mgr);
+            CopyTree(Path.Combine(windows, @"Windows\Boot\EFI"), boot);
+            CopyTree(Path.Combine(windows, @"Windows\Boot\Fonts"), Path.Combine(boot, "Fonts"));
+            Directory.CreateDirectory(Path.Combine(esp, @"EFI\Boot"));
+            File.Copy(mgr, Path.Combine(esp, @"EFI\Boot\bootaa64.efi"), true);
+
+            string bcd = Path.Combine(boot, "BCD");
+            foreach (string f in new[] { bcd, bcd + ".LOG", bcd + ".LOG1", bcd + ".LOG2" })
+                if (File.Exists(f)) { File.SetAttributes(f, FileAttributes.Normal); File.Delete(f); }
+
+            string created = null;
+            async Task Bcd(string args)
+            {
+                if (await Tools.Run(Tools.System32("bcdedit.exe"), $"/store \"{bcd}\" " + args, line =>
+                    {
+                        log(line);
+                        var m = System.Text.RegularExpressions.Regex.Match(line, @"\{[0-9a-fA-F-]{36}\}");
+                        if (m.Success) created = m.Value;
+                    }) != 0)
+                    throw new InvalidOperationException("bcdedit " + args);
+            }
+            if (await Tools.Run(Tools.System32("bcdedit.exe"), $"/createstore \"{bcd}\"", log) != 0)
+                throw new InvalidOperationException("bcdedit /createstore");
+            await Bcd("/create {bootmgr} /d \"Windows Boot Manager\"");
+            await Bcd($"/set {{bootmgr}} device partition={s}");
+            await Bcd(@"/set {bootmgr} path \EFI\Microsoft\Boot\bootmgfw.efi");
+            await Bcd("/set {bootmgr} locale en-US");
+            await Bcd("/set {bootmgr} timeout 0");
+            created = null;
+            await Bcd("/create /d \"Windows\" /application osloader");
+            string id = created ?? throw new InvalidOperationException("bcdedit did not return the new entry");
+            await Bcd($"/set {id} device partition={w}");
+            await Bcd($"/set {id} osdevice partition={w}");
+            await Bcd($@"/set {id} path \Windows\system32\winload.efi");
+            await Bcd($@"/set {id} systemroot \Windows");
+            await Bcd($"/set {id} locale en-US");
+            await Bcd($"/displayorder {id}");
+            await Bcd($"/default {id}");
+        }
+
+        static void CopyTree(string src, string dest)
+        {
+            if (!Directory.Exists(src)) return;
+            foreach (string f in Directory.GetFiles(src, "*", SearchOption.AllDirectories))
+            {
+                string to = Path.Combine(dest, Path.GetRelativePath(src, f));
+                Directory.CreateDirectory(Path.GetDirectoryName(to));
+                if (File.Exists(to)) File.SetAttributes(to, FileAttributes.Normal);
+                File.Copy(f, to, true);
+            }
+        }
     }
 }
