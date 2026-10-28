@@ -106,6 +106,16 @@ typedef struct _NV_DIAG {
 
 #define NV_DIAG_REG_SECONDS 10
 
+// The registry diag thread (0.2.2) and the buffered PIO (0.2.2) are off:
+// 0.2.3-0.2.5 stopped with WHEA_UNCORRECTABLE_ERROR and 0.2.1, which had
+// neither, ran to the desktop. Turn them back on one at a time to find out.
+#ifndef NV_DIAG_REG
+#define NV_DIAG_REG 0
+#endif
+#ifndef NV_PIO_BUFFERED
+#define NV_PIO_BUFFERED 0
+#endif
+
 static NV_DIAG NvDiag = { .LastErrorCommand = 0xFF };
 
 static UCHAR
@@ -174,6 +184,7 @@ NvDiagDpc(
                  NvDiag.BlocksRead);
 }
 
+#if NV_DIAG_REG
 static VOID
 NvDiagSetValue(
     _In_ HANDLE Key,
@@ -244,6 +255,7 @@ NvDiagThread(
         ZwClose(Key);
     }
 }
+#endif
 
 #ifdef ALLOC_PRAGMA
     #pragma alloc_text(INIT, DriverEntry)
@@ -292,6 +304,7 @@ Return Value:
     }
 #endif
 
+#if NV_DIAG_REG
     {
         PUNICODE_STRING Service = (PUNICODE_STRING) RegistryPath;
         HANDLE Thread;
@@ -309,6 +322,9 @@ Return Value:
             }
         }
     }
+#else
+    UNREFERENCED_PARAMETER(RegistryPath);
+#endif
 
     RtlZeroMemory(&InitializationData, sizeof(InitializationData));
     InitializationData.StructureSize = sizeof(InitializationData);
@@ -3002,6 +3018,7 @@ Return value:
 
     Port = (PUCHAR) SdhcExtension->BaseAddress + SDHC_DATA_PORT;
 
+#if NV_PIO_BUFFERED
     // One buffered read for the whole block instead of one call per DWORD.
     if (Length >= sizeof(ULONG)) {
         SdhcReadRegisterBufferUlong(SdhcExtension,
@@ -3012,6 +3029,17 @@ Return value:
         Buffer += Length & ~(sizeof(ULONG) - 1);
         Length &= sizeof(ULONG) - 1;
     }
+#else
+    while (Length >= sizeof(ULONG)) {
+        SdhcReadRegisterBufferUlong(SdhcExtension,
+                                    SDHC_DATA_PORT,
+                                    (PULONG) Buffer,
+                                    1);
+
+        Buffer += sizeof(ULONG);
+        Length -= sizeof(ULONG);
+    }
+#endif
 
     if (Length >= sizeof(USHORT)) {
         SdhcReadRegisterBufferUshort(SdhcExtension,
@@ -3072,6 +3100,7 @@ Return value:
 
 {
 
+#if NV_PIO_BUFFERED
     // One buffered write for the whole block instead of one call per DWORD.
     if (Length >= sizeof(ULONG)) {
         SdhcWriteRegisterBufferUlong(SdhcExtension,
@@ -3082,6 +3111,17 @@ Return value:
         Buffer += Length & ~(sizeof(ULONG) - 1);
         Length &= sizeof(ULONG) - 1;
     }
+#else
+    while (Length >= sizeof(ULONG)) {
+        SdhcWriteRegisterBufferUlong(SdhcExtension,
+                                     SDHC_DATA_PORT,
+                                     (PULONG) Buffer,
+                                     1);
+
+        Buffer += sizeof(ULONG);
+        Length -= sizeof(ULONG);
+    }
+#endif
 
     if (Length >= sizeof(USHORT)) {
         SdhcWriteRegisterBufferUshort(SdhcExtension,
