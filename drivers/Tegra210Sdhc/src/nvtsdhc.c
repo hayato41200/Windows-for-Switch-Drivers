@@ -81,7 +81,22 @@ typedef struct _NV_DIAG {
     ULONG Commands;
     ULONG CommandsOk;
     ULONG BlocksRead;
+
+    // Written to <service>\Parameters\Diag every NV_DIAG_REG_SECONDS once
+    // Windows is running, to see how the slot performs.
+    PVOID Extension;
+    ULONG ClockKhzRequested;
+    ULONG ClockKhzActual;
+    ULONG BusWidth;
+    ULONG BusSpeed;
+    ULONG Interrupts;
+    ULONG ErrorInterrupts;
+    ULONG CommandErrors;
+    ULONG BlocksWritten;
+    WCHAR RegistryPath[256];
 } NV_DIAG;
+
+#define NV_DIAG_REG_SECONDS 10
 
 static NV_DIAG NvDiag = { .LastErrorCommand = 0xFF };
 
@@ -145,6 +160,80 @@ NvDiagDpc(
                  NvDiag.BlocksRead);
 }
 
+static VOID
+NvDiagSetValue(
+    _In_ HANDLE Key,
+    _In_ PCWSTR Name,
+    _In_ ULONG Value
+    )
+{
+    UNICODE_STRING ValueName;
+
+    RtlInitUnicodeString(&ValueName, Name);
+    ZwSetValueKey(Key, &ValueName, 0, REG_DWORD, &Value, sizeof(Value));
+}
+
+static VOID
+NvDiagThread(
+    _In_ PVOID Context
+    )
+{
+    UNICODE_STRING Path;
+    OBJECT_ATTRIBUTES Attributes;
+    HANDLE Key;
+    LARGE_INTEGER Interval;
+    PSDHC_EXTENSION Ext;
+    ULONG Seconds = 0;
+
+    UNREFERENCED_PARAMETER(Context);
+
+    RtlInitUnicodeString(&Path, NvDiag.RegistryPath);
+    InitializeObjectAttributes(&Attributes, &Path,
+                               OBJ_KERNEL_HANDLE | OBJ_CASE_INSENSITIVE, NULL, NULL);
+
+    Interval.QuadPart = -10000000LL * NV_DIAG_REG_SECONDS;
+    for (;;) {
+        KeDelayExecutionThread(KernelMode, FALSE, &Interval);
+        Seconds += NV_DIAG_REG_SECONDS;
+        if (!NT_SUCCESS(ZwCreateKey(&Key, KEY_SET_VALUE, &Attributes, 0, NULL,
+                                    REG_OPTION_NON_VOLATILE, NULL))) {
+            continue;
+        }
+
+        Ext = (PSDHC_EXTENSION) NvDiag.Extension;
+        NvDiagSetValue(Key, L"Seconds", Seconds);
+        NvDiagSetValue(Key, L"ClockKhzRequested", NvDiag.ClockKhzRequested);
+        NvDiagSetValue(Key, L"ClockKhzActual", NvDiag.ClockKhzActual);
+        NvDiagSetValue(Key, L"BusWidth", NvDiag.BusWidth);
+        NvDiagSetValue(Key, L"BusSpeed", NvDiag.BusSpeed);
+        NvDiagSetValue(Key, L"Interrupts", NvDiag.Interrupts);
+        NvDiagSetValue(Key, L"ErrorInterrupts", NvDiag.ErrorInterrupts);
+        NvDiagSetValue(Key, L"Commands", NvDiag.Commands);
+        NvDiagSetValue(Key, L"CommandsOk", NvDiag.CommandsOk);
+        NvDiagSetValue(Key, L"CommandErrors", NvDiag.CommandErrors);
+        NvDiagSetValue(Key, L"LastErrors", NvDiag.LastErrors);
+        NvDiagSetValue(Key, L"LastErrorCommand", NvDiag.LastErrorCommand);
+        NvDiagSetValue(Key, L"BlocksRead", NvDiag.BlocksRead);
+        NvDiagSetValue(Key, L"BlocksWritten", NvDiag.BlocksWritten);
+        if (Ext != NULL) {
+            NvDiagSetValue(Key, L"RegCapabilities",
+                           SdhcReadRegisterUlong(Ext, SDHC_CAPABILITIES));
+            NvDiagSetValue(Key, L"RegCapabilities2",
+                           SdhcReadRegisterUlong(Ext, SDHC_CAPABILITIES2));
+            NvDiagSetValue(Key, L"RegClockControl",
+                           SdhcReadRegisterUshort(Ext, SDHC_CLOCK_CONTROL));
+            NvDiagSetValue(Key, L"RegHostControl",
+                           SdhcReadRegisterUchar(Ext, SDHC_HOST_CONTROL));
+            NvDiagSetValue(Key, L"RegPresentState",
+                           SdhcReadRegisterUlong(Ext, SDHC_PRESENT_STATE));
+            NvDiagSetValue(Key, L"BaseClockKhz",
+                           Ext->Capabilities.BaseClockFrequencyKhz);
+        }
+
+        ZwClose(Key);
+    }
+}
+
 #ifdef ALLOC_PRAGMA
     #pragma alloc_text(INIT, DriverEntry)
 #endif
@@ -191,6 +280,24 @@ Return Value:
         KeSetTimer(&NvDiag.Timer, Due, &NvDiag.Dpc);
     }
 #endif
+
+    {
+        PUNICODE_STRING Service = (PUNICODE_STRING) RegistryPath;
+        HANDLE Thread;
+        USHORT Chars = (Service != NULL) ? Service->Length / sizeof(WCHAR) : 0;
+
+        if ((Service != NULL) && (Service->Buffer != NULL) &&
+            (Chars + 20 < RTL_NUMBER_OF(NvDiag.RegistryPath))) {
+            RtlCopyMemory(NvDiag.RegistryPath, Service->Buffer, Service->Length);
+            RtlCopyMemory(&NvDiag.RegistryPath[Chars], L"\\Parameters\\Diag",
+                          sizeof(L"\\Parameters\\Diag"));
+
+            if (NT_SUCCESS(PsCreateSystemThread(&Thread, THREAD_ALL_ACCESS, NULL, NULL,
+                                                NULL, NvDiagThread, NULL))) {
+                ZwClose(Thread);
+            }
+        }
+    }
 
     RtlZeroMemory(&InitializationData, sizeof(InitializationData));
     InitializationData.StructureSize = sizeof(InitializationData);
@@ -606,6 +713,7 @@ Return value:
         NvDiag.Flags |= 0x2;
     }
 
+    NvDiag.Extension = SdhcExtension;
     NvDiag.Initialized = TRUE;
     return STATUS_SUCCESS;
 }
@@ -668,10 +776,13 @@ Return value:
         Status = SdhcSetBusWidth(SdhcExtension,
                                  BusOperation->Parameters.BusWidth);
 
+        NvDiag.BusWidth = BusOperation->Parameters.BusWidth;
+
         break;
 
     case SdSetBusSpeed:
         Status = SdhcSetSpeed(SdhcExtension, BusOperation->Parameters.BusSpeed);
+        NvDiag.BusSpeed = BusOperation->Parameters.BusSpeed;
         break;
 
     case SdSetSignalingVoltage:
@@ -829,7 +940,9 @@ Return value:
     }
 
     NvDiag.Flags |= 0x4;
+    NvDiag.Interrupts += 1;
     if (*Events & SDHC_IS_ERROR_INTERRUPT) {
+        NvDiag.ErrorInterrupts += 1;
         *Errors = (ULONG) SdhcGetErrorStatus(SdhcExtension);
     }
 
@@ -1050,6 +1163,7 @@ Return value:
         NvDiag.LastErrorCommand = Request->Command.Index;
         NvDiag.LastErrorKind = NvDiagErrorKind(Errors);
         NvDiag.LastErrors = Errors;
+        NvDiag.CommandErrors += 1;
     } else if ((Request->RequiredEvents == 0) &&
                (Request->Type != SdRequestTypeStartTransfer)) {
         NvDiag.CommandsOk += 1;
@@ -1414,6 +1528,9 @@ Return value:
     ClockControl = SdhcCalcClockFrequency(SdhcExtension,
                                           Frequency,
                                           &ActualFrequency);
+
+    NvDiag.ClockKhzRequested = Frequency;
+    NvDiag.ClockKhzActual = ActualFrequency;
 
     ClockControl |= SDHC_CC_INTERNAL_CLOCK_ENABLE;
     SdhcWriteRegisterUshort(SdhcExtension, SDHC_CLOCK_CONTROL, ClockControl);
@@ -2866,14 +2983,16 @@ Return value:
     PUCHAR Port;
 
     Port = (PUCHAR) SdhcExtension->BaseAddress + SDHC_DATA_PORT;
-    while (Length >= sizeof(ULONG)) {
+
+    // One buffered read for the whole block instead of one call per DWORD.
+    if (Length >= sizeof(ULONG)) {
         SdhcReadRegisterBufferUlong(SdhcExtension,
                                     SDHC_DATA_PORT,
                                     (PULONG) Buffer,
-                                    1);
+                                    Length / sizeof(ULONG));
 
-        Buffer += sizeof(ULONG);
-        Length -= sizeof(ULONG);
+        Buffer += Length & ~(sizeof(ULONG) - 1);
+        Length &= sizeof(ULONG) - 1;
     }
 
     if (Length >= sizeof(USHORT)) {
@@ -2935,14 +3054,15 @@ Return value:
 
 {
 
-    while (Length >= sizeof(ULONG)) {
+    // One buffered write for the whole block instead of one call per DWORD.
+    if (Length >= sizeof(ULONG)) {
         SdhcWriteRegisterBufferUlong(SdhcExtension,
                                      SDHC_DATA_PORT,
                                      (PULONG) Buffer,
-                                     1);
+                                     Length / sizeof(ULONG));
 
-        Buffer += sizeof(ULONG);
-        Length -= sizeof(ULONG);
+        Buffer += Length & ~(sizeof(ULONG) - 1);
+        Length &= sizeof(ULONG) - 1;
     }
 
     if (Length >= sizeof(USHORT)) {
@@ -3199,6 +3319,8 @@ Return value:
         SdhcWriteDataPort(SdhcExtension,
                           Request->Command.DataBuffer,
                           Request->Command.BlockSize);
+
+        NvDiag.BlocksWritten += 1;
     }
 
     Request->Command.BlockCount -= 1;
