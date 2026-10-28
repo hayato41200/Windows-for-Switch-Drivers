@@ -93,6 +93,14 @@ typedef struct _NV_DIAG {
     ULONG ErrorInterrupts;
     ULONG CommandErrors;
     ULONG BlocksWritten;
+
+    // Register snapshots taken where the driver already touches the host. The
+    // diag thread must not read the host itself: when the port powers it down,
+    // a register read is a bus error (WHEA_UNCORRECTABLE_ERROR, seen in 0.2.3).
+    ULONG RegCapabilities;
+    ULONG RegCapabilities2;
+    ULONG RegClockControl;
+    ULONG RegHostControl;
     WCHAR RegistryPath[256];
 } NV_DIAG;
 
@@ -221,17 +229,12 @@ NvDiagThread(
         NvDiagSetValue(Key, L"LastErrorCommand", NvDiag.LastErrorCommand);
         NvDiagSetValue(Key, L"BlocksRead", NvDiag.BlocksRead);
         NvDiagSetValue(Key, L"BlocksWritten", NvDiag.BlocksWritten);
+        NvDiagSetValue(Key, L"RegCapabilities", NvDiag.RegCapabilities);
+        NvDiagSetValue(Key, L"RegCapabilities2", NvDiag.RegCapabilities2);
+        NvDiagSetValue(Key, L"RegClockControl", NvDiag.RegClockControl);
+        NvDiagSetValue(Key, L"RegHostControl", NvDiag.RegHostControl);
+        NvDiagSetValue(Key, L"RegPresentState", NvDiag.PresentState);
         if (Ext != NULL) {
-            NvDiagSetValue(Key, L"RegCapabilities",
-                           SdhcReadRegisterUlong(Ext, SDHC_CAPABILITIES));
-            NvDiagSetValue(Key, L"RegCapabilities2",
-                           SdhcReadRegisterUlong(Ext, SDHC_CAPABILITIES2));
-            NvDiagSetValue(Key, L"RegClockControl",
-                           SdhcReadRegisterUshort(Ext, SDHC_CLOCK_CONTROL));
-            NvDiagSetValue(Key, L"RegHostControl",
-                           SdhcReadRegisterUchar(Ext, SDHC_HOST_CONTROL));
-            NvDiagSetValue(Key, L"RegPresentState",
-                           SdhcReadRegisterUlong(Ext, SDHC_PRESENT_STATE));
             NvDiagSetValue(Key, L"BaseClockKhz",
                            Ext->Capabilities.BaseClockFrequencyKhz);
         }
@@ -721,6 +724,8 @@ Return value:
         NvDiag.Flags |= 0x2;
     }
 
+    NvDiag.RegCapabilities = CapabilitiesReg.AsUlong;
+    NvDiag.RegCapabilities2 = Capabilities2Reg.AsUlong;
     NvDiag.Extension = SdhcExtension;
     NvDiag.Initialized = TRUE;
     return STATUS_SUCCESS;
@@ -785,12 +790,16 @@ Return value:
                                  BusOperation->Parameters.BusWidth);
 
         NvDiag.BusWidth = BusOperation->Parameters.BusWidth;
+        NvDiag.RegHostControl =
+            SdhcReadRegisterUchar(SdhcExtension, SDHC_HOST_CONTROL);
 
         break;
 
     case SdSetBusSpeed:
         Status = SdhcSetSpeed(SdhcExtension, BusOperation->Parameters.BusSpeed);
         NvDiag.BusSpeed = BusOperation->Parameters.BusSpeed;
+        NvDiag.RegHostControl =
+            SdhcReadRegisterUchar(SdhcExtension, SDHC_HOST_CONTROL);
         break;
 
     case SdSetSignalingVoltage:
@@ -1571,6 +1580,7 @@ Return value:
 
     ClockControl |= SDHC_CC_CLOCK_ENABLE;
     SdhcWriteRegisterUshort(SdhcExtension, SDHC_CLOCK_CONTROL, ClockControl);
+    NvDiag.RegClockControl = ClockControl;
 
     //
     // Some hardware need more time here to stabilize, but minimize latency
