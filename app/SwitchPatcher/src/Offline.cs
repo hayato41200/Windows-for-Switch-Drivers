@@ -206,6 +206,23 @@ namespace SwitchPatcher
             await Bcd($"/set {id} locale en-US");
             await Bcd($"/displayorder {id}");
             await Bcd($"/default {id}");
+
+            // Mark it the system store, as bcdboot does. Without Description\System = 1 the
+            // specialize pass of Windows Setup fails ("File is not system store").
+            if (await Tools.Run(Tools.System32("reg.exe"), $"load HKLM\\SWOA_PATCH_BCD \"{bcd}\"", log) != 0)
+                throw new InvalidOperationException("reg load BCD");
+            try
+            {
+                using RegistryKey k = Registry.LocalMachine.CreateSubKey(@"SWOA_PATCH_BCD\Description");
+                k.SetValue("System", 1, RegistryValueKind.DWord);
+            }
+            finally
+            {
+                GC.Collect();
+                GC.WaitForPendingFinalizers();
+                if (await Tools.Run(Tools.System32("reg.exe"), @"unload HKLM\SWOA_PATCH_BCD", log) != 0)
+                    throw new InvalidOperationException("reg unload BCD");
+            }
         }
 
         static void CopyTree(string src, string dest)
