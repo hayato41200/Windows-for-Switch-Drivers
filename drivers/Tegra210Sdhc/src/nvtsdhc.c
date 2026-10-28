@@ -46,6 +46,17 @@ Revision History:
 #define NV_T210_PIO_ONLY 1
 #endif
 
+// SDMMC1 input clock from the CAR: PLLP (408 MHz, source 0) divided by 8.5
+// (7.1 divider field 15) = 48 MHz. High speed (50 MHz) then runs undivided
+// at 48 MHz and identification divides by 120 to 400 kHz.
+#ifndef NV_T210_FIXED_CAR_CLOCK
+#define NV_T210_FIXED_CAR_CLOCK 1
+#endif
+#define NV_T210_CAR_BASE            0x60006000
+#define NV_T210_CLK_SOURCE_SDMMC1   0x150
+#define NV_T210_SDMMC1_CAR_SOURCE   ((0u << 29) | 15u)
+#define NV_T210_SDMMC1_CAR_KHZ      48000
+
 // Boot diagnostics. Nothing (debugger, boot log, dump) survives a failed boot
 // from the SD this driver serves, so if the slot has not read any data a few
 // seconds after the driver starts, stop the machine with a code saying how far
@@ -101,6 +112,8 @@ typedef struct _NV_DIAG {
     ULONG RegCapabilities2;
     ULONG RegClockControl;
     ULONG RegHostControl;
+    ULONG CarSdmmc1Before;
+    ULONG CarSdmmc1After;
     WCHAR RegistryPath[256];
 } NV_DIAG;
 
@@ -244,6 +257,8 @@ NvDiagSaveClock(
     NvDiagSetValue(Key, L"BusSpeed", NvDiag.BusSpeed);
     NvDiagSetValue(Key, L"Commands", NvDiag.Commands);
     NvDiagSetValue(Key, L"BlocksRead", NvDiag.BlocksRead);
+    NvDiagSetValue(Key, L"CarSdmmc1Before", NvDiag.CarSdmmc1Before);
+    NvDiagSetValue(Key, L"CarSdmmc1After", NvDiag.CarSdmmc1After);
     ZwClose(Key);
 }
 #endif
@@ -624,6 +639,49 @@ Return value:
     Capabilities->MaximumBlockCount = 0xFFFF;
     Capabilities->BaseClockFrequencyKhz =
         CapabilitiesReg.BaseClockFrequency * 1000;
+
+#if NV_T210_FIXED_CAR_CLOCK
+    //
+    // The controller reports 208 MHz, but its real input is the CAR
+    // SDMMC1 clock, which the UEFI leaves at whatever card clock it used
+    // last (tens of MHz). Dividing for 208 MHz then gave the card about a
+    // sixth of the intended clock (2.6 MB/s). Set the CAR clock to a known
+    // rate and divide from that. Not in crashdump mode: the normal load
+    // already set it.
+    //
+
+    BOOLEAN CarSet = (BOOLEAN) CrashdumpMode;
+
+    if (!CrashdumpMode) {
+        PHYSICAL_ADDRESS Car;
+        PULONG CarBase;
+        USHORT ClockControl;
+
+        ClockControl = SdhcReadRegisterUshort(SdhcExtension, SDHC_CLOCK_CONTROL);
+        SdhcWriteRegisterUshort(SdhcExtension,
+                                SDHC_CLOCK_CONTROL,
+                                ClockControl & ~SDHC_CC_CLOCK_ENABLE);
+
+        Car.QuadPart = NV_T210_CAR_BASE;
+        CarBase = (PULONG) MmMapIoSpaceEx(Car, PAGE_SIZE,
+                                         PAGE_READWRITE | PAGE_NOCACHE);
+        if (CarBase != NULL) {
+            NvDiag.CarSdmmc1Before =
+                READ_REGISTER_ULONG(&CarBase[NV_T210_CLK_SOURCE_SDMMC1 / 4]);
+            WRITE_REGISTER_ULONG(&CarBase[NV_T210_CLK_SOURCE_SDMMC1 / 4],
+                                 NV_T210_SDMMC1_CAR_SOURCE);
+            KeStallExecutionProcessor(10);
+            NvDiag.CarSdmmc1After =
+                READ_REGISTER_ULONG(&CarBase[NV_T210_CLK_SOURCE_SDMMC1 / 4]);
+            MmUnmapIoSpace(CarBase, PAGE_SIZE);
+            CarSet = TRUE;
+        }
+    }
+
+    if (CarSet) {
+        Capabilities->BaseClockFrequencyKhz = NV_T210_SDMMC1_CAR_KHZ;
+    }
+#endif
 
     Capabilities->DmaDescriptorSize =
         sizeof(SDHC_ADMA2_DESCRIPTOR_TABLE_ENTRY) +
