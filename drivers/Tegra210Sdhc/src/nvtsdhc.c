@@ -116,6 +116,13 @@ typedef struct _NV_DIAG {
 #define NV_PIO_BUFFERED 0
 #endif
 
+// Clock and bus settings written to <service>\Parameters\Diag when the port
+// sets them (passive level, never in crashdump mode): no thread, no flush,
+// no register access of its own. Read on the Switch with reg query.
+#ifndef NV_DIAG_CLOCK
+#define NV_DIAG_CLOCK 1
+#endif
+
 static NV_DIAG NvDiag = { .LastErrorCommand = 0xFF };
 
 static UCHAR
@@ -184,7 +191,7 @@ NvDiagDpc(
                  NvDiag.BlocksRead);
 }
 
-#if NV_DIAG_REG
+#if NV_DIAG_REG || NV_DIAG_CLOCK
 static VOID
 NvDiagSetValue(
     _In_ HANDLE Key,
@@ -197,6 +204,51 @@ NvDiagSetValue(
     RtlInitUnicodeString(&ValueName, Name);
     ZwSetValueKey(Key, &ValueName, 0, REG_DWORD, &Value, sizeof(Value));
 }
+#endif
+
+#if NV_DIAG_CLOCK
+static VOID
+NvDiagSaveClock(
+    _In_ PSDHC_EXTENSION SdhcExtension
+    )
+{
+    static ULONG Saves;
+    UNICODE_STRING Path;
+    OBJECT_ATTRIBUTES Attributes;
+    HANDLE Key;
+
+    if ((KeGetCurrentIrql() != PASSIVE_LEVEL) ||
+        SdhcExtension->CrashdumpMode ||
+        (NvDiag.RegistryPath[0] == L'\0')) {
+        return;
+    }
+
+    RtlInitUnicodeString(&Path, NvDiag.RegistryPath);
+    InitializeObjectAttributes(&Attributes, &Path,
+                               OBJ_KERNEL_HANDLE | OBJ_CASE_INSENSITIVE, NULL, NULL);
+    if (!NT_SUCCESS(ZwCreateKey(&Key, KEY_SET_VALUE, &Attributes, 0, NULL,
+                                REG_OPTION_NON_VOLATILE, NULL))) {
+        return;
+    }
+
+    Saves += 1;
+    NvDiagSetValue(Key, L"Saves", Saves);
+    NvDiagSetValue(Key, L"ClockKhzRequested", NvDiag.ClockKhzRequested);
+    NvDiagSetValue(Key, L"ClockKhzActual", NvDiag.ClockKhzActual);
+    NvDiagSetValue(Key, L"BaseClockKhz",
+                   SdhcExtension->Capabilities.BaseClockFrequencyKhz);
+    NvDiagSetValue(Key, L"RegCapabilities", NvDiag.RegCapabilities);
+    NvDiagSetValue(Key, L"RegClockControl", NvDiag.RegClockControl);
+    NvDiagSetValue(Key, L"RegHostControl", NvDiag.RegHostControl);
+    NvDiagSetValue(Key, L"BusWidth", NvDiag.BusWidth);
+    NvDiagSetValue(Key, L"BusSpeed", NvDiag.BusSpeed);
+    NvDiagSetValue(Key, L"Commands", NvDiag.Commands);
+    NvDiagSetValue(Key, L"BlocksRead", NvDiag.BlocksRead);
+    ZwClose(Key);
+}
+#endif
+
+#if NV_DIAG_REG
 
 static VOID
 NvDiagThread(
@@ -294,7 +346,7 @@ Return Value:
     SDPORT_INITIALIZATION_DATA InitializationData;
 
 #if NV_DIAG_STOP
-    {
+    if (DriverObject != NULL) {
         LARGE_INTEGER Due;
 
         KeInitializeTimer(&NvDiag.Timer);
@@ -304,10 +356,12 @@ Return Value:
     }
 #endif
 
-#if NV_DIAG_REG
-    {
+#if NV_DIAG_REG || NV_DIAG_CLOCK
+    // Loaded for crashdump or hibernation, DriverObject is NULL and the second
+    // argument is not a registry path; reading it as one (0.2.2-0.2.5) is the
+    // likely cause of their WHEA_UNCORRECTABLE_ERROR.
+    if (DriverObject != NULL) {
         PUNICODE_STRING Service = (PUNICODE_STRING) RegistryPath;
-        HANDLE Thread;
         USHORT Chars = (Service != NULL) ? Service->Length / sizeof(WCHAR) : 0;
 
         if ((Service != NULL) && (Service->Buffer != NULL) &&
@@ -316,10 +370,16 @@ Return Value:
             RtlCopyMemory(&NvDiag.RegistryPath[Chars], L"\\Parameters\\Diag",
                           sizeof(L"\\Parameters\\Diag"));
 
-            if (NT_SUCCESS(PsCreateSystemThread(&Thread, THREAD_ALL_ACCESS, NULL, NULL,
-                                                NULL, NvDiagThread, NULL))) {
-                ZwClose(Thread);
+#if NV_DIAG_REG
+            {
+                HANDLE Thread;
+
+                if (NT_SUCCESS(PsCreateSystemThread(&Thread, THREAD_ALL_ACCESS, NULL, NULL,
+                                                    NULL, NvDiagThread, NULL))) {
+                    ZwClose(Thread);
+                }
             }
+#endif
         }
     }
 #else
@@ -808,6 +868,9 @@ Return value:
         NvDiag.BusWidth = BusOperation->Parameters.BusWidth;
         NvDiag.RegHostControl =
             SdhcReadRegisterUchar(SdhcExtension, SDHC_HOST_CONTROL);
+#if NV_DIAG_CLOCK
+        NvDiagSaveClock(SdhcExtension);
+#endif
 
         break;
 
@@ -816,6 +879,9 @@ Return value:
         NvDiag.BusSpeed = BusOperation->Parameters.BusSpeed;
         NvDiag.RegHostControl =
             SdhcReadRegisterUchar(SdhcExtension, SDHC_HOST_CONTROL);
+#if NV_DIAG_CLOCK
+        NvDiagSaveClock(SdhcExtension);
+#endif
         break;
 
     case SdSetSignalingVoltage:
@@ -1605,6 +1671,9 @@ Return value:
 
     Delay = (SdhcExtension->Removable) ? (10 * 1000) : 50;
     SdPortWait(Delay);
+#if NV_DIAG_CLOCK
+    NvDiagSaveClock(SdhcExtension);
+#endif
     return STATUS_SUCCESS;
 }
 
