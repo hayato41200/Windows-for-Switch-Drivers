@@ -1,13 +1,13 @@
 # Windows for Switch — Drivers
 
-Windows 10 on ARM (ARM64) で動く、Nintendo Switch（Tegra210 / Erista）用のドライバーと、コントロールセンター（SwitchCenter）です。
+Windows on ARM (ARM64) で動く、Nintendo Switch（Tegra210 / Erista）用のドライバーと、コントロールセンター（SwitchCenter）です。
 
 UEFI と DSDT は [Windows-for-Switch](https://github.com/hayato41200/Windows-for-Switch) にあります。このリポジトリのドライバーは、そちらの UEFI（R367 以降）が DSDT に追加するデバイスを使います。
 
 English summary: KMDF drivers (GPIO, I2C, battery + USB-C role, fan + backlight, touch screen,
-power button, CPU clock, RTC) and a tray / control-center app for Windows 10 ARM64 on the
+power button, CPU clock, RTC) and a tray / control-center app for Windows on ARM (ARM64) on the
 Nintendo Switch. Install from the release ZIPs; build with `release/Make-Release.ps1`.
-Tested on Windows 10 IoT Enterprise LTSC 2021 (19044) ARM64; bring your own Windows image and license.
+Tested on Windows 11 Arm64 22H2 (22621); bring your own Windows image and license.
 
 ## ドライバー
 
@@ -25,7 +25,7 @@ Tested on Windows 10 IoT Enterprise LTSC 2021 (19044) ARM64; bring your own Wind
 
 ## 動作を確かめた OS
 
-- Windows 10 IoT Enterprise LTSC 2021（ビルド 19044）ARM64
+- Windows 11 Arm64 22H2（ビルド 22621）
 
 Windows のイメージとライセンスは、各自で用意してください。このリポジトリには、Windows は含まれていません。
 
