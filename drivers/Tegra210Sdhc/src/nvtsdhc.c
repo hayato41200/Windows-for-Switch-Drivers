@@ -230,6 +230,8 @@ NvDiagThread(
                            Ext->Capabilities.BaseClockFrequencyKhz);
         }
 
+        // Write it to the hive file now, so it survives holding the power button.
+        ZwFlushKey(Key);
         ZwClose(Key);
     }
 }
