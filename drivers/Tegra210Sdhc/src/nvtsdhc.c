@@ -51,7 +51,7 @@ Revision History:
 // seconds after the driver starts, stop the machine with a code saying how far
 // it got. The stop code is shown as hex on the blue screen:
 //
-//   0xD S F CC EE K
+//   0xD S F CC EE K   (stages 0-2 only: once commands succeed the card is coming up)
 //      S  stage: 0 slot never initialized, 1 no command issued,
 //                2 no command succeeded, 3 commands OK but no data read,
 //                4 some data read (fewer than NV_DIAG_OK_BLOCKS blocks)
@@ -144,6 +144,12 @@ NvDiagDpc(
         Stage = 3;
     } else {
         Stage = 4;
+    }
+
+    // Commands are completing, so the card is coming up; card init alone can
+    // take longer than NV_DIAG_DELAY_MS (seen: 0xD4706051, stopped at CMD6).
+    if (Stage >= 3) {
+        return;
     }
 
     Code = 0xD0000000 |
