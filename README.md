@@ -117,6 +117,9 @@ GPIO と I2C は、ほかのドライバーが使っているので、その場�
 | `release/` | `Make-Release.ps1` |
 | `docs/` | 設計のメモ |
 
+##クレジット
+Claude:このGithubリポジトリや、Readmeの作成、など手伝ってくれてありがとう。
+
 ## ライセンス
 
 GPL-2.0（Windows-for-Switch と同じ）。レジスタの手順の一部は、Hekate と Linux（どちらも GPL-2.0）に従っています。
