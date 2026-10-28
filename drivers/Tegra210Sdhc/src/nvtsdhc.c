@@ -46,6 +46,105 @@ Revision History:
 #define NV_T210_PIO_ONLY 1
 #endif
 
+// Boot diagnostics. Nothing (debugger, boot log, dump) survives a failed boot
+// from the SD this driver serves, so if the slot has not read any data a few
+// seconds after the driver starts, stop the machine with a code saying how far
+// it got. The stop code is shown as hex on the blue screen:
+//
+//   0xD S F CC EE K
+//      S  stage: 0 slot never initialized, 1 no command issued,
+//                2 no command succeeded, 3 commands OK but no data read,
+//                4 some data read (fewer than NV_DIAG_OK_BLOCKS blocks)
+//      F  flags: 1 card-inserted bit, 2 card-stable bit (present state at
+//                initialize), 4 an interrupt was seen, 8 host reset failed
+//      CC last command index issued
+//      EE command index of the last error (FF: none)
+//      K  last error: 0 none, 1 command timeout, 2 command CRC, 3 command end
+//         bit/index, 4 data timeout, 5 data CRC, 6 data end bit, 7 other,
+//         8 the request could not be issued
+#ifndef NV_DIAG_STOP
+#define NV_DIAG_STOP 1
+#endif
+#define NV_DIAG_DELAY_MS 2500
+#define NV_DIAG_OK_BLOCKS 8
+
+typedef struct _NV_DIAG {
+    KTIMER Timer;
+    KDPC Dpc;
+    BOOLEAN Initialized;
+    ULONG PresentState;
+    ULONG Flags;
+    UCHAR LastCommand;
+    UCHAR LastErrorCommand;
+    UCHAR LastErrorKind;
+    ULONG LastErrors;
+    ULONG Commands;
+    ULONG CommandsOk;
+    ULONG BlocksRead;
+} NV_DIAG;
+
+static NV_DIAG NvDiag = { .LastErrorCommand = 0xFF };
+
+static UCHAR
+NvDiagErrorKind(
+    _In_ ULONG Errors
+    )
+{
+    if (Errors & 0x1) return 1;
+    if (Errors & 0x2) return 2;
+    if (Errors & 0xC) return 3;
+    if (Errors & 0x10) return 4;
+    if (Errors & 0x20) return 5;
+    if (Errors & 0x40) return 6;
+    return 7;
+}
+
+static VOID
+NvDiagDpc(
+    _In_ PKDPC Dpc,
+    _In_opt_ PVOID Context,
+    _In_opt_ PVOID Arg1,
+    _In_opt_ PVOID Arg2
+    )
+{
+    ULONG Stage;
+    ULONG Code;
+
+    UNREFERENCED_PARAMETER(Dpc);
+    UNREFERENCED_PARAMETER(Context);
+    UNREFERENCED_PARAMETER(Arg1);
+    UNREFERENCED_PARAMETER(Arg2);
+
+    if (NvDiag.BlocksRead >= NV_DIAG_OK_BLOCKS) {
+        return;
+    }
+
+    if (!NvDiag.Initialized) {
+        Stage = 0;
+    } else if (NvDiag.Commands == 0) {
+        Stage = 1;
+    } else if (NvDiag.CommandsOk == 0) {
+        Stage = 2;
+    } else if (NvDiag.BlocksRead == 0) {
+        Stage = 3;
+    } else {
+        Stage = 4;
+    }
+
+    Code = 0xD0000000 |
+           (Stage << 24) |
+           ((NvDiag.Flags & 0xF) << 20) |
+           ((ULONG) NvDiag.LastCommand << 12) |
+           ((ULONG) NvDiag.LastErrorCommand << 4) |
+           (NvDiag.LastErrorKind & 0xF);
+
+    KeBugCheckEx(Code,
+                 NvDiag.PresentState,
+                 (NvDiag.CommandsOk << 16) | (NvDiag.Commands & 0xFFFF),
+                 NvDiag.LastErrors,
+                 NvDiag.BlocksRead);
+}
+
 #ifdef ALLOC_PRAGMA
     #pragma alloc_text(INIT, DriverEntry)
 #endif
@@ -81,6 +180,17 @@ Return Value:
 {
 
     SDPORT_INITIALIZATION_DATA InitializationData;
+
+#if NV_DIAG_STOP
+    {
+        LARGE_INTEGER Due;
+
+        KeInitializeTimer(&NvDiag.Timer);
+        KeInitializeDpc(&NvDiag.Dpc, NvDiagDpc, NULL);
+        Due.QuadPart = -10000LL * NV_DIAG_DELAY_MS;
+        KeSetTimer(&NvDiag.Timer, Due, &NvDiag.Dpc);
+    }
+#endif
 
     RtlZeroMemory(&InitializationData, sizeof(InitializationData));
     InitializationData.StructureSize = sizeof(InitializationData);
@@ -481,10 +591,22 @@ Return value:
          Index < Capabilities->MaximumOutstandingRequests;
          Index += 1) {
 
-        RtlZeroMemory(&SdhcExtension->OutstandingRequests[Index], 
+        RtlZeroMemory(&SdhcExtension->OutstandingRequests[Index],
                       sizeof(PSDPORT_REQUEST));
     }
 
+    NvDiag.PresentState =
+        SdhcReadRegisterUlong(SdhcExtension, SDHC_PRESENT_STATE);
+
+    if (NvDiag.PresentState & SDHC_PS_CARD_INSERTED) {
+        NvDiag.Flags |= 0x1;
+    }
+
+    if (NvDiag.PresentState & SDHC_PS_CARD_STATE_STABLE) {
+        NvDiag.Flags |= 0x2;
+    }
+
+    NvDiag.Initialized = TRUE;
     return STATUS_SUCCESS;
 }
 
@@ -521,8 +643,12 @@ Return value:
     SdhcExtension = (PSDHC_EXTENSION) PrivateExtension;
     switch (BusOperation->Type) {
     case SdResetHost:
-        Status = SdhcResetHost(SdhcExtension, 
+        Status = SdhcResetHost(SdhcExtension,
                                BusOperation->Parameters.ResetType);
+
+        if (!NT_SUCCESS(Status)) {
+            NvDiag.Flags |= 0x8;
+        }
 
         break;
 
@@ -622,7 +748,11 @@ Return value:
     PSDHC_EXTENSION SdhcExtension;
 
     SdhcExtension = (PSDHC_EXTENSION) PrivateExtension;
-    return SdhcIsCardInserted(SdhcExtension);
+
+    // The Switch reports card detect on a GPIO, not reliably in the SDHCI
+    // present state. Windows boots from this card, so it is always there.
+    UNREFERENCED_PARAMETER(SdhcExtension);
+    return TRUE;
 }
 
 BOOLEAN
@@ -698,6 +828,7 @@ Return value:
         return FALSE;
     }
 
+    NvDiag.Flags |= 0x4;
     if (*Events & SDHC_IS_ERROR_INTERRUPT) {
         *Errors = (ULONG) SdhcGetErrorStatus(SdhcExtension);
     }
@@ -806,6 +937,16 @@ Return value:
         break;
     }
 
+    if (Request->Type != SdRequestTypeStartTransfer) {
+        NvDiag.Commands += 1;
+        NvDiag.LastCommand = Request->Command.Index;
+    }
+
+    if (!NT_SUCCESS(Status)) {
+        NvDiag.LastErrorCommand = Request->Command.Index;
+        NvDiag.LastErrorKind = 8;
+    }
+
     return Status;
 }
 
@@ -904,6 +1045,15 @@ Return value:
     // error interrupt for the same transfer. It might be mitigated by
     // handling request completion in a DPC for ISR.
     //
+
+    if (Errors) {
+        NvDiag.LastErrorCommand = Request->Command.Index;
+        NvDiag.LastErrorKind = NvDiagErrorKind(Errors);
+        NvDiag.LastErrors = Errors;
+    } else if ((Request->RequiredEvents == 0) &&
+               (Request->Type != SdRequestTypeStartTransfer)) {
+        NvDiag.CommandsOk += 1;
+    }
 
     if (Errors) {
         Request->RequiredEvents = 0;
@@ -3042,6 +3192,8 @@ Return value:
         SdhcReadDataPort(SdhcExtension,
                          Request->Command.DataBuffer,
                          Request->Command.BlockSize);
+
+        NvDiag.BlocksRead += 1;
 
     } else {
         SdhcWriteDataPort(SdhcExtension,

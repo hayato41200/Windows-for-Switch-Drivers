@@ -11,4 +11,9 @@ SD host miniport for `sdport.sys`, for the Switch's microSD slot (Tegra210 SDMMC
 The UEFI does not describe the SD host yet. `loader\sd-acpi-chainloader.zig` (built as `SDLOADAA64.EFI`,
 placed at `EFI\Boot\bootaa64.efi`) installs `acpi\SDH0-Test.asl` as an SSDT and then starts Windows Boot Manager.
 
+Boot diagnostics (`NV_DIAG_STOP`, default on while bringing it up): if fewer than 8 blocks have been read
+2.5 s after `DriverEntry`, the driver bugchecks with stop code `0xDSFCCEEK` (stage, flags, last command,
+last error command, error kind; see the comment at the top of `src/nvtsdhc.c`). Card detect always reports
+a card, since the Switch wires it to a GPIO.
+
 Status: not yet tested on hardware.
