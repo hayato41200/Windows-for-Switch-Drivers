@@ -38,6 +38,7 @@ namespace SwitchCenter
     sealed class Release
     {
         public string Tag, PageUrl, AppVersion, AppFile, AppSha256, AppUrl, DriversFile, DriversSha256, DriversUrl;
+        public bool Prerelease;           // a GitHub pre-release: beta drivers (Make-Release.ps1 -Beta)
         public List<ManifestDriver> Drivers = new List<ManifestDriver>();
         public SdBoot Sd;                 // null in releases without it
     }
@@ -60,6 +61,29 @@ namespace SwitchCenter
             return c;
         }
 
+        /// <summary>
+        /// The newest release of a channel: stable = releases/latest (GitHub skips pre-releases there),
+        /// beta = the newest release including pre-releases.
+        /// </summary>
+        public static async Task<Release> FetchChannelAsync(bool beta)
+        {
+            if (!beta) return await FetchAsync(null);
+            string newest = null;
+            using (HttpClient http = NewClient())
+            using (JsonDocument list = JsonDocument.Parse(await http.GetStringAsync($"https://api.github.com/repos/{Repo}/releases?per_page=20")))
+            {
+                foreach (JsonElement rel in list.RootElement.EnumerateArray())     // newest first
+                {
+                    string tag = rel.GetProperty("tag_name").GetString();
+                    if (rel.GetProperty("draft").GetBoolean() || tag == null || !TagPattern.IsMatch(tag)) continue;
+                    newest = tag;
+                    break;
+                }
+            }
+            if (newest == null) throw new InvalidDataException("no release found");
+            return await FetchAsync(newest);
+        }
+
         /// <summary>Reads releases/latest (tag == null) or the given tag, and its manifest.json.</summary>
         public static async Task<Release> FetchAsync(string tag)
         {
@@ -71,6 +95,7 @@ namespace SwitchCenter
             {
                 Tag = rel.RootElement.GetProperty("tag_name").GetString(),
                 PageUrl = rel.RootElement.GetProperty("html_url").GetString(),
+                Prerelease = rel.RootElement.TryGetProperty("prerelease", out JsonElement pre) && pre.GetBoolean(),
             };
             if (!TagPattern.IsMatch(r.Tag) || (tag != null && r.Tag != tag)) throw new InvalidDataException("unexpected tag " + r.Tag);
             var assets = new Dictionary<string, string>();

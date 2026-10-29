@@ -19,7 +19,8 @@
 param(
   [Parameter(Mandatory = $true)][ValidatePattern('^\d{4}\.\d{1,2}\.\d{1,2}(\.\d+)?$')][string]$Version,
   [switch]$Publish,
-  [switch]$PublishOnly
+  [switch]$PublishOnly,
+  [switch]$Beta                   # pre-release: also the drivers marked Beta (stable releases leave them out)
 )
 
 $Repo = 'hayato41200/Windows-for-Switch-Drivers'
@@ -31,15 +32,20 @@ function Publish-Release([string]$dir) {
   & $gh auth status 2>&1 | Out-Null
   if ($LASTEXITCODE -ne 0) { throw 'gh is not logged in. Run: gh auth login' }
   $m = Get-Content (Join-Path $dir 'manifest.json') -Raw | ConvertFrom-Json
-  $notes = @("Drivers $Version", '', '| Driver | Version | Device | Needs UEFI |', '|---|---|---|---|')
-  $notes += $m.drivers.items | ForEach-Object { "| $($_.service) | $($_.version) | $($_.hwid) | $($_.minUefi) |" }
+  $pre = [bool]$m.prerelease
+  $title = if ($pre) { "Drivers $Version (beta)" } else { "Drivers $Version" }
+  $notes = @($title, '')
+  if ($pre) { $notes += 'Beta: includes drivers still in testing (marked beta). The control center offers them only on the beta channel.', '' }
+  $notes += '| Driver | Version | Device | Needs UEFI |', '|---|---|---|---|'
+  $notes += $m.drivers.items | ForEach-Object { "| $($_.service)$(if ($_.beta) { ' (beta)' }) | $($_.version) | $($_.hwid) | $($_.minUefi) |" }
   $notes += '', "Control center: $($m.app.version) ($($m.app.file))"
   if ($m.patcher) { $notes += "SwitchPatcher (PC): $($m.patcher.version) ($($m.patcher.file))" }
   $notes += '', 'SHA-256 values are in manifest.json.'
   $notesFile = Join-Path $dir 'release-notes.md'
   $notes -join "`n" | Set-Content $notesFile -Encoding utf8
   $files = Get-ChildItem $dir -File | Where-Object { $_.Name -ne 'release-notes.md' } | ForEach-Object FullName
-  & $gh release create "drivers-$Version" @files --repo $Repo --title "Drivers $Version" --notes-file $notesFile
+  $preArg = if ($pre) { @('--prerelease') } else { @() }
+  & $gh release create "drivers-$Version" @files --repo $Repo --title $title --notes-file $notesFile @preArg
   if ($LASTEXITCODE -ne 0) { throw 'gh release create failed' }
 }
 
@@ -67,7 +73,7 @@ $Drivers = @(
   @{ Dir = 'SwitchPowerButton'; Name = 'switchpwrbtn';  Src = 'switchpwrbtn.c';  Libs = @('vhfkm.lib', 'libcntpr.lib');  Inc = $Spb; Kit = 'Switch-PowerButton'; Hwid = 'ACPI\SWOA0601'; MinUefi = 'R374'; Ja = '電源ボタン'; En = 'Power button'; Boot = $false }
   @{ Dir = 'SwitchCpuClock';    Name = 'switchcpu';     Src = 'switchcpu.c';     Libs = @();                             Inc = $Spb; Kit = 'Switch-CpuClock';    Hwid = 'ACPI\SWOA0701'; MinUefi = 'R375'; Ja = 'CPU のクロック'; En = 'CPU clock'; Boot = $false }
   @{ Dir = 'SwitchRtc';         Name = 'switchrtc';     Src = 'switchrtc.c';     Libs = @();                             Inc = $Spb; Kit = 'Switch-Rtc';         Hwid = 'ACPI\SWOA0801'; MinUefi = 'R377'; Ja = '時計（RTC）'; En = 'Clock (RTC)'; Boot = $false }
-  @{ Dir = 'SwitchSensor';      Name = 'switchsensor';  Src = 'switchsensor.c';  Libs = @();                             Inc = $Spb; Kit = 'Switch-Sensor';      Hwid = 'ACPI\SWOA0901'; MinUefi = 'R379'; Ja = '明るさ・傾きセンサー'; En = 'Light, tilt sensors'; Boot = $false }
+  @{ Dir = 'SwitchSensor';      Name = 'switchsensor';  Src = 'switchsensor.c';  Libs = @();                             Inc = $Spb; Kit = 'Switch-Sensor';      Hwid = 'ACPI\SWOA0901'; MinUefi = 'R379'; Ja = '明るさ・傾きセンサー'; En = 'Light, tilt sensors'; Boot = $false; Beta = $true }
   @{ Dir = 'SwoaDiag';          Name = 'swoadiag';      Src = 'swoadiag.c';      Libs = @();                             Inc = @();  Kit = 'Switch-UsbDiag';     Hwid = '';              MinUefi = '' }
   @{ Dir = 'SwoaHello';         Name = 'SwoaHello';     Src = 'hello.c';         Libs = @();                             Inc = @();  Kit = 'Switch-Stage0';      Hwid = '';              MinUefi = '' }
 )
@@ -78,6 +84,7 @@ function Sha256([string]$path) { (Get-FileHash -Algorithm SHA256 $path).Hash.ToL
 $DriverStage = Join-Path $Stage 'SwitchDrivers'
 $manifestDrivers = @()
 foreach ($d in $Drivers) {
+  if ($d.Beta -and -not $Beta) { continue }
   $dir = Join-Path $Root "drivers\$($d.Dir)"
   $build = Join-Path $Root "build\$($d.Dir)"
   $inf = Join-Path $dir "$($d.Name).inf"
@@ -100,7 +107,7 @@ foreach ($d in $Drivers) {
     $manifestDrivers += [ordered]@{
       service = $d.Name; kit = $d.Kit; inf = "$($d.Kit)/$($d.Name).inf"; hwid = $d.Hwid
       version = $ver; minUefi = $d.MinUefi; sysSha256 = (Sha256 (Join-Path $build "$($d.Name).sys"))
-      nameJa = $d.Ja; nameEn = $d.En; installAt = $(if ($d.Boot) { 'boot' } else { 'live' })
+      nameJa = $d.Ja; nameEn = $d.En; installAt = $(if ($d.Boot) { 'boot' } else { 'live' }); beta = [bool]$d.Beta
     }
   }
 }
@@ -151,6 +158,7 @@ Compress-Archive -Path (Join-Path $patcherStage 'SwitchPatcher.exe'), (Join-Path
 # ------------------------------------------------------------ manifest
 $manifest = [ordered]@{
   release   = "drivers-$Version"
+  prerelease = [bool]$Beta
   created   = (Get-Date).ToString('yyyy-MM-ddTHH:mm:ssK')
   signer    = 'A9E1F054DFCC96F43010918892C3C30D5A522712'
   app       = [ordered]@{ version = $appVersion; file = (Split-Path $appZip -Leaf); sha256 = (Sha256 $appZip) }

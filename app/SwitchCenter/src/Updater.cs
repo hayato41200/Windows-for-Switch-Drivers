@@ -61,6 +61,7 @@ namespace SwitchCenter
         static readonly TimeSpan PnputilTimeout = TimeSpan.FromMinutes(2);
 
         public static Task<Release> FetchAsync(string tag) => ReleaseClient.FetchAsync(tag);
+        public static Task<Release> FetchChannelAsync(bool beta) => ReleaseClient.FetchChannelAsync(beta);
         static HttpClient NewClient() => ReleaseClient.NewClient();
         static string Sha256(string path) => ReleaseClient.Sha256(path);
 
