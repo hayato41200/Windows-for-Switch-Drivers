@@ -44,7 +44,7 @@ function Publish-Release([string]$dir) {
   $notesFile = Join-Path $dir 'release-notes.md'
   $notes -join "`n" | Set-Content $notesFile -Encoding utf8
   $files = Get-ChildItem $dir -File | Where-Object { $_.Name -ne 'release-notes.md' } | ForEach-Object FullName
-  $preArg = if ($pre) { @('--prerelease') } else { @() }
+  $preArg = @(if ($pre) { '--prerelease' })          # @() keeps it an array (a lone string would not splat as one argument)
   & $gh release create "drivers-$Version" @files --repo $Repo --title $title --notes-file $notesFile @preArg
   if ($LASTEXITCODE -ne 0) { throw 'gh release create failed' }
 }
