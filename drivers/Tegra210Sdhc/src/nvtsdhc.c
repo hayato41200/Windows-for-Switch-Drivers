@@ -121,6 +121,18 @@ typedef struct _NV_DIAG {
     ULONG RegHostControl;
     ULONG CarSdmmc1Before;
     ULONG CarSdmmc1After;
+
+    // Data commands, timed from issue to completion (DataUs) and from the
+    // previous completion to the next issue (GapUs): bus time against time
+    // spent above the miniport. 0.3.0 read 5 MB/s at 48 MHz, 4 bit.
+    PVOID DataRequest;
+    LONGLONG DataStart;
+    LONGLONG DataEnd;
+    ULONG DataStartBlocks;
+    ULONG DataCommands;
+    ULONG DataBlocks;
+    ULONG DataUs;
+    ULONG GapUs;
     WCHAR RegistryPath[256];
 } NV_DIAG;
 
@@ -311,6 +323,16 @@ NvDiagSaveClock(
     NvDiagSetValue(Key, L"BlocksRead", NvDiag.BlocksRead);
     NvDiagSetValue(Key, L"CarSdmmc1Before", NvDiag.CarSdmmc1Before);
     NvDiagSetValue(Key, L"CarSdmmc1After", NvDiag.CarSdmmc1After);
+    NvDiagSetValue(Key, L"BlocksWritten", NvDiag.BlocksWritten);
+    NvDiagSetValue(Key, L"Interrupts", NvDiag.Interrupts);
+    NvDiagSetValue(Key, L"ErrorInterrupts", NvDiag.ErrorInterrupts);
+    NvDiagSetValue(Key, L"CommandErrors", NvDiag.CommandErrors);
+    NvDiagSetValue(Key, L"LastErrors", NvDiag.LastErrors);
+    NvDiagSetValue(Key, L"LastErrorCommand", NvDiag.LastErrorCommand);
+    NvDiagSetValue(Key, L"DataCommands", NvDiag.DataCommands);
+    NvDiagSetValue(Key, L"DataBlocks", NvDiag.DataBlocks);
+    NvDiagSetValue(Key, L"DataUs", NvDiag.DataUs);
+    NvDiagSetValue(Key, L"GapUs", NvDiag.GapUs);
     ZwClose(Key);
 }
 #endif
@@ -1251,6 +1273,20 @@ Return value:
     // Dispatch the request based off of the request type.
     //
 
+    if (Request->Type == SdRequestTypeCommandWithTransfer) {
+        LARGE_INTEGER Frequency;
+        LONGLONG Now;
+
+        Now = KeQueryPerformanceCounter(&Frequency).QuadPart;
+        if ((NvDiag.DataEnd != 0) && (Frequency.QuadPart != 0)) {
+            NvDiag.GapUs += (ULONG) ((Now - NvDiag.DataEnd) * 1000000 / Frequency.QuadPart);
+        }
+
+        NvDiag.DataRequest = Request;
+        NvDiag.DataStart = Now;
+        NvDiag.DataStartBlocks = Request->Command.BlockCount;
+    }
+
     switch (Request->Type) {
     case SdRequestTypeCommandNoTransfer:
     case SdRequestTypeCommandWithTransfer:
@@ -1383,6 +1419,29 @@ Return value:
     } else if ((Request->RequiredEvents == 0) &&
                (Request->Type != SdRequestTypeStartTransfer)) {
         NvDiag.CommandsOk += 1;
+    }
+
+    if ((Request == NvDiag.DataRequest) &&
+        ((Errors != 0) ||
+         ((Request->RequiredEvents == 0) &&
+          (Request->Status != STATUS_MORE_PROCESSING_REQUIRED)))) {
+
+        LARGE_INTEGER Frequency;
+
+        NvDiag.DataEnd = KeQueryPerformanceCounter(&Frequency).QuadPart;
+        if (Frequency.QuadPart != 0) {
+            NvDiag.DataUs += (ULONG) ((NvDiag.DataEnd - NvDiag.DataStart) * 1000000 /
+                                      Frequency.QuadPart);
+        }
+
+        NvDiag.DataRequest = NULL;
+        NvDiag.DataCommands += 1;
+        NvDiag.DataBlocks += NvDiag.DataStartBlocks;
+#if NV_DIAG_CLOCK
+        if ((NvDiag.DataCommands % 1024) == 0) {
+            NvDiagSaveClock(SdhcExtension);
+        }
+#endif
     }
 
     if (Errors) {
