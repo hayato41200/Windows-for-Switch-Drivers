@@ -1,7 +1,9 @@
 // Automatic screen brightness (light sensor) and orientation (accelerometer),
 // from switchsensor.sys. Settings in HKCU\Software\SwitchWOA\SwitchClock:
-// AutoBrightness, AutoRotate (0/1), RotateBase (the DMDO_* orientation for
-// the Switch held normally) and RotateReverse (0/1).
+// AutoBrightness, AutoRotate (0/1), RotateUp0..3 (the DMDO_* orientation the
+// user taught for each chip axis pointing up, -1 = not taught), RotateReverse
+// (0/1, used only until two poses are taught) and RotateBase (0.6.0: the
+// orientation for up axis 0).
 using System;
 using System.ComponentModel;
 using System.Runtime.InteropServices;
@@ -44,8 +46,8 @@ namespace SwitchCenter
             set
             {
                 // The orientation when it is turned on counts as "held normally" if it is a landscape one.
-                if (value && ReadInt("RotateBase", -1) < 0 && Display.Current() is int now && now % 2 == 1)
-                    WriteInt("RotateBase", now);
+                if (value && !AnyTaught() && Display.Current() is int now && now % 2 == 1)
+                    WriteInt("RotateUp0", now);
                 WriteInt("AutoRotate", value ? 1 : 0);
                 candidate = -1;
                 lastUp = -1;
@@ -59,13 +61,30 @@ namespace SwitchCenter
             set { WriteInt("RotateReverse", value ? 1 : 0); lastUp = -1; }
         }
 
-        /// <summary>Remember the current orientation as the one for the Switch held as it is now.</summary>
-        public void SetBaseFromNow()
+        /// <summary>
+        /// Remember the current orientation as right for how the Switch is held now. Two poses a
+        /// quarter turn apart (e.g. landscape and portrait) also settle which way it turns.
+        /// False when the Switch is flat or tilted too far to tell.
+        /// </summary>
+        public bool SetBaseFromNow()
         {
-            if (Display.Current() is not int now || Last is not { AccelValid: true } s || UpAxis(s) is not int up) return;
-            WriteInt("RotateBase", ((now - Step(up)) % 4 + 4) % 4);
+            if (Display.Current() is not int now || Last is not { AccelValid: true } s || UpAxis(s) is not int up) return false;
+            // A taught pose that disagrees with this one in direction is from an earlier mistake: forget it.
+            for (int i = 0; i < 4; i++)
+            {
+                int other = Taught(i);
+                if (i != up && other >= 0 && Direction(up, now, i, other) == 0) WriteInt("RotateUp" + i, -1);
+            }
+            WriteInt("RotateUp" + up, now);
             lastUp = up;
+            return true;
         }
+
+        /// <summary>Turn the screen a quarter turn by hand (to put it right before "remember").</summary>
+        public static bool TurnScreen() => Display.Current() is int now && Display.Set((now + 1) % 4);
+
+        /// <summary>The up axis for the value display: "+Y" etc., or null.</summary>
+        public static string UpAxisName(Sensors.Status s) => UpAxis(s) switch { 0 => "+Y", 1 => "+X", 2 => "-Y", 3 => "-X", _ => null };
 
         /// <summary>Keep sampling while the window shows the values, even with both features off.</summary>
         public bool Watching { get => watching; set { watching = value; Update(); } }
@@ -118,8 +137,38 @@ namespace SwitchCenter
             return ay >= ax ? (s.Y > 0 ? 0 : 2) : (s.X > 0 ? 1 : 3);
         }
 
-        /// <summary>Quarter turns of the picture for an up axis (L4T mount matrix: X right, Y up when held normally).</summary>
-        int Step(int up) => RotateReverse ? (4 - up) % 4 : up;
+        int Taught(int up)
+        {
+            int v = ReadInt("RotateUp" + up, -2);
+            if (v == -2) v = up == 0 ? ReadInt("RotateBase", -1) : -1;   // never written: the 0.6.0 setting for axis 0
+            return v is >= 0 and <= 3 ? v : -1;
+        }
+
+        bool AnyTaught() => Taught(0) >= 0 || Taught(1) >= 0 || Taught(2) >= 0 || Taught(3) >= 0;
+
+        /// <summary>+1 if the picture turns with the axis index, -1 if against it, 0 if the two poses contradict.</summary>
+        static int Direction(int upA, int orientA, int upB, int orientB)
+        {
+            int axes = ((upB - upA) % 4 + 4) % 4, turns = ((orientB - orientA) % 4 + 4) % 4;
+            if (axes == 0) return turns == 0 ? 1 : 0;
+            if (axes == 2) return turns == 2 ? 1 : 0;           // half turn: fits either direction
+            return turns == axes ? 1 : turns == 4 - axes ? -1 : 0;
+        }
+
+        /// <summary>The orientation for an up axis: taught, or worked out from a taught one.</summary>
+        int? OrientationFor(int up)
+        {
+            if (Taught(up) is int t && t >= 0) return t;
+            int known = -1, dir = RotateReverse ? -1 : 1;      // the chip axes advance with the turns unless taught otherwise
+            for (int i = 0; i < 4; i++)
+            {
+                if (Taught(i) < 0) continue;
+                if (known >= 0 && (i - known) % 2 != 0) dir = Direction(known, Taught(known), i, Taught(i)) is int d && d != 0 ? d : dir;
+                if (known < 0) known = i;
+            }
+            if (known < 0) return null;
+            return ((Taught(known) + dir * (up - known)) % 4 + 8) % 4;
+        }
 
         void Rotate(Sensors.Status s)
         {
@@ -127,9 +176,7 @@ namespace SwitchCenter
             if (up != candidate) { candidate = up; candidateTicks = 0; return; }
             if (++candidateTicks < StableTicks || up == lastUp) return;
             lastUp = up;
-            int baseOrientation = ReadInt("RotateBase", -1);
-            if (baseOrientation < 0) return;
-            Display.Set((baseOrientation + Step(up)) % 4);
+            if (OrientationFor(up) is int target) Display.Set(target);
         }
 
         // ------------------------------------------------------------ settings

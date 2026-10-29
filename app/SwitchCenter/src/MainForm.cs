@@ -46,6 +46,7 @@ namespace SwitchCenter
         readonly CheckBox autoRotate = new CheckBox { Dock = DockStyle.Top, Height = 40 };
         readonly CheckBox rotateReverse = new CheckBox { Dock = DockStyle.Top, Height = 40 };
         readonly Button rotateBase = new Button { Dock = DockStyle.Top, Height = 44 };
+        readonly Button rotateTurn = new Button { Dock = DockStyle.Top, Height = 44 };
         readonly Label sensorValues = new Label { Dock = DockStyle.Top, Height = 72 };
         readonly Timer sensorTimer = new Timer { Interval = 500 };
         bool updatingBar;
@@ -209,7 +210,8 @@ namespace SwitchCenter
             };
             autoBright.Text = T("明るさを自動で調整する（明るさセンサー）", "Adjust the brightness automatically (light sensor)");
             autoRotate.Text = T("画面を自動で回転する（傾きセンサー）", "Rotate the screen automatically (tilt sensor)");
-            rotateReverse.Text = T("回転の向きを逆にする（逆に回るとき）", "Reverse the rotation (if it turns the wrong way)");
+            rotateReverse.Text = T("回転の向きを逆にする（横と縦の両方を覚えたら不要）", "Reverse the rotation (not needed once landscape and portrait are remembered)");
+            rotateTurn.Text = T("画面を 90° 回す（向きを手で直す）", "Turn the screen 90° (put it right by hand)");
             rotateBase.Text = T("今の画面の向きを、今の持ち方の正しい向きとして覚える", "Remember this orientation as right for how the Switch is held now");
             autoBright.Checked = auto.AutoBrightness;
             autoRotate.Checked = auto.AutoRotate;
@@ -217,9 +219,18 @@ namespace SwitchCenter
             autoBright.CheckedChanged += (_, _) => { auto.AutoBrightness = autoBright.Checked; brightnessBar.Enabled = !autoBright.Checked; };
             autoRotate.CheckedChanged += (_, _) => auto.AutoRotate = autoRotate.Checked;
             rotateReverse.CheckedChanged += (_, _) => auto.RotateReverse = rotateReverse.Checked;
-            rotateBase.Click += (_, _) => { auto.SetBaseFromNow(); RefreshSensors(); };
+            rotateBase.Click += (_, _) =>
+            {
+                if (!auto.SetBaseFromNow())
+                    MessageBox.Show(this, T("本体の向きが分かりませんでした。机に置かずに、横か縦にまっすぐ持って、もう一度押してください。",
+                                            "Could not tell how the Switch is held. Hold it upright (not flat), landscape or portrait, and press again."),
+                                    Text, MessageBoxButtons.OK, MessageBoxIcon.Information);
+                RefreshSensors();
+            };
+            rotateTurn.Click += (_, _) => { AutoScreen.TurnScreen(); RefreshSensors(); };
             page.Controls.Add(sensorValues);
             page.Controls.Add(rotateBase);
+            page.Controls.Add(rotateTurn);
             page.Controls.Add(rotateReverse);
             page.Controls.Add(autoRotate);
             page.Controls.Add(note);
@@ -592,7 +603,9 @@ namespace SwitchCenter
             string light = s.LightValid
                 ? $"{s.Lux:0.#} lux (DATA0 {s.Data0}, DATA1 {s.Data1}, x{s.Gain}) -> {AutoScreen.PercentForLux(s.Lux)}%"
                 : T("なし", "none");
-            string tilt = s.AccelValid ? $"X {s.X}  Y {s.Y}  Z {s.Z} mg" : T("なし", "none") + $" (ID {s.ImuId:X2})";
+            string tilt = s.AccelValid
+                ? $"X {s.X}  Y {s.Y}  Z {s.Z} mg  " + T("上の軸: ", "up: ") + (AutoScreen.UpAxisName(s) ?? T("不明（平ら・斜め）", "unclear (flat or tilted)"))
+                : T("なし", "none") + $" (ID {s.ImuId:X2})";
             string orientation = Display.Current() is int o ? $"{o * 90}°" : "—";
             sensorValues.Text = T("明るさセンサー: ", "Light sensor: ") + light + "\n" +
                                 T("傾きセンサー: ", "Tilt sensor: ") + tilt + "\n" +
