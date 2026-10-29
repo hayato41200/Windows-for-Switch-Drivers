@@ -69,15 +69,18 @@ namespace SwitchCenter
         {
             if (!beta) return await FetchAsync(null);
             string newest = null;
+            Version newestVersion = null;
             using (HttpClient http = NewClient())
-            using (JsonDocument list = JsonDocument.Parse(await http.GetStringAsync($"https://api.github.com/repos/{Repo}/releases?per_page=20")))
+            using (JsonDocument list = JsonDocument.Parse(await http.GetStringAsync($"https://api.github.com/repos/{Repo}/releases?per_page=30")))
             {
-                foreach (JsonElement rel in list.RootElement.EnumerateArray())     // newest first
+                // GitHub orders the list by the tagged commit's date, not by publishing, so
+                // releases tagged on the same commit come in any order: compare the tags instead.
+                foreach (JsonElement rel in list.RootElement.EnumerateArray())
                 {
                     string tag = rel.GetProperty("tag_name").GetString();
                     if (rel.GetProperty("draft").GetBoolean() || tag == null || !TagPattern.IsMatch(tag)) continue;
-                    newest = tag;
-                    break;
+                    Version v = System.Version.Parse(tag.Substring("drivers-".Length));
+                    if (newestVersion == null || v > newestVersion) { newest = tag; newestVersion = v; }
                 }
             }
             if (newest == null) throw new InvalidDataException("no release found");
