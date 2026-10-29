@@ -103,6 +103,25 @@ foreach ($d in $Drivers) {
     }
   }
 }
+# SD boot (Switch-Sd): the loaders and nvtsdhc. Kept out of drivers.items so the
+# control center never installs nvtsdhc live; SwitchPatcher puts it on Windows 11 SDs.
+Write-Host '=== nvtsdhc'
+$sdBuild = Join-Path $Root 'build\Tegra210Sdhc'
+$sdInf = Join-Path $Root 'drivers\Tegra210Sdhc\nvtsdhc.inf'
+& (Join-Path $Root 'tools\Build-Driver.ps1') -Wdm -Name nvtsdhc -Sources (Join-Path $Root 'drivers\Tegra210Sdhc\src\nvtsdhc.c') `
+  -Libs sdport.lib -Inf $sdInf -OutDir $sdBuild | Out-Host
+$sdKit = Join-Path $DriverStage 'Switch-Sd'
+New-Item -ItemType Directory -Force $sdKit | Out-Null
+Copy-Item (Join-Path $Root 'kits\Switch-Sd\*') $sdKit -Recurse
+foreach ($ext in 'sys', 'cat', 'inf') { Copy-Item (Join-Path $sdBuild "nvtsdhc.$ext") $sdKit }
+$manifestSd = [ordered]@{
+  kit = 'Switch-Sd'; service = 'nvtsdhc'; inf = 'Switch-Sd/nvtsdhc.inf'; hwid = 'ACPI\NVDA0101'; minBuild = 22000
+  version = (Select-String -Path $sdInf -Pattern '^\s*DriverVer\s*=\s*[^,]+,\s*(\S+)').Matches[0].Groups[1].Value
+  sysSha256 = (Sha256 (Join-Path $sdBuild 'nvtsdhc.sys'))
+  loader = [ordered]@{ file = 'Switch-Sd/SDLOADAA64.EFI'; sha256 = (Sha256 (Join-Path $sdKit 'SDLOADAA64.EFI')) }
+  loaderNoCid = [ordered]@{ file = 'Switch-Sd/SDLOADAA64-NOCID.EFI'; sha256 = (Sha256 (Join-Path $sdKit 'SDLOADAA64-NOCID.EFI')) }
+}
+
 Copy-Item (Join-Path $Root 'tools\cert\SwitchWOA-Test.cer') $DriverStage
 $driversZip = Join-Path $Out "SwitchDrivers-$Version.zip"
 Compress-Archive -Path (Join-Path $DriverStage '*') -DestinationPath $driversZip -CompressionLevel Optimal
@@ -136,6 +155,7 @@ $manifest = [ordered]@{
   app       = [ordered]@{ version = $appVersion; file = (Split-Path $appZip -Leaf); sha256 = (Sha256 $appZip) }
   patcher   = [ordered]@{ version = $patcherVersion; file = (Split-Path $patcherZip -Leaf); sha256 = (Sha256 $patcherZip) }
   drivers   = [ordered]@{ file = (Split-Path $driversZip -Leaf); sha256 = (Sha256 $driversZip); items = $manifestDrivers }
+  sd        = $manifestSd
 }
 $manifest | ConvertTo-Json -Depth 6 | Set-Content (Join-Path $Out 'manifest.json') -Encoding utf8
 Remove-Item $Stage -Recurse -Force

@@ -70,6 +70,72 @@ namespace SwitchPatcher
             return changes;
         }
 
+        /// <summary>The build number of the offline Windows (19044 = Windows 10 21H2, 22621 = Windows 11 22H2).</summary>
+        public static int WindowsBuild(string windows) =>
+            System.Diagnostics.FileVersionInfo.GetVersionInfo(Path.Combine(windows, @"Windows\System32\ntoskrnl.exe")).FileBuildPart;
+
+        /// <summary>
+        /// Makes service a boot-start kernel driver (Start = 0, as the boot loader must
+        /// load the SD host before Windows can read the SD) in every control set.
+        /// Returns "service: old -> 0" lines.
+        /// </summary>
+        public static System.Collections.Generic.List<string> AddBootDriver(RegistryKey system, string service)
+        {
+            var changes = new System.Collections.Generic.List<string>();
+            foreach (string cs in system.GetSubKeyNames())
+            {
+                if (!cs.StartsWith("ControlSet", StringComparison.OrdinalIgnoreCase)) continue;
+                using RegistryKey k = system.CreateSubKey($@"{cs}\Services\{service}", true);
+                object old = k.GetValue("Start");
+                k.SetValue("Type", 1, RegistryValueKind.DWord);
+                k.SetValue("Start", 0, RegistryValueKind.DWord);
+                k.SetValue("ErrorControl", 1, RegistryValueKind.DWord);
+                k.SetValue("BootFlags", 8, RegistryValueKind.DWord);
+                k.SetValue("ImagePath", $@"\SystemRoot\System32\drivers\{service}.sys", RegistryValueKind.ExpandString);
+                k.SetValue("Group", "System Bus Extender", RegistryValueKind.String);
+                changes.Add($@"{cs}\{service}: Start {old ?? "-"} -> 0");
+            }
+            return changes;
+        }
+
+        /// <summary>
+        /// Copies the driver's .sys to Windows\System32\drivers, replacing one left by an
+        /// earlier run (owned by TrustedInstaller after dism, so it is taken over first).
+        /// </summary>
+        public static async Task CopyDriverFile(string windows, string sys, Action<string> log)
+        {
+            string dest = Path.Combine(windows, @"Windows\System32\drivers", Path.GetFileName(sys));
+            if (File.Exists(dest))
+            {
+                await Tools.Run(Tools.System32("takeown.exe"), $"/f \"{dest}\" /a", log);
+                await Tools.Run(Tools.System32("icacls.exe"), $"\"{dest}\" /grant *S-1-5-32-544:F", log);
+                File.SetAttributes(dest, FileAttributes.Normal);
+            }
+            File.Copy(sys, dest, true);
+        }
+
+        /// <summary>Puts the SD loader at EFI\Boot\bootaa64.efi (the file the Switch UEFI starts) and checks the copy.</summary>
+        public static void PutLoader(string esp, string loader)
+        {
+            string dest = Path.Combine(esp, @"EFI\Boot\bootaa64.efi");
+            Directory.CreateDirectory(Path.GetDirectoryName(dest));
+            if (File.Exists(dest)) File.SetAttributes(dest, FileAttributes.Normal);
+            File.Copy(loader, dest, true);
+            if (SwitchCenter.ReleaseClient.Sha256(dest) != SwitchCenter.ReleaseClient.Sha256(loader))
+                throw new IOException(T("ESP に置いたローダーが元のファイルと合いません。", "The loader on the ESP does not match its source."));
+        }
+
+        /// <summary>
+        /// Removes the boot debugging settings used while bringing up Windows 11 on the SD
+        /// (boot log, driver names on screen, all failures shown, no restart after a stop).
+        /// A value that is not set is left alone.
+        /// </summary>
+        public static async Task ClearBootDebug(string bcd)
+        {
+            foreach (string v in new[] { "bootlog", "sos", "bootstatuspolicy", "nocrashautoreboot" })
+                await Tools.Run(Tools.System32("bcdedit.exe"), $"/store \"{bcd}\" /deletevalue {{default}} {v}", _ => { });
+        }
+
         /// <summary>
         /// The registry "Blob" Windows keeps for a certificate in a store. Made by
         /// adding the certificate to a temporary store of this user and reading

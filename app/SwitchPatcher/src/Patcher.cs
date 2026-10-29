@@ -44,7 +44,9 @@ namespace SwitchPatcher
                 string files = Path.Combine(work, "drivers");
                 var infs = new List<string>();
                 X509Certificate2 cert = null;
-                if (o.Drivers || o.TestMode)
+                (string Inf, string Loader, string LoaderNoCid) sd = default;
+                // Always: the SD boot files are needed whenever the SD holds Windows 11,
+                // which is known only once the image is on the SD.
                 {
                     string zip = Path.Combine(work, rel.DriversFile);
                     log(T($"{rel.DriversFile} をダウンロードしています…", $"Downloading {rel.DriversFile}..."));
@@ -54,6 +56,11 @@ namespace SwitchPatcher
                     {
                         infs.Add(ReleaseClient.VerifyDriver(files, d));
                         log(T($"  {d.Service} {d.Version}: .sys と署名を確かめました。", $"  {d.Service} {d.Version}: .sys and signature checked."));
+                    }
+                    if (rel.Sd != null)
+                    {
+                        sd = ReleaseClient.VerifySd(files, rel.Sd);
+                        log(T($"  SD 起動用（{rel.Sd.Service} {rel.Sd.Version}、ローダー）: 確かめました。", $"  SD boot ({rel.Sd.Service} {rel.Sd.Version}, loaders): checked."));
                     }
                     cert = new X509Certificate2(Path.Combine(files, "SwitchWOA-Test.cer"));
                     if (!string.Equals(cert.Thumbprint, ReleaseClient.Signer, StringComparison.OrdinalIgnoreCase))
@@ -119,12 +126,56 @@ namespace SwitchPatcher
                     throw new InvalidOperationException(T($"{win} に Windows がありません。", $"There is no Windows on {win}."));
                 }
 
+                // ---- SD boot. Windows 10 reads the SD with the inbox sdbus; Windows 11 (22621) cannot
+                // boot that way, so it gets nvtsdhc and the loader that keeps sdbus off the SD host.
+                int build = Offline.WindowsBuild(win);
+                bool win11 = build >= (rel.Sd?.MinBuild ?? 22000);
+                log(T($"SD の Windows はビルド {build} です。", $"The Windows on the SD is build {build}."));
+                if (win11 && rel.Sd == null)
+                    throw new InvalidDataException(T($"リリース {rel.Tag} には、Windows 11 を SD から起動するためのファイルがありません。",
+                                                     $"Release {rel.Tag} has no files for booting Windows 11 from the SD."));
+                if (win11 && !o.TestMode)
+                {
+                    o.TestMode = true;
+                    log(T("Windows 11 の SD ドライバー（nvtsdhc）はテスト署名なので、テストモードも入れます。",
+                          "The Windows 11 SD driver (nvtsdhc) is test-signed, so test mode is turned on as well."));
+                }
+                string loader = win11 ? sd.LoaderNoCid : o.InstallImage && rel.Sd != null ? sd.Loader : null;
+                if (loader != null)
+                {
+                    if (backup == null)
+                    {
+                        backup = Offline.BackupEsp(esp);
+                        log(T($"ESP の起動ファイルを保存しました: {backup}", $"Saved the ESP boot files: {backup}"));
+                    }
+                    Offline.PutLoader(esp, loader);
+                    log(T($"SD のローダー（{Path.GetFileName(loader)}）を EFI\\Boot\\bootaa64.efi に置きました。",
+                          $"Put the SD loader ({Path.GetFileName(loader)}) at EFI\\Boot\\bootaa64.efi."));
+                }
+                else if (o.InstallImage)
+                {
+                    log(T("このリリースには SD のローダーがないので、bootaa64.efi はそのままです（Switch では起動できません）。",
+                          "This release has no SD loader, so bootaa64.efi is unchanged (it will not boot on the Switch)."));
+                }
+                if (win11)
+                {
+                    int code = await Tools.Run(Tools.System32("dism.exe"), $"/Image:{win} /Add-Driver /Driver:\"{sd.Inf}\"", log, progress);
+                    if (code != 0)
+                        code = await Tools.Run(Tools.System32("dism.exe"), $"/Image:{win} /Add-Driver /Driver:\"{sd.Inf}\" /ForceUnsigned", log, progress);
+                    if (code != 0) throw new InvalidOperationException(T("nvtsdhc を入れられませんでした。", "Could not add nvtsdhc."));
+                    await Offline.CopyDriverFile(win, Path.Combine(Path.GetDirectoryName(sd.Inf), rel.Sd.Service + ".sys"), log);
+                }
+
                 // ---- offline registry: the SD drivers load at every boot (needed to boot from the Switch's SD)
                 await Offline.WithHive(win, "SYSTEM", system =>
                 {
                     foreach (string line in Offline.LoadSdDriversAtBoot(system)) log("  " + line);
+                    if (win11)
+                        foreach (string line in Offline.AddBootDriver(system, rel.Sd.Service)) log("  " + line);
                 }, log);
-                log(T("SD のドライバー（sdbus、sdstor）を、起動のときに必ず読み込むようにしました。", "The SD drivers (sdbus, sdstor) now load at every boot."));
+                log(win11 ? T($"SD のドライバー（{rel.Sd.Service} {rel.Sd.Version}）を、起動のときに必ず読み込むようにしました。",
+                              $"The SD driver ({rel.Sd.Service} {rel.Sd.Version}) now loads at every boot.")
+                          : T("SD のドライバー（sdbus、sdstor）を、起動のときに必ず読み込むようにしました。", "The SD drivers (sdbus, sdstor) now load at every boot."));
 
                 // ---- offline registry: certificate, autostart, first boot without network
                 if (o.TestMode || o.ControlCenter || o.InstallImage)
@@ -176,6 +227,8 @@ namespace SwitchPatcher
                     }
                     if (await Tools.Run(Tools.System32("bcdedit.exe"), $"/store \"{bcd}\" /set {{default}} testsigning on", log) != 0)
                         throw new InvalidOperationException(T("bcdedit が失敗しました。", "bcdedit failed."));
+                    await Offline.ClearBootDebug(bcd);
+                    log(T("起動のデバッグ設定（bootlog、sos など）があれば外しました。", "Removed the boot debugging settings (bootlog, sos, ...), if any."));
                     await Tools.Run(Tools.System32("bcdedit.exe"), $"/store \"{bcd}\" /enum {{default}}", log);
                 }
 

@@ -25,10 +25,21 @@ namespace SwitchCenter
         public bool AtNextBoot;           // replaced at the next boot instead of live (GPIO, I2C)
     }
 
+    /// <summary>
+    /// SD boot files in the drivers zip (manifest "sd", from drivers-2026.10.29): the loaders
+    /// for EFI\Boot\bootaa64.efi and nvtsdhc, which SwitchPatcher puts on Windows 11 SDs only.
+    /// </summary>
+    sealed class SdBoot
+    {
+        public string Service, Inf, Version, SysSha256, Loader, LoaderSha256, LoaderNoCid, LoaderNoCidSha256;
+        public int MinBuild;
+    }
+
     sealed class Release
     {
         public string Tag, PageUrl, AppVersion, AppFile, AppSha256, AppUrl, DriversFile, DriversSha256, DriversUrl;
         public List<ManifestDriver> Drivers = new List<ManifestDriver>();
+        public SdBoot Sd;                 // null in releases without it
     }
 
     static class ReleaseClient
@@ -102,7 +113,41 @@ namespace SwitchCenter
                     throw new InvalidDataException("bad manifest entry " + d.Service);
                 r.Drivers.Add(d);
             }
+            if (root.TryGetProperty("sd", out JsonElement sd))
+            {
+                r.Sd = new SdBoot
+                {
+                    Service = sd.GetProperty("service").GetString(),
+                    Inf = sd.GetProperty("inf").GetString(),
+                    Version = sd.GetProperty("version").GetString(),
+                    SysSha256 = sd.GetProperty("sysSha256").GetString().ToLowerInvariant(),
+                    MinBuild = sd.GetProperty("minBuild").GetInt32(),
+                    Loader = sd.GetProperty("loader").GetProperty("file").GetString(),
+                    LoaderSha256 = sd.GetProperty("loader").GetProperty("sha256").GetString().ToLowerInvariant(),
+                    LoaderNoCid = sd.GetProperty("loaderNoCid").GetProperty("file").GetString(),
+                    LoaderNoCidSha256 = sd.GetProperty("loaderNoCid").GetProperty("sha256").GetString().ToLowerInvariant(),
+                };
+                if (!ServicePattern.IsMatch(r.Sd.Service) || !System.Version.TryParse(r.Sd.Version, out _))
+                    throw new InvalidDataException("bad manifest entry sd");
+            }
             return r;
+        }
+
+        /// <summary>
+        /// Checks the SD boot files unpacked under files: nvtsdhc like any driver, and both
+        /// loaders against the manifest. Returns the full paths (.inf, loader, NOCID loader).
+        /// </summary>
+        public static (string Inf, string Loader, string LoaderNoCid) VerifySd(string files, SdBoot sd)
+        {
+            string inf = VerifyDriver(files, new ManifestDriver { Service = sd.Service, Inf = sd.Inf, SysSha256 = sd.SysSha256 });
+            string Checked(string rel, string sha256)
+            {
+                string p = Path.GetFullPath(Path.Combine(files, rel));
+                if (!p.StartsWith(files + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase) || !File.Exists(p) || Sha256(p) != sha256)
+                    throw new InvalidDataException(T($"{rel} が manifest と合いません。", $"{rel} does not match the manifest."));
+                return p;
+            }
+            return (inf, Checked(sd.Loader, sd.LoaderSha256), Checked(sd.LoaderNoCid, sd.LoaderNoCidSha256));
         }
 
         /// <summary>Downloads url to path and checks its SHA-256 (lower-case hex).</summary>

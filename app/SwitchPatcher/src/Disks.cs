@@ -14,6 +14,7 @@ namespace SwitchPatcher
     sealed class PartInfo
     {
         public const string EspType = "{c12a7328-f81f-11d2-ba4b-00a0c93ec93b}";
+        public const string MsrType = "{e3c9e316-0b5c-4db8-817d-f92df00215ae}";
         public int Number;
         public string Letter;             // "" when it has none
         public long Size;
@@ -41,11 +42,11 @@ namespace SwitchPatcher
 
     static class Disks
     {
-        /// <summary>All disks except the ones the PC boots and runs from.</summary>
+        /// <summary>All disks except the ones the PC boots and runs from, and empty card reader slots (0 bytes).</summary>
         public static async Task<List<DiskInfo>> ListAsync()
         {
             using JsonDocument j = await Tools.PowerShellJson(@"
-$list = @(Get-Disk | Where-Object { -not $_.IsBoot -and -not $_.IsSystem } | ForEach-Object {
+$list = @(Get-Disk | Where-Object { -not $_.IsBoot -and -not $_.IsSystem -and $_.Size -gt 0 } | ForEach-Object {
   $d = $_
   [pscustomobject]@{
     Number = $d.Number; Name = [string]$d.FriendlyName; Size = [long]$d.Size
@@ -114,7 +115,8 @@ ConvertTo-Json -InputObject $list -Depth 5 -Compress");
 
         /// <summary>
         /// Erases the whole disk and makes the Switch SD layout: GPT, an ESP
-        /// (FAT32, 260 MB) and an NTFS partition for Windows on the rest. Only for
+        /// (FAT32, 260 MB), the Microsoft reserved partition (16 MB, as Windows
+        /// Setup makes it) and an NTFS partition for Windows on the rest. Only for
         /// SD / USB card readers (and virtual disks, for testing). The ESP is made
         /// as a data partition first and retyped after formatting, because
         /// Windows does not let Format-Volume open a partition that is already an ESP.
@@ -138,11 +140,12 @@ Update-Disk -Number {n}
 $d = Get-Disk -Number {n}
 if ($d.PartitionStyle -ne 'GPT') {{ throw ""disk {n} is $($d.PartitionStyle), not GPT"" }}
 if (@(Get-Partition -DiskNumber {n} -ErrorAction SilentlyContinue | Where-Object {{ $_.Type -ne 'Reserved' }}).Count) {{ throw ""disk {n} still has partitions"" }}");
-            log(T("ESP（FAT32、260 MB）と Windows の区画（NTFS）を作っています…", "Creating the ESP (FAT32, 260 MB) and the Windows partition (NTFS)..."));
+            log(T("ESP（FAT32、260 MB）、MSR（16 MB）と Windows の区画（NTFS）を作っています…", "Creating the ESP (FAT32, 260 MB), the MSR (16 MB) and the Windows partition (NTFS)..."));
             await Tools.PowerShell($@"
 $esp = New-Partition -DiskNumber {n} -Size 260MB
 $esp | Format-Volume -FileSystem FAT32 -NewFileSystemLabel ESP -Confirm:$false | Out-Null
 Set-Partition -DiskNumber {n} -PartitionNumber $esp.PartitionNumber -GptType '{PartInfo.EspType}'
+New-Partition -DiskNumber {n} -Size 16MB -GptType '{PartInfo.MsrType}' | Out-Null
 New-Partition -DiskNumber {n} -UseMaximumSize | Format-Volume -FileSystem NTFS -NewFileSystemLabel Windows -Confirm:$false | Out-Null");
         }
 
