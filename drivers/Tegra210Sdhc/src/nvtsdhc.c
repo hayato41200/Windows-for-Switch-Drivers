@@ -237,6 +237,23 @@ NvDiagSetValue(
 #endif
 
 #if NV_DIAG_CLOCK
+static VOID NvDiagSaveClock(_In_ PSDHC_EXTENSION SdhcExtension);
+
+static WORK_QUEUE_ITEM NvDiagSaveItem;
+static volatile LONG NvDiagSaveQueued;
+static PSDHC_EXTENSION NvDiagSaveExtension;
+
+static VOID
+NvDiagSaveWorker(
+    _In_ PVOID Context
+    )
+{
+    UNREFERENCED_PARAMETER(Context);
+
+    InterlockedExchange(&NvDiagSaveQueued, 0);
+    NvDiagSaveClock(NvDiagSaveExtension);
+}
+
 static VOID
 NvDiagSaveClock(
     _In_ PSDHC_EXTENSION SdhcExtension
@@ -247,9 +264,27 @@ NvDiagSaveClock(
     OBJECT_ATTRIBUTES Attributes;
     HANDLE Key;
 
-    if ((KeGetCurrentIrql() != PASSIVE_LEVEL) ||
-        SdhcExtension->CrashdumpMode ||
+    if (SdhcExtension->CrashdumpMode ||
         (NvDiag.RegistryPath[0] == L'\0')) {
+        return;
+    }
+
+    //
+    // The port sets the final clock and bus width above passive level, where
+    // the registry cannot be written (0.3.0 kept only the 375 kHz setup).
+    // Write those later from a system worker thread.
+    //
+
+    if (KeGetCurrentIrql() != PASSIVE_LEVEL) {
+        NvDiagSaveExtension = SdhcExtension;
+        if (InterlockedExchange(&NvDiagSaveQueued, 1) == 0) {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+            ExInitializeWorkItem(&NvDiagSaveItem, NvDiagSaveWorker, NULL);
+            ExQueueWorkItem(&NvDiagSaveItem, DelayedWorkQueue);
+#pragma clang diagnostic pop
+        }
+
         return;
     }
 
