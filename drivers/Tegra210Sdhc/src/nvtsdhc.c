@@ -43,8 +43,15 @@ Revision History:
 // pretending it is coherent (_CCA = 1) hung the boot. PIO avoids DMA and cache
 // maintenance entirely; it is slower but enough to boot.
 #ifndef NV_T210_PIO_ONLY
-#define NV_T210_PIO_ONLY 1
+#define NV_T210_PIO_ONLY 0
 #endif
+
+// 0.3.0: PIO tops out near 5 MB/s (each 4-byte data port read costs ~0.8 us),
+// so move data with ADMA2, 32-bit addressing only. The DMA adapter then bounces
+// buffers above 4 GB into low memory, and 64-bit ADMA (which Tegra210 runs in
+// host v4 mode under L4T) and its descriptor format are not used. Cache
+// maintenance comes from _CCA = 0. Crashdump mode keeps PIO.
+#define NV_T210_ADMA32 1
 
 // SDMMC1 input clock from the CAR: PLLP (408 MHz, source 0) divided by 8.5
 // (7.1 divider field 15) = 48 MHz. High speed (50 MHz) then runs undivided
@@ -693,13 +700,17 @@ Return value:
     }
 #endif
 
+#if NV_T210_ADMA32
+    CapabilitiesReg.SystemBus64Support = 0;
+#endif
+
     Capabilities->DmaDescriptorSize =
         sizeof(SDHC_ADMA2_DESCRIPTOR_TABLE_ENTRY) +
         (CapabilitiesReg.SystemBus64Support ?
         sizeof(ULONGLONG) : sizeof(ULONG));
 
-    Capabilities->AlignmentRequirement = 
-        (CapabilitiesReg.SystemBus64Support ? 
+    Capabilities->AlignmentRequirement =
+        (CapabilitiesReg.SystemBus64Support ?
             sizeof(ULONGLONG) : sizeof(ULONG)) - 1;
 
     //
@@ -714,7 +725,10 @@ Return value:
 #if NV_T210_PIO_ONLY
     Capabilities->PioTransferMaxThreshold = MAXULONG;
 #else
-    if (CapabilitiesReg.Adma2Support) {
+    if (CrashdumpMode) {
+        Capabilities->PioTransferMaxThreshold = MAXULONG;
+
+    } else if (CapabilitiesReg.Adma2Support) {
         Capabilities->Supported.ScatterGatherDma = 1;
     }
 #endif
@@ -3469,6 +3483,13 @@ Return value:
 
         NT_ASSERT(Request->Command.DmaPhysicalAddress.HighPart == 0);
 
+    }
+
+    if (Request->Command.TransferDirection == SdTransferDirectionRead) {
+        NvDiag.BlocksRead += Request->Command.BlockCount;
+
+    } else {
+        NvDiag.BlocksWritten += Request->Command.BlockCount;
     }
 
     return STATUS_SUCCESS;
