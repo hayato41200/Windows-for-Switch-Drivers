@@ -18,6 +18,7 @@ namespace SwitchCenter
     {
         readonly Func<int, bool> chooseProfile;          // TrayApp.ChooseProfile (asks for experimental profiles)
         readonly SystemUsage usage;                      // sampled by the tray every 2 s
+        readonly AutoScreen auto;                        // automatic brightness and rotation (owned by the tray)
         readonly Timer timer = new Timer { Interval = 2000 };
         readonly Font tileValueFont = new Font("Segoe UI", 22f, FontStyle.Bold);
         readonly Font tileTitleFont = new Font("Yu Gothic UI", 10f);
@@ -41,15 +42,22 @@ namespace SwitchCenter
         readonly Label brightnessLabel = new Label { Dock = DockStyle.Top, Height = 48 };
         readonly Label displayState = new Label { Dock = DockStyle.Top, Height = 40 };
         readonly Timer brightnessApply = new Timer { Interval = 150 };
+        readonly CheckBox autoBright = new CheckBox { Dock = DockStyle.Top, Height = 40 };
+        readonly CheckBox autoRotate = new CheckBox { Dock = DockStyle.Top, Height = 40 };
+        readonly CheckBox rotateReverse = new CheckBox { Dock = DockStyle.Top, Height = 40 };
+        readonly Button rotateBase = new Button { Dock = DockStyle.Top, Height = 44 };
+        readonly Label sensorValues = new Label { Dock = DockStyle.Top, Height = 72 };
+        readonly Timer sensorTimer = new Timer { Interval = 500 };
         bool updatingBar;
 
         /// <summary>This control center's version, e.g. 0.5.3 (shown in the title and on the Drivers tab).</summary>
         static string AppVersion => Application.ProductVersion.Split('+')[0];
 
-        public MainForm(Func<int, bool> chooseProfile, SystemUsage usage)
+        public MainForm(Func<int, bool> chooseProfile, SystemUsage usage, AutoScreen auto)
         {
             this.chooseProfile = chooseProfile;
             this.usage = usage;
+            this.auto = auto;
             Text = T("Switch コントロールセンター", "Switch Control Center") + " " + AppVersion;
             Font = bodyFont;
             AutoScaleMode = AutoScaleMode.Dpi;
@@ -75,7 +83,12 @@ namespace SwitchCenter
 
             timer.Tick += (_, _) => RefreshAll();
             brightnessApply.Tick += (_, _) => { brightnessApply.Stop(); ApplyBrightness(); };
-            VisibleChanged += (_, _) => { if (Visible) { RefreshAll(); timer.Start(); } else timer.Stop(); };
+            sensorTimer.Tick += (_, _) => RefreshSensors();
+            VisibleChanged += (_, _) =>
+            {
+                auto.Watching = Visible;
+                if (Visible) { RefreshAll(); timer.Start(); sensorTimer.Start(); } else { timer.Stop(); sensorTimer.Stop(); }
+            };
             FormClosing += (_, e) =>
             {
                 if (e.CloseReason == CloseReason.UserClosing) { e.Cancel = true; Hide(); }
@@ -194,8 +207,24 @@ namespace SwitchCenter
                          "- The brightness you choose is restored at the next boot.\n" +
                          "- The Windows brightness setting does not work with the current display driver."),
             };
+            autoBright.Text = T("明るさを自動で調整する（明るさセンサー）", "Adjust the brightness automatically (light sensor)");
+            autoRotate.Text = T("画面を自動で回転する（傾きセンサー）", "Rotate the screen automatically (tilt sensor)");
+            rotateReverse.Text = T("回転の向きを逆にする（逆に回るとき）", "Reverse the rotation (if it turns the wrong way)");
+            rotateBase.Text = T("今の画面の向きを、今の持ち方の正しい向きとして覚える", "Remember this orientation as right for how the Switch is held now");
+            autoBright.Checked = auto.AutoBrightness;
+            autoRotate.Checked = auto.AutoRotate;
+            rotateReverse.Checked = auto.RotateReverse;
+            autoBright.CheckedChanged += (_, _) => { auto.AutoBrightness = autoBright.Checked; brightnessBar.Enabled = !autoBright.Checked; };
+            autoRotate.CheckedChanged += (_, _) => auto.AutoRotate = autoRotate.Checked;
+            rotateReverse.CheckedChanged += (_, _) => auto.RotateReverse = rotateReverse.Checked;
+            rotateBase.Click += (_, _) => { auto.SetBaseFromNow(); RefreshSensors(); };
+            page.Controls.Add(sensorValues);
+            page.Controls.Add(rotateBase);
+            page.Controls.Add(rotateReverse);
+            page.Controls.Add(autoRotate);
             page.Controls.Add(note);
             page.Controls.Add(displayState);
+            page.Controls.Add(autoBright);
             page.Controls.Add(brightnessBar);
             page.Controls.Add(brightnessLabel);
             return page;
@@ -503,8 +532,35 @@ namespace SwitchCenter
 
         void LoadReport() => reportBox.Text = DiagnosticReport.BuildText(usage).Replace("\n", Environment.NewLine).Replace("\r\r", "\r");
 
+        void RefreshSensors()
+        {
+            Sensors.Status s = auto.Last;
+            autoBright.Checked = auto.AutoBrightness;     // the tray menu may have changed them
+            autoRotate.Checked = auto.AutoRotate;
+            if (s == null)
+            {
+                sensorValues.Text = T("センサーのドライバーに接続できません（UEFI R379 以降と switchsensor が必要）。",
+                                      "Cannot reach the sensor driver (needs UEFI R379 or later and switchsensor).") +
+                                    (auto.LastError != null ? $" ({auto.LastError})" : "");
+                autoBright.Enabled = autoBright.Checked;
+                autoRotate.Enabled = autoRotate.Checked;
+                return;
+            }
+            autoBright.Enabled = s.LightValid || autoBright.Checked;
+            autoRotate.Enabled = s.AccelValid || autoRotate.Checked;
+            string light = s.LightValid
+                ? $"{s.Lux:0.#} lux (DATA0 {s.Data0}, DATA1 {s.Data1}, x{s.Gain}) -> {AutoScreen.PercentForLux(s.Lux)}%"
+                : T("なし", "none");
+            string tilt = s.AccelValid ? $"X {s.X}  Y {s.Y}  Z {s.Z} mg" : T("なし", "none") + $" (ID {s.ImuId:X2})";
+            string orientation = Display.Current() is int o ? $"{o * 90}°" : "—";
+            sensorValues.Text = T("明るさセンサー: ", "Light sensor: ") + light + "\n" +
+                                T("傾きセンサー: ", "Tilt sensor: ") + tilt + "\n" +
+                                T("今の画面の向き: ", "Screen orientation now: ") + orientation;
+        }
+
         void ApplyBrightness()
         {
+            if (autoBright.Checked) autoBright.Checked = false;     // a manual choice turns the automatic one off
             try { Backlight.Set(Backlight.PercentToLevel(brightnessBar.Value)); }
             catch (Win32Exception e) { brightnessLabel.Text = T("明るさを変えられませんでした: ", "Could not change the brightness: ") + e.Message; }
         }
@@ -577,7 +633,7 @@ namespace SwitchCenter
                     2 => T("暗くしている", "dimmed"),
                     _ => T("オン", "on"),
                 };
-                brightnessBar.Enabled = true;
+                brightnessBar.Enabled = !autoBright.Checked;
             }
             else
             {
@@ -593,6 +649,7 @@ namespace SwitchCenter
             {
                 timer.Dispose();
                 brightnessApply.Dispose();
+                sensorTimer.Dispose();
                 tileValueFont.Dispose();
                 tileTitleFont.Dispose();
                 bodyFont.Dispose();
