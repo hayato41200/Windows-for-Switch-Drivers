@@ -129,6 +129,16 @@ typedef struct _NV_DIAG {
 #define NV_PIO_BUFFERED 0
 #endif
 
+// PIO: after one buffer-ready interrupt, keep moving blocks while the present
+// state says the buffer is ready (as Linux sdhci does), waiting up to
+// NV_PIO_POLL_US for each next block, at most NV_PIO_POLL_BLOCKS per call.
+// One interrupt round trip per 512-byte block held reads at 5.4 MB/s (0.2.8).
+#ifndef NV_PIO_POLL
+#define NV_PIO_POLL 1
+#endif
+#define NV_PIO_POLL_US 200
+#define NV_PIO_POLL_BLOCKS 32
+
 // Clock and bus settings written to <service>\Parameters\Diag when the port
 // sets them (passive level, never in crashdump mode): no thread, no flush,
 // no register access of its own. Read on the Switch with reg query.
@@ -3493,6 +3503,74 @@ Return value:
     NT_ASSERT((Request->Command.TransferDirection == SdTransferDirectionRead) ||
               (Request->Command.TransferDirection == SdTransferDirectionWrite));
 
+#if NV_PIO_POLL
+    BOOLEAN Read;
+    ULONG Moved;
+    ULONG ReadyBit;
+    ULONG Waited;
+
+    Read = (Request->Command.TransferDirection == SdTransferDirectionRead);
+    ReadyBit = Read ? SDHC_PS_BUFFER_READ_ENABLE : SDHC_PS_BUFFER_WRITE_ENABLE;
+    for (Moved = 0; Moved < NV_PIO_POLL_BLOCKS; Moved += 1) {
+
+        //
+        // The buffer-ready event that started this call may be for a block
+        // already moved by polling, so move data only when the buffer is ready.
+        // Stop on an error: the interrupt reports it.
+        //
+
+        for (Waited = 0; ; Waited += 1) {
+            if ((SdhcReadRegisterUlong(SdhcExtension, SDHC_PRESENT_STATE) & ReadyBit) != 0) {
+                break;
+            }
+
+            if ((Waited >= NV_PIO_POLL_US) ||
+                ((SdhcReadRegisterUshort(SdhcExtension, SDHC_INTERRUPT_STATUS) &
+                  SDHC_IS_ERROR_INTERRUPT) != 0)) {
+
+                break;
+            }
+
+            KeStallExecutionProcessor(1);
+        }
+
+        if ((SdhcReadRegisterUlong(SdhcExtension, SDHC_PRESENT_STATE) & ReadyBit) == 0) {
+            break;
+        }
+
+        if (Read) {
+            SdhcReadDataPort(SdhcExtension,
+                             Request->Command.DataBuffer,
+                             Request->Command.BlockSize);
+
+            NvDiag.BlocksRead += 1;
+
+        } else {
+            SdhcWriteDataPort(SdhcExtension,
+                              Request->Command.DataBuffer,
+                              Request->Command.BlockSize);
+
+            NvDiag.BlocksWritten += 1;
+        }
+
+        Request->Command.BlockCount -= 1;
+        if (Request->Command.BlockCount == 0) {
+            Request->RequiredEvents |= SDHC_IS_TRANSFER_COMPLETE;
+            Request->Status = STATUS_SUCCESS;
+            return STATUS_PENDING;
+        }
+
+        Request->Command.DataBuffer += Request->Command.BlockSize;
+    }
+
+    //
+    // More blocks to come: wait for the next buffer-ready interrupt.
+    //
+
+    Request->RequiredEvents |= Read ? SDHC_IS_BUFFER_READ_READY : SDHC_IS_BUFFER_WRITE_READY;
+    Request->Status = STATUS_MORE_PROCESSING_REQUIRED;
+    return STATUS_PENDING;
+#else
     if (Request->Command.TransferDirection == SdTransferDirectionRead) {
         SdhcReadDataPort(SdhcExtension,
                          Request->Command.DataBuffer,
@@ -3529,6 +3607,7 @@ Return value:
     }
 
     return STATUS_PENDING;
+#endif
 }
 
 NTSTATUS
