@@ -73,7 +73,7 @@ $Drivers = @(
   @{ Dir = 'SwitchPowerButton'; Name = 'switchpwrbtn';  Src = 'switchpwrbtn.c';  Libs = @('vhfkm.lib', 'libcntpr.lib');  Inc = $Spb; Kit = 'Switch-PowerButton'; Hwid = 'ACPI\SWOA0601'; MinUefi = 'R374'; Ja = '電源ボタン'; En = 'Power button'; Boot = $false }
   @{ Dir = 'SwitchCpuClock';    Name = 'switchcpu';     Src = 'switchcpu.c';     Libs = @();                             Inc = $Spb; Kit = 'Switch-CpuClock';    Hwid = 'ACPI\SWOA0701'; MinUefi = 'R375'; Ja = 'CPU のクロック'; En = 'CPU clock'; Boot = $false }
   @{ Dir = 'SwitchRtc';         Name = 'switchrtc';     Src = 'switchrtc.c';     Libs = @();                             Inc = $Spb; Kit = 'Switch-Rtc';         Hwid = 'ACPI\SWOA0801'; MinUefi = 'R377'; Ja = '時計（RTC）'; En = 'Clock (RTC)'; Boot = $false }
-  @{ Dir = 'SwitchSensor';      Name = 'switchsensor';  Src = 'switchsensor.c';  Libs = @();                             Inc = $Spb; Kit = 'Switch-Sensor';      Hwid = 'ACPI\SWOA0901'; MinUefi = 'R379'; Ja = '明るさ・傾きセンサー'; En = 'Light, tilt sensors'; Boot = $false; Beta = $true }
+  @{ Dir = 'SwitchSensor';      Name = 'switchsensor';  Src = 'switchsensor.c';  Libs = @();                             Inc = $Spb; Kit = 'Switch-Sensor';      Hwid = 'ACPI\SWOA0901'; MinUefi = 'R379'; Ja = '明るさ・傾きセンサー'; En = 'Light, tilt sensors'; Boot = $false }
   @{ Dir = 'SwoaDiag';          Name = 'swoadiag';      Src = 'swoadiag.c';      Libs = @();                             Inc = @();  Kit = 'Switch-UsbDiag';     Hwid = '';              MinUefi = '' }
   @{ Dir = 'SwoaHello';         Name = 'SwoaHello';     Src = 'hello.c';         Libs = @();                             Inc = @();  Kit = 'Switch-Stage0';      Hwid = '';              MinUefi = '' }
 )
