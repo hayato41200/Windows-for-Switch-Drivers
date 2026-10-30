@@ -5,7 +5,7 @@ Windows on ARM (ARM64) で動く、Nintendo Switch（Tegra210 / Erista）用の�
 UEFI と DSDT は [Windows-for-Switch](https://github.com/hayato41200/Windows-for-Switch) にあります。このリポジトリのドライバーは、そちらの UEFI（R367 以降）が DSDT に追加するデバイスを使います。
 
 English summary: KMDF drivers (GPIO, I2C, battery + USB-C role, fan + backlight, touch screen,
-power button, CPU clock, RTC) and a tray / control-center app for Windows on ARM (ARM64) on the
+power button, CPU clock, RTC, light and tilt sensors) and a tray / control-center app for Windows on ARM (ARM64) on the
 Nintendo Switch. Install from the release ZIPs; build with `release/Make-Release.ps1`.
 Tested on Windows 11 Arm64 22H2 (22621); bring your own Windows image and license.
 
@@ -21,6 +21,7 @@ Tested on Windows 11 Arm64 22H2 (22621); bring your own Windows image and licens
 | `switchpwrbtn` | ACPI\SWOA0601 | R374 | 電源ボタン（VHF の HID） |
 | `switchcpu` | ACPI\SWOA0701 | R375 | CPU のクロックのプロファイル（614〜1766 MHz）、温度による制限 |
 | `switchrtc` | ACPI\SWOA0801 | R377 | 時計（MAX77620 の RTC を読み、ずれを覚えて時刻を合わせる） |
+| `switchsensor` | ACPI\SWOA0901 | R379 | 傾きセンサー（画面の自動回転）。明るさセンサーは、この本体では見つからず使えていない |
 | `swoadiag` | —（読み込んだときだけ） | — | USB（XUSB）のレジスタを読むだけの診断用 |
 
 ## 動作を確かめた OS
@@ -44,6 +45,7 @@ Windows のイメージとライセンスは、各自で用意してください
    6. 電源ボタン
    7. CPU
    8. RTC
+   9. センサー
 4. **コントロールセンターを使う:** `SwitchCenter-<版>-arm64.zip` を展開して、`SwitchCenter.exe` を起動する。通知領域のアイコンから、次のことができる。
    - CPU のプロファイル
    - 画面の明るさ
@@ -58,7 +60,7 @@ Switch の SD を PC に挿して、SD の Windows にドライバー、テス�
 - **入手:** リリースの `SwitchPatcher-<版>-x64.zip`
 - **使い方:** `kits/Switch-Patcher/README-ja.md`
 - **設計:** `docs/Design-SwitchPatcher-ja.md`
-- **状態:** 試験中。仮想ディスクでは最後まで動いたが、本物の SD ではまだ試していない。
+- **状態:** 本物の SD と Switch で動作を確かめた（0.3.0、Windows 11 Arm64 22H2）。
 
 ## ビルド（PC）
 
@@ -72,12 +74,15 @@ Switch の SD を PC に挿して、SD の Windows にドライバー、テス�
 .\release\Make-Release.ps1 -Version 2026.10.26
 ```
 
-`out\<版>\` に、リリースに付ける3つのファイルができる。
+`out\<版>\` に、リリースに付ける4つのファイルができる。
 - `SwitchDrivers-<版>.zip`
 - `SwitchCenter-<版>-arm64.zip`
+- `SwitchPatcher-<版>-x64.zip`
 - `manifest.json`
 
-GitHub でリリースを作って（タグは `drivers-<版>`）、この3つを付ける。
+GitHub でリリースを作って（タグは `drivers-<版>`）、この4つを付ける。
+
+`-Beta` を付けると、プレリリース（ベータ版）を作る。表で `Beta` の印を付けたドライバーは、ベータ版にだけ入る。コントロールセンターの「更新の種類」でベータ版を選ぶと、プレリリースも更新の候補になる。
 
 GitHub CLI（`gh auth login` 済み）があれば、`-Publish` を付けるとリリースの作成とアップロードまで自動で行う。すでに作ったファイルをあとから公開するときは、`-PublishOnly` を使う。
 
