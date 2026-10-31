@@ -9,10 +9,14 @@
   -Mode Remove  : remove the driver package
   -Mode Retry   : after a boot that hung, the driver stays idle (SafeMode=1); this lets it run again
                   at the next boot (Install does the same)
+  -Mode Firmware -Path <file> : copy the Broadcom patch file BCM4356A3.hcd that you have (for example
+                  from a Switchroot Linux or Android install) to System32\drivers\SwitchWOA, where
+                  switchbt 1.0.0.8+ loads it at start. The file is Broadcom's and is not shipped here.
 
   Log: C:\SwitchWOA-Bluetooth.txt
 #>
-param([Parameter(Mandatory = $true)][ValidateSet('Install', 'Status', 'Remove', 'Retry')][string]$Mode)
+param([Parameter(Mandatory = $true)][ValidateSet('Install', 'Status', 'Remove', 'Retry', 'Firmware')][string]$Mode,
+      [string]$Path)
 
 $ErrorActionPreference = 'Continue'
 # Windows PowerShell on Windows 10 ARM64 is x86: reach System32 via Sysnative.
@@ -74,6 +78,11 @@ function Show-Status {
       Log ("child (1.0.0.6+, added 20 s after start): D0 {0}  requests {1}  forward failures {2} (last status 0x{3:X8})  last IOCTL 0x{4:X}" -f `
         $p.ChildD0, $p.ChildRequests, $p.ChildForwardFailures, $p.LastForwardStatus, $p.LastChildIoctl)
     }
+    if ($null -ne $p.UartClockMHz) {
+      $hs = @{ 0 = '115200 (R390 clock or HighSpeed=0)'; 1 = 'refused by the chip, 115200'; 2 = '3 Mbaud, flow control'; 3 = '3 Mbaud, no flow control'; 4 = 'LOST at 3 Mbaud' }
+      $fw = if ($p.FirmwareResult -eq 1) { "patched ($($p.FirmwareRecords) records, $($p.FirmwareBytes) bytes)" } elseif ($p.FirmwareResult -eq 0) { 'none (ROM code)' } else { 'FAILED 0x{0:X8}' -f $p.FirmwareResult }
+      Log ("stage 3 (1.0.0.8+): UART clock {0} MHz  speed {1}  firmware {2}" -f $p.UartClockMHz, $hs[[int]$p.HighSpeedResult], $fw)
+    }
     if ($null -ne $p.CapsRequests) {
       Log ("setup (1.0.0.7+): get version {0}  set version {1} (value {2})  capabilities {3}  last failure 0x{4:X8}" -f `
         $p.GetVersionRequests, $p.SetVersionRequests, $p.SetVersionValue, $p.CapsRequests, $p.LastSetupStatus)
@@ -95,6 +104,24 @@ function Clear-BootPending {
 }
 
 switch ($Mode) {
+  'Firmware' {
+    Log ''
+    Log "=== Bluetooth Firmware  $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
+    if (-not $Path -or -not (Test-Path -LiteralPath $Path -PathType Leaf)) { Log "File not found: '$Path'. Use -Path <your BCM4356A3.hcd>."; exit 1 }
+    $b = [IO.File]::ReadAllBytes((Resolve-Path -LiteralPath $Path).Path)
+    # An .hcd is a list of HCI commands: opcode (2, little endian), length, parameters. Broadcom's are
+    # vendor commands (opcode high byte FC) and the list ends exactly at the end of the file.
+    $off = 0; $n = 0; $ok = $b.Length -gt 3
+    while ($ok -and $off + 3 -le $b.Length) {
+      if ($b[$off + 1] -ne 0xFC) { $ok = $false; break }
+      $off += 3 + $b[$off + 2]; $n++
+    }
+    if (-not $ok -or $off -ne $b.Length) { Log "Not a Broadcom .hcd patch file ($($b.Length) bytes). Nothing copied."; exit 1 }
+    $dir = Join-Path $Sys 'drivers\SwitchWOA'
+    New-Item -ItemType Directory -Force $dir | Out-Null
+    Copy-Item -LiteralPath $Path -Destination (Join-Path $dir 'BCM4356A3.hcd') -Force
+    Log ("Copied {0} ({1} bytes, {2} records) to {3}\BCM4356A3.hcd. It is used from the next start of the driver (reboot)." -f $Path, $b.Length, $n, $dir)
+  }
   'Retry' {
     Log ''
     Log "=== Bluetooth Retry  $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"

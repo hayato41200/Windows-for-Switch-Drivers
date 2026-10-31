@@ -24,6 +24,19 @@
   - 送受信は割り込みで行う。速度は 115200 bps のまま（マウスやキーボードには十分。音声は第3段）。
   - ファームウェアのパッチは、まだ当てない（チップの ROM のまま）。
 
+## 第3段：ファームウェアと 3 Mbps（1.0.0.8 以降、UEFI R391）
+
+- **ファームウェアのパッチ:** Broadcom の `BCM4356A3.hcd` が要る。Broadcom のファイルなので、ここでは配らない。自分で持っているもの（Switchroot の Linux の `/lib/firmware/brcm/BCM4356A3.hcd` など）を使う。
+  ```bat
+  powershell -ExecutionPolicy Bypass -File C:\SwitchWOA\Bluetooth\Bluetooth.ps1 -Mode Firmware -Path <BCM4356A3.hcd の場所>
+  ```
+  - `System32\drivers\SwitchWOA\BCM4356A3.hcd` にコピーする。形（Broadcom のコマンドの並び）を確かめてからコピーする。
+  - 次にドライバーが始まるとき（再起動）、HCI_Reset、Download_Minidriver（FC2E）、ファイルの中身、HCI_Reset の順に送る（Linux の btbcm と同じ）。115200 bps で数秒かかる。
+- **3 Mbps:** UEFI R391 は UART-D を 48 MHz にする。ドライバーは Broadcom のコマンド（FC18）でチップを 3 Mbps にして、自分も合わせる（フロー制御あり、だめならなし）。
+  - R390（408 MHz）のときは 115200 bps のまま。
+  - `Parameters\HighSpeed` を 0 にすると、115200 bps のまま。
+- `-Mode Status` の `stage 3 (1.0.0.8+)` の行に、UART のクロック、速度、ファームウェアの結果が出る。
+
 ## 起動が止まったとき（1.0.0.5 以降）
 
 - ドライバーは、起動のたびに `BootPending` をディスクに書き、60 秒動いたら消す。

@@ -51,6 +51,19 @@
  * the only option, so they now match the sample (HCI bypass, one SCO channel,
  * idle capable). The three requests are recorded: the version BthMini asked
  * for and what each request was completed with.
+ *
+ * 1.0.0.8 (stage 3): the Bluetooth toggle works but scans found nothing.
+ *   - UART clock: UEFI R391 feeds UART-D 48 MHz (R390: 408 MHz). The probe
+ *     tries 115200 with the 48 MHz divisor first, then the 408 MHz one.
+ *   - Firmware patch (Broadcom patchram, as Linux btbcm): when
+ *     %SystemRoot%\System32\drivers\SwitchWOA\BCM4356A3.hcd exists (the
+ *     user copies it in; it is Broadcom's file and is not distributed here):
+ *     HCI_Reset, Download_Minidriver (FC2E), every record of the file as an
+ *     HCI command, 250 ms, HCI_Reset again at the ROM speed.
+ *   - 3 Mbaud with 48 MHz: Broadcom Update_UART_Baud_Rate (FC18), then the
+ *     host follows (divisor 1) with hardware flow control; Read_Local_Version
+ *     must answer, else without flow control, else the chip is given up for
+ *     this boot (HighSpeedResult). Parameters\HighSpeed = 0 keeps 115200.
  */
 #include <ntddk.h>
 #include <ntstrsafe.h>
@@ -77,7 +90,16 @@ NTSYSAPI ULONG NTAPI RtlRandomEx(PULONG Seed);     /* ntoskrnl export, declared 
 #define UART_IIR_NO_INT   0x01u
 #define UART_IER_RX       0x15u         /* received data, line status, RX timeout */
 #define UART_IER_TX       0x02u         /* transmitter empty */
-#define UART_DIV_115200   221u          /* 408 MHz / 16 / 221 = 115384 baud */
+#define UART_DIV_115200   221u          /* 408 MHz / 16 / 221 = 115384 baud (UEFI R390) */
+#define UART_DIV_48M_115200 26u         /* 48 MHz / 16 / 26 = 115384 baud (UEFI R391+) */
+#define UART_DIV_48M_3M   1u            /* 48 MHz / 16 = 3 Mbaud */
+#define UART_MCR_RTS      0x02u
+#define UART_MCR_FLOW     0x62u         /* RTS on, CTS_EN and RTS_EN: hardware flow control */
+#define BCM_DOWNLOAD_MINI 0xFC2E
+#define BCM_UPDATE_BAUD   0xFC18
+#define BCM_HIGH_BAUD     3000000u
+#define FIRMWARE_PATH     L"\\SystemRoot\\System32\\drivers\\SwitchWOA\\BCM4356A3.hcd"
+#define FIRMWARE_MAX      (256u * 1024u)
 #define UART_TX_BURST     16u           /* bytes per transmitter-empty interrupt (FIFO is 32) */
 
 /* HCI (H4). */
@@ -306,15 +328,22 @@ static VOID SwBtWrite(PSWBT_DEVICE Dev, ULONG Reg, ULONG Value)
     WRITE_REGISTER_ULONG((PULONG)&Dev->Uart[Reg], Value);
 }
 
-static VOID SwBtUartInit(PSWBT_DEVICE Dev)
+static VOID SwBtUartInit(PSWBT_DEVICE Dev, ULONG Divisor, ULONG Mcr)
 {
     SwBtWrite(Dev, UART_IER, 0);
     SwBtWrite(Dev, UART_LCR, 0x80);                 /* divisor latch */
-    SwBtWrite(Dev, UART_DLL, UART_DIV_115200 & 0xFF);
-    SwBtWrite(Dev, UART_DLM, UART_DIV_115200 >> 8);
+    SwBtWrite(Dev, UART_DLL, Divisor & 0xFF);
+    SwBtWrite(Dev, UART_DLM, (Divisor >> 8) & 0xFF);
     SwBtWrite(Dev, UART_LCR, 0x03);                 /* 8N1 */
     SwBtWrite(Dev, UART_FCR, 0x07);                 /* FIFOs on and cleared, RX trigger 1 byte */
-    SwBtWrite(Dev, UART_MCR, 0x02);                 /* RTS on */
+    SwBtWrite(Dev, UART_MCR, Mcr);
+}
+
+static VOID SwBtSleepMs(ULONG Ms)
+{
+    LARGE_INTEGER Delay;
+    Delay.QuadPart = -(LONGLONG)Ms * 10000;
+    (VOID)KeDelayExecutionThread(KernelMode, FALSE, &Delay);
 }
 
 static ULONGLONG SwBtNowMs(VOID)
@@ -376,11 +405,8 @@ static ULONG SwBtPollEvent(PSWBT_DEVICE Dev, UCHAR *Buffer, ULONG Max, ULONG Tim
 static ULONG SwBtPollCommand(PSWBT_DEVICE Dev, USHORT Opcode, const UCHAR *Params, UCHAR ParamLength,
                              UCHAR *Event, ULONG Max)
 {
-    UCHAR Cmd[4 + 16];
+    UCHAR Cmd[4 + 255];
     ULONG Tries, Length;
-    if (ParamLength > 16) {
-        return 0;
-    }
     Cmd[0] = HCI_COMMAND_PKT;
     Cmd[1] = (UCHAR)Opcode;
     Cmd[2] = (UCHAR)(Opcode >> 8);
@@ -427,32 +453,175 @@ static VOID SwBtChooseAddress(PSWBT_DEVICE Dev)
     Dev->BdAddr[5] = (UCHAR)(NINTENDO_OUI >> 16);
 }
 
-static BOOLEAN SwBtProbe(PSWBT_DEVICE Dev)
+static VOID SwBtFlushRx(PSWBT_DEVICE Dev)
 {
-    UCHAR Event[260];
-    WCHAR Text[256];
-    ULONG Length, Index;
-
-    SwBtUartInit(Dev);
-    KeStallExecutionProcessor(100);
+    ULONG Index;
     for (Index = 0; Index < 4096 && (SwBtRead(Dev, UART_LSR) & UART_LSR_DR) != 0; ++Index) {
         (VOID)SwBtRead(Dev, UART_THR);
     }
+}
 
-    Length = SwBtPollCommand(Dev, HCI_RESET, NULL, 0, Event, sizeof(Event));
-    SwBtTrace(L"HciReset", Length >= 7 ? Event[6] + 0x100u : 0);     /* 0x100 = answered, status 0 */
-    if (Length < 7) {
-        SwBtTraceString(L"Result", L"no answer to HCI_Reset");
-        return FALSE;
-    }
+/* HCI_Reset at the current speed; TRUE when it is answered with status 0. */
+static BOOLEAN SwBtReset(PSWBT_DEVICE Dev, UCHAR *Event, ULONG Max)
+{
+    ULONG Length;
+    SwBtFlushRx(Dev);
+    Length = SwBtPollCommand(Dev, HCI_RESET, NULL, 0, Event, Max);
+    return Length >= 7 && Event[6] == 0;
+}
 
-    Length = SwBtPollCommand(Dev, HCI_READ_VERSION, NULL, 0, Event, sizeof(Event));
+static VOID SwBtTraceVersion(PSWBT_DEVICE Dev, UCHAR *Event, ULONG Max)
+{
+    ULONG Length = SwBtPollCommand(Dev, HCI_READ_VERSION, NULL, 0, Event, Max);
     if (Length >= 15 && Event[6] == 0) {
         SwBtTrace(L"HciVersion", Event[7]);
         SwBtTrace(L"HciRevision", Event[8] | (Event[9] << 8));
         SwBtTrace(L"LmpVersion", Event[10]);
         SwBtTrace(L"Manufacturer", Event[11] | (Event[12] << 8));
         SwBtTrace(L"LmpSubversion", Event[13] | (Event[14] << 8));
+    }
+}
+
+/* Reads the .hcd the user put in place; NULL when there is none. PASSIVE. */
+static PUCHAR SwBtLoadFirmware(PULONG Length)
+{
+    UNICODE_STRING Path;
+    OBJECT_ATTRIBUTES Attributes;
+    IO_STATUS_BLOCK Io;
+    FILE_STANDARD_INFORMATION Info;
+    HANDLE File;
+    PUCHAR Data = NULL;
+    NTSTATUS Status;
+
+    *Length = 0;
+    RtlInitUnicodeString(&Path, FIRMWARE_PATH);
+    InitializeObjectAttributes(&Attributes, &Path, OBJ_KERNEL_HANDLE | OBJ_CASE_INSENSITIVE, NULL, NULL);
+    Status = ZwCreateFile(&File, GENERIC_READ | SYNCHRONIZE, &Attributes, &Io, NULL, FILE_ATTRIBUTE_NORMAL,
+                          FILE_SHARE_READ, FILE_OPEN, FILE_SYNCHRONOUS_IO_NONALERT | FILE_NON_DIRECTORY_FILE, NULL, 0);
+    SwBtTrace(L"FirmwareOpen", (ULONG)Status);
+    if (!NT_SUCCESS(Status)) {
+        return NULL;
+    }
+    Status = ZwQueryInformationFile(File, &Io, &Info, sizeof(Info), FileStandardInformation);
+    if (NT_SUCCESS(Status) && Info.EndOfFile.QuadPart > 0 && Info.EndOfFile.QuadPart <= FIRMWARE_MAX) {
+        Data = (PUCHAR)ExAllocatePool2(POOL_FLAG_PAGED, (SIZE_T)Info.EndOfFile.QuadPart, POOL_TAG);
+        if (Data != NULL) {
+            Status = ZwReadFile(File, NULL, NULL, NULL, &Io, Data, (ULONG)Info.EndOfFile.QuadPart, NULL, NULL);
+            if (NT_SUCCESS(Status) && Io.Information == (ULONG_PTR)Info.EndOfFile.QuadPart) {
+                *Length = (ULONG)Io.Information;
+            } else {
+                ExFreePoolWithTag(Data, POOL_TAG);
+                Data = NULL;
+            }
+        }
+    }
+    ZwClose(File);
+    SwBtTrace(L"FirmwareBytes", *Length);
+    return Data;
+}
+
+/* Broadcom patchram (Linux btbcm_patchram). Returns the records sent, 0 on failure. */
+static ULONG SwBtPatchram(PSWBT_DEVICE Dev, const UCHAR *Fw, ULONG FwLength, UCHAR *Event, ULONG Max)
+{
+    ULONG Offset = 0, Records = 0;
+    if (SwBtPollCommand(Dev, BCM_DOWNLOAD_MINI, NULL, 0, Event, Max) < 7 || Event[6] != 0) {
+        SwBtTrace(L"FirmwareResult", 0xF0000001u);
+        return 0;
+    }
+    SwBtSleepMs(50);
+    while (Offset + 3 <= FwLength) {
+        USHORT Opcode = (USHORT)(Fw[Offset] | (Fw[Offset + 1] << 8));
+        UCHAR ParamLength = Fw[Offset + 2];
+        if (Offset + 3 + ParamLength > FwLength) {
+            SwBtTrace(L"FirmwareResult", 0xF0000002u);       /* truncated file */
+            return 0;
+        }
+        if (SwBtPollCommand(Dev, Opcode, &Fw[Offset + 3], ParamLength, Event, Max) < 7) {
+            SwBtTrace(L"FirmwareResult", 0xF0000003u);
+            SwBtTrace(L"FirmwareFailedRecord", Records);
+            return 0;
+        }
+        Offset += 3u + ParamLength;
+        ++Records;
+    }
+    SwBtSleepMs(250);                                       /* the chip boots the patched code */
+    return Records;
+}
+
+/* Moves the chip and the host to 3 Mbaud. FALSE: the chip no longer answers. */
+static BOOLEAN SwBtHighSpeed(PSWBT_DEVICE Dev, UCHAR *Event, ULONG Max)
+{
+    UCHAR Params[6] = { 0, 0, (UCHAR)BCM_HIGH_BAUD, (UCHAR)(BCM_HIGH_BAUD >> 8),
+                        (UCHAR)(BCM_HIGH_BAUD >> 16), (UCHAR)(BCM_HIGH_BAUD >> 24) };
+    ULONG Length = SwBtPollCommand(Dev, BCM_UPDATE_BAUD, Params, sizeof(Params), Event, Max);
+    if (Length < 7 || Event[6] != 0) {
+        SwBtTrace(L"HighSpeedResult", 1);                   /* refused: still 115200 */
+        return TRUE;
+    }
+    SwBtUartInit(Dev, UART_DIV_48M_3M, UART_MCR_FLOW);
+    SwBtSleepMs(10);
+    SwBtFlushRx(Dev);
+    Length = SwBtPollCommand(Dev, HCI_READ_VERSION, NULL, 0, Event, Max);
+    if (Length >= 15 && Event[6] == 0) {
+        SwBtTrace(L"HighSpeedResult", 2);                   /* 3 Mbaud, flow control */
+        return TRUE;
+    }
+    SwBtUartInit(Dev, UART_DIV_48M_3M, UART_MCR_RTS);
+    SwBtSleepMs(10);
+    SwBtFlushRx(Dev);
+    Length = SwBtPollCommand(Dev, HCI_READ_VERSION, NULL, 0, Event, Max);
+    if (Length >= 15 && Event[6] == 0) {
+        SwBtTrace(L"HighSpeedResult", 3);                   /* 3 Mbaud, no flow control */
+        return TRUE;
+    }
+    SwBtTrace(L"HighSpeedResult", 4);                       /* lost: the next boot powers the chip again */
+    return FALSE;
+}
+
+static BOOLEAN SwBtProbe(PSWBT_DEVICE Dev)
+{
+    UCHAR Event[260];
+    WCHAR Text[256];
+    ULONG Length, Index, Clock48, FwLength = 0, HighSpeed = 1;
+    PUCHAR Fw;
+
+    /* 115200 with the R391 clock (48 MHz), else with the R390 one (408 MHz). */
+    Clock48 = 1;
+    SwBtUartInit(Dev, UART_DIV_48M_115200, UART_MCR_RTS);
+    KeStallExecutionProcessor(100);
+    if (!SwBtReset(Dev, Event, sizeof(Event))) {
+        Clock48 = 0;
+        SwBtUartInit(Dev, UART_DIV_115200, UART_MCR_RTS);
+        KeStallExecutionProcessor(100);
+        SwBtSleepMs(50);
+        if (!SwBtReset(Dev, Event, sizeof(Event)) && !SwBtReset(Dev, Event, sizeof(Event))) {   /* the first may meet bytes sent at the wrong speed */
+            SwBtTrace(L"HciReset", 0);
+            SwBtTraceString(L"Result", L"no answer to HCI_Reset");
+            return FALSE;
+        }
+    }
+    SwBtTrace(L"HciReset", 0x100);
+    SwBtTrace(L"UartClockMHz", Clock48 ? 48 : 408);
+    SwBtTraceVersion(Dev, Event, sizeof(Event));
+
+    /* Firmware patch, if the user put the file in place. */
+    Fw = SwBtLoadFirmware(&FwLength);
+    if (Fw != NULL) {
+        ULONG Records = SwBtPatchram(Dev, Fw, FwLength, Event, sizeof(Event));
+        ExFreePoolWithTag(Fw, POOL_TAG);
+        SwBtTrace(L"FirmwareRecords", Records);
+        if (Records != 0) {
+            if (SwBtReset(Dev, Event, sizeof(Event))) {
+                SwBtTrace(L"FirmwareResult", 1);            /* patched and answering */
+                SwBtTraceVersion(Dev, Event, sizeof(Event));
+            } else {
+                SwBtTrace(L"FirmwareResult", 0xF0000004u);
+                SwBtTraceString(L"Result", L"no answer after the firmware patch");
+                return FALSE;
+            }
+        }
+    } else {
+        SwBtTrace(L"FirmwareResult", 0);                    /* no file: ROM code */
     }
 
     SwBtChooseAddress(Dev);
@@ -474,6 +643,16 @@ static BOOLEAN SwBtProbe(PSWBT_DEVICE Dev)
         }
         Text[Index] = L'\0';
         SwBtTraceString(L"LocalName", Text);
+    }
+
+    (VOID)SwBtReadParam(L"HighSpeed", &HighSpeed);
+    if (Clock48 && HighSpeed != 0) {
+        if (!SwBtHighSpeed(Dev, Event, sizeof(Event))) {
+            SwBtTraceString(L"Result", L"lost the chip at 3 Mbaud");
+            return FALSE;
+        }
+    } else {
+        SwBtTrace(L"HighSpeedResult", 0);                   /* 115200 (R390 clock, or turned off) */
     }
     SwBtTraceString(L"Result", L"ok");
     return TRUE;
@@ -1244,7 +1423,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
         RtlCopyMemory(&SwBtParamsPath[RegistryPath->Length / sizeof(WCHAR)], L"\\Parameters", sizeof(L"\\Parameters"));
         (VOID)RtlCreateRegistryKey(RTL_REGISTRY_ABSOLUTE, SwBtParamsPath);
     }
-    SwBtTrace(L"DriverVersion", 7);
+    SwBtTrace(L"DriverVersion", 8);
     WDF_DRIVER_CONFIG_INIT(&Config, SwBtEvtDeviceAdd);
     return WdfDriverCreate(DriverObject, RegistryPath, WDF_NO_OBJECT_ATTRIBUTES, &Config, WDF_NO_HANDLE);
 }
