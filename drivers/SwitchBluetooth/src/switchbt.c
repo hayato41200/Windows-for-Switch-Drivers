@@ -23,6 +23,11 @@
  *   READ_HCI: waits in the event or ACL queue; the ISR moves received bytes
  *     to a ring, the DPC cuts them into H4 packets and completes the oldest
  *     waiting read of that type (or keeps the packet until one comes).
+ *
+ * 1.0.0.4: requests are completed only after Lock is released (SWBT_DONE).
+ * BthMini sends the next READ_HCI from its completion routine, which came
+ * back into SwBtEvtIoDeviceControl on the same CPU and spun on Lock forever:
+ * Windows hung at the boot logo.
  */
 #include <ntddk.h>
 #include <ntstrsafe.h>
@@ -80,6 +85,42 @@ typedef struct _SWBT_PACKET {
     ULONG Length;
     UCHAR Data[1];
 } SWBT_PACKET, *PSWBT_PACKET;
+
+/* Requests finished under Lock, completed after it is released. */
+#define SWBT_DONE_MAX 32
+typedef struct _SWBT_DONE {
+    ULONG Count;
+    WDFREQUEST Request[SWBT_DONE_MAX];
+    NTSTATUS Status[SWBT_DONE_MAX];
+    ULONG_PTR Information[SWBT_DONE_MAX];
+} SWBT_DONE, *PSWBT_DONE;
+
+static BOOLEAN SwBtDoneFull(PSWBT_DONE Done)
+{
+    return Done->Count >= SWBT_DONE_MAX;
+}
+
+static VOID SwBtDoneAdd(PSWBT_DONE Done, WDFREQUEST Request, NTSTATUS Status, ULONG_PTR Information)
+{
+    if (Done->Count < SWBT_DONE_MAX) {
+        Done->Request[Done->Count] = Request;
+        Done->Status[Done->Count] = Status;
+        Done->Information[Done->Count] = Information;
+        Done->Count++;
+    } else {
+        WdfRequestCompleteWithInformation(Request, Status, Information);   /* not reached: callers check */
+    }
+}
+
+/* Lock must not be held. */
+static VOID SwBtDoneFlush(PSWBT_DONE Done)
+{
+    ULONG Index;
+    for (Index = 0; Index < Done->Count; ++Index) {
+        WdfRequestCompleteWithInformation(Done->Request[Index], Done->Status[Index], Done->Information[Index]);
+    }
+    Done->Count = 0;
+}
 
 typedef struct _SWBT_DEVICE {
     volatile ULONG *Uart;
@@ -458,8 +499,8 @@ NTSTATUS SwBtEvtInterruptDisable(WDFINTERRUPT Interrupt, WDFDEVICE AssociatedDev
 
 /* -------------------------------------------------------- packets (DPC) */
 
-/* Completes a READ_HCI with one packet. Lock held. */
-static VOID SwBtCompleteRead(WDFREQUEST Request, UCHAR Type, const UCHAR *Data, ULONG Length)
+/* Fills a READ_HCI with one packet; it is completed after Lock. Lock held. */
+static VOID SwBtCompleteRead(PSWBT_DONE Done, WDFREQUEST Request, UCHAR Type, const UCHAR *Data, ULONG Length)
 {
     WDFMEMORY Memory;
     size_t Size = 0;
@@ -467,30 +508,30 @@ static VOID SwBtCompleteRead(WDFREQUEST Request, UCHAR Type, const UCHAR *Data, 
     ULONG Bytes = FIELD_OFFSET(BTHX_HCI_READ_WRITE_CONTEXT, Data) + Length;
     NTSTATUS Status = WdfRequestRetrieveOutputMemory(Request, &Memory);
     if (!NT_SUCCESS(Status)) {
-        WdfRequestComplete(Request, Status);
+        SwBtDoneAdd(Done, Request, Status, 0);
         return;
     }
     Ctx = (PBTHX_HCI_READ_WRITE_CONTEXT)WdfMemoryGetBuffer(Memory, &Size);
     if (Size < Bytes) {
-        WdfRequestCompleteWithInformation(Request, STATUS_BUFFER_TOO_SMALL, 0);
+        SwBtDoneAdd(Done, Request, STATUS_BUFFER_TOO_SMALL, 0);
         return;
     }
     Ctx->Type = Type;
     Ctx->DataLen = Length;
     RtlCopyMemory(Ctx->Data, Data, Length);
-    WdfRequestCompleteWithInformation(Request, STATUS_SUCCESS, Bytes);
+    SwBtDoneAdd(Done, Request, STATUS_SUCCESS, Bytes);
 }
 
 /* A whole H4 packet from the chip (without the type byte). Lock held. */
-static VOID SwBtDeliver(PSWBT_DEVICE Dev, UCHAR Type, const UCHAR *Data, ULONG Length)
+static VOID SwBtDeliver(PSWBT_DEVICE Dev, PSWBT_DONE Done, UCHAR Type, const UCHAR *Data, ULONG Length)
 {
     WDFQUEUE Queue = Type == HCI_EVENT_PKT ? Dev->EventQueue : Dev->AclQueue;
     PLIST_ENTRY Kept = Type == HCI_EVENT_PKT ? &Dev->KeptEvents : &Dev->KeptAcl;
     WDFREQUEST Request;
     PSWBT_PACKET Packet;
 
-    if (IsListEmpty(Kept) && NT_SUCCESS(WdfIoQueueRetrieveNextRequest(Queue, &Request))) {
-        SwBtCompleteRead(Request, Type, Data, Length);
+    if (IsListEmpty(Kept) && !SwBtDoneFull(Done) && NT_SUCCESS(WdfIoQueueRetrieveNextRequest(Queue, &Request))) {
+        SwBtCompleteRead(Done, Request, Type, Data, Length);
         return;
     }
     if (Dev->KeptCount >= MAX_KEPT_PACKETS) {
@@ -510,13 +551,13 @@ static VOID SwBtDeliver(PSWBT_DEVICE Dev, UCHAR Type, const UCHAR *Data, ULONG L
 }
 
 /* Hands kept packets to reads that came in since. Lock held. */
-static VOID SwBtDrainKept(PSWBT_DEVICE Dev, PLIST_ENTRY Kept, WDFQUEUE Queue)
+static VOID SwBtDrainKept(PSWBT_DEVICE Dev, PSWBT_DONE Done, PLIST_ENTRY Kept, WDFQUEUE Queue)
 {
     WDFREQUEST Request;
-    while (!IsListEmpty(Kept) && NT_SUCCESS(WdfIoQueueRetrieveNextRequest(Queue, &Request))) {
+    while (!IsListEmpty(Kept) && !SwBtDoneFull(Done) && NT_SUCCESS(WdfIoQueueRetrieveNextRequest(Queue, &Request))) {
         PSWBT_PACKET Packet = CONTAINING_RECORD(RemoveHeadList(Kept), SWBT_PACKET, Link);
         Dev->KeptCount--;
-        SwBtCompleteRead(Request, Packet->Type, Packet->Data, Packet->Length);
+        SwBtCompleteRead(Done, Request, Packet->Type, Packet->Data, Packet->Length);
         ExFreePoolWithTag(Packet, POOL_TAG);
     }
 }
@@ -533,7 +574,7 @@ static VOID SwBtFreeKept(PSWBT_DEVICE Dev)
 }
 
 /* H4 parser: one received byte. Lock held. */
-static VOID SwBtParse(PSWBT_DEVICE Dev, UCHAR Byte)
+static VOID SwBtParse(PSWBT_DEVICE Dev, PSWBT_DONE Done, UCHAR Byte)
 {
     UCHAR Type;
     if (Dev->RxGot == 0) {
@@ -579,20 +620,21 @@ static VOID SwBtParse(PSWBT_DEVICE Dev, UCHAR Byte)
         Dev->AclIn++;
     }
     if (Type != HCI_SCO_PKT) {                               /* SCO over HCI is not offered */
-        SwBtDeliver(Dev, Type, &Dev->RxPacket[1], Dev->RxGot - 1);
+        SwBtDeliver(Dev, Done, Type, &Dev->RxPacket[1], Dev->RxGot - 1);
     }
     Dev->RxGot = 0;
 }
 
 /* Starts the next WRITE_HCI if the transmitter is free. Lock held. */
-static VOID SwBtStartTx(PSWBT_DEVICE Dev)
+static VOID SwBtStartTx(PSWBT_DEVICE Dev, PSWBT_DONE Done)
 {
     WDFREQUEST Request;
     WDFMEMORY Memory;
     size_t Size = 0;
     PBTHX_HCI_READ_WRITE_CONTEXT Ctx = NULL;
 
-    while (Dev->TxRequest == NULL && NT_SUCCESS(WdfIoQueueRetrieveNextRequest(Dev->TxQueue, &Request))) {
+    while (Dev->TxRequest == NULL && !SwBtDoneFull(Done) &&
+           NT_SUCCESS(WdfIoQueueRetrieveNextRequest(Dev->TxQueue, &Request))) {
         NTSTATUS Status = WdfRequestRetrieveInputMemory(Request, &Memory);
         if (NT_SUCCESS(Status)) {
             Ctx = (PBTHX_HCI_READ_WRITE_CONTEXT)WdfMemoryGetBuffer(Memory, &Size);
@@ -604,7 +646,7 @@ static VOID SwBtStartTx(PSWBT_DEVICE Dev)
             }
         }
         if (!NT_SUCCESS(Status)) {
-            WdfRequestComplete(Request, Status);
+            SwBtDoneAdd(Done, Request, Status, 0);
             continue;
         }
         Dev->TxRequest = Request;
@@ -635,7 +677,7 @@ static VOID SwBtStartTx(PSWBT_DEVICE Dev)
 }
 
 /* The ISR sent the whole packet. Lock held. */
-static VOID SwBtCompleteTx(PSWBT_DEVICE Dev)
+static VOID SwBtCompleteTx(PSWBT_DEVICE Dev, PSWBT_DONE Done)
 {
     WDFREQUEST Request = Dev->TxRequest;
     WDFMEMORY Memory;
@@ -649,19 +691,21 @@ static VOID SwBtCompleteTx(PSWBT_DEVICE Dev)
             Info = sizeof(ULONG);
         }
     }
-    WdfRequestCompleteWithInformation(Request, STATUS_SUCCESS, Info);
+    SwBtDoneAdd(Done, Request, STATUS_SUCCESS, Info);
 }
 
 VOID SwBtEvtDpc(WDFINTERRUPT Interrupt, WDFOBJECT AssociatedObject)
 {
     PSWBT_DEVICE Dev = SwBtGetDevice(WdfInterruptGetDevice(Interrupt));
-    UCHAR Chunk[256];
+    UCHAR Chunk[64];                /* at most 21 packets, so Done never fills */
+    SWBT_DONE Done;
     BOOLEAN TxDone;
     UNREFERENCED_PARAMETER(AssociatedObject);
 
-    WdfSpinLockAcquire(Dev->Lock);
+    Done.Count = 0;
     for (;;) {
         ULONG Count = 0, Index;
+        WdfSpinLockAcquire(Dev->Lock);
         WdfInterruptAcquireLock(Interrupt);
         while (Count < sizeof(Chunk) && Dev->RxTail != Dev->RxHead) {
             Chunk[Count++] = Dev->RxRing[Dev->RxTail & (RX_RING_SIZE - 1)];
@@ -671,17 +715,18 @@ VOID SwBtEvtDpc(WDFINTERRUPT Interrupt, WDFOBJECT AssociatedObject)
         Dev->TxDone = FALSE;
         WdfInterruptReleaseLock(Interrupt);
         for (Index = 0; Index < Count; ++Index) {
-            SwBtParse(Dev, Chunk[Index]);
+            SwBtParse(Dev, &Done, Chunk[Index]);
         }
         if (TxDone && Dev->TxRequest != NULL) {
-            SwBtCompleteTx(Dev);
-            SwBtStartTx(Dev);
+            SwBtCompleteTx(Dev, &Done);
+            SwBtStartTx(Dev, &Done);
         }
+        WdfSpinLockRelease(Dev->Lock);
+        SwBtDoneFlush(&Done);
         if (Count == 0 && !TxDone) {
             break;
         }
     }
-    WdfSpinLockRelease(Dev->Lock);
 }
 
 /* ------------------------------------------------------------------- I/O */
@@ -692,6 +737,7 @@ VOID SwBtEvtIoDeviceControl(WDFQUEUE Queue, WDFREQUEST Request, size_t OutLength
     WDFMEMORY Memory;
     PVOID Buffer;
     size_t Size = 0;
+    SWBT_DONE Done;
     NTSTATUS Status;
 
     switch (Code) {
@@ -726,12 +772,14 @@ VOID SwBtEvtIoDeviceControl(WDFQUEUE Queue, WDFREQUEST Request, size_t OutLength
             WdfRequestComplete(Request, STATUS_DEVICE_NOT_READY);
             return;
         }
+        Done.Count = 0;
         WdfSpinLockAcquire(Dev->Lock);
         Status = WdfRequestForwardToIoQueue(Request, Dev->TxQueue);
         if (NT_SUCCESS(Status)) {
-            SwBtStartTx(Dev);
+            SwBtStartTx(Dev, &Done);
         }
         WdfSpinLockRelease(Dev->Lock);
+        SwBtDoneFlush(&Done);
         if (!NT_SUCCESS(Status)) {
             WdfRequestComplete(Request, Status);
         }
@@ -749,16 +797,18 @@ VOID SwBtEvtIoDeviceControl(WDFQUEUE Queue, WDFREQUEST Request, size_t OutLength
             break;
         }
         InterlockedIncrement(Type == HciPacketEvent ? &Dev->ReadEventRequests : &Dev->ReadAclRequests);
+        Done.Count = 0;
         WdfSpinLockAcquire(Dev->Lock);
         Status = WdfRequestForwardToIoQueue(Request, Type == HciPacketEvent ? Dev->EventQueue : Dev->AclQueue);
         if (NT_SUCCESS(Status)) {
             if (Type == HciPacketEvent) {
-                SwBtDrainKept(Dev, &Dev->KeptEvents, Dev->EventQueue);
+                SwBtDrainKept(Dev, &Done, &Dev->KeptEvents, Dev->EventQueue);
             } else {
-                SwBtDrainKept(Dev, &Dev->KeptAcl, Dev->AclQueue);
+                SwBtDrainKept(Dev, &Done, &Dev->KeptAcl, Dev->AclQueue);
             }
         }
         WdfSpinLockRelease(Dev->Lock);
+        SwBtDoneFlush(&Done);
         if (!NT_SUCCESS(Status)) {
             WdfRequestComplete(Request, Status);
         }
@@ -1047,7 +1097,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
         RtlCopyMemory(&SwBtParamsPath[RegistryPath->Length / sizeof(WCHAR)], L"\\Parameters", sizeof(L"\\Parameters"));
         (VOID)RtlCreateRegistryKey(RTL_REGISTRY_ABSOLUTE, SwBtParamsPath);
     }
-    SwBtTrace(L"DriverVersion", 3);
+    SwBtTrace(L"DriverVersion", 4);
     WDF_DRIVER_CONFIG_INIT(&Config, SwBtEvtDeviceAdd);
     return WdfDriverCreate(DriverObject, RegistryPath, WDF_NO_OBJECT_ATTRIBUTES, &Config, WDF_NO_HANDLE);
 }
