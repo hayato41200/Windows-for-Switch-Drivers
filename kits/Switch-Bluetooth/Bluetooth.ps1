@@ -46,6 +46,17 @@ function Show-Status {
   $mini = (Test-Path $bth) -and (Select-String -Path $bth -Pattern 'MS_BTHX_BTHMINI' -Quiet)
   $sysFile = Test-Path (Join-Path $Sys 'drivers\BthMini.sys')
   Log ("Windows BthMini: bth.inf has MS_BTHX_BTHMINI={0}  BthMini.sys={1}" -f $mini, $sysFile)
+  # Stage 2: the radio child (SWOA\BTH_UART_H4, BthMini) and what Windows built on it.
+  $radio = @(Get-CimInstance Win32_PnPEntity -ErrorAction SilentlyContinue | Where-Object { $_.PNPDeviceID -like 'SWOA\BTH_UART_H4*' })
+  if ($radio.Count -eq 0) { Log 'radio: NOT FOUND (SWOA\BTH_UART_H4). Is switchbt 1.0.0.2 installed?' }
+  foreach ($d in $radio) {
+    Log ("radio: {0}  name='{1}' status={2} problem={3} service={4}" -f $d.PNPDeviceID, $d.Name, $d.Status, $d.ConfigManagerErrorCode, $d.Service)
+  }
+  $bt = @(Get-CimInstance Win32_PnPEntity -ErrorAction SilentlyContinue | Where-Object { $_.PNPClass -eq 'Bluetooth' })
+  foreach ($d in $bt) { Log ("bluetooth: '{0}' status={1} problem={2}" -f $d.Name, $d.Status, $d.ConfigManagerErrorCode) }
+  $svc = Get-Service bthserv -ErrorAction SilentlyContinue
+  if ($svc) { Log ("Bluetooth Support Service: {0}" -f $svc.Status) }
+  if ($radio.Count -gt 0 -and $radio[0].ConfigManagerErrorCode -eq 0) { Log 'RESULT 2: the radio runs under BthMini. Look for Bluetooth in Settings.' }
 }
 
 switch ($Mode) {

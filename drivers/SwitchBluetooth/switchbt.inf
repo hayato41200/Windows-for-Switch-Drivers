@@ -1,5 +1,5 @@
 ;
-; switchbt.inf - Nintendo Switch Bluetooth (BCM4356A3 on UART-D), stage 1: link check
+; switchbt.inf - Nintendo Switch Bluetooth (BCM4356A3 on UART-D), H4 transport for the inbox BthMini
 ;
 
 [Version]
@@ -8,7 +8,7 @@ Class       = System
 ClassGuid   = {4d36e97d-e325-11ce-bfc1-08002be10318}
 Provider    = %Mfg%
 CatalogFile = switchbt.cat
-DriverVer   = 10/30/2026,1.0.0.1
+DriverVer   = 10/31/2026,1.0.0.2
 PnpLockdown = 1
 
 [DestinationDirs]
