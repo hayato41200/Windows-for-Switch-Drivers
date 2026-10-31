@@ -91,6 +91,13 @@
  * (problem 43): THRE does not mean the whole 32-byte FIFO is free, so bytes
  * were lost. Back to 16 bytes per burst; the 8-byte RX trigger stays (no
  * overruns, events of 7 bytes came through on the RX timeout).
+ *
+ * 1.0.0.12: after a session at 3 Mbaud the chip did not answer at 115200 on
+ * the next boot, even after UEFI's 20 ms power cycle: it was still at
+ * 3 Mbaud with the patch loaded. The probe now also tries 3 Mbaud and keeps
+ * using it when the chip answers there (FoundAt3M). When the device powers
+ * down (shutdown, restart, driver update) the driver moves the chip and the
+ * UART back to 115200, so the next start finds it at the ROM speed.
  */
 #include <ntddk.h>
 #include <ntstrsafe.h>
@@ -204,6 +211,7 @@ typedef struct _SWBT_DEVICE {
     WDFINTERRUPT Interrupt;
     BOOLEAN ChipOk;
     BOOLEAN SafeMode;               /* the last boot did not finish: stay idle */
+    BOOLEAN HighSpeedNow;           /* the chip and the UART run at 3 Mbaud */
     UCHAR BdAddr[6];                /* little endian, as HCI */
 
     /* Shared with the ISR (interrupt lock). */
@@ -282,6 +290,7 @@ EVT_WDF_DRIVER_DEVICE_ADD SwBtEvtDeviceAdd;
 EVT_WDF_DEVICE_PREPARE_HARDWARE SwBtEvtPrepareHardware;
 EVT_WDF_DEVICE_RELEASE_HARDWARE SwBtEvtReleaseHardware;
 EVT_WDF_DEVICE_D0_ENTRY SwBtEvtD0Entry;
+EVT_WDF_DEVICE_D0_EXIT SwBtEvtD0Exit;
 EVT_WDF_INTERRUPT_ISR SwBtEvtIsr;
 EVT_WDF_INTERRUPT_DPC SwBtEvtDpc;
 EVT_WDF_INTERRUPT_ENABLE SwBtEvtInterruptEnable;
@@ -601,6 +610,7 @@ static BOOLEAN SwBtHighSpeed(PSWBT_DEVICE Dev, UCHAR *Event, ULONG Max)
     Length = SwBtPollCommand(Dev, HCI_READ_VERSION, NULL, 0, Event, Max);
     if (Length >= 15 && Event[6] == 0) {
         SwBtTrace(L"HighSpeedResult", 2);                   /* 3 Mbaud, flow control */
+        Dev->HighSpeedNow = TRUE;
         return TRUE;
     }
     SwBtUartInit(Dev, UART_DIV_3M, UART_MCR_RTS);
@@ -609,6 +619,7 @@ static BOOLEAN SwBtHighSpeed(PSWBT_DEVICE Dev, UCHAR *Event, ULONG Max)
     Length = SwBtPollCommand(Dev, HCI_READ_VERSION, NULL, 0, Event, Max);
     if (Length >= 15 && Event[6] == 0) {
         SwBtTrace(L"HighSpeedResult", 3);                   /* 3 Mbaud, no flow control */
+        Dev->HighSpeedNow = TRUE;
         return TRUE;
     }
     SwBtTrace(L"HighSpeedResult", 4);                       /* lost: the next boot powers the chip again */
@@ -631,18 +642,38 @@ static BOOLEAN SwBtProbe(PSWBT_DEVICE Dev)
     }
     SwBtUartInit(Dev, UART_DIV_115200, UART_MCR_RTS);
     KeStallExecutionProcessor(100);
+    Dev->HighSpeedNow = FALSE;
+    SwBtTrace(L"FoundAt3M", 0);
     if (!SwBtReset(Dev, Event, sizeof(Event)) && !SwBtReset(Dev, Event, sizeof(Event))) {
-        SwBtTrace(L"HciReset", 0);
-        SwBtTraceString(L"Result", L"no answer to HCI_Reset");
-        return FALSE;
+        /* Still at 3 Mbaud from the last session (the power cycle did not reset it)? */
+        if (Dev->CarUartd != NULL) {
+            WRITE_REGISTER_ULONG((PULONG)Dev->CarUartd, CAR_UART_3M);
+            KeStallExecutionProcessor(10);
+            SwBtUartInit(Dev, UART_DIV_3M, UART_MCR_FLOW);
+            SwBtSleepMs(10);
+            if (SwBtReset(Dev, Event, sizeof(Event)) || SwBtReset(Dev, Event, sizeof(Event))) {
+                Dev->HighSpeedNow = TRUE;
+                SwBtTrace(L"FoundAt3M", 1);
+            } else {
+                WRITE_REGISTER_ULONG((PULONG)Dev->CarUartd, CAR_UART_PLLP);
+                SwBtUartInit(Dev, UART_DIV_115200, UART_MCR_RTS);
+            }
+        }
+        if (!Dev->HighSpeedNow) {
+            SwBtTrace(L"HciReset", 0);
+            SwBtTraceString(L"Result", L"no answer to HCI_Reset (115200 or 3 Mbaud)");
+            return FALSE;
+        }
     }
     SwBtTrace(L"HciReset", 0x100);
-    SwBtTrace(L"UartClockMHz", 408);
+    SwBtTrace(L"UartClockMHz", Dev->HighSpeedNow ? 48 : 408);
     SwBtTraceVersion(Dev, Event, sizeof(Event));
 
-    /* Firmware patch, if the user put the file in place. */
-    Fw = SwBtLoadFirmware(&FwLength);
-    if (Fw != NULL) {
+    /* Firmware patch, if the user put the file in place (not when the chip already runs it at 3 Mbaud). */
+    Fw = Dev->HighSpeedNow ? NULL : SwBtLoadFirmware(&FwLength);
+    if (Dev->HighSpeedNow) {
+        SwBtTrace(L"FirmwareResult", 2);                    /* kept from the last session */
+    } else if (Fw != NULL) {
         ULONG Records = SwBtPatchram(Dev, Fw, FwLength, Event, sizeof(Event));
         ExFreePoolWithTag(Fw, POOL_TAG);
         SwBtTrace(L"FirmwareRecords", Records);
@@ -682,7 +713,9 @@ static BOOLEAN SwBtProbe(PSWBT_DEVICE Dev)
     }
 
     (VOID)SwBtReadParam(L"HighSpeed", &HighSpeed);
-    if (CanSwitchClock && HighSpeed != 0) {
+    if (Dev->HighSpeedNow) {
+        SwBtTrace(L"HighSpeedResult", 5);                   /* already at 3 Mbaud */
+    } else if (CanSwitchClock && HighSpeed != 0) {
         if (!SwBtHighSpeed(Dev, Event, sizeof(Event))) {
             SwBtTraceString(L"Result", L"lost the chip at 3 Mbaud");
             return FALSE;
@@ -1295,6 +1328,32 @@ NTSTATUS SwBtEvtReleaseHardware(WDFDEVICE Device, WDFCMRESLIST Translated)
     return STATUS_SUCCESS;
 }
 
+/*
+ * Interrupts are already off here. At 3 Mbaud: ask the chip for 115200
+ * (Update_UART_Baud_Rate) and follow, so the next start finds the ROM speed.
+ */
+NTSTATUS SwBtEvtD0Exit(WDFDEVICE Device, WDF_POWER_DEVICE_STATE TargetState)
+{
+    PSWBT_DEVICE Dev = SwBtGetDevice(Device);
+    UCHAR Event[64];
+    UCHAR Params[6] = { 0, 0, (UCHAR)115200u, (UCHAR)(115200u >> 8), (UCHAR)(115200u >> 16), 0 };
+    ULONG Length;
+    UNREFERENCED_PARAMETER(TargetState);
+
+    if (Dev->SafeMode || Dev->Uart == NULL || Dev->CarUartd == NULL || !Dev->HighSpeedNow) {
+        return STATUS_SUCCESS;
+    }
+    SwBtFlushRx(Dev);
+    Length = SwBtPollCommand(Dev, BCM_UPDATE_BAUD, Params, sizeof(Params), Event, sizeof(Event));
+    WRITE_REGISTER_ULONG((PULONG)Dev->CarUartd, CAR_UART_PLLP);
+    KeStallExecutionProcessor(10);
+    SwBtUartInit(Dev, UART_DIV_115200, UART_MCR_RTS);
+    Dev->HighSpeedNow = FALSE;
+    SwBtTrace(L"ExitTo115200", Length >= 7 ? Event[6] + 0x100u : 0);
+    SwBtFlush();
+    return STATUS_SUCCESS;
+}
+
 /* Interrupts are still off here: the probe polls. */
 NTSTATUS SwBtEvtD0Entry(WDFDEVICE Device, WDF_POWER_DEVICE_STATE PreviousState)
 {
@@ -1404,6 +1463,7 @@ NTSTATUS SwBtEvtDeviceAdd(WDFDRIVER Driver, PWDFDEVICE_INIT DeviceInit)
     Pnp.EvtDevicePrepareHardware = SwBtEvtPrepareHardware;
     Pnp.EvtDeviceReleaseHardware = SwBtEvtReleaseHardware;
     Pnp.EvtDeviceD0Entry = SwBtEvtD0Entry;
+    Pnp.EvtDeviceD0Exit = SwBtEvtD0Exit;
     WdfDeviceInitSetPnpPowerEventCallbacks(DeviceInit, &Pnp);
     WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&Attributes, SWBT_DEVICE);
     Status = WdfDeviceCreate(&DeviceInit, &Attributes, &Device);
@@ -1483,7 +1543,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
         RtlCopyMemory(&SwBtParamsPath[RegistryPath->Length / sizeof(WCHAR)], L"\\Parameters", sizeof(L"\\Parameters"));
         (VOID)RtlCreateRegistryKey(RTL_REGISTRY_ABSOLUTE, SwBtParamsPath);
     }
-    SwBtTrace(L"DriverVersion", 11);
+    SwBtTrace(L"DriverVersion", 12);
     WDF_DRIVER_CONFIG_INIT(&Config, SwBtEvtDeviceAdd);
     return WdfDriverCreate(DriverObject, RegistryPath, WDF_NO_OBJECT_ATTRIBUTES, &Config, WDF_NO_HANDLE);
 }
