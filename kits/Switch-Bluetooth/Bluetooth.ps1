@@ -57,6 +57,22 @@ function Show-Status {
   $svc = Get-Service bthserv -ErrorAction SilentlyContinue
   if ($svc) { Log ("Bluetooth Support Service: {0}" -f $svc.Status) }
   if ($radio.Count -gt 0 -and $radio[0].ConfigManagerErrorCode -eq 0) { Log 'RESULT 2: the radio runs under BthMini. Look for Bluetooth in Settings.' }
+  # Traffic between the Windows Bluetooth stack and the chip (switchbt 1.0.0.3+).
+  if ($p -and $null -ne $p.IsrCalls) {
+    Log ("traffic: interrupts {0} (IIR seen 0x{1:X})  sent {2} bytes ({3} commands, {4} ACL)  received {5} bytes ({6} events, {7} ACL)" -f `
+      $p.IsrCalls, $p.IirSeen, $p.TxBytes, $p.CmdsOut, $p.AclOut, $p.RxBytes, $p.EventsIn, $p.AclIn)
+    Log ("requests: write {0}  read event {1}  read ACL {2}  other {3} (last 0x{4:X})  tx busy {5}  dropped {6}  overflow {7}" -f `
+      $p.WriteRequests, $p.ReadEventRequests, $p.ReadAclRequests, $p.OtherIoctls, $p.LastOtherIoctl, $p.TxBusy, $p.Dropped, $p.RxOverflows)
+    Log ("last commands: {0}" -f $p.LastCommands)
+    Log ("last events (code:opcode): {0}" -f $p.LastEvents)
+  }
+  $ev = @(Get-WinEvent -LogName System -MaxEvents 400 -ErrorAction SilentlyContinue |
+    Where-Object { $_.ProviderName -match 'BTH|Bluetooth' } | Select-Object -First 8)
+  foreach ($e in $ev) {
+    $msg = ($e.Message -replace '\s+', ' ')
+    if ($msg.Length -gt 160) { $msg = $msg.Substring(0, 160) }
+    Log ("event {0:HH:mm:ss} {1} id={2}: {3}" -f $e.TimeCreated, $e.ProviderName, $e.Id, $msg)
+  }
 }
 
 switch ($Mode) {

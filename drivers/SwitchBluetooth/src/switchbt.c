@@ -116,6 +116,27 @@ typedef struct _SWBT_DEVICE {
     ULONG RxGot;
     ULONG RxNeed;
     BTHX_CAPABILITIES Caps;
+
+    /* Diagnostics, written to the registry every few seconds by Timer. */
+    WDFTIMER Timer;
+    ULONG Ticks;
+    volatile LONG IsrCalls;
+    ULONG IirSeen;                  /* bit (IIR >> 1) & 7 for each interrupt source seen */
+    ULONG RxBytes;
+    ULONG TxBytes;
+    ULONG CmdsOut;
+    ULONG AclOut;
+    ULONG EventsIn;
+    ULONG AclIn;
+    volatile LONG ReadEventRequests;
+    volatile LONG ReadAclRequests;
+    volatile LONG WriteRequests;
+    volatile LONG OtherIoctls;
+    ULONG LastOtherIoctl;
+    ULONG CmdLog[8];                /* last commands: opcode */
+    ULONG EventLog[8];              /* last events: code << 16 | opcode (complete / status) */
+    ULONG CmdLogNext;
+    ULONG EventLogNext;
 } SWBT_DEVICE, *PSWBT_DEVICE;
 WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(SWBT_DEVICE, SwBtGetDevice)
 
@@ -130,6 +151,7 @@ EVT_WDF_INTERRUPT_ENABLE SwBtEvtInterruptEnable;
 EVT_WDF_INTERRUPT_DISABLE SwBtEvtInterruptDisable;
 EVT_WDF_IO_QUEUE_IO_DEVICE_CONTROL SwBtEvtIoDeviceControl;
 EVT_WDF_IO_QUEUE_IO_DEVICE_CONTROL SwBtEvtChildIoDeviceControl;
+EVT_WDF_TIMER SwBtEvtTimer;
 
 static WCHAR SwBtParamsPath[256];
 
@@ -352,6 +374,27 @@ static BOOLEAN SwBtProbe(PSWBT_DEVICE Dev)
 
 /* ---------------------------------------------------------- interrupt */
 
+/*
+ * Puts up to one burst into the empty transmit FIFO. Returns TRUE when the
+ * packet is all out (the DPC then completes the request). Interrupt lock held.
+ */
+static BOOLEAN SwBtTxBurst(PSWBT_DEVICE Dev)
+{
+    ULONG Count;
+    for (Count = 0; Count < UART_TX_BURST && Dev->TxSent < Dev->TxLength; ++Count) {
+        SwBtWrite(Dev, UART_THR, Dev->TxBuffer[Dev->TxSent++]);
+        Dev->TxBytes++;
+    }
+    if (Dev->TxSent < Dev->TxLength) {
+        return FALSE;
+    }
+    Dev->TxBusy = FALSE;
+    Dev->TxDone = TRUE;
+    Dev->Ier &= ~UART_IER_TX;
+    SwBtWrite(Dev, UART_IER, Dev->Ier);
+    return TRUE;
+}
+
 BOOLEAN SwBtEvtIsr(WDFINTERRUPT Interrupt, ULONG MessageId)
 {
     PSWBT_DEVICE Dev = SwBtGetDevice(WdfInterruptGetDevice(Interrupt));
@@ -365,9 +408,12 @@ BOOLEAN SwBtEvtIsr(WDFINTERRUPT Interrupt, ULONG MessageId)
             break;
         }
         Mine = TRUE;
+        InterlockedIncrement(&Dev->IsrCalls);
+        Dev->IirSeen |= 1u << ((Iir >> 1) & 7);
         Lsr = SwBtRead(Dev, UART_LSR);
         for (Count = 0; Count < 64 && (Lsr & UART_LSR_DR) != 0; ++Count) {
             UCHAR Byte = (UCHAR)SwBtRead(Dev, UART_THR);
+            Dev->RxBytes++;
             if (Dev->RxHead - Dev->RxTail < RX_RING_SIZE) {
                 Dev->RxRing[Dev->RxHead & (RX_RING_SIZE - 1)] = Byte;
                 Dev->RxHead++;
@@ -378,16 +424,7 @@ BOOLEAN SwBtEvtIsr(WDFINTERRUPT Interrupt, ULONG MessageId)
             Lsr = SwBtRead(Dev, UART_LSR);
         }
         if (Dev->TxBusy && (Lsr & UART_LSR_THRE) != 0) {
-            for (Count = 0; Count < UART_TX_BURST && Dev->TxSent < Dev->TxLength; ++Count) {
-                SwBtWrite(Dev, UART_THR, Dev->TxBuffer[Dev->TxSent++]);
-            }
-            if (Dev->TxSent == Dev->TxLength) {
-                Dev->TxBusy = FALSE;
-                Dev->TxDone = TRUE;
-                Dev->Ier &= ~UART_IER_TX;
-                SwBtWrite(Dev, UART_IER, Dev->Ier);
-                Wake = TRUE;
-            }
+            Wake |= SwBtTxBurst(Dev);
         } else if (!Dev->TxBusy && (Dev->Ier & UART_IER_TX) != 0) {
             Dev->Ier &= ~UART_IER_TX;
             SwBtWrite(Dev, UART_IER, Dev->Ier);
@@ -529,6 +566,18 @@ static VOID SwBtParse(PSWBT_DEVICE Dev, UCHAR Byte)
     if (Dev->RxGot < Dev->RxNeed) {
         return;
     }
+    if (Type == HCI_EVENT_PKT) {
+        ULONG Opcode = 0;
+        if (Dev->RxPacket[1] == HCI_EV_COMPLETE && Dev->RxGot >= 6) {
+            Opcode = Dev->RxPacket[4] | (Dev->RxPacket[5] << 8);
+        } else if (Dev->RxPacket[1] == 0x0F && Dev->RxGot >= 7) {   /* Command Status */
+            Opcode = Dev->RxPacket[5] | (Dev->RxPacket[6] << 8);
+        }
+        Dev->EventsIn++;
+        Dev->EventLog[Dev->EventLogNext++ % RTL_NUMBER_OF(Dev->EventLog)] = ((ULONG)Dev->RxPacket[1] << 16) | Opcode;
+    } else if (Type == HCI_ACL_PKT) {
+        Dev->AclIn++;
+    }
     if (Type != HCI_SCO_PKT) {                               /* SCO over HCI is not offered */
         SwBtDeliver(Dev, Type, &Dev->RxPacket[1], Dev->RxGot - 1);
     }
@@ -560,6 +609,13 @@ static VOID SwBtStartTx(PSWBT_DEVICE Dev)
         }
         Dev->TxRequest = Request;
         Dev->TxRequestLength = Ctx->DataLen;
+        if (Ctx->Type == HciPacketCommand) {
+            Dev->CmdsOut++;
+            Dev->CmdLog[Dev->CmdLogNext++ % RTL_NUMBER_OF(Dev->CmdLog)] =
+                Ctx->DataLen >= 2 ? (ULONG)(Ctx->Data[0] | (Ctx->Data[1] << 8)) : 0xFFFF;
+        } else {
+            Dev->AclOut++;
+        }
         WdfInterruptAcquireLock(Dev->Interrupt);
         Dev->TxBuffer[0] = Ctx->Type;
         RtlCopyMemory(&Dev->TxBuffer[1], Ctx->Data, Ctx->DataLen);
@@ -567,8 +623,13 @@ static VOID SwBtStartTx(PSWBT_DEVICE Dev)
         Dev->TxSent = 0;
         Dev->TxDone = FALSE;
         Dev->TxBusy = TRUE;
-        Dev->Ier |= UART_IER_TX;                             /* fires at once: the FIFO is empty */
-        SwBtWrite(Dev, UART_IER, Dev->Ier);
+        /* Fill the FIFO now; the transmitter-empty interrupt sends the rest. */
+        if ((SwBtRead(Dev, UART_LSR) & UART_LSR_THRE) != 0 && SwBtTxBurst(Dev)) {
+            WdfInterruptQueueDpcForIsr(Dev->Interrupt);
+        } else {
+            Dev->Ier |= UART_IER_TX;
+            SwBtWrite(Dev, UART_IER, Dev->Ier);
+        }
         WdfInterruptReleaseLock(Dev->Interrupt);
     }
 }
@@ -660,6 +721,7 @@ VOID SwBtEvtIoDeviceControl(WDFQUEUE Queue, WDFREQUEST Request, size_t OutLength
         return;
 
     case IOCTL_BTHX_WRITE_HCI:
+        InterlockedIncrement(&Dev->WriteRequests);
         if (!Dev->ChipOk) {
             WdfRequestComplete(Request, STATUS_DEVICE_NOT_READY);
             return;
@@ -686,6 +748,7 @@ VOID SwBtEvtIoDeviceControl(WDFQUEUE Queue, WDFREQUEST Request, size_t OutLength
         if (Type != HciPacketEvent && Type != HciPacketAclData) {
             break;
         }
+        InterlockedIncrement(Type == HciPacketEvent ? &Dev->ReadEventRequests : &Dev->ReadAclRequests);
         WdfSpinLockAcquire(Dev->Lock);
         Status = WdfRequestForwardToIoQueue(Request, Type == HciPacketEvent ? Dev->EventQueue : Dev->AclQueue);
         if (NT_SUCCESS(Status)) {
@@ -703,9 +766,57 @@ VOID SwBtEvtIoDeviceControl(WDFQUEUE Queue, WDFREQUEST Request, size_t OutLength
     }
 
     default:
+        InterlockedIncrement(&Dev->OtherIoctls);
+        Dev->LastOtherIoctl = Code;
         break;
     }
     WdfRequestComplete(Request, STATUS_INVALID_PARAMETER);
+}
+
+/* Diagnostics: every 2 s for the first minute, then every 10 s. */
+VOID SwBtEvtTimer(WDFTIMER Timer)
+{
+    PSWBT_DEVICE Dev = SwBtGetDevice((WDFDEVICE)WdfTimerGetParentObject(Timer));
+    WCHAR Text[160];
+    ULONG Index, Next;
+
+    SwBtTrace(L"IsrCalls", (ULONG)Dev->IsrCalls);
+    SwBtTrace(L"IirSeen", Dev->IirSeen);
+    SwBtTrace(L"RxBytes", Dev->RxBytes);
+    SwBtTrace(L"TxBytes", Dev->TxBytes);
+    SwBtTrace(L"RxOverflows", Dev->RxOverflows);
+    SwBtTrace(L"CmdsOut", Dev->CmdsOut);
+    SwBtTrace(L"AclOut", Dev->AclOut);
+    SwBtTrace(L"EventsIn", Dev->EventsIn);
+    SwBtTrace(L"AclIn", Dev->AclIn);
+    SwBtTrace(L"Dropped", Dev->Dropped);
+    SwBtTrace(L"ReadEventRequests", (ULONG)Dev->ReadEventRequests);
+    SwBtTrace(L"ReadAclRequests", (ULONG)Dev->ReadAclRequests);
+    SwBtTrace(L"WriteRequests", (ULONG)Dev->WriteRequests);
+    SwBtTrace(L"OtherIoctls", (ULONG)Dev->OtherIoctls);
+    SwBtTrace(L"LastOtherIoctl", Dev->LastOtherIoctl);
+    SwBtTrace(L"TxBusy", Dev->TxBusy | (Dev->TxRequest != NULL ? 2u : 0u));
+
+    Text[0] = L'\0';
+    Next = Dev->CmdLogNext;
+    for (Index = Next > 8 ? Next - 8 : 0; Index < Next; ++Index) {
+        WCHAR Item[12];
+        (VOID)RtlStringCchPrintfW(Item, RTL_NUMBER_OF(Item), L"%04X ", Dev->CmdLog[Index % 8]);
+        (VOID)RtlStringCchCatW(Text, RTL_NUMBER_OF(Text), Item);
+    }
+    SwBtTraceString(L"LastCommands", Text);
+    Text[0] = L'\0';
+    Next = Dev->EventLogNext;
+    for (Index = Next > 8 ? Next - 8 : 0; Index < Next; ++Index) {
+        WCHAR Item[16];
+        (VOID)RtlStringCchPrintfW(Item, RTL_NUMBER_OF(Item), L"%02X:%04X ", Dev->EventLog[Index % 8] >> 16,
+                                  Dev->EventLog[Index % 8] & 0xFFFF);
+        (VOID)RtlStringCchCatW(Text, RTL_NUMBER_OF(Text), Item);
+    }
+    SwBtTraceString(L"LastEvents", Text);
+
+    ++Dev->Ticks;
+    WdfTimerStart(Timer, WDF_REL_TIMEOUT_IN_SEC(Dev->Ticks < 30 ? 2 : 10));
 }
 
 /* The child (BthMini) hands every BTHX request to this device. */
@@ -909,6 +1020,19 @@ NTSTATUS SwBtEvtDeviceAdd(WDFDRIVER Driver, PWDFDEVICE_INIT DeviceInit)
     if (!NT_SUCCESS(Status)) {
         return Status;
     }
+    {
+        WDF_TIMER_CONFIG TimerConfig;
+        WDF_TIMER_CONFIG_INIT(&TimerConfig, SwBtEvtTimer);
+        TimerConfig.AutomaticSerialization = FALSE;
+        WDF_OBJECT_ATTRIBUTES_INIT(&Attributes);
+        Attributes.ParentObject = Device;
+        Attributes.ExecutionLevel = WdfExecutionLevelPassive;
+        Status = WdfTimerCreate(&TimerConfig, &Attributes, &Dev->Timer);
+        if (!NT_SUCCESS(Status)) {
+            return Status;
+        }
+        WdfTimerStart(Dev->Timer, WDF_REL_TIMEOUT_IN_SEC(2));
+    }
     Status = SwBtCreateChild(Device);
     SwBtTrace(L"ChildStatus", (ULONG)Status);
     return Status;
@@ -923,7 +1047,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
         RtlCopyMemory(&SwBtParamsPath[RegistryPath->Length / sizeof(WCHAR)], L"\\Parameters", sizeof(L"\\Parameters"));
         (VOID)RtlCreateRegistryKey(RTL_REGISTRY_ABSOLUTE, SwBtParamsPath);
     }
-    SwBtTrace(L"DriverVersion", 2);
+    SwBtTrace(L"DriverVersion", 3);
     WDF_DRIVER_CONFIG_INIT(&Config, SwBtEvtDeviceAdd);
     return WdfDriverCreate(DriverObject, RegistryPath, WDF_NO_OBJECT_ATTRIBUTES, &Config, WDF_NO_HANDLE);
 }
