@@ -116,6 +116,7 @@ static BOOLEAN SwBtSend(PSWBT_DEVICE Dev, const UCHAR *Buffer, ULONG Length)
 /*
  * Reads one HCI event into Buffer (04 code len params) within TimeoutMs.
  * The loop polls faster than 115200 baud fills the FIFO, so nothing is lost.
+ * The deadline holds even when the line never stops sending.
  */
 static ULONG SwBtReadEvent(PSWBT_DEVICE Dev, UCHAR *Buffer, ULONG Max, ULONG TimeoutMs)
 {
@@ -123,10 +124,10 @@ static ULONG SwBtReadEvent(PSWBT_DEVICE Dev, UCHAR *Buffer, ULONG Max, ULONG Tim
     ULONG Got = 0, Need = 3;
     while (Got < Need) {
         UCHAR Byte;
+        if (SwBtNowMs() > End) {
+            return 0;
+        }
         if ((SwBtRead(Dev, UART_LSR) & UART_LSR_DR) == 0) {
-            if (SwBtNowMs() > End) {
-                return 0;
-            }
             KeStallExecutionProcessor(5);
             continue;
         }
@@ -174,7 +175,7 @@ static VOID SwBtProbe(PSWBT_DEVICE Dev)
 
     SwBtUartInit(Dev);
     KeStallExecutionProcessor(100);
-    while ((SwBtRead(Dev, UART_LSR) & UART_LSR_DR) != 0) {
+    for (Index = 0; Index < 4096 && (SwBtRead(Dev, UART_LSR) & UART_LSR_DR) != 0; ++Index) {
         (VOID)SwBtRead(Dev, UART_THR);
     }
 
