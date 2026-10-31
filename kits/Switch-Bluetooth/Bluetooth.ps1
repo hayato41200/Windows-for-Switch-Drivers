@@ -74,6 +74,10 @@ function Show-Status {
       $p.IsrCalls, $p.IirSeen, $p.TxBytes, $p.CmdsOut, $p.AclOut, $p.RxBytes, $p.EventsIn, $p.AclIn)
     Log ("requests: write {0}  read event {1}  read ACL {2}  other {3} (last 0x{4:X})  tx busy {5}  dropped {6}  overflow {7}" -f `
       $p.WriteRequests, $p.ReadEventRequests, $p.ReadAclRequests, $p.OtherIoctls, $p.LastOtherIoctl, $p.TxBusy, $p.Dropped, $p.RxOverflows)
+    if ($null -ne $p.LineOverruns) {
+      Log ("receive errors (1.0.0.10+): UART overruns {0}  parity/framing/break {1}  bytes skipped to find a packet {2}" -f `
+        $p.LineOverruns, $p.LineErrors, $p.ParserSkipped)
+    }
     if ($null -ne $p.ChildD0) {
       Log ("child (1.0.0.6+, added 20 s after start): D0 {0}  requests {1}  forward failures {2} (last status 0x{3:X8})  last IOCTL 0x{4:X}" -f `
         $p.ChildD0, $p.ChildRequests, $p.ChildForwardFailures, $p.LastForwardStatus, $p.LastChildIoctl)

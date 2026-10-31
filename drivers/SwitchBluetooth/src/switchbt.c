@@ -81,6 +81,10 @@
  * the receiver interrupts at 8 bytes (the RX timeout catches the rest)
  * instead of every byte, and once the boot is known good (60 s) the
  * counters are still written every 10 s but no longer forced to disk.
+ * At 3 Mbaud audio mostly stopped (a keyboard was fine): lost receive bytes
+ * would lose Number_Of_Completed_Packets events and starve the ACL credits.
+ * Line errors are counted now (LSR overrun, parity, framing, break) and so
+ * are the H4 bytes the parser had to skip to find the next packet.
  */
 #include <ntddk.h>
 #include <ntstrsafe.h>
@@ -104,6 +108,8 @@ NTSYSAPI ULONG NTAPI RtlRandomEx(PULONG Seed);     /* ntoskrnl export, declared 
 #define UART_DLM          (0x04 / 4)
 #define UART_LSR_DR       0x01u
 #define UART_LSR_THRE     0x20u
+#define UART_LSR_OE       0x02u         /* overrun: a byte was lost in the FIFO */
+#define UART_LSR_ERRORS   0x1Eu         /* overrun, parity, framing, break */
 #define UART_IIR_NO_INT   0x01u
 #define UART_IER_RX       0x15u         /* received data, line status, RX timeout */
 #define UART_IER_TX       0x02u         /* transmitter empty */
@@ -199,6 +205,9 @@ typedef struct _SWBT_DEVICE {
     ULONG RxHead;                   /* written by the ISR */
     ULONG RxTail;                   /* written by the DPC */
     ULONG RxOverflows;
+    ULONG LineOverruns;             /* LSR OE seen by the ISR */
+    ULONG LineErrors;               /* LSR PE/FE/BI seen by the ISR */
+    ULONG ParserSkipped;            /* bytes skipped while looking for an H4 packet type */
     UCHAR TxBuffer[1 + HCI_MAX_PACKET + 8];
     ULONG TxLength;
     ULONG TxSent;
@@ -718,6 +727,10 @@ BOOLEAN SwBtEvtIsr(WDFINTERRUPT Interrupt, ULONG MessageId)
         InterlockedIncrement(&Dev->IsrCalls);
         Dev->IirSeen |= 1u << ((Iir >> 1) & 7);
         Lsr = SwBtRead(Dev, UART_LSR);
+        if ((Lsr & UART_LSR_ERRORS) != 0) {
+            if ((Lsr & UART_LSR_OE) != 0) Dev->LineOverruns++;
+            if ((Lsr & (UART_LSR_ERRORS & ~UART_LSR_OE)) != 0) Dev->LineErrors++;
+        }
         for (Count = 0; Count < 64 && (Lsr & UART_LSR_DR) != 0; ++Count) {
             UCHAR Byte = (UCHAR)SwBtRead(Dev, UART_THR);
             Dev->RxBytes++;
@@ -729,6 +742,10 @@ BOOLEAN SwBtEvtIsr(WDFINTERRUPT Interrupt, ULONG MessageId)
             }
             Wake = TRUE;
             Lsr = SwBtRead(Dev, UART_LSR);
+            if ((Lsr & UART_LSR_ERRORS) != 0) {
+                if ((Lsr & UART_LSR_OE) != 0) Dev->LineOverruns++;
+                if ((Lsr & (UART_LSR_ERRORS & ~UART_LSR_OE)) != 0) Dev->LineErrors++;
+            }
         }
         if (Dev->TxBusy && (Lsr & UART_LSR_THRE) != 0) {
             Wake |= SwBtTxBurst(Dev);
@@ -848,7 +865,7 @@ static VOID SwBtParse(PSWBT_DEVICE Dev, PSWBT_DONE Done, UCHAR Byte)
         case HCI_EVENT_PKT: Dev->RxNeed = 1 + 2; break;      /* code, length */
         case HCI_ACL_PKT:   Dev->RxNeed = 1 + 4; break;      /* handle(2), length(2) */
         case HCI_SCO_PKT:   Dev->RxNeed = 1 + 3; break;      /* handle(2), length */
-        default:            return;                          /* out of step: skip */
+        default:            Dev->ParserSkipped++; return;    /* out of step: skip */
         }
     }
     Dev->RxPacket[Dev->RxGot++] = Byte;
@@ -1113,6 +1130,9 @@ VOID SwBtEvtTimer(WDFTIMER Timer)
     SwBtTrace(L"RxBytes", Dev->RxBytes);
     SwBtTrace(L"TxBytes", Dev->TxBytes);
     SwBtTrace(L"RxOverflows", Dev->RxOverflows);
+    SwBtTrace(L"LineOverruns", Dev->LineOverruns);
+    SwBtTrace(L"LineErrors", Dev->LineErrors);
+    SwBtTrace(L"ParserSkipped", Dev->ParserSkipped);
     SwBtTrace(L"CmdsOut", Dev->CmdsOut);
     SwBtTrace(L"AclOut", Dev->AclOut);
     SwBtTrace(L"EventsIn", Dev->EventsIn);
