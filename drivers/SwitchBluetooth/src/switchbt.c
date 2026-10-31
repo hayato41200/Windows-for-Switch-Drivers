@@ -75,6 +75,12 @@
  * the override and divisor 221 for 115200 at start (whatever UEFI left), and
  * the override with N = 15 (48 MHz = 16 x 3 Mbaud) for 3 Mbaud. UEFI R390
  * is enough; R391 is not needed.
+ *
+ * 1.0.0.10: a keyboard works; audio broke up every ~0.7 s. For streaming:
+ * the transmitter gets 32 bytes per empty-FIFO interrupt (the whole FIFO),
+ * the receiver interrupts at 8 bytes (the RX timeout catches the rest)
+ * instead of every byte, and once the boot is known good (60 s) the
+ * counters are still written every 10 s but no longer forced to disk.
  */
 #include <ntddk.h>
 #include <ntstrsafe.h>
@@ -113,7 +119,7 @@ NTSYSAPI ULONG NTAPI RtlRandomEx(PULONG Seed);     /* ntoskrnl export, declared 
 #define BCM_HIGH_BAUD     3000000u
 #define FIRMWARE_PATH     L"\\SystemRoot\\System32\\drivers\\SwitchWOA\\BCM4356A3.hcd"
 #define FIRMWARE_MAX      (256u * 1024u)
-#define UART_TX_BURST     16u           /* bytes per transmitter-empty interrupt (FIFO is 32) */
+#define UART_TX_BURST     32u           /* bytes per transmitter-empty interrupt: the whole FIFO */
 
 /* HCI (H4). */
 #define HCI_COMMAND_PKT   0x01
@@ -349,7 +355,7 @@ static VOID SwBtUartInit(PSWBT_DEVICE Dev, ULONG Divisor, ULONG Mcr)
     SwBtWrite(Dev, UART_DLL, Divisor & 0xFF);
     SwBtWrite(Dev, UART_DLM, (Divisor >> 8) & 0xFF);
     SwBtWrite(Dev, UART_LCR, 0x03);                 /* 8N1 */
-    SwBtWrite(Dev, UART_FCR, 0x07);                 /* FIFOs on and cleared, RX trigger 1 byte */
+    SwBtWrite(Dev, UART_FCR, 0x87);                 /* FIFOs on and cleared, RX trigger 8 bytes (+ RX timeout) */
     SwBtWrite(Dev, UART_MCR, Mcr);
 }
 
@@ -1150,6 +1156,7 @@ VOID SwBtEvtTimer(WDFTIMER Timer)
     ++Dev->Ticks;
     if (Dev->Ticks == 30) {
         SwBtTrace(L"BootPending", 0);           /* 60 s of running: this boot is fine */
+        SwBtFlush();
     }
     if (Dev->Ticks == CHILD_DELAY_TICKS && !Dev->ChildAdded && Dev->ChipOk) {
         WDFDEVICE Device = (WDFDEVICE)WdfTimerGetParentObject(Timer);
@@ -1161,7 +1168,9 @@ VOID SwBtEvtTimer(WDFTIMER Timer)
         SwBtTrace(L"ChildStatus", (ULONG)Status);
         SwBtTrace(L"Stage", 6);
     }
-    SwBtFlush();
+    if (Dev->Ticks < 30) {
+        SwBtFlush();                            /* only while a hang is still possible */
+    }
     WdfTimerStart(Timer, WDF_REL_TIMEOUT_IN_SEC(Dev->Ticks < 30 ? 2 : 10));
 }
 
@@ -1448,7 +1457,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
         RtlCopyMemory(&SwBtParamsPath[RegistryPath->Length / sizeof(WCHAR)], L"\\Parameters", sizeof(L"\\Parameters"));
         (VOID)RtlCreateRegistryKey(RTL_REGISTRY_ABSOLUTE, SwBtParamsPath);
     }
-    SwBtTrace(L"DriverVersion", 9);
+    SwBtTrace(L"DriverVersion", 10);
     WDF_DRIVER_CONFIG_INIT(&Config, SwBtEvtDeviceAdd);
     return WdfDriverCreate(DriverObject, RegistryPath, WDF_NO_OBJECT_ATTRIBUTES, &Config, WDF_NO_HANDLE);
 }
