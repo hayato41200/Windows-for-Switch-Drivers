@@ -37,6 +37,13 @@
  *     Install clears it.
  *   - Stage and the traffic counters are flushed to disk as they change, so
  *     the values of a boot that hung can be read after the next one.
+ *
+ * 1.0.0.6: the record of a boot that stuck at the logo: the driver ran for
+ * over 60 s (stage 5) but no BTHX request ever reached it. So the boot waited
+ * on the Bluetooth stack above the child, not on this driver. The child is
+ * now added 20 s after the device starts (so Windows can finish booting
+ * whatever the stack does), its queue is not power managed, and the child
+ * side is recorded too: D0 entries, requests seen, failed forwards.
  */
 #include <ntddk.h>
 #include <ntstrsafe.h>
@@ -188,6 +195,14 @@ typedef struct _SWBT_DEVICE {
     ULONG EventLog[8];              /* last events: code << 16 | opcode (complete / status) */
     ULONG CmdLogNext;
     ULONG EventLogNext;
+
+    /* 1.0.0.6: the child, added late, and what reaches it. */
+    BOOLEAN ChildAdded;
+    volatile LONG ChildD0;
+    volatile LONG ChildRequests;
+    volatile LONG ChildForwardFailures;
+    ULONG LastChildIoctl;
+    ULONG LastForwardStatus;
 } SWBT_DEVICE, *PSWBT_DEVICE;
 WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(SWBT_DEVICE, SwBtGetDevice)
 
@@ -203,6 +218,9 @@ EVT_WDF_INTERRUPT_DISABLE SwBtEvtInterruptDisable;
 EVT_WDF_IO_QUEUE_IO_DEVICE_CONTROL SwBtEvtIoDeviceControl;
 EVT_WDF_IO_QUEUE_IO_DEVICE_CONTROL SwBtEvtChildIoDeviceControl;
 EVT_WDF_TIMER SwBtEvtTimer;
+EVT_WDF_DEVICE_D0_ENTRY SwBtEvtChildD0Entry;
+static NTSTATUS SwBtCreateChild(WDFDEVICE Device);
+#define CHILD_DELAY_TICKS 10            /* timer ticks of 2 s: the child comes 20 s after start */
 
 static WCHAR SwBtParamsPath[256];
 
@@ -879,6 +897,11 @@ VOID SwBtEvtTimer(WDFTIMER Timer)
     SwBtTrace(L"WriteRequests", (ULONG)Dev->WriteRequests);
     SwBtTrace(L"OtherIoctls", (ULONG)Dev->OtherIoctls);
     SwBtTrace(L"LastOtherIoctl", Dev->LastOtherIoctl);
+    SwBtTrace(L"ChildD0", (ULONG)Dev->ChildD0);
+    SwBtTrace(L"ChildRequests", (ULONG)Dev->ChildRequests);
+    SwBtTrace(L"ChildForwardFailures", (ULONG)Dev->ChildForwardFailures);
+    SwBtTrace(L"LastChildIoctl", Dev->LastChildIoctl);
+    SwBtTrace(L"LastForwardStatus", Dev->LastForwardStatus);
     SwBtTrace(L"TxBusy", Dev->TxBusy | (Dev->TxRequest != NULL ? 2u : 0u));
 
     Text[0] = L'\0';
@@ -903,15 +926,33 @@ VOID SwBtEvtTimer(WDFTIMER Timer)
     if (Dev->Ticks == 30) {
         SwBtTrace(L"BootPending", 0);           /* 60 s of running: this boot is fine */
     }
+    if (Dev->Ticks == CHILD_DELAY_TICKS && !Dev->ChildAdded && Dev->ChipOk) {
+        WDFDEVICE Device = (WDFDEVICE)WdfTimerGetParentObject(Timer);
+        NTSTATUS Status;
+        WdfFdoLockStaticChildListForIteration(Device);
+        Status = SwBtCreateChild(Device);
+        WdfFdoUnlockStaticChildListFromIteration(Device);   /* PnP re-enumerates: the child appears */
+        Dev->ChildAdded = NT_SUCCESS(Status);
+        SwBtTrace(L"ChildStatus", (ULONG)Status);
+        SwBtTrace(L"Stage", 6);
+    }
     SwBtFlush();
     WdfTimerStart(Timer, WDF_REL_TIMEOUT_IN_SEC(Dev->Ticks < 30 ? 2 : 10));
 }
 
 /* The child (BthMini) hands every BTHX request to this device. */
+NTSTATUS SwBtEvtChildD0Entry(WDFDEVICE Device, WDF_POWER_DEVICE_STATE PreviousState)
+{
+    UNREFERENCED_PARAMETER(PreviousState);
+    InterlockedIncrement(&SwBtGetDevice(WdfPdoGetParent(Device))->ChildD0);
+    return STATUS_SUCCESS;
+}
+
 VOID SwBtEvtChildIoDeviceControl(WDFQUEUE Queue, WDFREQUEST Request, size_t OutLength, size_t InLength, ULONG Code)
 {
     WDF_REQUEST_FORWARD_OPTIONS Options;
     WDFDEVICE Parent = WdfPdoGetParent(WdfIoQueueGetDevice(Queue));
+    PSWBT_DEVICE Dev = SwBtGetDevice(Parent);
     NTSTATUS Status = STATUS_INVALID_PARAMETER;
     UNREFERENCED_PARAMETER(OutLength);
     UNREFERENCED_PARAMETER(InLength);
@@ -928,6 +969,12 @@ VOID SwBtEvtChildIoDeviceControl(WDFQUEUE Queue, WDFREQUEST Request, size_t OutL
         break;
     default:
         break;
+    }
+    InterlockedIncrement(&Dev->ChildRequests);
+    Dev->LastChildIoctl = Code;
+    if (!NT_SUCCESS(Status)) {
+        InterlockedIncrement(&Dev->ChildForwardFailures);
+        Dev->LastForwardStatus = (ULONG)Status;
     }
     if (!NT_SUCCESS(Status)) {
         WdfRequestComplete(Request, Status);
@@ -1032,6 +1079,12 @@ static NTSTATUS SwBtCreateChild(WDFDEVICE Device)
     }
     WdfPdoInitSetDefaultLocale(Init, 0x409);
     WdfPdoInitAllowForwardingRequestToParent(Init);
+    {
+        WDF_PNPPOWER_EVENT_CALLBACKS Pnp;
+        WDF_PNPPOWER_EVENT_CALLBACKS_INIT(&Pnp);
+        Pnp.EvtDeviceD0Entry = SwBtEvtChildD0Entry;
+        WdfDeviceInitSetPnpPowerEventCallbacks(Init, &Pnp);
+    }
 
     Status = WdfDeviceCreate(&Init, WDF_NO_OBJECT_ATTRIBUTES, &Child);
     if (!NT_SUCCESS(Status)) {
@@ -1049,6 +1102,7 @@ static NTSTATUS SwBtCreateChild(WDFDEVICE Device)
     WDF_IO_QUEUE_CONFIG_INIT_DEFAULT_QUEUE(&QueueConfig, WdfIoQueueDispatchParallel);
     QueueConfig.EvtIoInternalDeviceControl = SwBtEvtChildIoDeviceControl;
     QueueConfig.EvtIoDeviceControl = SwBtEvtChildIoDeviceControl;
+    QueueConfig.PowerManaged = WdfFalse;
     Status = WdfIoQueueCreate(Child, &QueueConfig, WDF_NO_OBJECT_ATTRIBUTES, WDF_NO_HANDLE);
     if (!NT_SUCCESS(Status)) {
         return Status;
@@ -1146,10 +1200,8 @@ NTSTATUS SwBtEvtDeviceAdd(WDFDRIVER Driver, PWDFDEVICE_INIT DeviceInit)
         }
         WdfTimerStart(Dev->Timer, WDF_REL_TIMEOUT_IN_SEC(2));
     }
-    Status = SwBtCreateChild(Device);
-    SwBtTrace(L"ChildStatus", (ULONG)Status);
-    SwBtStage(2);
-    return Status;
+    SwBtStage(2);                           /* the child comes from the timer */
+    return STATUS_SUCCESS;
 }
 
 NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
@@ -1161,7 +1213,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
         RtlCopyMemory(&SwBtParamsPath[RegistryPath->Length / sizeof(WCHAR)], L"\\Parameters", sizeof(L"\\Parameters"));
         (VOID)RtlCreateRegistryKey(RTL_REGISTRY_ABSOLUTE, SwBtParamsPath);
     }
-    SwBtTrace(L"DriverVersion", 5);
+    SwBtTrace(L"DriverVersion", 6);
     WDF_DRIVER_CONFIG_INIT(&Config, SwBtEvtDeviceAdd);
     return WdfDriverCreate(DriverObject, RegistryPath, WDF_NO_OBJECT_ATTRIBUTES, &Config, WDF_NO_HANDLE);
 }

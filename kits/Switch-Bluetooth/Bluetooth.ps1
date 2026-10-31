@@ -37,7 +37,7 @@ function Show-Status {
     $vals = $p.PSObject.Properties | Where-Object { $_.Name -notmatch '^PS' } | ForEach-Object {
       if ($_.Value -is [string]) { '{0}={1}' -f $_.Name, $_.Value } else { '{0}=0x{1:X}' -f $_.Name, $_.Value } }
     Log ('driver trace: ' + ($vals -join ' '))
-    # 1.0.0.5: how far the last boot with the driver got (1 added, 2 child, 3 hardware, 4 probe, 5 running).
+    # 1.0.0.5: how far the last boot with the driver got (1 added, 2 queues, 3 hardware, 4 probe, 5 running, 6 child added).
     if ($null -ne $p.Stage) {
       Log ("boot record: stage {0}  boot pending {1}  safe mode {2}" -f $p.Stage, $p.BootPending, $p.SafeMode)
       if ($p.SafeMode -eq 1) { Log 'SAFE MODE: the boot before did not finish, so the driver stays idle. -Mode Retry lets it run again.' }
@@ -70,6 +70,10 @@ function Show-Status {
       $p.IsrCalls, $p.IirSeen, $p.TxBytes, $p.CmdsOut, $p.AclOut, $p.RxBytes, $p.EventsIn, $p.AclIn)
     Log ("requests: write {0}  read event {1}  read ACL {2}  other {3} (last 0x{4:X})  tx busy {5}  dropped {6}  overflow {7}" -f `
       $p.WriteRequests, $p.ReadEventRequests, $p.ReadAclRequests, $p.OtherIoctls, $p.LastOtherIoctl, $p.TxBusy, $p.Dropped, $p.RxOverflows)
+    if ($null -ne $p.ChildD0) {
+      Log ("child (1.0.0.6+, added 20 s after start): D0 {0}  requests {1}  forward failures {2} (last status 0x{3:X8})  last IOCTL 0x{4:X}" -f `
+        $p.ChildD0, $p.ChildRequests, $p.ChildForwardFailures, $p.LastForwardStatus, $p.LastChildIoctl)
+    }
     Log ("last commands: {0}" -f $p.LastCommands)
     Log ("last events (code:opcode): {0}" -f $p.LastEvents)
   }
