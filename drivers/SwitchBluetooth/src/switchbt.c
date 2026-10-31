@@ -64,6 +64,17 @@
  *     host follows (divisor 1) with hardware flow control; Read_Local_Version
  *     must answer, else without flow control, else the chip is given up for
  *     this boot (HighSpeedResult). Parameters\HighSpeed = 0 keeps 115200.
+ *
+ * 1.0.0.9: bit 24 of CLK_SOURCE_UARTD is not a finer divider: it makes the
+ * CAR clock itself the 16x baud clock and the UART's DLL/DLM no longer
+ * count (coreboot: "We override the 16.0 UART divider with the 15.1
+ * CLK_SOURCE divider"). So UEFI R391 (48 MHz with bit 24) ran the UART at
+ * 3 Mbaud and its 115200 test got no answer, and 1.0.0.8's first try with
+ * the "48 MHz divisor" sent bytes at the wrong speed and confused the chip.
+ * The driver now sets the clock itself, as Linux does: PLLP 408 MHz without
+ * the override and divisor 221 for 115200 at start (whatever UEFI left), and
+ * the override with N = 15 (48 MHz = 16 x 3 Mbaud) for 3 Mbaud. UEFI R390
+ * is enough; R391 is not needed.
  */
 #include <ntddk.h>
 #include <ntstrsafe.h>
@@ -91,8 +102,10 @@ NTSYSAPI ULONG NTAPI RtlRandomEx(PULONG Seed);     /* ntoskrnl export, declared 
 #define UART_IER_RX       0x15u         /* received data, line status, RX timeout */
 #define UART_IER_TX       0x02u         /* transmitter empty */
 #define UART_DIV_115200   221u          /* 408 MHz / 16 / 221 = 115384 baud (UEFI R390) */
-#define UART_DIV_48M_115200 26u         /* 48 MHz / 16 / 26 = 115384 baud (UEFI R391+) */
-#define UART_DIV_48M_3M   1u            /* 48 MHz / 16 = 3 Mbaud */
+#define UART_DIV_3M       1u            /* not counted while the CAR override is on */
+#define CAR_UARTD_SOURCE  0x600061C0u   /* CLK_SOURCE_UARTD */
+#define CAR_UART_PLLP     0x00000000u   /* PLLP 408 MHz, the UART divisor counts */
+#define CAR_UART_3M       ((1u << 24) | 15u)   /* override: 2 x 408 / (15 + 2) = 48 MHz = 16 x 3 Mbaud */
 #define UART_MCR_RTS      0x02u
 #define UART_MCR_FLOW     0x62u         /* RTS on, CTS_EN and RTS_EN: hardware flow control */
 #define BCM_DOWNLOAD_MINI 0xFC2E
@@ -169,6 +182,7 @@ static VOID SwBtDoneFlush(PSWBT_DONE Done)
 
 typedef struct _SWBT_DEVICE {
     volatile ULONG *Uart;
+    volatile ULONG *CarUartd;       /* CLK_SOURCE_UARTD, so the driver sets the UART clock */
     WDFINTERRUPT Interrupt;
     BOOLEAN ChipOk;
     BOOLEAN SafeMode;               /* the last boot did not finish: stay idle */
@@ -558,7 +572,9 @@ static BOOLEAN SwBtHighSpeed(PSWBT_DEVICE Dev, UCHAR *Event, ULONG Max)
         SwBtTrace(L"HighSpeedResult", 1);                   /* refused: still 115200 */
         return TRUE;
     }
-    SwBtUartInit(Dev, UART_DIV_48M_3M, UART_MCR_FLOW);
+    WRITE_REGISTER_ULONG((PULONG)Dev->CarUartd, CAR_UART_3M);
+    KeStallExecutionProcessor(10);
+    SwBtUartInit(Dev, UART_DIV_3M, UART_MCR_FLOW);
     SwBtSleepMs(10);
     SwBtFlushRx(Dev);
     Length = SwBtPollCommand(Dev, HCI_READ_VERSION, NULL, 0, Event, Max);
@@ -566,7 +582,7 @@ static BOOLEAN SwBtHighSpeed(PSWBT_DEVICE Dev, UCHAR *Event, ULONG Max)
         SwBtTrace(L"HighSpeedResult", 2);                   /* 3 Mbaud, flow control */
         return TRUE;
     }
-    SwBtUartInit(Dev, UART_DIV_48M_3M, UART_MCR_RTS);
+    SwBtUartInit(Dev, UART_DIV_3M, UART_MCR_RTS);
     SwBtSleepMs(10);
     SwBtFlushRx(Dev);
     Length = SwBtPollCommand(Dev, HCI_READ_VERSION, NULL, 0, Event, Max);
@@ -582,26 +598,25 @@ static BOOLEAN SwBtProbe(PSWBT_DEVICE Dev)
 {
     UCHAR Event[260];
     WCHAR Text[256];
-    ULONG Length, Index, Clock48, FwLength = 0, HighSpeed = 1;
+    ULONG Length, Index, CanSwitchClock, FwLength = 0, HighSpeed = 1;
     PUCHAR Fw;
 
-    /* 115200 with the R391 clock (48 MHz), else with the R390 one (408 MHz). */
-    Clock48 = 1;
-    SwBtUartInit(Dev, UART_DIV_48M_115200, UART_MCR_RTS);
+    /* 115200 from PLLP 408 MHz, whatever clock UEFI left (R391 left the 3 Mbaud override). */
+    CanSwitchClock = Dev->CarUartd != NULL;
+    if (Dev->CarUartd != NULL) {
+        SwBtTrace(L"CarUartdAtStart", READ_REGISTER_ULONG((PULONG)Dev->CarUartd));
+        WRITE_REGISTER_ULONG((PULONG)Dev->CarUartd, CAR_UART_PLLP);
+        KeStallExecutionProcessor(10);
+    }
+    SwBtUartInit(Dev, UART_DIV_115200, UART_MCR_RTS);
     KeStallExecutionProcessor(100);
-    if (!SwBtReset(Dev, Event, sizeof(Event))) {
-        Clock48 = 0;
-        SwBtUartInit(Dev, UART_DIV_115200, UART_MCR_RTS);
-        KeStallExecutionProcessor(100);
-        SwBtSleepMs(50);
-        if (!SwBtReset(Dev, Event, sizeof(Event)) && !SwBtReset(Dev, Event, sizeof(Event))) {   /* the first may meet bytes sent at the wrong speed */
-            SwBtTrace(L"HciReset", 0);
-            SwBtTraceString(L"Result", L"no answer to HCI_Reset");
-            return FALSE;
-        }
+    if (!SwBtReset(Dev, Event, sizeof(Event)) && !SwBtReset(Dev, Event, sizeof(Event))) {
+        SwBtTrace(L"HciReset", 0);
+        SwBtTraceString(L"Result", L"no answer to HCI_Reset");
+        return FALSE;
     }
     SwBtTrace(L"HciReset", 0x100);
-    SwBtTrace(L"UartClockMHz", Clock48 ? 48 : 408);
+    SwBtTrace(L"UartClockMHz", 408);
     SwBtTraceVersion(Dev, Event, sizeof(Event));
 
     /* Firmware patch, if the user put the file in place. */
@@ -646,7 +661,7 @@ static BOOLEAN SwBtProbe(PSWBT_DEVICE Dev)
     }
 
     (VOID)SwBtReadParam(L"HighSpeed", &HighSpeed);
-    if (Clock48 && HighSpeed != 0) {
+    if (CanSwitchClock && HighSpeed != 0) {
         if (!SwBtHighSpeed(Dev, Event, sizeof(Event))) {
             SwBtTraceString(L"Result", L"lost the chip at 3 Mbaud");
             return FALSE;
@@ -1216,6 +1231,12 @@ NTSTATUS SwBtEvtPrepareHardware(WDFDEVICE Device, WDFCMRESLIST Raw, WDFCMRESLIST
         }
     }
     SwBtTrace(L"HaveUart", Dev->Uart != NULL);
+    if (Dev->Uart != NULL && Dev->CarUartd == NULL) {
+        PHYSICAL_ADDRESS Car;
+        Car.QuadPart = CAR_UARTD_SOURCE;
+        Dev->CarUartd = (volatile ULONG *)MmMapIoSpaceEx(Car, sizeof(ULONG), PAGE_READWRITE | PAGE_NOCACHE);
+    }
+    SwBtTrace(L"HaveCar", Dev->CarUartd != NULL);
     SwBtStage(3);
     return Dev->Uart == NULL ? STATUS_DEVICE_CONFIGURATION_ERROR : STATUS_SUCCESS;
 }
@@ -1231,6 +1252,10 @@ NTSTATUS SwBtEvtReleaseHardware(WDFDEVICE Device, WDFCMRESLIST Translated)
     if (Dev->Uart != NULL) {
         MmUnmapIoSpace((PVOID)Dev->Uart, UART_LENGTH);
         Dev->Uart = NULL;
+    }
+    if (Dev->CarUartd != NULL) {
+        MmUnmapIoSpace((PVOID)Dev->CarUartd, sizeof(ULONG));
+        Dev->CarUartd = NULL;
     }
     return STATUS_SUCCESS;
 }
@@ -1423,7 +1448,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
         RtlCopyMemory(&SwBtParamsPath[RegistryPath->Length / sizeof(WCHAR)], L"\\Parameters", sizeof(L"\\Parameters"));
         (VOID)RtlCreateRegistryKey(RTL_REGISTRY_ABSOLUTE, SwBtParamsPath);
     }
-    SwBtTrace(L"DriverVersion", 8);
+    SwBtTrace(L"DriverVersion", 9);
     WDF_DRIVER_CONFIG_INIT(&Config, SwBtEvtDeviceAdd);
     return WdfDriverCreate(DriverObject, RegistryPath, WDF_NO_OBJECT_ATTRIBUTES, &Config, WDF_NO_HANDLE);
 }

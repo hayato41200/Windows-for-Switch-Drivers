@@ -79,7 +79,7 @@ function Show-Status {
         $p.ChildD0, $p.ChildRequests, $p.ChildForwardFailures, $p.LastForwardStatus, $p.LastChildIoctl)
     }
     if ($null -ne $p.UartClockMHz) {
-      $hs = @{ 0 = '115200 (R390 clock or HighSpeed=0)'; 1 = 'refused by the chip, 115200'; 2 = '3 Mbaud, flow control'; 3 = '3 Mbaud, no flow control'; 4 = 'LOST at 3 Mbaud' }
+      $hs = @{ 0 = '115200 (HighSpeed=0, or no CAR access)'; 1 = 'refused by the chip, 115200'; 2 = '3 Mbaud, flow control'; 3 = '3 Mbaud, no flow control'; 4 = 'LOST at 3 Mbaud' }
       $fw = if ($p.FirmwareResult -eq 1) { "patched ($($p.FirmwareRecords) records, $($p.FirmwareBytes) bytes)" } elseif ($p.FirmwareResult -eq 0) { 'none (ROM code)' } else { 'FAILED 0x{0:X8}' -f $p.FirmwareResult }
       Log ("stage 3 (1.0.0.8+): UART clock {0} MHz  speed {1}  firmware {2}" -f $p.UartClockMHz, $hs[[int]$p.HighSpeedResult], $fw)
     }

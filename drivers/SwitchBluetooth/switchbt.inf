@@ -8,7 +8,7 @@ Class       = System
 ClassGuid   = {4d36e97d-e325-11ce-bfc1-08002be10318}
 Provider    = %Mfg%
 CatalogFile = switchbt.cat
-DriverVer   = 10/31/2026,1.0.0.8
+DriverVer   = 10/31/2026,1.0.0.9
 PnpLockdown = 1
 
 [DestinationDirs]
