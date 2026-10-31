@@ -7,10 +7,12 @@
   -Mode Status  : report BTH0 (ACPI\SWOA0B01), the driver trace (chip answers) and whether
                   Windows has the BthMini UART transport (MS_BTHX_BTHMINI in bth.inf)
   -Mode Remove  : remove the driver package
+  -Mode Retry   : after a boot that hung, the driver stays idle (SafeMode=1); this lets it run again
+                  at the next boot (Install does the same)
 
   Log: C:\SwitchWOA-Bluetooth.txt
 #>
-param([Parameter(Mandatory = $true)][ValidateSet('Install', 'Status', 'Remove')][string]$Mode)
+param([Parameter(Mandatory = $true)][ValidateSet('Install', 'Status', 'Remove', 'Retry')][string]$Mode)
 
 $ErrorActionPreference = 'Continue'
 # Windows PowerShell on Windows 10 ARM64 is x86: reach System32 via Sysnative.
@@ -35,6 +37,11 @@ function Show-Status {
     $vals = $p.PSObject.Properties | Where-Object { $_.Name -notmatch '^PS' } | ForEach-Object {
       if ($_.Value -is [string]) { '{0}={1}' -f $_.Name, $_.Value } else { '{0}=0x{1:X}' -f $_.Name, $_.Value } }
     Log ('driver trace: ' + ($vals -join ' '))
+    # 1.0.0.5: how far the last boot with the driver got (1 added, 2 child, 3 hardware, 4 probe, 5 running).
+    if ($null -ne $p.Stage) {
+      Log ("boot record: stage {0}  boot pending {1}  safe mode {2}" -f $p.Stage, $p.BootPending, $p.SafeMode)
+      if ($p.SafeMode -eq 1) { Log 'SAFE MODE: the boot before did not finish, so the driver stays idle. -Mode Retry lets it run again.' }
+    }
     if ($p.Result -eq 'ok') {
       Log ("chip: '{0}'  address {1}  maker 0x{2:X4} (000F = Broadcom)  LMP subversion 0x{3:X4}" -f $p.LocalName, $p.BdAddr, $p.Manufacturer, $p.LmpSubversion)
       Log 'RESULT: the Bluetooth chip answers.'
@@ -75,10 +82,21 @@ function Show-Status {
   }
 }
 
+function Clear-BootPending {
+  if (Test-Path $Key) { Set-ItemProperty -Path $Key -Name BootPending -Value 0 -Type DWord }
+}
+
 switch ($Mode) {
+  'Retry' {
+    Log ''
+    Log "=== Bluetooth Retry  $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
+    Clear-BootPending
+    Log 'BootPending cleared: the driver runs again at the next boot (or when the device restarts).'
+  }
   'Install' {
     Log ''
     Log "=== Bluetooth Install  $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
+    Clear-BootPending
     $inf = Join-Path $Here 'switchbt.inf'
     (& $Pnputil /add-driver $inf /install 2>&1) | ForEach-Object { Log "  $_" }
     Log "  exit=$LASTEXITCODE"

@@ -28,6 +28,15 @@
  * BthMini sends the next READ_HCI from its completion routine, which came
  * back into SwBtEvtIoDeviceControl on the same CPU and spun on Lock forever:
  * Windows hung at the boot logo.
+ *
+ * 1.0.0.5: Windows still hung at boot with R390. Safety and a record:
+ *   - BootPending is set (and flushed to disk) when the device is added and
+ *     cleared after 60 s of running. If it is still set at the next boot,
+ *     that boot did not get there: the driver stays idle (SafeMode=1, no
+ *     interrupt, no probe, no child) until Bluetooth.ps1 -Mode Retry or
+ *     Install clears it.
+ *   - Stage and the traffic counters are flushed to disk as they change, so
+ *     the values of a boot that hung can be read after the next one.
  */
 #include <ntddk.h>
 #include <ntstrsafe.h>
@@ -126,6 +135,7 @@ typedef struct _SWBT_DEVICE {
     volatile ULONG *Uart;
     WDFINTERRUPT Interrupt;
     BOOLEAN ChipOk;
+    BOOLEAN SafeMode;               /* the last boot did not finish: stay idle */
     UCHAR BdAddr[6];                /* little endian, as HCI */
 
     /* Shared with the ISR (interrupt lock). */
@@ -196,6 +206,23 @@ EVT_WDF_TIMER SwBtEvtTimer;
 
 static WCHAR SwBtParamsPath[256];
 
+/* Writes the Parameters key to disk now, so it survives a hang. PASSIVE only. */
+static VOID SwBtFlush(VOID)
+{
+    UNICODE_STRING Path;
+    OBJECT_ATTRIBUTES Attributes;
+    HANDLE Key;
+    if (SwBtParamsPath[0] == L'\0' || KeGetCurrentIrql() != PASSIVE_LEVEL) {
+        return;
+    }
+    RtlInitUnicodeString(&Path, SwBtParamsPath);
+    InitializeObjectAttributes(&Attributes, &Path, OBJ_KERNEL_HANDLE | OBJ_CASE_INSENSITIVE, NULL, NULL);
+    if (NT_SUCCESS(ZwOpenKey(&Key, KEY_WRITE, &Attributes))) {
+        (VOID)ZwFlushKey(Key);
+        ZwClose(Key);
+    }
+}
+
 static VOID SwBtTrace(PCWSTR Name, ULONG Value)
 {
     if (SwBtParamsPath[0] != L'\0' && KeGetCurrentIrql() == PASSIVE_LEVEL) {
@@ -209,6 +236,13 @@ static VOID SwBtTraceString(PCWSTR Name, PCWSTR Value)
         (VOID)RtlWriteRegistryValue(RTL_REGISTRY_ABSOLUTE, SwBtParamsPath, Name, REG_SZ, (PVOID)Value,
                                     (ULONG)((wcslen(Value) + 1) * sizeof(WCHAR)));
     }
+}
+
+/* How far this boot got, on disk at once. */
+static VOID SwBtStage(ULONG Stage)
+{
+    SwBtTrace(L"Stage", Stage);
+    SwBtFlush();
 }
 
 static BOOLEAN SwBtReadParam(PCWSTR Name, PULONG Value)
@@ -793,7 +827,7 @@ VOID SwBtEvtIoDeviceControl(WDFQUEUE Queue, WDFREQUEST Request, size_t OutLength
         }
         Buffer = WdfMemoryGetBuffer(Memory, &Size);
         RtlCopyMemory(&Type, Buffer, min(Size, sizeof(Type)));
-        if (Type != HciPacketEvent && Type != HciPacketAclData) {
+        if ((Type != HciPacketEvent && Type != HciPacketAclData) || Dev->EventQueue == NULL) {
             break;
         }
         InterlockedIncrement(Type == HciPacketEvent ? &Dev->ReadEventRequests : &Dev->ReadAclRequests);
@@ -866,6 +900,10 @@ VOID SwBtEvtTimer(WDFTIMER Timer)
     SwBtTraceString(L"LastEvents", Text);
 
     ++Dev->Ticks;
+    if (Dev->Ticks == 30) {
+        SwBtTrace(L"BootPending", 0);           /* 60 s of running: this boot is fine */
+    }
+    SwBtFlush();
     WdfTimerStart(Timer, WDF_REL_TIMEOUT_IN_SEC(Dev->Ticks < 30 ? 2 : 10));
 }
 
@@ -904,6 +942,10 @@ NTSTATUS SwBtEvtPrepareHardware(WDFDEVICE Device, WDFCMRESLIST Raw, WDFCMRESLIST
     ULONG Count = WdfCmResourceListGetCount(Translated), Index;
     UNREFERENCED_PARAMETER(Raw);
 
+    if (Dev->SafeMode) {
+        return STATUS_SUCCESS;
+    }
+
     for (Index = 0; Index < Count; ++Index) {
         PCM_PARTIAL_RESOURCE_DESCRIPTOR Desc = WdfCmResourceListGetDescriptor(Translated, Index);
         if (Desc != NULL && Desc->Type == CmResourceTypeMemory && Dev->Uart == NULL) {
@@ -917,6 +959,7 @@ NTSTATUS SwBtEvtPrepareHardware(WDFDEVICE Device, WDFCMRESLIST Raw, WDFCMRESLIST
         }
     }
     SwBtTrace(L"HaveUart", Dev->Uart != NULL);
+    SwBtStage(3);
     return Dev->Uart == NULL ? STATUS_DEVICE_CONFIGURATION_ERROR : STATUS_SUCCESS;
 }
 
@@ -941,12 +984,17 @@ NTSTATUS SwBtEvtD0Entry(WDFDEVICE Device, WDF_POWER_DEVICE_STATE PreviousState)
     PSWBT_DEVICE Dev = SwBtGetDevice(Device);
     UNREFERENCED_PARAMETER(PreviousState);
 
+    if (Dev->SafeMode) {
+        return STATUS_SUCCESS;
+    }
+    SwBtStage(4);
     Dev->ChipOk = SwBtProbe(Dev);
     Dev->RxGot = 0;
     WdfSpinLockAcquire(Dev->Lock);
     SwBtFreeKept(Dev);
     WdfSpinLockRelease(Dev->Lock);
     SwBtTrace(L"ChipOk", Dev->ChipOk);
+    SwBtStage(5);
     return STATUS_SUCCESS;
 }
 
@@ -1051,6 +1099,21 @@ NTSTATUS SwBtEvtDeviceAdd(WDFDRIVER Driver, PWDFDEVICE_INIT DeviceInit)
     if (!NT_SUCCESS(Status)) {
         return Status;
     }
+    {
+        ULONG Pending = 0;
+        Dev->SafeMode = SwBtReadParam(L"BootPending", &Pending) && Pending != 0;
+    }
+    SwBtTrace(L"SafeMode", Dev->SafeMode);
+    if (Dev->SafeMode) {
+        SwBtFlush();
+        WDF_IO_QUEUE_CONFIG_INIT_DEFAULT_QUEUE(&QueueConfig, WdfIoQueueDispatchParallel);
+        QueueConfig.EvtIoInternalDeviceControl = SwBtEvtIoDeviceControl;
+        QueueConfig.EvtIoDeviceControl = SwBtEvtIoDeviceControl;
+        QueueConfig.PowerManaged = WdfFalse;
+        return WdfIoQueueCreate(Device, &QueueConfig, WDF_NO_OBJECT_ATTRIBUTES, WDF_NO_HANDLE);
+    }
+    SwBtTrace(L"BootPending", 1);
+    SwBtStage(1);
     WDF_INTERRUPT_CONFIG_INIT(&InterruptConfig, SwBtEvtIsr, SwBtEvtDpc);
     InterruptConfig.EvtInterruptEnable = SwBtEvtInterruptEnable;
     InterruptConfig.EvtInterruptDisable = SwBtEvtInterruptDisable;
@@ -1085,6 +1148,7 @@ NTSTATUS SwBtEvtDeviceAdd(WDFDRIVER Driver, PWDFDEVICE_INIT DeviceInit)
     }
     Status = SwBtCreateChild(Device);
     SwBtTrace(L"ChildStatus", (ULONG)Status);
+    SwBtStage(2);
     return Status;
 }
 
@@ -1097,7 +1161,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
         RtlCopyMemory(&SwBtParamsPath[RegistryPath->Length / sizeof(WCHAR)], L"\\Parameters", sizeof(L"\\Parameters"));
         (VOID)RtlCreateRegistryKey(RTL_REGISTRY_ABSOLUTE, SwBtParamsPath);
     }
-    SwBtTrace(L"DriverVersion", 4);
+    SwBtTrace(L"DriverVersion", 5);
     WDF_DRIVER_CONFIG_INIT(&Config, SwBtEvtDeviceAdd);
     return WdfDriverCreate(DriverObject, RegistryPath, WDF_NO_OBJECT_ATTRIBUTES, &Config, WDF_NO_HANDLE);
 }
