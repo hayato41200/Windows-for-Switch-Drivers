@@ -130,7 +130,7 @@ switch ($Mode) {
     Log ''
     Log "=== Bluetooth Retry  $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
     Clear-BootPending
-    Log 'BootPending cleared: the driver runs again at the next boot (or when the device restarts).'
+    Log 'BootPending cleared: switchbt 1.0.0.13+ starts within a few seconds (older versions at the next restart).'
   }
   'Install' {
     Log ''
