@@ -30,6 +30,13 @@ namespace SwitchCenter
         readonly Label loadValue = new Label(), memoryValue = new Label();
         readonly Label details = new Label { AutoSize = false, Dock = DockStyle.Fill };
         readonly HistoryChart chart = new HistoryChart { Dock = DockStyle.Fill };
+        // 0.6.3: the overview stacks tiles, details and chart when the window is tall,
+        // and puts the chart beside them when it is wide (landscape), so it stays visible.
+        TabPage overviewPage;
+        TableLayoutPanel overviewGrid;
+        GroupBox overviewDetails, overviewChart;
+        readonly Panel overviewLeft = new Panel { Dock = DockStyle.Left };
+        bool? overviewWide;
 
         // Performance
         readonly FlowLayoutPanel profilePanel = new FlowLayoutPanel { Dock = DockStyle.Fill, FlowDirection = FlowDirection.TopDown, WrapContents = false, AutoScroll = true };
@@ -63,8 +70,11 @@ namespace SwitchCenter
             Font = bodyFont;
             AutoScaleMode = AutoScaleMode.Dpi;
             StartPosition = FormStartPosition.CenterScreen;
-            ClientSize = new Size(560, 820);
-            MinimumSize = new Size(420, 520);
+            Rectangle area = Screen.PrimaryScreen?.WorkingArea ?? new Rectangle(0, 0, 720, 1280);
+            ClientSize = area.Width > area.Height
+                ? new Size(Math.Min(1000, area.Width - 40), Math.Min(820, area.Height - 60))   // landscape: wide window
+                : new Size(560, Math.Min(820, area.Height - 60));
+            MinimumSize = new Size(420, 420);
 
             var tabs = new TabControl { Dock = DockStyle.Fill, ItemSize = new Size(88, 40), SizeMode = TabSizeMode.Fixed };
             tabs.TabPages.Add(BuildOverview());
@@ -81,6 +91,8 @@ namespace SwitchCenter
                 else if (tabs.SelectedTab == logs) LoadReport();
             };
             Controls.Add(tabs);
+            Resize += (_, _) => LayoutOverview();
+            LayoutOverview();
 
             timer.Tick += (_, _) => RefreshAll();
             brightnessApply.Tick += (_, _) => { brightnessApply.Stop(); ApplyBrightness(); };
@@ -108,6 +120,8 @@ namespace SwitchCenter
         {
             var page = new TabPage(T("概要", "Overview")) { Padding = new Padding(10) };
             var grid = new TableLayoutPanel { Dock = DockStyle.Top, Height = 330, ColumnCount = 2, RowCount = 3 };
+            overviewPage = page;
+            overviewGrid = grid;
             grid.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50));
             grid.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50));
             for (int i = 0; i < 3; i++) grid.RowStyles.Add(new RowStyle(SizeType.Percent, 33.3f));
@@ -126,11 +140,39 @@ namespace SwitchCenter
                 Dock = DockStyle.Fill, Padding = new Padding(6),
             };
             chartBox.Controls.Add(chart);
-
-            page.Controls.Add(chartBox);
-            page.Controls.Add(detailBox);
-            page.Controls.Add(grid);
+            overviewDetails = detailBox;
+            overviewChart = chartBox;
             return page;
+        }
+
+        /// <summary>Tall window: tiles, details, chart from the top. Wide window: tiles and details
+        /// on the left, the chart on the right (otherwise the chart has no room in landscape).</summary>
+        void LayoutOverview()
+        {
+            if (overviewPage == null) return;
+            bool wide = ClientSize.Width >= 760 && ClientSize.Width > ClientSize.Height;
+            if (wide) overviewLeft.Width = Math.Max(380, ClientSize.Width * 45 / 100);
+            if (overviewWide == wide) return;
+            overviewWide = wide;
+            overviewPage.SuspendLayout();
+            overviewPage.Controls.Clear();
+            overviewLeft.Controls.Clear();
+            if (wide)
+            {
+                overviewDetails.Dock = DockStyle.Fill;
+                overviewLeft.Controls.Add(overviewDetails);
+                overviewLeft.Controls.Add(overviewGrid);         // Top, above the details
+                overviewPage.Controls.Add(overviewChart);        // Fill, the rest on the right
+                overviewPage.Controls.Add(overviewLeft);
+            }
+            else
+            {
+                overviewDetails.Dock = DockStyle.Top;
+                overviewPage.Controls.Add(overviewChart);
+                overviewPage.Controls.Add(overviewDetails);
+                overviewPage.Controls.Add(overviewGrid);
+            }
+            overviewPage.ResumeLayout();
         }
 
         Control Tile(string title, Label value)
@@ -154,10 +196,10 @@ namespace SwitchCenter
             {
                 Dock = DockStyle.Bottom, Height = 90,
                 Text = T("・SoC が 80℃ 以上になると、自動で標準に下げます（70℃ 未満で戻ります）。\n" +
-                         "・ログインしたとき、前回のプロファイルに戻します。ただし、試験的なものは戻しません。\n" +
+                         "・ログインしたとき、前回のプロファイルに戻します。\n" +
                          "・タスクマネージャーの「速度」は変わりません。ここの値が実際のクロックです。",
                          "- At 80℃ or more the SoC is held at the standard profile (released below 70℃).\n" +
-                         "- At login the last profile is restored, except experimental ones.\n" +
+                         "- At login the last profile is restored.\n" +
                          "- Task Manager keeps showing the boot speed; the clock shown here is the real one."),
             };
             page.Controls.Add(profilePanel);
@@ -192,7 +234,7 @@ namespace SwitchCenter
 
         TabPage BuildDisplay()
         {
-            var page = new TabPage(T("画面", "Display")) { Padding = new Padding(16) };
+            var page = new TabPage(T("画面", "Display")) { Padding = new Padding(16), AutoScroll = true };
             brightnessBar.ValueChanged += (_, _) =>
             {
                 brightnessLabel.Text = T("明るさ: ", "Brightness: ") + $"{brightnessBar.Value}%";

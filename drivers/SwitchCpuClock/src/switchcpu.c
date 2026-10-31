@@ -62,8 +62,8 @@ static const CPU_PROFILE SwCpuProfiles[] = {
     { 63, 1091, 0 },                            /* 1209.6 MHz, ODN 1051 mV */
     { 74, 1157, 0 },                            /* 1420.8 MHz, ODN 1117 mV */
     { 82, 1170, 0 },                            /* 1574.4 MHz, ODN 1130 mV */
-    { 87, 1208, SWCPU_PROFILE_EXPERIMENTAL },   /* 1670.4 MHz, ODN 1168 mV */
-    { 92, 1227, SWCPU_PROFILE_EXPERIMENTAL },   /* 1766.4 MHz, ODN 1228 mV: no margin */
+    { 87, 1208, 0 },                            /* 1670.4 MHz, ODN 1168 mV (v3: stable in use, no longer experimental) */
+    { 92, 1227, 0 },                            /* 1766.4 MHz, ODN 1228 mV: no margin (v3: stable in use) */
 };
 #define PROFILE_COUNT RTL_NUMBER_OF(SwCpuProfiles)
 
@@ -689,7 +689,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
         RtlCopyMemory(&SwCpuParamsPath[RegistryPath->Length / sizeof(WCHAR)], L"\\Parameters", sizeof(L"\\Parameters"));
         (VOID)RtlCreateRegistryKey(RTL_REGISTRY_ABSOLUTE, SwCpuParamsPath);
     }
-    SwCpuTrace(L"DriverVersion", 2);
+    SwCpuTrace(L"DriverVersion", 3);
     WDF_DRIVER_CONFIG_INIT(&Config, SwCpuEvtDeviceAdd);
     return WdfDriverCreate(DriverObject, RegistryPath, WDF_NO_OBJECT_ATTRIBUTES, &Config, WDF_NO_HANDLE);
 }
