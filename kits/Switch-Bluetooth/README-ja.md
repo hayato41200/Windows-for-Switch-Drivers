@@ -1,4 +1,6 @@
-# Bluetooth：Nintendo Switch の Bluetooth ドライバー（ベータ、試験中）
+# Bluetooth：Nintendo Switch の Bluetooth ドライバー
+
+**動作確認（1.0.0.13、2026-10-31）:** キーボード、オーディオ（A2DP）、再起動・シャットダウンのあとも使える。電波は機器にかなり近づけないと届かない（アンテナまわりは Wi-Fi 側が動いていないため。Wi-Fi のドライバーのときに見る）。
 
 チップを、Windows に最初から入っている Bluetooth の部品（BthMini）につなぎます。うまくいけば、設定に「Bluetooth」が出て、マウスやキーボードとペアリングできます。
 

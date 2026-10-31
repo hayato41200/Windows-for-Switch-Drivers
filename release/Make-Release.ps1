@@ -74,7 +74,7 @@ $Drivers = @(
   @{ Dir = 'SwitchCpuClock';    Name = 'switchcpu';     Src = 'switchcpu.c';     Libs = @();                             Inc = $Spb; Kit = 'Switch-CpuClock';    Hwid = 'ACPI\SWOA0701'; MinUefi = 'R375'; Ja = 'CPU のクロック'; En = 'CPU clock'; Boot = $false }
   @{ Dir = 'SwitchRtc';         Name = 'switchrtc';     Src = 'switchrtc.c';     Libs = @();                             Inc = $Spb; Kit = 'Switch-Rtc';         Hwid = 'ACPI\SWOA0801'; MinUefi = 'R377'; Ja = '時計（RTC）'; En = 'Clock (RTC)'; Boot = $false }
   @{ Dir = 'SwitchSensor';      Name = 'switchsensor';  Src = 'switchsensor.c';  Libs = @();                             Inc = $Spb; Kit = 'Switch-Sensor';      Hwid = 'ACPI\SWOA0901'; MinUefi = 'R379'; Ja = '明るさ・傾きセンサー'; En = 'Light, tilt sensors'; Boot = $false }
-  @{ Dir = 'SwitchBluetooth';   Name = 'switchbt';      Src = 'switchbt.c';      Libs = @();                             Inc = @();  Kit = 'Switch-Bluetooth';   Hwid = 'ACPI\SWOA0B01'; MinUefi = 'R390'; Ja = 'Bluetooth'; En = 'Bluetooth'; Boot = $false; Beta = $true }
+  @{ Dir = 'SwitchBluetooth';   Name = 'switchbt';      Src = 'switchbt.c';      Libs = @();                             Inc = @();  Kit = 'Switch-Bluetooth';   Hwid = 'ACPI\SWOA0B01'; MinUefi = 'R390'; Ja = 'Bluetooth'; En = 'Bluetooth'; Boot = $false }
   @{ Dir = 'SwoaDiag';          Name = 'swoadiag';      Src = 'swoadiag.c';      Libs = @();                             Inc = @();  Kit = 'Switch-UsbDiag';     Hwid = '';              MinUefi = '' }
   @{ Dir = 'SwoaHello';         Name = 'SwoaHello';     Src = 'hello.c';         Libs = @();                             Inc = @();  Kit = 'Switch-Stage0';      Hwid = '';              MinUefi = '' }
 )

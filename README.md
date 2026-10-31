@@ -5,7 +5,7 @@ Windows on ARM (ARM64) で動く、Nintendo Switch（Tegra210 / Erista）用の�
 UEFI と DSDT は [Windows-for-Switch](https://github.com/hayato41200/Windows-for-Switch) にあります。このリポジトリのドライバーは、そちらの UEFI（R367 以降）が DSDT に追加するデバイスを使います。
 
 English summary: KMDF drivers (GPIO, I2C, battery + USB-C role, fan + backlight, touch screen,
-power button, CPU clock, RTC, light and tilt sensors) and a tray / control-center app for Windows on ARM (ARM64) on the
+power button, CPU clock, RTC, light and tilt sensors, Bluetooth) and a tray / control-center app for Windows on ARM (ARM64) on the
 Nintendo Switch. Install from the release ZIPs; build with `release/Make-Release.ps1`.
 Tested on Windows 11 Arm64 22H2 (22621); bring your own Windows image and license.
 
@@ -21,7 +21,7 @@ Tested on Windows 11 Arm64 22H2 (22621); bring your own Windows image and licens
 | `switchpwrbtn` | ACPI\SWOA0601 | R374 | 電源ボタン（VHF の HID） |
 | `switchcpu` | ACPI\SWOA0701 | R375 | CPU のクロックのプロファイル（614〜1766 MHz）、温度による制限 |
 | `switchrtc` | ACPI\SWOA0801 | R377 | 時計（MAX77620 の RTC を読み、ずれを覚えて時刻を合わせる） |
-| `switchbt`（ベータ） | ACPI\SWOA0B01 | R390 | Bluetooth（UART-D の BCM4356A3 を、Windows 標準の BthMini につなぐ）。試験中 |
+| `switchbt` | ACPI\SWOA0B01 | R390 | Bluetooth（UART-D の BCM4356A3 を、Windows 標準の BthMini につなぐ）。3 Mbps。ファームウェアのパッチ `BCM4356A3.hcd` は各自で用意（配布しない）。今は電波がとても近くまでしか届かない（Wi-Fi 側が動いていないため） |
 | `switchsensor` | ACPI\SWOA0901 | R379 | 傾きセンサー（画面の自動回転）。明るさセンサーは、この本体では見つからず使えていない |
 | `swoadiag` | —（読み込んだときだけ） | — | USB（XUSB）のレジスタを読むだけの診断用 |
 
@@ -47,6 +47,7 @@ Windows のイメージとライセンスは、各自で用意してください
    7. CPU
    8. RTC
    9. センサー
+   10. Bluetooth（UEFI R390 以降。キットの README を見て、ファームウェアのパッチを入れる）
 4. **コントロールセンターを使う:** `SwitchCenter-<版>-arm64.zip` を展開して、`SwitchCenter.exe` を起動する。通知領域のアイコンから、次のことができる。
    - CPU のプロファイル
    - 画面の明るさ
