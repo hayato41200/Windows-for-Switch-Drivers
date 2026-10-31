@@ -44,6 +44,13 @@
  * now added 20 s after the device starts (so Windows can finish booting
  * whatever the stack does), its queue is not power managed, and the child
  * side is recorded too: D0 entries, requests seen, failed forwards.
+ *
+ * 1.0.0.7: Windows booted; BthMini sent GET_VERSION, SET_VERSION and
+ * QUERY_CAPABILITIES, then failed to start (problem 10). The capabilities
+ * said ScoSupportNone; Microsoft's serialhcibus sample notes HCI bypass is
+ * the only option, so they now match the sample (HCI bypass, one SCO channel,
+ * idle capable). The three requests are recorded: the version BthMini asked
+ * for and what each request was completed with.
  */
 #include <ntddk.h>
 #include <ntstrsafe.h>
@@ -203,6 +210,13 @@ typedef struct _SWBT_DEVICE {
     volatile LONG ChildForwardFailures;
     ULONG LastChildIoctl;
     ULONG LastForwardStatus;
+
+    /* 1.0.0.7: the setup requests from BthMini and their results. */
+    volatile LONG GetVersionRequests;
+    volatile LONG SetVersionRequests;
+    volatile LONG CapsRequests;
+    ULONG SetVersionValue;
+    ULONG LastSetupStatus;          /* IOCTL function << 24 | low bits of the status */
 } SWBT_DEVICE, *PSWBT_DEVICE;
 WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(SWBT_DEVICE, SwBtGetDevice)
 
@@ -794,7 +808,9 @@ VOID SwBtEvtIoDeviceControl(WDFQUEUE Queue, WDFREQUEST Request, size_t OutLength
 
     switch (Code) {
     case IOCTL_BTHX_GET_VERSION:
-        if (OutLength < sizeof(BTHX_VERSION) || !NT_SUCCESS(WdfRequestRetrieveOutputMemory(Request, &Memory))) {
+        InterlockedIncrement(&Dev->GetVersionRequests);
+        if (OutLength < sizeof(BTHX_VERSION) || !NT_SUCCESS(Status = WdfRequestRetrieveOutputMemory(Request, &Memory))) {
+            Dev->LastSetupStatus = 0x01000000u | (OutLength < sizeof(BTHX_VERSION) ? 0xFFFFFFu : ((ULONG)Status & 0xFFFFFFu));
             break;
         }
         Buffer = WdfMemoryGetBuffer(Memory, &Size);
@@ -803,14 +819,24 @@ VOID SwBtEvtIoDeviceControl(WDFQUEUE Queue, WDFREQUEST Request, size_t OutLength
         return;
 
     case IOCTL_BTHX_SET_VERSION:
+        InterlockedIncrement(&Dev->SetVersionRequests);
         if (InLength < sizeof(BTHX_VERSION)) {
+            Dev->LastSetupStatus = 0x02FFFFFFu;
             break;
+        }
+        if (NT_SUCCESS(WdfRequestRetrieveInputMemory(Request, &Memory))) {
+            Buffer = WdfMemoryGetBuffer(Memory, &Size);
+            if (Size >= sizeof(BTHX_VERSION)) {
+                Dev->SetVersionValue = ((PBTHX_VERSION)Buffer)->Version;
+            }
         }
         WdfRequestComplete(Request, STATUS_SUCCESS);
         return;
 
     case IOCTL_BTHX_QUERY_CAPABILITIES:
-        if (OutLength < sizeof(BTHX_CAPABILITIES) || !NT_SUCCESS(WdfRequestRetrieveOutputMemory(Request, &Memory))) {
+        InterlockedIncrement(&Dev->CapsRequests);
+        if (OutLength < sizeof(BTHX_CAPABILITIES) || !NT_SUCCESS(Status = WdfRequestRetrieveOutputMemory(Request, &Memory))) {
+            Dev->LastSetupStatus = 0x03000000u | (OutLength < sizeof(BTHX_CAPABILITIES) ? (ULONG)OutLength : ((ULONG)Status & 0xFFFFFFu));
             break;
         }
         Buffer = WdfMemoryGetBuffer(Memory, &Size);
@@ -898,6 +924,11 @@ VOID SwBtEvtTimer(WDFTIMER Timer)
     SwBtTrace(L"OtherIoctls", (ULONG)Dev->OtherIoctls);
     SwBtTrace(L"LastOtherIoctl", Dev->LastOtherIoctl);
     SwBtTrace(L"ChildD0", (ULONG)Dev->ChildD0);
+    SwBtTrace(L"GetVersionRequests", (ULONG)Dev->GetVersionRequests);
+    SwBtTrace(L"SetVersionRequests", (ULONG)Dev->SetVersionRequests);
+    SwBtTrace(L"SetVersionValue", Dev->SetVersionValue);
+    SwBtTrace(L"CapsRequests", (ULONG)Dev->CapsRequests);
+    SwBtTrace(L"LastSetupStatus", Dev->LastSetupStatus);
     SwBtTrace(L"ChildRequests", (ULONG)Dev->ChildRequests);
     SwBtTrace(L"ChildForwardFailures", (ULONG)Dev->ChildForwardFailures);
     SwBtTrace(L"LastChildIoctl", Dev->LastChildIoctl);
@@ -1144,9 +1175,9 @@ NTSTATUS SwBtEvtDeviceAdd(WDFDRIVER Driver, PWDFDEVICE_INIT DeviceInit)
     InitializeListHead(&Dev->KeptEvents);
     InitializeListHead(&Dev->KeptAcl);
     Dev->Caps.MaxAclTransferInSize = HCI_MAX_PACKET;
-    Dev->Caps.ScoSupport = ScoSupportNone;
-    Dev->Caps.MaxScoChannels = 0;
-    Dev->Caps.IsDeviceIdleCapable = FALSE;
+    Dev->Caps.ScoSupport = ScoSupportHCIBypass;     /* as the sample: the only option BthMini takes */
+    Dev->Caps.MaxScoChannels = 1;
+    Dev->Caps.IsDeviceIdleCapable = TRUE;
     Dev->Caps.IsDeviceWakeCapable = FALSE;
 
     Status = WdfSpinLockCreate(WDF_NO_OBJECT_ATTRIBUTES, &Dev->Lock);
@@ -1213,7 +1244,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
         RtlCopyMemory(&SwBtParamsPath[RegistryPath->Length / sizeof(WCHAR)], L"\\Parameters", sizeof(L"\\Parameters"));
         (VOID)RtlCreateRegistryKey(RTL_REGISTRY_ABSOLUTE, SwBtParamsPath);
     }
-    SwBtTrace(L"DriverVersion", 6);
+    SwBtTrace(L"DriverVersion", 7);
     WDF_DRIVER_CONFIG_INIT(&Config, SwBtEvtDeviceAdd);
     return WdfDriverCreate(DriverObject, RegistryPath, WDF_NO_OBJECT_ATTRIBUTES, &Config, WDF_NO_HANDLE);
 }

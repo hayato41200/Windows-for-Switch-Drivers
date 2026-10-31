@@ -74,6 +74,10 @@ function Show-Status {
       Log ("child (1.0.0.6+, added 20 s after start): D0 {0}  requests {1}  forward failures {2} (last status 0x{3:X8})  last IOCTL 0x{4:X}" -f `
         $p.ChildD0, $p.ChildRequests, $p.ChildForwardFailures, $p.LastForwardStatus, $p.LastChildIoctl)
     }
+    if ($null -ne $p.CapsRequests) {
+      Log ("setup (1.0.0.7+): get version {0}  set version {1} (value {2})  capabilities {3}  last failure 0x{4:X8}" -f `
+        $p.GetVersionRequests, $p.SetVersionRequests, $p.SetVersionValue, $p.CapsRequests, $p.LastSetupStatus)
+    }
     Log ("last commands: {0}" -f $p.LastCommands)
     Log ("last events (code:opcode): {0}" -f $p.LastEvents)
   }
