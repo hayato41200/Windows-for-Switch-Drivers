@@ -85,6 +85,12 @@
  * would lose Number_Of_Completed_Packets events and starve the ACL credits.
  * Line errors are counted now (LSR overrun, parity, framing, break) and so
  * are the H4 bytes the parser had to skip to find the next packet.
+ *
+ * 1.0.0.11: with 32-byte bursts the chip stopped answering after the
+ * 244-byte Write_Extended_Inquiry_Response (0C52) and BthMini gave up
+ * (problem 43): THRE does not mean the whole 32-byte FIFO is free, so bytes
+ * were lost. Back to 16 bytes per burst; the 8-byte RX trigger stays (no
+ * overruns, events of 7 bytes came through on the RX timeout).
  */
 #include <ntddk.h>
 #include <ntstrsafe.h>
@@ -125,7 +131,7 @@ NTSYSAPI ULONG NTAPI RtlRandomEx(PULONG Seed);     /* ntoskrnl export, declared 
 #define BCM_HIGH_BAUD     3000000u
 #define FIRMWARE_PATH     L"\\SystemRoot\\System32\\drivers\\SwitchWOA\\BCM4356A3.hcd"
 #define FIRMWARE_MAX      (256u * 1024u)
-#define UART_TX_BURST     32u           /* bytes per transmitter-empty interrupt: the whole FIFO */
+#define UART_TX_BURST     16u           /* bytes per transmitter-empty interrupt (32 lost bytes, 1.0.0.11) */
 
 /* HCI (H4). */
 #define HCI_COMMAND_PKT   0x01
@@ -1477,7 +1483,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
         RtlCopyMemory(&SwBtParamsPath[RegistryPath->Length / sizeof(WCHAR)], L"\\Parameters", sizeof(L"\\Parameters"));
         (VOID)RtlCreateRegistryKey(RTL_REGISTRY_ABSOLUTE, SwBtParamsPath);
     }
-    SwBtTrace(L"DriverVersion", 10);
+    SwBtTrace(L"DriverVersion", 11);
     WDF_DRIVER_CONFIG_INIT(&Config, SwBtEvtDeviceAdd);
     return WdfDriverCreate(DriverObject, RegistryPath, WDF_NO_OBJECT_ATTRIBUTES, &Config, WDF_NO_HANDLE);
 }
