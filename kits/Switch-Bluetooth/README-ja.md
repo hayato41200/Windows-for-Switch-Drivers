@@ -1,4 +1,4 @@
-# Bluetooth：Nintendo Switch の Bluetooth ドライバー（第2段：Windows の Bluetooth）
+# Bluetooth：Nintendo Switch の Bluetooth ドライバー（ベータ、試験中）
 
 チップを、Windows に最初から入っている Bluetooth の部品（BthMini）につなぎます。うまくいけば、設定に「Bluetooth」が出て、マウスやキーボードとペアリングできます。
 
@@ -23,6 +23,13 @@
 - **そのあと:** 子デバイス `SWOA\BTH_UART_H4`（互換 ID `MS_BTHX_BTHMINI`）を作る。Windows の `bth.inf` が、そこに BthMini と Bluetooth のスタックを入れる。
   - 送受信は割り込みで行う。速度は 115200 bps のまま（マウスやキーボードには十分。音声は第3段）。
   - ファームウェアのパッチは、まだ当てない（チップの ROM のまま）。
+
+## 起動が止まったとき（1.0.0.5 以降）
+
+- ドライバーは、起動のたびに `BootPending` をディスクに書き、60 秒動いたら消す。
+- 前の起動で消えていなければ（Windows が途中で止まった）、その起動ではドライバーは何もしない（`SafeMode=1`）。そのまま Windows は起動できる。
+- `Stage`（1 追加、2 子デバイス、3 ハードウェア、4 チップの確認、5 動作中）と、やり取りの数も、その場でディスクに書く。止まった起動で、どこまで進んだかが分かる。
+- もう一度動かすときは `-Mode Retry`（または `-Mode Install`）を実行して、再起動する。
 
 ## 手順
 

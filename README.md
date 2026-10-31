@@ -21,6 +21,7 @@ Tested on Windows 11 Arm64 22H2 (22621); bring your own Windows image and licens
 | `switchpwrbtn` | ACPI\SWOA0601 | R374 | 電源ボタン（VHF の HID） |
 | `switchcpu` | ACPI\SWOA0701 | R375 | CPU のクロックのプロファイル（614〜1766 MHz）、温度による制限 |
 | `switchrtc` | ACPI\SWOA0801 | R377 | 時計（MAX77620 の RTC を読み、ずれを覚えて時刻を合わせる） |
+| `switchbt`（ベータ） | ACPI\SWOA0B01 | R390 | Bluetooth（UART-D の BCM4356A3 を、Windows 標準の BthMini につなぐ）。試験中 |
 | `switchsensor` | ACPI\SWOA0901 | R379 | 傾きセンサー（画面の自動回転）。明るさセンサーは、この本体では見つからず使えていない |
 | `swoadiag` | —（読み込んだときだけ） | — | USB（XUSB）のレジスタを読むだけの診断用 |
 
