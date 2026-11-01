@@ -6,10 +6,12 @@
   -Mode Install : pnputil /add-driver switchaudio.inf /install, then report
   -Mode Status  : report AUD0 (ACPI\SWOA0C01), the driver trace and the Windows audio endpoints
   -Mode Remove  : remove the driver package
+  -Mode Tone    : (1.0.0.2+) the driver plays one second of 1 kHz from its own buffer, without the
+                  Windows audio engine (TestTone=1, then the device restarts), then report
 
   Log: C:\SwitchWOA-Audio.txt
 #>
-param([Parameter(Mandatory = $true)][ValidateSet('Install', 'Status', 'Remove')][string]$Mode)
+param([Parameter(Mandatory = $true)][ValidateSet('Install', 'Status', 'Remove', 'Tone')][string]$Mode)
 
 $ErrorActionPreference = 'Continue'
 # Windows PowerShell on Windows 10 ARM64 is x86: reach System32 via Sysnative.
@@ -31,8 +33,20 @@ function Show-Status {
   }
   $p = Get-ItemProperty $Key -ErrorAction SilentlyContinue
   if ($p) {
-    $vals = $p.PSObject.Properties | Where-Object { $_.Name -notmatch '^PS' } | ForEach-Object { '{0}=0x{1:X}' -f $_.Name, $_.Value }
-    Log ('driver trace: ' + ($vals -join ' '))
+    $props = @($p.PSObject.Properties | Where-Object { $_.Name -notmatch '^PS' })
+    # 1.0.0.2: register snapshots, one line per moment (Start, Run0, Run100, Stop, ToneBefore, Tone).
+    $snap = @{}
+    $rest = @()
+    foreach ($q in $props) {
+      if ($q.Name -match '^(ToneBefore|Tone|Run100|Run0|Start|Stop)(Adma\w*|Xbar|I2s\w*)$') {
+        if (-not $snap[$Matches[1]]) { $snap[$Matches[1]] = @() }
+        $snap[$Matches[1]] += ('{0}=0x{1:X}' -f $Matches[2], $q.Value)
+      } else { $rest += ('{0}=0x{1:X}' -f $q.Name, $q.Value) }
+    }
+    Log ('driver trace: ' + ($rest -join ' '))
+    foreach ($g in 'Start', 'Run0', 'Run100', 'Stop', 'ToneBefore', 'Tone') {
+      if ($snap[$g]) { Log ("  {0}: {1}" -f $g, ($snap[$g] -join ' ')) }
+    }
     # Stage: 1 started, 2 hardware ready, 3 endpoints registered; 0x11 = APE clocks off (UEFI older than
     # R402), 0x12 = I2S1/XBAR not set up, 0x10 = ACPI resources missing.
     switch ($p.Stage) {
@@ -60,6 +74,15 @@ switch ($Mode) {
     Show-Status
   }
   'Status' { Show-Status }
+  'Tone' {
+    if (-not (Test-Path $Key)) { New-Item -Path $Key | Out-Null }
+    Set-ItemProperty -Path $Key -Name TestTone -Value 1 -Type DWord
+    $dev = @(Get-CimInstance Win32_PnPEntity -ErrorAction SilentlyContinue | Where-Object { $_.PNPDeviceID -like 'ACPI\SWOA0C01*' })
+    foreach ($d in $dev) { Log (& $Pnputil /restart-device $d.PNPDeviceID | Out-String) }
+    Log 'Listen: a one-second 1 kHz tone should play now.'
+    Start-Sleep -Seconds 3
+    Show-Status
+  }
   'Remove' {
     $pkgs = (& $Pnputil /enum-drivers | Out-String) -split "(\r?\n){2,}" | Where-Object { $_ -match 'switchaudio\.inf' }
     foreach ($b in $pkgs) {

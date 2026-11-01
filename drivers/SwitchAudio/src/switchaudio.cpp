@@ -25,6 +25,12 @@
  *
  * One render pin, no volume node: Windows scales the volume in software.
  * Diagnostics go to Services\switchaudio\Parameters.
+ *
+ * 1.0.0.2: 1.0.0.1 showed the speaker but played nothing. The registry now
+ * gets the state of ADMA, ADMAIF1, XBAR and I2S1 at the start of the device
+ * (Start*), 0 and 100 ms after each stream start (Run0*, Run100*) and at each
+ * stop (Stop*, with the periods ADMA finished). Parameters\TestTone = 1 plays
+ * a one-second tone from the driver's own buffer at the next device start.
  */
 
 #define INITGUID
@@ -33,6 +39,7 @@
 #include <ntddk.h>
 #include <portcls.h>
 #include <ksmedia.h>
+#include <ntstrsafe.h>
 
 #define POOL_TAG 'duAS'
 
@@ -63,6 +70,9 @@
 #define I2S1_RX_STATUS           0x100C
 #define I2S1_ENABLE              0x1080
 #define I2S1_CTRL                0x10A0
+#define I2S1_RX_CIF_FIFO         0x1034
+#define I2S1_STATUS              0x108C
+#define ADMAIF_TX1_INT_STATUS    0x310
 
 #define ADMA_CH_CMD              0x00
 #define ADMA_CH_STATUS           0x0C
@@ -150,6 +160,110 @@ static VOID SaAdmaStop(VOID)
     if (g_Hw.Adma != NULL) {
         WrAdma(ADMA_CH_CMD, 0);
     }
+}
+
+static VOID SaTraceAs(PCWSTR Prefix, PCWSTR Name, ULONG Value)
+{
+    WCHAR Full[48];
+    if (NT_SUCCESS(RtlStringCchPrintfW(Full, ARRAYSIZE(Full), L"%s%s", Prefix, Name))) {
+        SaTrace(Full, Value);
+    }
+}
+
+/* 1.0.0.2: the state of the whole path, PASSIVE_LEVEL only. */
+static VOID SaSnapshot(PCWSTR Prefix)
+{
+    if (g_Hw.Ahub == NULL || g_Hw.Adma == NULL) {
+        return;
+    }
+    SaTraceAs(Prefix, L"AdmaStatus", RdAdma(ADMA_CH_STATUS));
+    SaTraceAs(Prefix, L"AdmaXfer", RdAdma(ADMA_CH_XFER_STATUS));
+    SaTraceAs(Prefix, L"AdmaSrc", RdAdma(ADMA_CH_LOWER_SRC));
+    SaTraceAs(Prefix, L"AdmaTc", RdAdma(ADMA_CH_TC));
+    SaTraceAs(Prefix, L"AdmaGlobal", RdAdma(ADMA_GLOBAL_CMD));
+    SaTraceAs(Prefix, L"AdmaifEnable", RdAhub(ADMAIF_TX1_ENABLE));
+    SaTraceAs(Prefix, L"AdmaifStatus", RdAhub(ADMAIF_TX1_STATUS));
+    SaTraceAs(Prefix, L"AdmaifInt", RdAhub(ADMAIF_TX1_INT_STATUS));
+    SaTraceAs(Prefix, L"Xbar", RdAhub(XBAR_I2S1_RX_MUX));
+    SaTraceAs(Prefix, L"I2sEnable", RdAhub(I2S1_ENABLE));
+    SaTraceAs(Prefix, L"I2sRxEnable", RdAhub(I2S1_RX_ENABLE));
+    SaTraceAs(Prefix, L"I2sRxStatus", RdAhub(I2S1_RX_STATUS));
+    SaTraceAs(Prefix, L"I2sStatus", RdAhub(I2S1_STATUS));
+    SaTraceAs(Prefix, L"I2sRxFifo", RdAhub(I2S1_RX_CIF_FIFO));
+}
+
+static VOID SaSleepMs(ULONG Ms)
+{
+    LARGE_INTEGER Due;
+    Due.QuadPart = -(LONGLONG)Ms * 10000;
+    (VOID)KeDelayExecutionThread(KernelMode, FALSE, &Due);
+}
+
+static ULONG SaReadParam(PCWSTR Name)
+{
+    RTL_QUERY_REGISTRY_TABLE Table[2];
+    ULONG Value = 0;
+    RtlZeroMemory(Table, sizeof(Table));
+    Table[0].Flags = RTL_QUERY_REGISTRY_DIRECT | RTL_QUERY_REGISTRY_REQUIRED | RTL_QUERY_REGISTRY_TYPECHECK;
+    Table[0].Name = (PWSTR)Name;
+    Table[0].EntryContext = &Value;
+    Table[0].DefaultType = (REG_DWORD << RTL_QUERY_REGISTRY_TYPECHECK_SHIFT) | REG_NONE;
+    if (!NT_SUCCESS(RtlQueryRegistryValues(RTL_REGISTRY_SERVICES, g_ParamsPath, Table, NULL, NULL))) {
+        return 0;
+    }
+    return Value;
+}
+
+/* 1.0.0.2: Parameters\TestTone = 1 plays one second of 1 kHz (-18 dBFS) at the
+   next start, from the driver's own buffer: checks the hardware path without
+   the Windows audio engine. The value is cleared afterwards. */
+static VOID SaTestTone(VOID)
+{
+    PHYSICAL_ADDRESS Low, High, Skip;
+    ULONG *Words;
+    ULONG Index;
+    /* One 1 kHz period at 48 kHz, 1/8 of full scale (the UEFI R400 tone). */
+    static const SHORT Sine[48] = {
+            0,   535,  1060,  1567,  2048,  2493,  2896,  3250,  3547,  3784,  3956,  4061,
+         4096,  4061,  3956,  3784,  3547,  3250,  2896,  2493,  2048,  1567,  1060,   535,
+            0,  -535, -1060, -1567, -2048, -2493, -2896, -3250, -3547, -3784, -3956, -4061,
+        -4096, -4061, -3956, -3784, -3547, -3250, -2896, -2493, -2048, -1567, -1060,  -535,
+    };
+
+    SaTrace(L"TestTone", 0);
+    Low.QuadPart = 0;
+    High.QuadPart = 0xFFFFFFFFLL;
+    Skip.QuadPart = 0;
+    Words = (ULONG *)MmAllocateContiguousNodeMemory(PAGE_SIZE, Low, High, Skip, PAGE_READWRITE | PAGE_NOCACHE,
+                                                    MM_ANY_NODE_OK);
+    if (Words == NULL) {
+        SaTrace(L"ToneResult", 1);
+        return;
+    }
+    for (Index = 0; Index < 48; ++Index) {
+        Words[Index] = ((ULONG)(USHORT)Sine[Index] << 16) | (USHORT)Sine[Index];
+    }
+    SaSnapshot(L"ToneBefore");
+    WrAhub(ADMAIF_GLOBAL_ENABLE, 1);
+    WrAhub(ADMAIF_TX1_ENABLE, 1);
+    WrAhub(I2S1_RX_ENABLE, 1);
+    WrAhub(I2S1_ENABLE, 1);
+    WrAdma(ADMA_GLOBAL_CMD, 1);
+    WrAdma(ADMA_CH_CMD, 0);
+    WrAdma(ADMA_CH_TC, 48 * sizeof(ULONG));
+    WrAdma(ADMA_CH_CTRL, ADMA_CTRL_TX1);
+    WrAdma(ADMA_CH_LOWER_SRC, (ULONG)MmGetPhysicalAddress(Words).QuadPart);
+    WrAdma(ADMA_CH_LOWER_TRG, 0);
+    WrAdma(ADMA_CH_FIFO_CTRL, ADMA_FIFO_TX3);
+    WrAdma(ADMA_CH_CONFIG, ADMA_CONFIG(1));
+    WrAdma(ADMA_CH_CMD, 1);
+    SaSleepMs(500);
+    SaSnapshot(L"Tone");
+    SaSleepMs(500);
+    SaAdmaStop();
+    SaSleepMs(5);
+    MmFreeContiguousMemory(Words);
+    SaTrace(L"ToneResult", 2);
 }
 
 /* ------------------------------------------------------------ C++ support */
@@ -264,11 +378,13 @@ public:
     LONGLONG m_LastChange;          /* performance counter at the last period change */
     LONGLONG m_Frequency;
     ULONG m_LastOffset;
+    ULONG m_Runs;
+    ULONG m_PosCalls;
 
     CSaStream(PPORTWAVERTSTREAM PortStream)
         : m_Ref(1), m_PortStream(PortStream), m_Mdl(NULL), m_BufferSize(0), m_Period(0), m_Phys(0),
           m_State(KSSTATE_STOP), m_Started(FALSE), m_LastXfer(0), m_Periods(0), m_LastChange(0),
-          m_Frequency(1), m_LastOffset(0)
+          m_Frequency(1), m_LastOffset(0), m_Runs(0), m_PosCalls(0)
     {
         m_PortStream->AddRef();
     }
@@ -327,6 +443,8 @@ STDMETHODIMP_(NTSTATUS) CSaStream::SetState(KSSTATE State)
     LARGE_INTEGER Freq;
     LONGLONG Now = KeQueryPerformanceCounter(&Freq).QuadPart;
     ULONG Wait;
+    BOOLEAN Starting = FALSE, Stopping = FALSE;
+    ULONGLONG StoppedPeriods = 0;
 
     KeAcquireSpinLock(&g_Hw.Lock, &Irql);
     switch (State) {
@@ -355,6 +473,7 @@ STDMETHODIMP_(NTSTATUS) CSaStream::SetState(KSSTATE State)
             m_LastChange = Now;
             WrAdma(ADMA_CH_CMD, 1);
             m_Started = TRUE;
+            Starting = TRUE;
         } else {
             WrAdma(ADMA_CH_CTRL, ADMA_CTRL_TX1);       /* pause bit off */
             m_LastChange = Now;
@@ -372,6 +491,9 @@ STDMETHODIMP_(NTSTATUS) CSaStream::SetState(KSSTATE State)
     case KSSTATE_STOP:
     case KSSTATE_ACQUIRE:
         if (m_Started) {
+            UpdatePeriods(Now);
+            StoppedPeriods = m_Periods;
+            Stopping = TRUE;
             SaAdmaStop();
             m_Started = FALSE;
         }
@@ -383,6 +505,22 @@ STDMETHODIMP_(NTSTATUS) CSaStream::SetState(KSSTATE State)
     }
     m_State = State;
     KeReleaseSpinLock(&g_Hw.Lock, Irql);
+
+    /* 1.0.0.2: what each start and stop looked like (KS state changes come at PASSIVE_LEVEL). */
+    if (KeGetCurrentIrql() == PASSIVE_LEVEL) {
+        if (State == KSSTATE_RUN && Starting) {
+            SaTrace(L"Runs", ++m_Runs);
+            SaSnapshot(L"Run0");
+            SaSleepMs(100);
+            SaSnapshot(L"Run100");
+        } else if (State == KSSTATE_STOP || State == KSSTATE_ACQUIRE) {
+            if (Stopping) {
+                SaTrace(L"StopPeriods", (ULONG)StoppedPeriods);
+                SaTrace(L"StopPositionCalls", m_PosCalls);
+                SaSnapshot(L"Stop");
+            }
+        }
+    }
     return STATUS_SUCCESS;
 }
 
@@ -392,6 +530,7 @@ STDMETHODIMP_(NTSTATUS) CSaStream::GetPosition(PKSAUDIO_POSITION Position)
     ULONG Offset = 0;
 
     KeAcquireSpinLock(&g_Hw.Lock, &Irql);
+    ++m_PosCalls;
     if (m_Started && m_Period != 0) {
         LONGLONG Now = KeQueryPerformanceCounter(NULL).QuadPart;
         ULONGLONG Inside = 0;
@@ -699,6 +838,10 @@ static NTSTATUS SaStartDevice(PDEVICE_OBJECT DeviceObject, PIRP Irp, PRESOURCELI
         return STATUS_DEVICE_NOT_READY;
     }
     SaTrace(L"Stage", 2);
+    SaSnapshot(L"Start");
+    if (SaReadParam(L"TestTone") != 0) {
+        SaTestTone();
+    }
 
     Wave = SA_NEW CSaWave();
     Topo = SA_NEW CSaTopo();
