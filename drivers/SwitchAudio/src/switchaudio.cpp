@@ -46,6 +46,12 @@
  * 5 GetHWLatency, 6 GetPositionRegister, 7 GetClockRegister, 8 GetPosition,
  * 9 SetState, A the stream freed. The buffer is now exactly the requested
  * size when that makes periods of at least 1024 bytes (5.3 ms).
+ *
+ * 1.0.0.5: with the requested size Windows played, but crunchy. XFER_STATUS
+ * restarts from 0 when the channel is enabled, and the start value was read
+ * before that (0x3FA left over), so the first update jumped 0xFCC0 periods
+ * and the position stayed two periods off: Windows wrote where ADMA had
+ * already read. The start value is now read after the enable.
  */
 
 #define INITGUID
@@ -502,12 +508,13 @@ STDMETHODIMP_(NTSTATUS) CSaStream::SetState(KSSTATE State)
             WrAdma(ADMA_CH_LOWER_TRG, 0);
             WrAdma(ADMA_CH_FIFO_CTRL, ADMA_FIFO_TX3);
             WrAdma(ADMA_CH_CONFIG, ADMA_CONFIG(SA_PERIODS));
-            m_LastXfer = RdAdma(ADMA_CH_XFER_STATUS) & 0xFFFF;
             m_Periods = 0;
             m_LastOffset = 0;
             m_Frequency = Freq.QuadPart;
             m_LastChange = Now;
             WrAdma(ADMA_CH_CMD, 1);
+            /* XFER_STATUS restarts from 0 on the enable: read it after. */
+            m_LastXfer = RdAdma(ADMA_CH_XFER_STATUS) & 0xFFFF;
             m_Started = TRUE;
             Starting = TRUE;
         } else {
