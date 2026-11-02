@@ -20,6 +20,8 @@ powershell -ExecutionPolicy Bypass -File .\Audio.ps1 -Mode Install
 設定 > システム > サウンド に「スピーカー」が出れば、ドライバは動いている。
 
 - 状態を見る: `-Mode Status`（ログは `C:\SwitchWOA-Audio.txt`）
+- Windows の通知音を鳴らし、音声のエラーの記録（直近 1 時間）も表示する: `-Mode Check`
+- ドライバだけで 1 秒「ピー」と鳴らす（Windows の音声エンジンを通さない）: `-Mode Tone`
 - 外す: `-Mode Remove`
 
 ## しくみ（段階 1）

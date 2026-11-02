@@ -8,10 +8,12 @@
   -Mode Remove  : remove the driver package
   -Mode Tone    : (1.0.0.2+) the driver plays one second of 1 kHz from its own buffer, without the
                   Windows audio engine (TestTone=1, then the device restarts), then report
+  -Mode Check   : plays a Windows sound through the audio engine, lists audio errors from the
+                  event logs (last hour), then report
 
   Log: C:\SwitchWOA-Audio.txt
 #>
-param([Parameter(Mandatory = $true)][ValidateSet('Install', 'Status', 'Remove', 'Tone')][string]$Mode)
+param([Parameter(Mandatory = $true)][ValidateSet('Install', 'Status', 'Remove', 'Tone', 'Check')][string]$Mode)
 
 $ErrorActionPreference = 'Continue'
 # Windows PowerShell on Windows 10 ARM64 is x86: reach System32 via Sysnative.
@@ -37,6 +39,8 @@ function Show-Status {
     # 1.0.0.2: register snapshots, one line per moment (Start, Run0, Run100, Stop, ToneBefore, Tone).
     $snap = @{}
     $rest = @()
+    # 1.0.0.4: CallLog digits: 1 NewStream 2 SetFormat 3 AllocateAudioBuffer 4 FreeAudioBuffer
+    # 5 GetHWLatency 6 GetPositionRegister 7 GetClockRegister 8 GetPosition 9 SetState A freed.
     foreach ($q in $props) {
       if ($q.Name -match '^(ToneBefore|Tone|Run100|Run0|Start|Stop)(Adma\w*|Xbar|I2s\w*)$') {
         if (-not $snap[$Matches[1]]) { $snap[$Matches[1]] = @() }
@@ -74,6 +78,24 @@ switch ($Mode) {
     Show-Status
   }
   'Status' { Show-Status }
+  'Check' {
+    $wav = Join-Path $env:windir 'Media\Windows Notify System Generic.wav'
+    Log "Listen: playing $wav through the Windows audio engine."
+    try { (New-Object Media.SoundPlayer $wav).PlaySync(); Log 'play: no error' }
+    catch { Log ('play: ' + $_.Exception.Message) }
+    $since = (Get-Date).AddHours(-1)
+    $ev = @(Get-WinEvent -FilterHashtable @{ LogName = 'Application'; StartTime = $since } -ErrorAction SilentlyContinue |
+      Where-Object { $_.Message -match 'audiodg|audiosrv|AudioSes|AudioEng' })
+    $ev += @(Get-WinEvent -FilterHashtable @{ LogName = 'System'; StartTime = $since; Level = 1, 2, 3 } -ErrorAction SilentlyContinue |
+      Where-Object { $_.Message -match 'audio|switchaudio' })
+    if ($ev.Count -eq 0) { Log 'events: no audio errors in the last hour' }
+    foreach ($e in ($ev | Sort-Object TimeCreated -Descending | Select-Object -First 6)) {
+      $m = ($e.Message -replace '\s+', ' ')
+      if ($m.Length -gt 300) { $m = $m.Substring(0, 300) }
+      Log ("event: {0:HH:mm:ss} {1} id={2}: {3}" -f $e.TimeCreated, $e.ProviderName, $e.Id, $m)
+    }
+    Show-Status
+  }
   'Tone' {
     if (-not (Test-Path $Key)) { New-Item -Path $Key | Out-Null }
     Set-ItemProperty -Path $Key -Name TestTone -Value 1 -Type DWord

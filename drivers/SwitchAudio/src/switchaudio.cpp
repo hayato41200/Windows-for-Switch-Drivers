@@ -38,6 +38,14 @@
  * fault there. Now MmWriteCombined (Normal non-cacheable: no cache, so ADMA
  * still sees the data). Buffers counts AllocateAudioBuffer calls, StateLog
  * keeps the last eight KS states (one hex digit each, newest last).
+ *
+ * 1.0.0.4: with 1.0.0.3 Windows took the buffer eight times and closed the
+ * stream each time without a single state change. CallLog keeps the last
+ * eight calls into the stream (one hex digit each, newest last, repeats
+ * folded): 1 NewStream, 2 SetFormat, 3 AllocateAudioBuffer, 4 FreeAudioBuffer,
+ * 5 GetHWLatency, 6 GetPositionRegister, 7 GetClockRegister, 8 GetPosition,
+ * 9 SetState, A the stream freed. The buffer is now exactly the requested
+ * size when that makes periods of at least 1024 bytes (5.3 ms).
  */
 
 #define INITGUID
@@ -106,7 +114,7 @@
 #define SA_BYTES_PER_SEC         (SA_RATE * SA_FRAME)
 #define SA_PERIODS               8u
 #define SA_PERIOD_ALIGN          64u            /* one ADMA burst */
-#define SA_MIN_PERIOD            (SA_BYTES_PER_SEC / 100u)   /* 10 ms */
+#define SA_MIN_PERIOD            1024u          /* 256 frames, 5.3 ms */
 
 /* ------------------------------------------------------------ the hardware */
 
@@ -121,6 +129,7 @@ static SA_HW g_Hw;
 static WCHAR g_ParamsPath[] = L"switchaudio\\Parameters";
 static LONG g_Buffers;
 static ULONG g_StateLog;
+static ULONG g_CallLog;
 
 static ULONG RdAhub(ULONG Offset) { return READ_REGISTER_ULONG((volatile ULONG *)(g_Hw.Ahub + Offset)); }
 static VOID WrAhub(ULONG Offset, ULONG Value) { WRITE_REGISTER_ULONG((volatile ULONG *)(g_Hw.Ahub + Offset), Value); }
@@ -176,6 +185,20 @@ static VOID SaTraceAs(PCWSTR Prefix, PCWSTR Name, ULONG Value)
     WCHAR Full[48];
     if (NT_SUCCESS(RtlStringCchPrintfW(Full, ARRAYSIZE(Full), L"%s%s", Prefix, Name))) {
         SaTrace(Full, Value);
+    }
+}
+
+/* 1.0.0.4: one hex digit per call into the stream, repeats folded. */
+static VOID SaCall(ULONG Code)
+{
+    ULONG Old = g_CallLog, New;
+    if ((Old & 0xF) == Code) {
+        return;
+    }
+    New = (Old << 4) | Code;
+    if (InterlockedCompareExchange((volatile LONG *)&g_CallLog, (LONG)New, (LONG)Old) == (LONG)Old &&
+        KeGetCurrentIrql() == PASSIVE_LEVEL) {
+        SaTrace(L"CallLog", New);
     }
 }
 
@@ -422,6 +445,7 @@ public:
             KeReleaseSpinLock(&g_Hw.Lock, Irql);
             m_PortStream->Release();
             delete this;
+            SaCall(0xA);
         }
         return (ULONG)Ref;
     }
@@ -443,6 +467,7 @@ public:
 
 STDMETHODIMP_(NTSTATUS) CSaStream::SetFormat(PKSDATAFORMAT DataFormat)
 {
+    SaCall(2);
     return SaFormatOk(DataFormat) ? STATUS_SUCCESS : STATUS_NOT_SUPPORTED;
 }
 
@@ -454,6 +479,8 @@ STDMETHODIMP_(NTSTATUS) CSaStream::SetState(KSSTATE State)
     ULONG Wait;
     BOOLEAN Starting = FALSE, Stopping = FALSE;
     ULONGLONG StoppedPeriods = 0;
+
+    SaCall(9);
 
     KeAcquireSpinLock(&g_Hw.Lock, &Irql);
     switch (State) {
@@ -542,6 +569,7 @@ STDMETHODIMP_(NTSTATUS) CSaStream::GetPosition(PKSAUDIO_POSITION Position)
     KIRQL Irql;
     ULONG Offset = 0;
 
+    SaCall(8);
     KeAcquireSpinLock(&g_Hw.Lock, &Irql);
     ++m_PosCalls;
     if (m_Started && m_Period != 0) {
@@ -576,6 +604,7 @@ STDMETHODIMP_(NTSTATUS) CSaStream::AllocateAudioBuffer(ULONG RequestedSize, PMDL
     PMDL Mdl;
     PVOID Va;
 
+    SaCall(3);
     if (m_Mdl != NULL) {
         return STATUS_DEVICE_BUSY;
     }
@@ -612,6 +641,7 @@ STDMETHODIMP_(NTSTATUS) CSaStream::AllocateAudioBuffer(ULONG RequestedSize, PMDL
 STDMETHODIMP_(VOID) CSaStream::FreeAudioBuffer(PMDL AudioBufferMdl, ULONG BufferSize)
 {
     UNREFERENCED_PARAMETER(BufferSize);
+    SaCall(4);
     if (AudioBufferMdl != NULL) {
         KIRQL Irql;
         KeAcquireSpinLock(&g_Hw.Lock, &Irql);
@@ -629,6 +659,7 @@ STDMETHODIMP_(VOID) CSaStream::FreeAudioBuffer(PMDL AudioBufferMdl, ULONG Buffer
 
 STDMETHODIMP_(VOID) CSaStream::GetHWLatency(KSRTAUDIO_HWLATENCY *hwLatency)
 {
+    SaCall(5);
     hwLatency->FifoSize = 3 * 64 * 4;              /* ADMA FIFO plus ADMAIF, roughly */
     hwLatency->ChipsetDelay = 0;
     hwLatency->CodecDelay = 0;
@@ -636,12 +667,14 @@ STDMETHODIMP_(VOID) CSaStream::GetHWLatency(KSRTAUDIO_HWLATENCY *hwLatency)
 
 STDMETHODIMP_(NTSTATUS) CSaStream::GetPositionRegister(KSRTAUDIO_HWREGISTER *Register)
 {
+    SaCall(6);
     UNREFERENCED_PARAMETER(Register);
     return STATUS_NOT_SUPPORTED;
 }
 
 STDMETHODIMP_(NTSTATUS) CSaStream::GetClockRegister(KSRTAUDIO_HWREGISTER *Register)
 {
+    SaCall(7);
     UNREFERENCED_PARAMETER(Register);
     return STATUS_NOT_SUPPORTED;
 }
@@ -716,6 +749,7 @@ STDMETHODIMP_(NTSTATUS) CSaWave::NewStream(PMINIPORTWAVERTSTREAM *Stream, PPORTW
         return STATUS_INSUFFICIENT_RESOURCES;
     }
     *Stream = New;
+    SaCall(1);
     SaTrace(L"Streams", (ULONG)InterlockedIncrement(&m_Streams));
     return STATUS_SUCCESS;
 }
