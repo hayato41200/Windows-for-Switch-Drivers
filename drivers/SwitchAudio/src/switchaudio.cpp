@@ -52,6 +52,13 @@
  * before that (0x3FA left over), so the first update jumped 0xFCC0 periods
  * and the position stayed two periods off: Windows wrote where ADMA had
  * already read. The start value is now read after the enable.
+ *
+ * 1.0.0.6: clean, but with an occasional dropout. A period change was dated
+ * at the poll that saw it, up to one engine period (10 ms) late, so the
+ * position could lag ADMA by most of a period and Windows wrote where ADMA
+ * had already fetched. The change is now dated where the nominal rate puts
+ * it, kept between the previous poll and this one. The reported FIFO is one
+ * period, for more headroom. Gaps counts polls that missed a whole period.
  */
 
 #define INITGUID
@@ -418,11 +425,13 @@ public:
     ULONG m_LastOffset;
     ULONG m_Runs;
     ULONG m_PosCalls;
+    LONGLONG m_LastPoll;            /* performance counter at the last look at XFER_STATUS */
+    ULONG m_Gaps;                   /* polls that saw more than one period finish */
 
     CSaStream(PPORTWAVERTSTREAM PortStream)
         : m_Ref(1), m_PortStream(PortStream), m_Mdl(NULL), m_BufferSize(0), m_Period(0), m_Phys(0),
           m_State(KSSTATE_STOP), m_Started(FALSE), m_LastXfer(0), m_Periods(0), m_LastChange(0),
-          m_Frequency(1), m_LastOffset(0), m_Runs(0), m_PosCalls(0)
+          m_Frequency(1), m_LastOffset(0), m_Runs(0), m_PosCalls(0), m_LastPoll(0), m_Gaps(0)
     {
         m_PortStream->AddRef();
     }
@@ -464,10 +473,17 @@ public:
         ULONG Xfer = RdAdma(ADMA_CH_XFER_STATUS) & 0xFFFF;
         ULONG Delta = (Xfer - m_LastXfer) & 0xFFFF;
         if (Delta != 0) {
+            /* Where the nominal rate puts the change, but between the polls. */
+            LONGLONG Expected = m_LastChange +
+                (LONGLONG)((ULONGLONG)Delta * m_Period * (ULONGLONG)m_Frequency / SA_BYTES_PER_SEC);
+            if (Expected > Now) Expected = Now;
+            if (Expected < m_LastPoll) Expected = m_LastPoll;
+            if (Delta > 1) ++m_Gaps;
             m_Periods += Delta;
             m_LastXfer = Xfer;
-            m_LastChange = Now;
+            m_LastChange = Expected;
         }
+        m_LastPoll = Now;
     }
 };
 
@@ -512,6 +528,8 @@ STDMETHODIMP_(NTSTATUS) CSaStream::SetState(KSSTATE State)
             m_LastOffset = 0;
             m_Frequency = Freq.QuadPart;
             m_LastChange = Now;
+            m_LastPoll = Now;
+            m_Gaps = 0;
             WrAdma(ADMA_CH_CMD, 1);
             /* XFER_STATUS restarts from 0 on the enable: read it after. */
             m_LastXfer = RdAdma(ADMA_CH_XFER_STATUS) & 0xFFFF;
@@ -520,6 +538,7 @@ STDMETHODIMP_(NTSTATUS) CSaStream::SetState(KSSTATE State)
         } else {
             WrAdma(ADMA_CH_CTRL, ADMA_CTRL_TX1);       /* pause bit off */
             m_LastChange = Now;
+            m_LastPoll = Now;
         }
         break;
     case KSSTATE_PAUSE:
@@ -564,6 +583,7 @@ STDMETHODIMP_(NTSTATUS) CSaStream::SetState(KSSTATE State)
             if (Stopping) {
                 SaTrace(L"StopPeriods", (ULONG)StoppedPeriods);
                 SaTrace(L"StopPositionCalls", m_PosCalls);
+                SaTrace(L"StopGaps", m_Gaps);
                 SaSnapshot(L"Stop");
             }
         }
@@ -667,7 +687,8 @@ STDMETHODIMP_(VOID) CSaStream::FreeAudioBuffer(PMDL AudioBufferMdl, ULONG Buffer
 STDMETHODIMP_(VOID) CSaStream::GetHWLatency(KSRTAUDIO_HWLATENCY *hwLatency)
 {
     SaCall(5);
-    hwLatency->FifoSize = 3 * 64 * 4;              /* ADMA FIFO plus ADMAIF, roughly */
+    /* ADMA FIFO plus ADMAIF, and the position moving in period steps. */
+    hwLatency->FifoSize = m_Period > 768 ? m_Period : 768;
     hwLatency->ChipsetDelay = 0;
     hwLatency->CodecDelay = 0;
 }
