@@ -59,6 +59,14 @@
  * had already fetched. The change is now dated where the nominal rate puts
  * it, kept between the previous poll and this one. The reported FIFO is one
  * period, for more headroom. Gaps counts polls that missed a whole period.
+ *
+ * 1.0.0.7: headphones. UEFI R403 powers the codec's headphone path (muted)
+ * and makes PV6, the jack switch (low = plugged), a GPIO input. A thread
+ * reads PV6 every 200 ms; after two equal readings it unmutes the output
+ * the jack picks and mutes the other, over SPB (the I2cSerialBus of AUD0).
+ * Windows still shows one endpoint. With an older UEFI (HPO MIX without
+ * HPOVOL, or PV6 not a GPIO) the thread is not started: speaker only.
+ * Traces: HpoMixer, JackGpio, Jack (1 = headphones), JackSwitches, JackSpb.
  */
 
 #define INITGUID
@@ -68,6 +76,7 @@
 #include <portcls.h>
 #include <ksmedia.h>
 #include <ntstrsafe.h>
+#include <spb.h>
 
 #define POOL_TAG 'duAS'
 
@@ -131,11 +140,30 @@
 
 /* ------------------------------------------------------------ the hardware */
 
+/* 1.0.0.7: the jack switch and the codec registers for the outputs. */
+#define GPIO_PHYS                0x6000D000ull
+#define GPIO_LENGTH              0x1000u
+#define GPIO_PV_CNF              0x504u          /* port V: bank 5, port 1 */
+#define GPIO_PV_OE               0x514u
+#define GPIO_PV_IN               0x534u
+#define GPIO_PV6                 (1u << 6)
+#define RT5640_SPK_VOL           0x01
+#define RT5640_HP_VOL            0x02
+#define RT5640_HPO_MIXER         0x45
+#define RT5640_M_HPVOL_HM        (1u << 13)
+#define SA_SPK_VOL               0x1414u         /* -18 dB, as UEFI R402 */
+#define SA_HP_VOL                0x1818u         /* -24 dB, as UEFI R403 */
+#define SA_MUTE                  0x8080u
+
 typedef struct _SA_HW {
     volatile UCHAR *Ahub;
     volatile UCHAR *Adma;
     KSPIN_LOCK Lock;
     BOOLEAN Ready;
+    HANDLE Spb;                     /* the codec on I2C1 */
+    volatile UCHAR *Gpio;
+    PKTHREAD JackThread;
+    KEVENT JackStop;
 } SA_HW;
 
 static SA_HW g_Hw;
@@ -871,6 +899,152 @@ static NTSTATUS SaInstallSubdevice(PDEVICE_OBJECT DeviceObject, PIRP Irp, PCWSTR
     return Status;
 }
 
+/* ------------------------------------------------------------- headphones */
+
+static NTSTATUS SaCodecWrite(UCHAR Reg, USHORT Value)
+{
+    IO_STATUS_BLOCK Iosb;
+    UCHAR Buf[3] = { Reg, (UCHAR)(Value >> 8), (UCHAR)Value };
+    return ZwWriteFile(g_Hw.Spb, NULL, NULL, NULL, &Iosb, Buf, sizeof(Buf), NULL, NULL);
+}
+
+static NTSTATUS SaCodecRead(UCHAR Reg, USHORT *Value)
+{
+    IO_STATUS_BLOCK Iosb;
+    UCHAR Data[2] = { 0, 0 };
+    SPB_TRANSFER_LIST_AND_ENTRIES(2) Sequence;
+    NTSTATUS Status;
+
+    SPB_TRANSFER_LIST_INIT(&Sequence.List, 2);
+    Sequence.List.Transfers[0] = SPB_TRANSFER_LIST_ENTRY_INIT_SIMPLE(SpbTransferDirectionToDevice, 0, &Reg, 1);
+    Sequence.List.Transfers[1] = SPB_TRANSFER_LIST_ENTRY_INIT_SIMPLE(SpbTransferDirectionFromDevice, 0, Data, 2);
+    Status = ZwDeviceIoControlFile(g_Hw.Spb, NULL, NULL, NULL, &Iosb, IOCTL_SPB_EXECUTE_SEQUENCE,
+                                   &Sequence, sizeof(Sequence), NULL, 0);
+    *Value = (USHORT)((Data[0] << 8) | Data[1]);
+    return Status;
+}
+
+static NTSTATUS SaSpbOpen(PRESOURCELIST ResourceList)
+{
+    PCM_PARTIAL_RESOURCE_DESCRIPTOR Conn = ResourceList->FindTranslatedEntry(CmResourceTypeConnection, 0);
+    WCHAR PathBuf[64];
+    UNICODE_STRING Path;
+    OBJECT_ATTRIBUTES Oa;
+    IO_STATUS_BLOCK Iosb;
+    NTSTATUS Status;
+
+    if (Conn == NULL) {
+        return STATUS_NOT_FOUND;
+    }
+    Status = RtlStringCchPrintfW(PathBuf, ARRAYSIZE(PathBuf), L"\\Device\\RESOURCE_HUB\\%016I64x",
+                                 ((ULONG64)Conn->u.Connection.IdHighPart << 32) | Conn->u.Connection.IdLowPart);
+    if (!NT_SUCCESS(Status)) {
+        return Status;
+    }
+    RtlInitUnicodeString(&Path, PathBuf);
+    InitializeObjectAttributes(&Oa, &Path, OBJ_KERNEL_HANDLE | OBJ_CASE_INSENSITIVE, NULL, NULL);
+    return ZwCreateFile(&g_Hw.Spb, GENERIC_READ | GENERIC_WRITE | SYNCHRONIZE, &Oa, &Iosb, NULL, 0, 0, FILE_OPEN,
+                        FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT, NULL, 0);
+}
+
+/* Unmute the output the jack picks, the other one first muted. */
+static NTSTATUS SaJackApply(BOOLEAN Headphones)
+{
+    NTSTATUS Status;
+    if (Headphones) {
+        Status = SaCodecWrite(RT5640_SPK_VOL, SA_SPK_VOL | SA_MUTE);
+        if (NT_SUCCESS(Status)) Status = SaCodecWrite(RT5640_HP_VOL, SA_HP_VOL);
+    } else {
+        Status = SaCodecWrite(RT5640_HP_VOL, SA_HP_VOL | SA_MUTE);
+        if (NT_SUCCESS(Status)) Status = SaCodecWrite(RT5640_SPK_VOL, SA_SPK_VOL);
+    }
+    return Status;
+}
+
+static VOID SaJackThread(PVOID Context)
+{
+    LARGE_INTEGER Period;
+    ULONG Applied = 2, Last = 2, Switches = 0;
+
+    UNREFERENCED_PARAMETER(Context);
+    Period.QuadPart = -200LL * 10000;
+    while (KeWaitForSingleObject(&g_Hw.JackStop, Executive, KernelMode, FALSE, &Period) == STATUS_TIMEOUT) {
+        ULONG Now = (READ_REGISTER_ULONG((volatile ULONG *)(g_Hw.Gpio + GPIO_PV_IN)) & GPIO_PV6) == 0 ? 1 : 0;
+        if (Now == Last && Now != Applied) {         /* two equal readings, 200 ms apart */
+            NTSTATUS Status = SaJackApply(Now != 0);
+            SaTrace(L"JackSpb", (ULONG)Status);
+            if (NT_SUCCESS(Status)) {
+                Applied = Now;
+                SaTrace(L"Jack", Now);
+                SaTrace(L"JackSwitches", ++Switches);
+            }
+        }
+        Last = Now;
+    }
+    PsTerminateSystemThread(STATUS_SUCCESS);
+}
+
+static VOID SaJackStop(VOID)
+{
+    if (g_Hw.JackThread != NULL) {
+        KeSetEvent(&g_Hw.JackStop, IO_NO_INCREMENT, FALSE);
+        (VOID)KeWaitForSingleObject(g_Hw.JackThread, Executive, KernelMode, FALSE, NULL);
+        ObDereferenceObject(g_Hw.JackThread);
+        g_Hw.JackThread = NULL;
+    }
+    if (g_Hw.Spb != NULL) {
+        ZwClose(g_Hw.Spb);
+        g_Hw.Spb = NULL;
+    }
+    if (g_Hw.Gpio != NULL) {
+        MmUnmapIoSpace((PVOID)g_Hw.Gpio, GPIO_LENGTH);
+        g_Hw.Gpio = NULL;
+    }
+}
+
+/* Only with UEFI R403 or later: the headphone path set up, PV6 a GPIO input. */
+static VOID SaJackStart(PRESOURCELIST ResourceList)
+{
+    PHYSICAL_ADDRESS Pa;
+    USHORT Hpo = 0;
+    ULONG Cnf, Oe;
+    HANDLE Thread;
+    NTSTATUS Status;
+
+    Status = SaSpbOpen(ResourceList);
+    SaTrace(L"JackSpb", (ULONG)Status);
+    if (!NT_SUCCESS(Status)) {
+        g_Hw.Spb = NULL;
+        return;
+    }
+    Status = SaCodecRead(RT5640_HPO_MIXER, &Hpo);
+    SaTrace(L"HpoMixer", NT_SUCCESS(Status) ? Hpo : 0xFFFF0000u | (ULONG)(Status & 0xFFFF));
+    Pa.QuadPart = (LONGLONG)GPIO_PHYS;
+    g_Hw.Gpio = (volatile UCHAR *)MmMapIoSpaceEx(Pa, GPIO_LENGTH, PAGE_READWRITE | PAGE_NOCACHE);
+    if (!NT_SUCCESS(Status) || (Hpo & RT5640_M_HPVOL_HM) != 0 || g_Hw.Gpio == NULL) {
+        SaJackStop();
+        return;
+    }
+    Cnf = READ_REGISTER_ULONG((volatile ULONG *)(g_Hw.Gpio + GPIO_PV_CNF));
+    Oe = READ_REGISTER_ULONG((volatile ULONG *)(g_Hw.Gpio + GPIO_PV_OE));
+    SaTrace(L"JackGpio", (Cnf & 0xFF) | ((Oe & 0xFF) << 8) |
+                         ((READ_REGISTER_ULONG((volatile ULONG *)(g_Hw.Gpio + GPIO_PV_IN)) & 0xFF) << 16));
+    if ((Cnf & GPIO_PV6) == 0 || (Oe & GPIO_PV6) != 0) {
+        SaJackStop();
+        return;
+    }
+    KeClearEvent(&g_Hw.JackStop);
+    Status = PsCreateSystemThread(&Thread, THREAD_ALL_ACCESS, NULL, NULL, NULL, SaJackThread, NULL);
+    if (NT_SUCCESS(Status)) {
+        Status = ObReferenceObjectByHandle(Thread, SYNCHRONIZE, *PsThreadType, KernelMode, (PVOID *)&g_Hw.JackThread, NULL);
+        ZwClose(Thread);
+    }
+    if (!NT_SUCCESS(Status)) {
+        g_Hw.JackThread = NULL;
+        SaJackStop();
+    }
+}
+
 static NTSTATUS SaStartDevice(PDEVICE_OBJECT DeviceObject, PIRP Irp, PRESOURCELIST ResourceList)
 {
     PCM_PARTIAL_RESOURCE_DESCRIPTOR Mem0, Mem1;
@@ -945,6 +1119,7 @@ static NTSTATUS SaStartDevice(PDEVICE_OBJECT DeviceObject, PIRP Irp, PRESOURCELI
     if (NT_SUCCESS(Status)) {
         g_Hw.Ready = TRUE;
         SaTrace(L"Stage", 3);
+        SaJackStart(ResourceList);
     }
     return Status;
 }
@@ -957,6 +1132,7 @@ static NTSTATUS SaDispatchPnp(PDEVICE_OBJECT DeviceObject, PIRP Irp)
     NTSTATUS Status;
     if (Minor == IRP_MN_STOP_DEVICE || Minor == IRP_MN_REMOVE_DEVICE || Minor == IRP_MN_SURPRISE_REMOVAL) {
         KIRQL Irql;
+        SaJackStop();
         KeAcquireSpinLock(&g_Hw.Lock, &Irql);
         SaAdmaStop();
         KeReleaseSpinLock(&g_Hw.Lock, Irql);
@@ -983,6 +1159,7 @@ extern "C" NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING Reg
 {
     NTSTATUS Status;
     KeInitializeSpinLock(&g_Hw.Lock);
+    KeInitializeEvent(&g_Hw.JackStop, NotificationEvent, FALSE);
     SaInitDescriptors();
     Status = PcInitializeAdapterDriver(DriverObject, RegistryPath, (PDRIVER_ADD_DEVICE)SaAddDevice);
     if (NT_SUCCESS(Status)) {

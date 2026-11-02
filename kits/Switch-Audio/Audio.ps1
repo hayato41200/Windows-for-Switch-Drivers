@@ -59,6 +59,14 @@ function Show-Status {
       0x12 { Log 'RESULT: the APE clocks are on but UEFI did not set up I2S1. Boot with UEFI R402.' }
       default { Log "RESULT: the driver stopped at stage $($p.Stage)." }
     }
+    # 1.0.0.7: headphones (UEFI R403 sets up the codec's headphone path and the jack switch PV6).
+    if ($null -ne $p.Jack) {
+      Log ("JACK: {0} (switched {1} times)" -f $(if ($p.Jack -eq 1) { 'headphones' } else { 'speaker' }), $p.JackSwitches)
+    } elseif ($null -ne $p.HpoMixer -and ($p.HpoMixer -band 0x2000) -ne 0) {
+      Log 'JACK: off, the headphone path is not set up. Boot with UEFI R403.'
+    } elseif ($null -ne $p.JackSpb -and $p.JackSpb -ne 0) {
+      Log ("JACK: off, the codec could not be opened over I2C (0x{0:X})." -f $p.JackSpb)
+    }
   } else { Log 'driver trace: (no Parameters key)' }
   $ep = @(Get-CimInstance Win32_PnPEntity -ErrorAction SilentlyContinue | Where-Object { $_.PNPClass -eq 'AudioEndpoint' })
   foreach ($e in $ep) { Log ("endpoint: '{0}' status={1} problem={2}" -f $e.Name, $e.Status, $e.ConfigManagerErrorCode) }
