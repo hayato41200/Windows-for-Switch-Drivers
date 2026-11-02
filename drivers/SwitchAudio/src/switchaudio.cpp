@@ -31,6 +31,13 @@
  * (Start*), 0 and 100 ms after each stream start (Run0*, Run100*) and at each
  * stop (Stop*, with the periods ADMA finished). Parameters\TestTone = 1 plays
  * a one-second tone from the driver's own buffer at the next device start.
+ *
+ * 1.0.0.3: the tone played, but Windows opened 58 streams and never ran one.
+ * The buffer was MmNonCached, which ARM64 maps as Device memory; the audio
+ * engine (audiodg) maps the buffer too and its unaligned or DC ZVA writes
+ * fault there. Now MmWriteCombined (Normal non-cacheable: no cache, so ADMA
+ * still sees the data). Buffers counts AllocateAudioBuffer calls, StateLog
+ * keeps the last eight KS states (one hex digit each, newest last).
  */
 
 #define INITGUID
@@ -112,6 +119,8 @@ typedef struct _SA_HW {
 
 static SA_HW g_Hw;
 static WCHAR g_ParamsPath[] = L"switchaudio\\Parameters";
+static LONG g_Buffers;
+static ULONG g_StateLog;
 
 static ULONG RdAhub(ULONG Offset) { return READ_REGISTER_ULONG((volatile ULONG *)(g_Hw.Ahub + Offset)); }
 static VOID WrAhub(ULONG Offset, ULONG Value) { WRITE_REGISTER_ULONG((volatile ULONG *)(g_Hw.Ahub + Offset), Value); }
@@ -504,7 +513,11 @@ STDMETHODIMP_(NTSTATUS) CSaStream::SetState(KSSTATE State)
         break;
     }
     m_State = State;
+    g_StateLog = (g_StateLog << 4) | ((ULONG)State & 0xF);
     KeReleaseSpinLock(&g_Hw.Lock, Irql);
+    if (KeGetCurrentIrql() == PASSIVE_LEVEL) {
+        SaTrace(L"StateLog", g_StateLog);
+    }
 
     /* 1.0.0.2: what each start and stop looked like (KS state changes come at PASSIVE_LEVEL). */
     if (KeGetCurrentIrql() == PASSIVE_LEVEL) {
@@ -576,7 +589,7 @@ STDMETHODIMP_(NTSTATUS) CSaStream::AllocateAudioBuffer(ULONG RequestedSize, PMDL
         return STATUS_INSUFFICIENT_RESOURCES;
     }
     Phys = m_PortStream->GetPhysicalPageAddress(Mdl, 0);
-    Va = m_PortStream->MapAllocatedPages(Mdl, MmNonCached);
+    Va = m_PortStream->MapAllocatedPages(Mdl, MmWriteCombined);
     if (Va != NULL) {
         RtlZeroMemory(Va, (SIZE_T)Period * SA_PERIODS);
         m_PortStream->UnmapAllocatedPages(Va, Mdl);
@@ -588,7 +601,8 @@ STDMETHODIMP_(NTSTATUS) CSaStream::AllocateAudioBuffer(ULONG RequestedSize, PMDL
     *AudioBufferMdl = Mdl;
     *ActualSize = m_BufferSize;
     *OffsetFromFirstPage = 0;
-    *CacheType = MmNonCached;
+    *CacheType = MmWriteCombined;
+    SaTrace(L"Buffers", (ULONG)InterlockedIncrement(&g_Buffers));
     SaTrace(L"Requested", RequestedSize);
     SaTrace(L"BufferSize", m_BufferSize);
     SaTrace(L"BufferPhys", m_Phys);
