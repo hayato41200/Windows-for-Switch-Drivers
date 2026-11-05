@@ -1916,8 +1916,11 @@ Return value:
         break;
 
     case SdBusVoltageOff:
-        PowerControl = 0;
-        break;
+        SdhcWriteRegisterUchar(SdhcExtension, SDHC_POWER_CONTROL, 0);
+        SdPortWait(Delay);
+        PowerControlCheck = SdhcReadRegisterUchar(SdhcExtension, SDHC_POWER_CONTROL);
+        return (PowerControlCheck & SDHC_PC_BUS_POWER) ?
+               STATUS_DEVICE_POWER_FAILURE : STATUS_SUCCESS;
 
     default:
 
@@ -2221,6 +2224,13 @@ Return value:
     ULONG DatLines;
     USHORT HostControl2;
     USHORT Mask;
+
+    // SDPORT can request default signaling again after the card is selected.
+    // With the bus idle DAT[3:0] are high; no CMD11 handshake is in progress.
+    HostControl2 = SdhcReadRegisterUshort(SdhcExtension, SDHC_HOST_CONTROL2);
+    if (!Enable && !(HostControl2 & SDHC_HC2_1_8V_SIGNALING)) {
+        return STATUS_SUCCESS;
+    }
 
     //
     // Disable the bus clock.
