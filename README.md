@@ -1,5 +1,7 @@
 # Windows for Switch — Drivers
 
+Switch Lite HDH-001 development now lives in this consolidated branch. The 0.3.2.5 WINARM profile marks the presented NTFS partition active for Windows BCD discovery. The model-specific FTM4 source and desktop three-point checker are documented in [HDH-001 build notes](docs/hdh001/README.md). A physical Lite has reached Windows 11 Home first-run setup and accepted touch input on the setup dialog. OOBE completion and TOUCH PASS are pending.
+
 Windows on ARM (ARM64) で動く、Nintendo Switch（Tegra210 / Erista）用のドライバーと、コントロールセンター（SwitchCenter）です。
 
 UEFI と DSDT は [Windows-for-Switch](https://github.com/hayato41200/Windows-for-Switch) にあります。このリポジトリのドライバーは、そちらの UEFI（R367 以降）が DSDT に追加するデバイスを使います。
