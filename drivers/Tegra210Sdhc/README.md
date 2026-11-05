@@ -4,7 +4,7 @@ SD host miniport for `sdport.sys`, for the Switch's microSD slot (Tegra210 SDMMC
 
 - Based on the SDHC miniport in Microsoft's Windows-driver-samples (`sd/miniport/sdhc`, MIT license).
 - Tegra210 limits: 3.3 V, legacy/high speed only (`NV_T210_SAFE_BRINGUP`), no UHS-I voltage switch or tuning.
-- `NV_T210_PIO_ONLY` (default on): all data goes through the data port, never DMA. On Windows 11 22621 the
+- `NV_T210_PIO_ONLY` (default off): all data goes through the data port, never DMA. On Windows 11 22621 the
   inbox sdbus could not mount the boot volume on this non-coherent controller (`_CCA = 0`).
 - Build: `tools\Build-Driver.ps1 -Wdm -Name nvtsdhc -Sources drivers\Tegra210Sdhc\src\nvtsdhc.c -Libs sdport.lib -Inf drivers\Tegra210Sdhc\nvtsdhc.inf -OutDir build\Tegra210Sdhc`
 
@@ -16,4 +16,18 @@ Boot diagnostics (`NV_DIAG_STOP`, default on while bringing it up): if fewer tha
 last error command, error kind; see the comment at the top of `src/nvtsdhc.c`). Card detect always reports
 a card, since the Switch wires it to a GPIO.
 
-Status: not yet tested on hardware.
+## Switch Lite (HDH-001) read test
+
+For a RAM-booted WinPE that only needs to read its deployment card, add
+`-Defines NV_T210_LITE_READ_ONLY=1` to the PowerShell build command above and use a separate output directory.
+Use firmware that exposes the external slot as `ACPI\NVDA0101` with `_CCA = 0`, leaves it at 3.3 V
+and selects PLLP for SDMMC1. With WinX's SDM1 already present, load the boot manager directly;
+adding the example SSDT would describe the same controller twice. Inject the resulting signed package
+into the ARM64 WinPE image before boot.
+
+The profile reads the firmware's CAR divider, uses 1- or 4-bit default-speed PIO up to 25 MHz,
+and reports write protection to SDPORT. Data-out, block writes, write-protect changes and erase
+are rejected before a request is queued. The diagnostic stop timer and crash-dump path are disabled.
+For an on-device read check, place a marker file on the external FAT volume, boot to the WinPE RAM
+disk, and read that file from the external volume. One HDH-001 running 22621.1 passed this check
+with the development build. The default ADMA configuration was outside that test.
