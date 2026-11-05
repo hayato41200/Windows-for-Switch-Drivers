@@ -31,3 +31,18 @@ are rejected before a request is queued. The diagnostic stop timer and crash-dum
 For an on-device read check, place a marker file on the external FAT volume, boot to the WinPE RAM
 disk, and read that file from the external volume. One HDH-001 running 22621.1 passed this check
 with the development build. The default ADMA configuration was outside that test.
+
+## Restricted WINARM writes on HDH-001
+
+For the experimental WINARM build, set `NV_T210_LITE_WINARM_WRITE=1`. It shares the Lite PIO, clock and voltage setup, and restricts block writes to a configured 80 GiB NTFS partition. This profile requires a per-card header. The generator reads a saved whole-card image and checks the MBR, primary GPT and NTFS layout. The tested layout uses hybrid MBR slot 4 and GPT slot 11. Keep the generated card identifiers local.
+
+From the repository root in PowerShell:
+
+```powershell
+$sd = 'drivers/Tegra210Sdhc'
+py -3 "$sd/winarm/configure-target.py" 'D:/images/test-card.img' "$sd/winarm/generated"
+Copy-Item "$sd/winarm/generated/winarm-target.h" "$sd/src/"
+./tools/Build-Driver.ps1 -Wdm -Name nvtsdhc -Sources "$sd/src/nvtsdhc.c" -Libs sdport.lib -Defines 'NV_T210_LITE_WINARM_WRITE=1' -Inf "$sd/winarm/nvtsdhc.inf" -OutDir build/WINARM-R3
+```
+
+For WinPE deployment, use the matching R3 BL33, generated startnet.cmd and the signed test package. Verify the final SYS and INF against their catalog using a test certificate valid at the firmware's cold-start clock. The hardware build and test steps are in the [R3 source tree](https://github.com/ruje0504-2/winx/tree/b44da7475fb281d6e4390d976f8f8e0098154d87/docs/hdh001-winarm-r3). One HDH-001 verified the 4 KiB receipt file after shutdown and a second boot. [Hardware report](https://github.com/steck0714/winx/issues/5)

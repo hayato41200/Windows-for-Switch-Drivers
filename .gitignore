@@ -4,3 +4,5 @@ build/
 out/
 *.user
 .vs/
+/drivers/Tegra210Sdhc/src/winarm-target.h
+/drivers/Tegra210Sdhc/winarm/generated/
