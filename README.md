@@ -2,9 +2,9 @@
 
 This branch consolidates Switch Lite (HDH-001) development. The WINARM SD profile (0.3.2.5) marks its presented NTFS partition active for Windows BCD discovery. GPIO, I²C, FTM4 touch, power-button, and shared fan support are integrated; T214 clock code lives alongside the shared fan implementation. See the [HDH-001 build notes](docs/hdh001/README.md).
 
-The optional system profile reuses the shared battery and RTC drivers and the Windows inbox volume-button driver. Signed battery/RTC packages have passed ARM64 WinPE staging; deployment and physical validation are pending.
+The optional system/media profiles reuse the shared battery, RTC, audio, and inbox volume-button drivers. SwitchFan 1.0.0.4 corrects the CPU/EMC coupling and requested fan floor. The companion firmware supplies display-only rotation and a default-landscape helper. ARM64 build/staging checks pass; physical acceptance remains pending.
 
-A physical Lite has reached the Windows 11 Home 23H2 OOBE network setup page and accepted touch input on setup dialogs. OOBE completion, desktop TOUCH PASS, and the latest fan/clock/restart changes still await hardware confirmation. The upstream devices listed below are not all enabled or validated on Lite.
+A physical Lite has reached the Windows 11 Home 23H2 OOBE network setup page and accepted touch input on setup dialogs. The latest saved SYSTEM hive records completed setup flags. The combined system/media update is deployed; desktop TOUCH PASS and the latest audio/display/fan/clock/restart changes still await hardware confirmation. The upstream devices listed below are not all enabled or validated on Lite.
 
 KMDF drivers and SwitchCenter, a tray/control-center application, for Windows on ARM (ARM64) on the Nintendo Switch (Tegra210 / Erista).
 
