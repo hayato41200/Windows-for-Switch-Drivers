@@ -111,7 +111,7 @@ runtime hardware state remain under investigation.
 
 ## Windows Wi-Fi packet core
 
-The shared [SwitchWifi driver](../../drivers/SwitchWifi/README.md) now links as an ARM64 WiFiCx station driver. It handles radio, scan/abort, and NetAdapterCx transmit and receive queues using the BCM4356 msgbuf transport. Windows PE 22621.1 accepted the signed package in an isolated guest. WINARM still uses its existing boot profile. Version 0.2 implements directed open/WPA2-Personal association, CCMP key requests and disconnect. Windows scanning, authentication, DHCP and rekey on HDH-001 await hardware testing.
+The shared [SwitchWifi driver](../../drivers/SwitchWifi/README.md) now links as an ARM64 WiFiCx station driver. It handles radio, scan/abort, and NetAdapterCx transmit and receive queues using the BCM4356 msgbuf transport. Windows PE 22621.1 accepted the signed package in an isolated guest. WINARM still uses its existing boot profile. The station supports directed open/WPA2-Personal association, CCMP key requests and disconnect. Version 0.3 adds peer link measurements and a PnP status report for real-hardware bring-up. Windows scanning, authentication, DHCP and rekey on HDH-001 await hardware testing.
 
 
 For a Wi-Fi-only kit, use `Install-LiteSystem.cmd online wifi` or
