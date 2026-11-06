@@ -122,7 +122,7 @@ runtime hardware state remain under investigation.
 
 ## Windows Wi-Fi packet core
 
-The shared [SwitchWifi driver](../../drivers/SwitchWifi/README.md) implements an ARM64 WiFiCx station with NetAdapterCx packet queues, open/WPA2-Personal association, CCMP keys and receive filters. In Windows PE 22621.2861 the signed 0.5.0.0 package bound to an ACPI device, evaluated `WIRS` and registered GSI 130. The fixture intentionally omits the Tegra memory ranges and reported `hw=3/C0000182 irq=0 ring=0`. Version 0.5.1 routes association and disconnect notifications from the firmware control ring to the Windows connection handler. Wi-Fi 0.5.2.0 and the matching two-volume BasicDisplay firmware are installed on the card. Windows scan, association, DHCP and group rekey await testing on the Lite.
+The shared [SwitchWifi driver](../../drivers/SwitchWifi/README.md) implements an ARM64 WiFiCx station with NetAdapterCx packet queues, open/WPA2-Personal association, CCMP keys and receive filters. In Windows PE 22621.2861 the signed 0.5.0.0 package bound to an ACPI device, evaluated `WIRS` and registered GSI 130. The fixture intentionally omits the Tegra memory ranges and reported `hw=3/C0000182 irq=0 ring=0`. Version 0.5.1 routes association and disconnect notifications from the firmware control ring to the Windows connection handler. On trimmed Pro, Windows enumerated WFI0, loaded the BCM firmware and consumed ring completions with its interrupt handler active. Driver 0.5.2.0 failed during station creation with `0xC0200211`. Driver 0.5.3.0 corrects the adapter attributes. Scanning, WPA2 and DHCP in Windows await a board result.
 
 
 For a Wi-Fi-only kit, use `Install-LiteSystem.cmd online wifi` or
