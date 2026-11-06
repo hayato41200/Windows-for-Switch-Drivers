@@ -63,8 +63,8 @@ The separate 1.0.0.14 build starts the retry timer after KMDF connects the UART
 interrupt. Before entering a lower power state, it closes HCI access, drains
 the timer and completes held reads and writes. The boot marker clears after
 five two-second intervals with a successfully created child. The card retains
-1.0.0.13 for the BasicDisplay boot test. The reported blue screen had no
-recoverable stop code. In an isolated ARM64 Windows PE 22621.2861 guest,
+1.0.0.13. The owner later photographed stop 0x7B on the BasicDisplay boot.
+The storage handoff fix is being tested separately. In an isolated ARM64 Windows PE 22621.2861 guest,
 the signed driver bound to the ACPI UART and ran its timer in safe mode.
 The guest vetoed the device-disable request. Removal, physical radio pairing
 and system power transitions remain unverified.

@@ -34,7 +34,16 @@ with the development build. The default ADMA configuration was outside that test
 
 ## Restricted WINARM writes on HDH-001
 
-For the experimental WINARM build, set `NV_T210_LITE_WINARM_WRITE=1`. It shares the Lite PIO, clock and voltage setup, and restricts block writes to a configured 80 GiB NTFS partition. This profile requires a per-card header. The generator reads a saved whole-card image and checks the MBR, primary GPT and NTFS layout. The tested layout uses hybrid MBR slot 4 and GPT slot 11. Keep the generated card identifiers local.
+For the experimental WINARM build, set `NV_T210_LITE_WINARM_WRITE=1`. It shares the Lite PIO, clock and voltage setup, and restricts block writes to the configured 80 GiB NTFS partition and existing FAT32 data partition. This profile requires a per-card header. The generator reads a saved whole-card image and checks the MBR, primary GPT and NTFS layout. The tested layout uses hybrid MBR slot 4 and GPT slot 11. Keep the generated card identifiers local. Version 0.3.2.6 projects WINARM as the active first MBR entry and FAT32 as the second data entry, without writing the physical partition table. FAT32 writes require its matching extent and FAT32 boot-sector facts; WINARM retains its NTFS identity checks. Writes to partition tables, Linux, Android and emuMMC stay rejected.
+
+Build the companion UEFI with the same generated header used for this
+miniport. The firmware boot manager and storage driver must agree on all
+512 bytes of the projected MBR. A one-entry firmware view and this two-entry
+driver had different MBR checksums on the card that reproduced stop 0x7B.
+UEFI reads both configured data ranges and presents WINARM as the first,
+active partition. The Windows miniport separately checks the relevant boot
+sector before admitting writes to each data volume.
+[Windows disk signature fields](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/ntddk/ns-ntddk-_disk_signature).
 
 From the repository root in PowerShell:
 

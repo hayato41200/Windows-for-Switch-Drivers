@@ -52,7 +52,9 @@ Revision History:
 
 enum {
     LiteSdxc = 1, LiteGpt = 2, LitePartition = 4, LiteNtfs = 8, LiteMbr = 16,
-    LiteWriteFacts = LiteSdxc | LiteMbr | LiteNtfs
+    LiteFatBoot = 32,
+    LiteWriteFacts = LiteSdxc | LiteMbr | LiteNtfs,
+    LiteFatWriteFacts = LiteSdxc | LiteMbr | LiteFatBoot
 };
 
 static VOID LiteForgetCard(PSDHC_EXTENSION slot)
@@ -84,6 +86,9 @@ static VOID LiteObserveRead(PSDHC_EXTENSION slot, PSDPORT_COMMAND cmd)
     } else if (lba == WINARM_FIRST) {
         bit = LiteNtfs;
         matches = (BOOLEAN)LiteIsBootSector(cmd->DataBuffer);
+    } else if (lba == FAT32_FIRST) {
+        bit = LiteFatBoot;
+        matches = (BOOLEAN)LiteIsFatBootSector(cmd->DataBuffer);
     } else {
         return;
     }
@@ -108,15 +113,16 @@ static BOOLEAN LiteAllowRequest(PSDHC_EXTENSION slot, PSDPORT_REQUEST request)
     if (cmd->Index == 24 || cmd->Index == 25) {
         ULONG lba = cmd->Argument;
         ULONG count = cmd->BlockCount;
-        if ((slot->TargetFacts & LiteWriteFacts) != LiteWriteFacts || slot->CrashdumpMode || slot->AppPrefixAccepted ||
+        BOOLEAN ntfs = (BOOLEAN)LiteInsideExtent(lba, count, WINARM_FIRST, WINARM_COUNT);
+        BOOLEAN fat = (BOOLEAN)LiteInsideExtent(lba, count, FAT32_FIRST, FAT32_COUNT);
+        LONG required = ntfs ? LiteWriteFacts : LiteFatWriteFacts;
+        if ((!ntfs && !fat) || (slot->TargetFacts & required) != required || slot->CrashdumpMode || slot->AppPrefixAccepted ||
             cmd->Class == SdCommandClassApp || cmd->TransferDirection != SdTransferDirectionWrite ||
             cmd->TransferMethod != SdTransferMethodPio || cmd->BlockSize != 512 ||
             count == 0 || (cmd->Index == 24 && count != 1) ||
             (cmd->Index == 24 && cmd->TransferType != SdTransferTypeSingleBlock) ||
             (cmd->Index == 25 && cmd->TransferType != SdTransferTypeMultiBlock &&
-                                 cmd->TransferType != SdTransferTypeMultiBlockNoStop) ||
-            lba < WINARM_FIRST || lba - WINARM_FIRST >= WINARM_COUNT ||
-            count > WINARM_COUNT - (lba - WINARM_FIRST)) {
+                                 cmd->TransferType != SdTransferTypeMultiBlockNoStop)) {
             return FALSE;
         }
         if (request->Type == SdRequestTypeCommandWithTransfer) {
