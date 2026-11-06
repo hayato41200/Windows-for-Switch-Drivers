@@ -102,7 +102,7 @@ records, terminal status 0 and UEFI return Success. PCIe supply/PHY/link,
 BCM4356A3 firmware startup and control/event DMA are accepted for that
 pre-Windows check. The temporary check flag was removed and Home boots Windows
 normally again. This repository does not yet provide a working Windows Wi-Fi
-adapter; association/key management and packet/OS integration are ongoing.
+adapter. The Windows implementation now includes association, keys and queues. Physical Windows networking is pending.
 See the [shared Wi-Fi implementation and evidence](https://github.com/ruje0504-2/winx/blob/hdh001-hekate-sd/docs/hdh001-home/WIFI.md).
 
 Windows shutdown/restart still black-screen with the fan running. A pre-Windows
@@ -111,4 +111,11 @@ runtime hardware state remain under investigation.
 
 ## Windows Wi-Fi packet core
 
-The shared [SwitchWifi driver](../../drivers/SwitchWifi/README.md) now links as an ARM64 WiFiCx station driver. It handles radio, scan/abort, and NetAdapterCx transmit and receive queues using the BCM4356 msgbuf transport. Windows PE 22621.1 accepted the signed package in an isolated guest. WINARM still uses its existing boot profile. Windows scanning on HDH-001, association, keys and IP traffic are pending.
+The shared [SwitchWifi driver](../../drivers/SwitchWifi/README.md) now links as an ARM64 WiFiCx station driver. It handles radio, scan/abort, and NetAdapterCx transmit and receive queues using the BCM4356 msgbuf transport. Windows PE 22621.1 accepted the signed package in an isolated guest. WINARM still uses its existing boot profile. Version 0.2 implements directed open/WPA2-Personal association, CCMP key requests and disconnect. Windows scanning, authentication, DHCP and rekey on HDH-001 await hardware testing.
+
+
+For a Wi-Fi-only kit, use `Install-LiteSystem.cmd online wifi` or
+`Install-LiteSystem.cmd offline W:\ wifi`. Supply the signed `switchwifi`
+directory, matching `WifiPrepare.efi` and the private A3 firmware/NVRAM
+pair in `Firmware`. The installer keeps an existing complete board pair.
+The runtime BL33 must be prepared separately.

@@ -12,7 +12,7 @@ The media display experiment went black at device restart. At the owner's reques
 
 The companion firmware's R6 pre-Windows Wi-Fi probe completed passive scanning with six records and return Success. This accepts the BCM4356A3 PCIe/firmware/control-event DMA path, not a Windows Wi-Fi adapter. Association, keys, packet transport and Windows networking integration remain in progress; see the [shared Wi-Fi status](https://github.com/ruje0504-2/winx/blob/hdh001-hekate-sd/docs/hdh001-home/WIFI.md).
 
-The shared [SwitchWifi driver](drivers/SwitchWifi/README.md) now links as an ARM64 WiFiCx station driver. It handles radio, scan/abort, and NetAdapterCx transmit and receive queues using the BCM4356 msgbuf transport. Windows PE 22621.1 accepted the signed package in an isolated guest. WINARM still uses its existing boot profile. Windows scanning on HDH-001, association, keys and IP traffic are pending.
+The shared [SwitchWifi driver](drivers/SwitchWifi/README.md) now links as an ARM64 WiFiCx station driver. It handles radio, scan/abort, and NetAdapterCx transmit and receive queues using the BCM4356 msgbuf transport. Windows PE 22621.1 accepted the signed package in an isolated guest. WINARM still uses its existing boot profile. Version 0.2 implements directed open/WPA2-Personal association, CCMP key requests and disconnect. Windows scanning, authentication, DHCP and rekey on HDH-001 await hardware testing.
 
 KMDF drivers and SwitchCenter, a tray/control-center application, for Windows on ARM (ARM64) on the Nintendo Switch (Tegra210 / Erista).
 
