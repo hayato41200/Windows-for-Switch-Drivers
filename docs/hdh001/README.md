@@ -63,8 +63,8 @@ The separate 1.0.0.14 build starts the retry timer after KMDF connects the UART
 interrupt. Before entering a lower power state, it closes HCI access, drains
 the timer and completes held reads and writes. The boot marker clears after
 five two-second intervals with a successfully created child. The card retains
-1.0.0.13. The owner later photographed stop 0x7B on the BasicDisplay boot.
-The storage handoff fix is being tested separately. In an isolated ARM64 Windows PE 22621.2861 guest,
+1.0.0.13. After the two-volume storage repair the owner confirmed Bluetooth works
+on the trimmed Pro desktop. In an isolated ARM64 Windows PE 22621.2861 guest,
 the signed driver bound to the ACPI UART and ran its timer in safe mode.
 The guest vetoed the device-disable request. Removal, physical radio pairing
 and system power transitions remain unverified.
@@ -112,9 +112,8 @@ The shared long-term scope, including Switchroot-based Wi-Fi and Lite SIO, is tr
 The companion R6 firmware probe completed a physical passive scan with six
 records, terminal status 0 and UEFI return Success. PCIe supply/PHY/link,
 BCM4356A3 firmware startup and control/event DMA are accepted for that
-pre-Windows check. The temporary check flag was removed and Home boots Windows
-normally again. This repository does not yet provide a working Windows Wi-Fi
-adapter. The Windows implementation now includes association, keys and queues. Physical Windows networking is pending.
+pre-Windows check. The temporary check flag was removed. The Windows implementation now includes
+association, keys and packet queues.
 See the [shared Wi-Fi implementation and evidence](https://github.com/ruje0504-2/winx/blob/hdh001-hekate-sd/docs/hdh001-home/WIFI.md).
 
 Windows shutdown/restart still black-screen with the fan running. A pre-Windows
@@ -123,7 +122,7 @@ runtime hardware state remain under investigation.
 
 ## Windows Wi-Fi packet core
 
-The shared [SwitchWifi driver](../../drivers/SwitchWifi/README.md) implements an ARM64 WiFiCx station with NetAdapterCx packet queues, open/WPA2-Personal association, CCMP keys and receive filters. In Windows PE 22621.2861 the signed 0.5.0.0 package bound to an ACPI device, evaluated `WIRS` and registered GSI 130. The fixture intentionally omits the Tegra memory ranges and reported `hw=3/C0000182 irq=0 ring=0`. Version 0.5.1 routes association and disconnect notifications from the firmware control ring to the Windows connection handler. The physical Lite uses its BasicDisplay boot profile. Windows scanning, authentication, DHCP and group rekey await hardware testing.
+The shared [SwitchWifi driver](../../drivers/SwitchWifi/README.md) implements an ARM64 WiFiCx station with NetAdapterCx packet queues, open/WPA2-Personal association, CCMP keys and receive filters. In Windows PE 22621.2861 the signed 0.5.0.0 package bound to an ACPI device, evaluated `WIRS` and registered GSI 130. The fixture intentionally omits the Tegra memory ranges and reported `hw=3/C0000182 irq=0 ring=0`. Version 0.5.1 routes association and disconnect notifications from the firmware control ring to the Windows connection handler. Wi-Fi 0.5.2.0 and the matching two-volume BasicDisplay firmware are installed on the card. Windows scan, association, DHCP and group rekey await testing on the Lite.
 
 
 For a Wi-Fi-only kit, use `Install-LiteSystem.cmd online wifi` or
