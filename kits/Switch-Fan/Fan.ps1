@@ -25,8 +25,8 @@ $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIden
 if (-not $isAdmin) { Write-Host 'Run this from an elevated (Administrator) prompt.'; exit 1 }
 
 function Show-Status {
-  $dev = @(Get-CimInstance Win32_PnPEntity -ErrorAction SilentlyContinue | Where-Object { $_.PNPDeviceID -like 'ACPI\SWOA0401*' })
-  if ($dev.Count -eq 0) { Log 'FAN0: NOT FOUND (ACPI\SWOA0401). Is the Switch booted with UEFI R372?' }
+  $dev = @(Get-CimInstance Win32_PnPEntity -ErrorAction SilentlyContinue | Where-Object { ($_.PNPDeviceID -like 'ACPI\SWOA0401*' -or $_.PNPDeviceID -like 'ACPI\SWOA0402*') })
+  if ($dev.Count -eq 0) { Log 'FAN0: NOT FOUND (ACPI\SWOA0401 or SWOA0402). Is the Switch booted with UEFI R372?' }
   foreach ($d in $dev) {
     Log ("device: {0}  name='{1}' status={2} problem={3} service={4}" -f $d.PNPDeviceID, $d.Name, $d.Status, $d.ConfigManagerErrorCode, $d.Service)
   }

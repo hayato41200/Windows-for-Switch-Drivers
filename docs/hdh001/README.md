@@ -27,11 +27,11 @@ For the interrupted Home installation tested here, Windows subsequently required
 
 ## Shared fan and T214 clock control
 
-`drivers/SwitchFan` now supports both the original SWOA0401 device and Lite SWOA0402. Its common fan/I2C code stays in the upstream source file; only the Mariko clock helper and handoff definition are under `src/t214`. The original device retains its backlight interface. Lite maps PWM1 only and rejects backlight commands.
+`drivers/SwitchFan` now supports both the original SWOA0401 device and Lite SWOA0402. Its common fan/I2C/backlight code stays in the upstream source file; only the Mariko clock helper and handoff definition are under `src/t214`. The original device retains its backlight interface. Older Lite firmware exposes PWM1 only; the new optional backlight profile adds a separate PWM0 resource and enables the existing brightness interface.
 
 On Lite, TMP451 uses the Mariko -12.5 C remote offset. The optional firmware handoff requests CPU 1996.8 MHz with MAX77812 M4 at 1120 mV, independently of whether the firmware completed the requested EMC change. The fan timer owns both cooling and CPU transitions. At 80 C or after repeated sensor-read failures it restores the saved boot CPU frequency; at 70 C it can resume the request. It does not touch MAX77812 M1/GPU registers.
 
-Use the matching firmware's `cpu_oc`/`ram_oc` INI options and its LitePerformanceCheck application. Parameters records include CpuActualKhz, RamActualKhz, TempSoC, TempBoard, Duty, SensorFailures and status. Build with `docs/hdh001/build-drivers.sh`; the shared INF is version 1.0.0.4. The existing Erista CPU-clock driver is not loaded for the Lite profile.
+Use the matching firmware's `cpu_oc`/`ram_oc` INI options and its LitePerformanceCheck application. Parameters records include CpuActualKhz, RamActualKhz, TempSoC, TempBoard, Duty, SensorFailures and status. Build with `docs/hdh001/build-drivers.sh`; the shared INF is version 1.0.0.5. The existing Erista CPU-clock driver is not loaded for the Lite profile.
 
 The ARM64 build and host CPU-helper checks pass. Run the latter with `cc -std=c11 -Wall -Wextra -Werror drivers/SwitchFan/tests/test-t214-clock.c -o /tmp/test-t214-clock && /tmp/test-t214-clock`. Signed package validation is complete; physical clock, cooling and restart checks remain pending.
 
@@ -43,7 +43,7 @@ The companion firmware's `SWITCH_LITE_SYSTEM=1` option exposes the upstream BAT0
 - `switchrtc` 1.0.0.2 reads MAX77620 RTC (I2C5, 0x68). It learns a private Windows time offset after manual/NTP time changes and applies it on later starts, preserving the hardware calendar used by Horizon.
 - Volume up/down use the Windows inbox ACPI0011 button driver through the existing GPIO driver: PX6/GPIO190 and PX7/GPIO191, with both-edge interrupts. This adds input support, not an audio endpoint.
 
-The ARM64 build, signed SYS/catalog verification, and PnPUtil staging in ARM64 WinPE 22621.1 pass. Sign the final INF/SYS catalogs and use [Install-LiteSystem.cmd](Install-LiteSystem.cmd) beside the `switchfan`, `switchpwrbtn`, `switchbattery`, `switchrtc`, `winxdisplay`, and `switchaudio` package directories. Include LiteLandscape.exe for the default orientation. Run it with `online` from an elevated Home prompt, or `offline W:\` from ARM64 maintenance WinPE with WINARM's actual drive letter. Existing GPIO/I²C drivers and the Stage 6 test certificate are prerequisites. Battery readings, learned RTC time across boots, and physical volume-key input remain unverified on HDH-001.
+The ARM64 build, signed SYS/catalog verification, and PnPUtil staging in ARM64 WinPE 22621.1 pass. Sign the final INF/SYS catalogs and use [Install-LiteSystem.cmd](Install-LiteSystem.cmd) beside the `switchfan`, `switchpwrbtn`, `switchbattery`, `switchrtc`, and `switchaudio` package directories. Include LitePerformanceCheck.exe for clock readings and brightness controls. Run it with `online` from an elevated Home prompt, or `offline W:\` from ARM64 maintenance WinPE with WINARM's actual drive letter. Existing GPIO/I²C drivers and the Stage 6 test certificate are prerequisites. Battery readings, learned RTC time across boots, and physical volume-key input remain unverified on HDH-001.
 
 ## EMC failure and fan-floor correction
 
@@ -80,3 +80,15 @@ The next physical boot bound audio 1.0.0.8, cleared the reinstall flag and read 
 The owner clarified that only the Windows startup sound had been checked. The offline SOFTWARE hive had `Microsoft\Windows\CurrentVersion\Authentication\LogonUI\BootAnimation\DisableStartupSound=1`, with no overriding sound policy. The normal startup sound is enabled by setting this value to 0. The optional driver TestTone remains 0. No additional driver or firmware change is made for this configuration correction. Desktop playback and headphone output remain untested.
 
 The same boot read CPU 1996.8 MHz and RAM 1866 MHz. BPMP rounded below the 2100 MHz request, so the firmware correctly reported a target mismatch rather than claiming 2100 MHz success.
+
+## Backlight, audio pads and paging follow-up
+
+`SWITCH_LITE_BACKLIGHT=1` adds PWM0 (0x7000A000, four bytes) to FAN0 separately from PWM1. Shared SwitchFan 1.0.0.5 retains the fan/CPU behavior and enables its existing brightness IOCTLs and display-power callback when PWM0 is present. It preserves the firmware divider, uses the inherited Lite brightness on first start, and restores the saved user setting thereafter. LitePerformanceCheck adds touch-sized Darker/Brighter buttons. Old Lite firmware remains supported without backlight access. This does not provide GPU acceleration or software rotation.
+
+The owner confirmed silence during Windows Settings playback after enabling startup sound. SwitchAudio 1.0.0.8 was active, the speaker route was unmuted, codec reads succeeded, and ADMA completed transfers. The new Lite firmware explicitly selects 1.8 V for AUDIO/AUDIO_HV, exits pad DPD when required, and uses the Vali DAP1 output pinmux. These settings follow Switchroot's board DT and B01 PMC implementation; they are a candidate correction, not yet proven to restore sound. SwitchAudio 1.0.0.9 adds readback of pads, clock source, digital mixer and existing PCM-buffer peak/nonzero counts at the existing start/stop snapshots. It produces no extra sound and does no additional per-position/render work. TestTone remains disabled.
+
+Windows kept TempPageFile=1 and created no persistent pagefile despite the requested 512–2048 MB setting. Inspection of the target SDPORT binary with Microsoft public symbols found that SdhostQueryRemovability reads `_ADR`/`_RMV` on a slot child, and SdhostPdoDeviceUsageNotification rejects paging for a removable slot. Home had no slot child. The companion `SWITCH_LITE_BOOT_SD=1` profile now describes slot 0 / memory function 0 as a fixed boot device for the Windows session. The card is removable only after shutdown. This changes ACPI metadata, not the SD miniport, card partitions or 80 GiB write limits. Pagefile creation still needs the next boot result; crash-dump/hibernate support is not claimed.
+
+References: [Switchroot display/backlight wiring](https://github.com/CTCaer/switch-l4t-platform-t210-nx/blob/linux-5.1.2/kernel-dts/nx-platforms/tegra210-nx-common-disp.dtsi), [B01 pad control](https://github.com/CTCaer/switch-l4t-kernel-4.9/blob/linux-5.1.2/drivers/soc/tegra/pmc.c), and [Windows SD slot ACPI objects](https://learn.microsoft.com/en-us/windows-hardware/drivers/bringup/other-acpi-namespace-objects#sd-host-controllers-and-devices).
+
+The shared long-term scope, including Switchroot-based Wi-Fi and Lite SIO, is tracked in the [porting roadmap](https://github.com/ruje0504-2/winx/blob/hdh001-hekate-sd/docs/hdh001-home/PORTING.md).
