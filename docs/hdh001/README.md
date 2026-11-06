@@ -75,7 +75,21 @@ The installer includes Bluetooth only when a signed `switchbt/switchbt.inf` is p
 
 For diagnostics, use the existing `kits/Switch-Bluetooth/Bluetooth.ps1 -Mode Status`. Its `Retry` mode clears the upstream failed-boot hold and permits another probe without replacing the driver. The radio child is deliberately added after a delay, so check Settings after it enumerates.
 
-Do not add the Erista SwitchSensor device on Lite: [Switchroot's Lite DT](https://github.com/CTCaer/switch-l4t-platform-t210-nx/blob/linux-5.1.2/kernel-dts/tegra210b01-vali.dts) reserves SPI4 for SIO. Motion data and built-in controller support need that transport rather than the direct SPI4 sensor path.
+### Built-in gamepad and motion
+
+On HDH-001 the internal SIO controller owns the IMU. The optional
+`switchsio.inf` package binds to `ACPI\SWOA0902` on UART-C. It uses VHF
+for 14 buttons, a hat and four stick axes, and serves the latest accelerometer
+sample through the existing SwitchSensor status IOCTL. The Home button uses
+its separate GPIO. Build the firmware with `-D SWITCH_LITE_SIO=1` alongside
+the existing Lite touch/GPIO profile. Install the signed driver package with
+`pnputil /add-driver switchsio\switchsio.inf /install`.
+
+The protocol fixture covers the handshake, split replies, damaged headers,
+stick limits, button mapping and partial motion samples. The ARM64 driver and
+optional firmware build successfully. Physical input and motion are pending.
+[Switchroot Lite device tree](https://github.com/CTCaer/switch-l4t-platform-t210-nx/blob/linux-5.1.2/kernel-dts/tegra210b01-vali.dts)
+
 
 ## Audio 1.0.0.8 follow-up
 
