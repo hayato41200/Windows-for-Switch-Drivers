@@ -13,6 +13,8 @@ Drivers for the **HDH-001 (Tegra T214)** port of Windows 11 ARM64. They use the 
 | `switchaudio` 1.0.0.9 | The built-in speakers play audio. Headphones and jack switching await testing. |
 | `switchfan` 1.0.0.5 | The fan and panel brightness controls work. Readbacks showed 1996.8 MHz CPU and 1866 MHz RAM. |
 
+Windows uses CPU software rendering only. The Tegra GPU driver for Windows has not been implemented.
+
 Battery, RTC, built-in controls and Windows USB-C host support are tracked in the [porting notes](https://github.com/ruje0504-2/winx/blob/hdh001-hekate-sd/docs/hdh001-home/PORTING.md).
 
 ## Building and installing
