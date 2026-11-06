@@ -64,3 +64,11 @@ The installer includes Bluetooth only when a signed `switchbt/switchbt.inf` is p
 For diagnostics, use the existing `kits/Switch-Bluetooth/Bluetooth.ps1 -Mode Status`. Its `Retry` mode clears the upstream failed-boot hold and permits another probe without replacing the driver. The radio child is deliberately added after a delay, so check Settings after it enumerates.
 
 Do not add the Erista SwitchSensor device on Lite: [Switchroot's Lite DT](https://github.com/CTCaer/switch-l4t-platform-t210-nx/blob/linux-5.1.2/kernel-dts/tegra210b01-vali.dts) reserves SPI4 for SIO. Motion data and built-in controller support need that transport rather than the direct SPI4 sensor path.
+
+## Audio 1.0.0.8 follow-up
+
+The physical Lite reached Home with BasicDisplay. ADMA/I2S counters advanced during playback, but the owner heard no internal-speaker output and had not tested headphones. The companion firmware now applies Switchroot's NX bias/class-D initialization for Lite. The shared 1.0.0.8 driver snapshots codec power, mixers, clocks and private tuning on jack-route changes; rendering behavior and endpoint format are unchanged. The existing one-shot TestTone option is disabled on the tested Home installation; the normal Windows startup sound is the first audible check. Actual sound remains pending.
+
+Offline Add-Driver initially staged 1.0.0.8 without replacing the existing device's 1.0.0.7 binding. Native maintenance removed the identified superseded non-boot-critical package, retained the signed 1.0.0.8 package, and marked only the audio devnode with CONFIGFLAG_REINSTALL (0x20) for the next enumeration. See the [Windows PnP reinstall flag](https://learn.microsoft.com/en-us/windows-hardware/drivers/install/determining-whether-a-device-is-plugged-in). Driver staging does not establish successful runtime binding or sound output.
+
+The same boot confirmed the Bluetooth patch loaded, the 3 Mbaud path and BthMini child started without transport errors. Pairing/range still need physical confirmation. CPU readback remained 1996.8 MHz, and the owner confirmed the fan turns. EMC readback was still 204 MHz before the companion RAM R2 correction.
