@@ -8,7 +8,7 @@ The companion Home firmware provides the GPIO interrupt resources, I²C3, touch 
 
 ## Compile the Lite driver set
 
-Set WDK_INCLUDE to the WDK Include/version directory, WDK_LIB to Lib/version/km/ARM64, WDF_INCLUDE to Include/wdf/kmdf/1.15, and WDF_LIB to Lib/wdf/kmdf/ARM64/1.15. CLANG_CL and LLD_LINK select the tools. WDK_EXTRA_LIB can select the matching SPB, GPIO, VHF, and battery-class (`battc.lib`) libraries. The script builds GPIO, I²C, Lite touch, power button, fan, battery, and RTC.
+Set WDK_INCLUDE to the WDK Include/version directory, WDK_LIB to Lib/version/km/ARM64, WDF_INCLUDE to Include/wdf/kmdf/1.15, and WDF_LIB to Lib/wdf/kmdf/ARM64/1.15. CLANG_CL and LLD_LINK select the tools. WDK_EXTRA_LIB can select the matching SPB, GPIO, VHF, and battery-class (`battc.lib`) libraries. The script builds GPIO, I²C, Lite touch, power button, fan, battery, RTC, and Bluetooth.
 
 ```sh
 sh docs/hdh001/build-drivers.sh . /path/to/output
@@ -49,10 +49,18 @@ The ARM64 build, signed SYS/catalog verification, and PnPUtil staging in ARM64 W
 
 The first physical performance run reported CPU 998.4 MHz, failed BPMP initialization, and a running temperature timer at 34 C / 33 C with duty zero. SwitchFan 1.0.0.4 separates CPU preparation from EMC status and keeps the minimum fan duty for a valid configured CPU request. PMIC voltage/readback, CPU clock checks, and thermal fallback remain in place. The companion firmware corrects the ATOMICS trigger/result registers and maps the Mariko BPMP mailbox carveout. Target clock rates and cooling after this correction still await hardware confirmation.
 
-## Shared audio and display integration
+## Audio integration and display rollback
 
-`drivers/SwitchAudio` remains the upstream PortCls/WaveRT implementation. Its ARM64 cross-build script uses `portcls.lib` and the same resident-section/native-driver linker settings as `tools/Build-Driver.ps1`. The companion firmware's `SWITCH_LITE_AUDIO=1` profile prepares APE, I2C1, RT5639, I2S1, and PV6 headphone detection using the shared R403 code. The target is stereo speaker/headphone playback and automatic jack switching; there is no microphone endpoint.
+`drivers/SwitchAudio` remains the upstream PortCls/WaveRT implementation. Its cross-build uses `portcls.lib` and the upstream native-driver linker settings. The companion firmware prepares APE, I2C1, RT5639, I2S1 and PV6 headphone detection using shared R403 code. The target is stereo speaker/headphone playback and automatic jack switching; no microphone endpoint is provided. The physical media boot created an audio endpoint; playback and jack behavior still need acceptance.
 
-The display-only implementation remains in the [existing WinX source tree](https://github.com/ruje0504-2/winx/tree/hdh001-hekate-sd/winx-display), avoiding a second source copy here. Its Lite profile binds ACPI WINX0001 and uses software framebuffer rotation. The companion sign-in helper saves 1280x720 landscape once per user. It does not add GPU acceleration.
+The display-only sources stay in the existing WinX tree. After the physical Lite went black during display-device restart, CPU-rendered rotation was withdrawn from the active profile. The Home installer no longer installs WinX display or LiteLandscape, and the companion firmware uses BasicDisplay in the native orientation. The proposed PE trial was cancelled. BasicDisplay does not provide GPU rendering acceleration.
 
-The combined firmware and ARM64 audio/display binaries build. The signed audio package stages successfully in ARM64 Windows. In the ARM64 VM, the display driver reports Started and rotation/restore succeed. The combined firmware and six complete INF/CAT/SYS packages have been deployed to the existing WINARM installation, preserving its completed setup state. Physical audio, orientation, and touch alignment are pending. The single Hekate entry remains **Lite Windows 11 Home**.
+## Bluetooth preparation
+
+The Lite build now includes the existing `drivers/SwitchBluetooth` 1.0.0.13 implementation. It uses the same UART-D H4 transport, BthMini child, patchram and 3 Mbaud flow-control path as upstream. No separate Lite Bluetooth source is added. The companion firmware's `SWITCH_LITE_BLUETOOTH=1` option supplies UART-D/PH3/PH4/PH5 initialization, the PMIC 32 kHz output, and BTH0 resources.
+
+The installer includes Bluetooth only when a signed `switchbt/switchbt.inf` is present beside it. Supply the Switch-specific patch at `Firmware/BCM4356A3.hcd`; it is copied before the driver is staged. The blob is not part of this source repository. Switchroot documents its [NX patch source](https://gitlab.com/switchroot/android/proprietary_vendor_firmware/-/blob/main/README.md). The combined BasicDisplay/audio/Bluetooth kit is built and deployed. Signed package checks and native Windows staging pass; pairing and range remain untested on Lite. Upstream reports limited radio range while the Wi-Fi-side antenna initialization is absent.
+
+For diagnostics, use the existing `kits/Switch-Bluetooth/Bluetooth.ps1 -Mode Status`. Its `Retry` mode clears the upstream failed-boot hold and permits another probe without replacing the driver. The radio child is deliberately added after a delay, so check Settings after it enumerates.
+
+Do not add the Erista SwitchSensor device on Lite: [Switchroot's Lite DT](https://github.com/CTCaer/switch-l4t-platform-t210-nx/blob/linux-5.1.2/kernel-dts/tegra210b01-vali.dts) reserves SPI4 for SIO. Motion data and built-in controller support need that transport rather than the direct SPI4 sensor path.
