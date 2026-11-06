@@ -33,7 +33,7 @@ On Lite, TMP451 uses the Mariko -12.5 C remote offset. The optional firmware han
 
 Use the matching firmware's `cpu_oc`/`ram_oc` INI options and its LitePerformanceCheck application. Parameters records include CpuActualKhz, RamActualKhz, TempSoC, TempBoard, Duty, SensorFailures and status. Build with `docs/hdh001/build-drivers.sh`; the shared INF is version 1.0.0.5. The existing Erista CPU-clock driver is not loaded for the Lite profile.
 
-The ARM64 build and host CPU-helper checks pass. Run the latter with `cc -std=c11 -Wall -Wextra -Werror drivers/SwitchFan/tests/test-t214-clock.c -o /tmp/test-t214-clock && /tmp/test-t214-clock`. Signed package validation is complete; physical clock, cooling and restart checks remain pending.
+The ARM64 build and host CPU-helper checks pass. Run the latter with `cc -std=c11 -Wall -Wextra -Werror drivers/SwitchFan/tests/test-t214-clock.c -o /tmp/test-t214-clock && /tmp/test-t214-clock`. Signed package validation is complete. Physical CPU readback is 1996.8 MHz and the fan turns; RAM reads 1866 MHz, below the requested 2100 MHz. Windows restart remains unresolved.
 
 ## Shared battery, RTC, and volume-button support
 
@@ -51,7 +51,7 @@ The first physical performance run reported CPU 998.4 MHz, failed BPMP initializ
 
 ## Audio integration and display rollback
 
-`drivers/SwitchAudio` remains the upstream PortCls/WaveRT implementation. Its cross-build uses `portcls.lib` and the upstream native-driver linker settings. The companion firmware prepares APE, I2C1, RT5639, I2S1 and PV6 headphone detection using shared R403 code. The target is stereo speaker/headphone playback and automatic jack switching; no microphone endpoint is provided. The physical media boot created an audio endpoint; playback and jack behavior still need acceptance.
+`drivers/SwitchAudio` remains the upstream PortCls/WaveRT implementation. Its cross-build uses `portcls.lib` and the upstream native-driver linker settings. The companion firmware prepares APE, I2C1, RT5639, I2S1 and PV6 headphone detection using shared R403 code. The target is stereo speaker/headphone playback and automatic jack switching; no microphone endpoint is provided. The owner confirmed audible speaker output after the later pad/1.0.0.9 update described below. Headphones and jack switching still need acceptance.
 
 The display-only sources stay in the existing WinX tree. After the physical Lite went black during display-device restart, CPU-rendered rotation was withdrawn from the active profile. The Home installer no longer installs WinX display or LiteLandscape, and the companion firmware uses BasicDisplay in the native orientation. The proposed PE trial was cancelled. BasicDisplay does not provide GPU rendering acceleration.
 
@@ -94,3 +94,17 @@ The paired update has been deployed to the existing WINARM installation and the 
 References: [Switchroot display/backlight wiring](https://github.com/CTCaer/switch-l4t-platform-t210-nx/blob/linux-5.1.2/kernel-dts/nx-platforms/tegra210-nx-common-disp.dtsi), [B01 pad control](https://github.com/CTCaer/switch-l4t-kernel-4.9/blob/linux-5.1.2/drivers/soc/tegra/pmc.c), and [Windows SD slot ACPI objects](https://learn.microsoft.com/en-us/windows-hardware/drivers/bringup/other-acpi-namespace-objects#sd-host-controllers-and-devices).
 
 The shared long-term scope, including Switchroot-based Wi-Fi and Lite SIO, is tracked in the [porting roadmap](https://github.com/ruje0504-2/winx/blob/hdh001-hekate-sd/docs/hdh001-home/PORTING.md).
+
+## Wi-Fi and power boundaries
+
+The companion R6 firmware probe completed a physical passive scan with six
+records, terminal status 0 and UEFI return Success. PCIe supply/PHY/link,
+BCM4356A3 firmware startup and control/event DMA are accepted for that
+pre-Windows check. The temporary check flag was removed and Home boots Windows
+normally again. This repository does not yet provide a working Windows Wi-Fi
+adapter; association/key management and packet/OS integration are ongoing.
+See the [shared Wi-Fi implementation and evidence](https://github.com/ruje0504-2/winx/blob/hdh001/docs/hdh001-home/WIFI.md).
+
+Windows shutdown/restart still black-screen with the fan running. A pre-Windows
+shutdown using the same Power R4 BL31 succeeded, so final Windows exit and
+runtime hardware state remain under investigation.
