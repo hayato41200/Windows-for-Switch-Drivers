@@ -1,5 +1,7 @@
 # Windows for Switch — Drivers
 
+**Wi-Fi works on Switch Lite (HDH-001).** SwitchWifi 0.5.5 connected automatically to a saved WPA2-Personal network on Windows 11 ARM64 23H2. Windows recorded successful authentication, an IPv4 DHCP lease and a default gateway. The owner confirmed Internet access. [Driver and hardware results](drivers/SwitchWifi/README.md)
+
 The current HDH-001 boots trimmed Windows 11 Pro 23H2 (22631.2861) through **Windows 11 Lite**. The owner reached the desktop and confirmed that the FAT32 partition is visible, the display works in landscape and Bluetooth works with switchbt 1.0.0.13.
 
 The earlier `INACCESSIBLE_BOOT_DEVICE` (0x7B) occurred when UEFI exposed only WINARM while nvtsdhc 0.3.2.6 exposed WINARM and FAT32. Replacing BL33 made UEFI present the same two volumes in the same order as the Windows driver. The next physical boot reached the desktop.
@@ -9,10 +11,6 @@ This branch consolidates HDH-001 development: bounded WINARM SD (0.3.2.6), share
 A physical Lite reaches the Home 23H2 desktop with BasicDisplay and working setup touch. **Measured clocks on HDH-001: CPU 1996.8 MHz; RAM 1866 MHz.** The `ram_oc=2100000` setting is a request, not the measured RAM clock; 2100 MHz operation has not been validated. The owner confirmed fan operation, audible output after the audio-pad update, and working brightness buttons. Returned-card readback confirms active SwitchAudio 1.0.0.9 and SwitchFan 1.0.0.5, plus a 512 MiB pagefile with a 2048 MB maximum. Headphones, jack switching and display wake remain untested. Windows shutdown and restart still hang on the companion Power R4 firmware. Pre-Windows shutdown with the same BL31 passed; the Windows late-exit/runtime-state boundary remains unresolved.
 
 The media display experiment went black at device restart. At the owner's request, the Home installer now excludes CPU-rendered display rotation and the landscape helper; the companion firmware retains BasicDisplay. The proposed PE display trial was cancelled. The combined update includes the shared UART-D Bluetooth driver and patch-aware installer; it is built, staged and deployed, with patch loading, 3 Mbaud transport and BthMini startup confirmed by the next boot; pairing and range remain pending. The upstream devices listed below are not all enabled or validated on Lite.
-
-The companion firmware's R6 pre-Windows Wi-Fi probe completed passive scanning with six records and return Success. This accepts the BCM4356A3 PCIe/firmware/control-event DMA path, not a Windows Wi-Fi adapter. Association, keys, packet transport and Windows networking integration remain in progress; see the [shared Wi-Fi status](https://github.com/ruje0504-2/winx/blob/hdh001-hekate-sd/docs/hdh001-home/WIFI.md).
-
-The shared [SwitchWifi driver](drivers/SwitchWifi/README.md) implements an ARM64 WiFiCx station with NetAdapterCx packet queues, open/WPA2-Personal association, CCMP keys and receive filters. In Windows PE 22621.2861 the signed 0.5.0.0 package bound to an ACPI device, evaluated `WIRS` and registered GSI 130. The fixture intentionally omits the Tegra memory ranges and reported `hw=3/C0000182 irq=0 ring=0`. Version 0.5.1 routes association and disconnect notifications from the firmware control ring to the Windows connection handler. On trimmed Pro, Windows enumerated WFI0, loaded the BCM firmware and consumed ring completions with its interrupt handler active. Driver 0.5.2.0 failed during station creation with `0xC0200211`. On the next boot, Windows started the 0.5.3.0 station and the owner saw Wi-Fi networks. The report counted 19 scans, with success for the latest scan. Connection, DHCP and rekey await a hardware result.
 
 KMDF drivers and SwitchCenter, a tray/control-center application, for Windows on ARM (ARM64) on the Nintendo Switch (Tegra210 / Erista).
 
@@ -30,7 +28,8 @@ The upstream UEFI and DSDT are maintained in [Windows-for-Switch](https://github
 | `switchpwrbtn` | ACPI\SWOA0601 | R374 | Power-button HID through VHF |
 | `switchcpu` | ACPI\SWOA0701 | R375 | Erista CPU clock profiles (614–1766 MHz) and thermal limits |
 | `switchrtc` | ACPI\SWOA0801 | R377 | MAX77620 RTC with a persistent Windows time offset |
-| `switchbt` | ACPI\SWOA0B01 | R390 | BCM4356A3 on UART-D, connected to the Windows BthMini stack at 3 Mbps. Supply `BCM4356A3.hcd` separately; it is not distributed. Upstream reports very short radio range while Wi-Fi is unavailable. |
+| `switchwifi` 0.5.5 | ACPI\SWOA0D01 | HDH-001 Wi-Fi runtime | BCM4356A3 PCIe station. WPA2, DHCP and Internet access confirmed on Lite. |
+| `switchbt` | ACPI\SWOA0B01 | R390 | BCM4356A3 on UART-D, connected to the Windows BthMini stack at 3 Mbps. Supply `BCM4356A3.hcd` separately; it is not distributed. The original Erista test reported limited Bluetooth range. |
 | `switchaudio` (beta) | ACPI\SWOA0C01 | R403; R402 for speakers only | PortCls WaveRT playback: 48 kHz, 16-bit stereo, speakers/headphones with automatic jack switching. One shared speaker endpoint and volume; no microphone. |
 | `switchsensor` | ACPI\SWOA0901 | R379 | Tilt sensing for automatic rotation. Upstream could not detect the ambient-light sensor on the tested device. |
 | `swoadiag` | Loaded on demand | — | Read-only USB (XUSB) register diagnostics |

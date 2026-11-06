@@ -123,12 +123,7 @@ The shared long-term scope, including Switchroot-based Wi-Fi and Lite SIO, is tr
 
 ## Wi-Fi and power boundaries
 
-The companion R6 firmware probe completed a physical passive scan with six
-records, terminal status 0 and UEFI return Success. PCIe supply/PHY/link,
-BCM4356A3 firmware startup and control/event DMA are accepted for that
-pre-Windows check. The temporary check flag was removed. The Windows implementation now includes
-association, keys and packet queues.
-See the [shared Wi-Fi implementation and evidence](https://github.com/ruje0504-2/winx/blob/hdh001-hekate-sd/docs/hdh001-home/WIFI.md).
+**Wi-Fi works on Switch Lite (HDH-001).** SwitchWifi 0.5.5 connected automatically to a saved WPA2-Personal network on Windows 11 ARM64 23H2. Windows recorded successful authentication, an IPv4 DHCP lease and a default gateway. The owner confirmed Internet access. [Driver and hardware results](../../drivers/SwitchWifi/README.md)
 
 Windows shutdown/restart still black-screen with the fan running. A pre-Windows
 shutdown using the same Power R4 BL31 succeeded, so final Windows exit and
@@ -136,7 +131,7 @@ runtime hardware state remain under investigation.
 
 ## Windows Wi-Fi packet core
 
-The shared [SwitchWifi driver](../../drivers/SwitchWifi/README.md) implements an ARM64 WiFiCx station with NetAdapterCx packet queues, open/WPA2-Personal association, CCMP keys and receive filters. In Windows PE 22621.2861 the signed 0.5.0.0 package bound to an ACPI device, evaluated `WIRS` and registered GSI 130. The fixture intentionally omits the Tegra memory ranges and reported `hw=3/C0000182 irq=0 ring=0`. Version 0.5.1 routes association and disconnect notifications from the firmware control ring to the Windows connection handler. On trimmed Pro, Windows enumerated WFI0, loaded the BCM firmware and consumed ring completions with its interrupt handler active. Driver 0.5.2.0 failed during station creation with `0xC0200211`. On the next boot, Windows started the 0.5.3.0 station and the owner saw Wi-Fi networks. The report counted 19 scans, with success for the latest scan. Connection, DHCP and rekey await a hardware result.
+The ARM64 WiFiCx driver uses NetAdapterCx packet queues and the Broadcom msgbuf transport. Current hardware evidence and the meaning of each diagnostic field are in the [driver notes](../../drivers/SwitchWifi/README.md).
 
 
 For a Wi-Fi-only kit, use `Install-LiteSystem.cmd online wifi` or
