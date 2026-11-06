@@ -57,7 +57,19 @@ The display-only sources stay in the existing WinX tree. After the physical Lite
 
 ## Bluetooth preparation
 
-The Lite build now includes the existing `drivers/SwitchBluetooth` 1.0.0.13 implementation. It uses the same UART-D H4 transport, BthMini child, patchram and 3 Mbaud flow-control path as upstream. No separate Lite Bluetooth source is added. The companion firmware's `SWITCH_LITE_BLUETOOTH=1` option supplies UART-D/PH3/PH4/PH5 initialization, the PMIC 32 kHz output, and BTH0 resources.
+The current card has the upstream `drivers/SwitchBluetooth` 1.0.0.13 implementation. It uses the same UART-D H4 transport, BthMini child, patchram and 3 Mbaud flow-control path as upstream. No separate Lite Bluetooth source is added. The companion firmware's `SWITCH_LITE_BLUETOOTH=1` option supplies UART-D/PH3/PH4/PH5 initialization, the PMIC 32 kHz output, and BTH0 resources.
+
+The separate 1.0.0.14 build starts the retry timer after KMDF connects the UART
+interrupt. Before entering a lower power state, it closes HCI access, drains
+the timer and completes held reads and writes. The boot marker clears after
+five two-second intervals with a successfully created child. The card retains
+1.0.0.13 for the BasicDisplay boot test. The reported blue screen had no
+recoverable stop code. In an isolated ARM64 Windows PE 22621.2861 guest,
+the signed driver bound to the ACPI UART and ran its timer in safe mode.
+The guest vetoed the device-disable request. Removal, physical radio pairing
+and system power transitions remain unverified.
+[KMDF interrupt power callback](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/wdfdevice/nc-wdfdevice-evt_wdf_device_d0_exit_pre_interrupts_disabled),
+[KMDF timer drain](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/wdftimer/nf-wdftimer-wdftimerstop).
 
 The installer includes Bluetooth only when a signed `switchbt/switchbt.inf` is present beside it. Supply the Switch-specific patch at `Firmware/BCM4356A3.hcd`; it is copied before the driver is staged. The blob is not part of this source repository. Switchroot documents its [NX patch source](https://gitlab.com/switchroot/android/proprietary_vendor_firmware/-/blob/main/README.md). The combined BasicDisplay/audio/Bluetooth kit is built and deployed. Signed package checks and native Windows staging pass; pairing and range remain untested on Lite. Upstream reports limited radio range while the Wi-Fi-side antenna initialization is absent.
 
