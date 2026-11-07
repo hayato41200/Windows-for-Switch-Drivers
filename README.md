@@ -8,6 +8,9 @@ English summary: KMDF drivers (GPIO, I2C, battery + USB-C role, fan + backlight,
 power button, CPU clock, RTC, light and tilt sensors, Bluetooth) and a tray / control-center app for Windows on ARM (ARM64) on the
 Nintendo Switch. Install from the release ZIPs; build with `release/Make-Release.ps1`.
 Tested on Windows 11 Arm64 22H2 (22621); bring your own Windows image and license.
+Blue screen with stop code `0xD0000FF0` when booting Windows 11 from SD: the SD driver (`nvtsdhc`) loaded but
+the SD host device is missing; check that `EFI\Boot\bootaa64.efi` on the ESP is `SDLOADAA64-NOCID.EFI` and that
+the UEFI starts it (not `bootmgfw.efi` directly). Other `0xD…` codes: see "ブルースクリーンのストップコード" below.
 
 ## ドライバー
 
@@ -25,6 +28,7 @@ Tested on Windows 11 Arm64 22H2 (22621); bring your own Windows image and licens
 | `switchaudio`（ベータ） | ACPI\SWOA0C01 | R403（R402 ならスピーカーだけ） | 音声。スピーカーとヘッドホンへの再生（PortCls WaveRT、48 kHz・16 ビット・ステレオ）。ヘッドホンを抜き差しすると自動で切り替わる。Windows に見える出力は「スピーカー」の1つで、音量も共通。マイクは無い |
 | `switchsensor` | ACPI\SWOA0901 | R379 | 傾きセンサー（画面の自動回転）。明るさセンサーは、この本体では見つからず使えていない |
 | `swoadiag` | —（読み込んだときだけ） | — | USB（XUSB）のレジスタを読むだけの診断用 |
+| `nvtsdhc` | ACPI\NVDA0101 | —（SD のローダーがデバイスを足す） | Windows 11 を SD から起動するための SD ホスト（sdport）。SwitchPatcher が SD に入れる（`kits/Switch-Sd`）。起動できないときは、ブルースクリーンに診断用のコードを出す（下の「ブルースクリーンのストップコード」） |
 
 ## 動作を確かめた OS
 
@@ -64,6 +68,44 @@ Switch の SD を PC に挿して、SD の Windows にドライバー、テス�
 - **使い方:** `kits/Switch-Patcher/README-ja.md`
 - **設計:** `docs/Design-SwitchPatcher-ja.md`
 - **状態:** 本物の SD と Switch で動作を確かめた（0.3.0、Windows 11 Arm64 22H2）。
+
+## ブルースクリーンのストップコード
+
+このリポジトリのドライバーは、原因を画面に残すために、自分でブルースクリーンを出すことがある。起動に失敗すると、ログもダンプも残らないため。ブルースクリーンの「Stop code:」の行を写真に撮れば、どこで止まったかが分かる。
+
+### `0xD???????`（`nvtsdhc`、SD から起動するとき）
+
+Windows 11 の SD で、ドライバーが読み込まれてから 2.5 秒たっても SD を読めていないと出る。コードは `0xD S F CC EE K` の形で、1桁ずつ意味がある。
+
+| 部分 | 意味 |
+|---|---|
+| `D` | 目印（いつも D） |
+| `S` | 段階。0: SD の差し込み口（スロット）が一度も初期化されていない。1: SD にコマンドを1つも送っていない。2: 成功したコマンドが1つも無い |
+| `F` | 足し算した印。1: カードがある、2: カードが安定している（どちらも初期化したときのコントローラーの状態）。4: 割り込みが来た。8: コントローラーのリセットに失敗した |
+| `CC` | 最後に送ったコマンドの番号（16 進） |
+| `EE` | 最後にエラーになったコマンドの番号（16 進。`FF` はエラー無し） |
+| `K` | 最後のエラーの種類。0: 無し、1: コマンドの応答が来ない、2: コマンドの CRC、3: コマンドの終わりのビットか番号、4: データが来ない、5: データの CRC、6: データの終わりのビット、7: そのほか、8: 要求を出せなかった |
+
+コマンドが通り始めたら（段階 3 以降）、カードの準備に時間がかかっているだけなので、このブルースクリーンは出さない。
+
+よくある例:
+
+- **`0xD0000FF0`（段階 0、何も記録が無い）:** ドライバーは読み込まれたが、SD ホストのデバイスが Windows に見えていない。SD ホストのデバイスは、ESP の `EFI\Boot\bootaa64.efi`（SwitchPatcher が入れる `SDLOADAA64-NOCID.EFI`）が起動のたびに足している。次のことを確かめる。
+  - ESP の `EFI\Boot\bootaa64.efi` が `SDLOADAA64-NOCID.EFI` になっているか。SwitchPatcher で入れ直すと確実。
+  - UEFI が `bootmgfw.efi` を直接起動していないか。ローダーを通らないと、SD ホストのデバイスが足されない。
+  - [Windows-for-Switch](https://github.com/hayato41200/Windows-for-Switch) の UEFI を使っているか。ほかの UEFI では確かめていない。
+- **段階 1・2（`0xD1…`、`0xD2…`）:** デバイスは見えていて、SD とのやりとりで止まっている。`K` がエラーの種類、`EE` がそのコマンド。この形のコードは、写真と一緒に Issue で知らせてほしい。
+
+ブルースクリーンを出さない設定は無い。このコードが出る場面では SD を読めていないので、出さなくても Windows は起動ドライブが見つからずに止まる（`INACCESSIBLE_BOOT_DEVICE`）。
+
+### `0xDEADDEAD`（`switchaudio`）
+
+音声のドライバーの内部の誤り（呼んではいけない関数が呼ばれた）。普通は出ない。出たら、ドライバーの版と一緒に Issue で知らせてほしい。
+
+### そのほか
+
+- `WHEA_UNCORRECTABLE_ERROR`: `nvtsdhc` 0.2.2〜0.2.5 で出ていた。新しい版に入れ替える。
+- それ以外の名前の付いたコード（`INACCESSIBLE_BOOT_DEVICE` など）は Windows 自身が出すもの。使っている UEFI の版、ドライバーの版、直前に変えたことを添えて知らせてほしい。
 
 ## ビルド（PC）
 
