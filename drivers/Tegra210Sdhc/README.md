@@ -147,6 +147,15 @@ diagnostics now include `AdmaBufferBytes`, `AdmaRequests`, `AdmaMaxBlocks` and
 Host tests cover the full 512 KiB descriptor chain and the separate dump limit;
 this is not a measured throughput or desktop-responsiveness result.
 
+The owner reached the desktop with 0.4.1.0 after removal of an unrelated
+experimental processor PEP, but reported recurring roughly one-minute stalls
+with FAT32 visible. The next comparison hides FAT32 in both BL33 and the
+miniport, retaining the same SDR104/ADMA2 source and 512 KiB runtime limit.
+Visible-FAT performance remains unresolved; both build profiles are retained.
+The first battery-only hibernation attempt did not restore the session:
+Windows recorded invalid hiber-header data (`0xc000007b`). A powered retry
+and the write/restore path still require investigation; this is not S4 approval.
+
 Build with all three defines: `NV_T210_LITE_WINARM_WRITE=1`, `NV_T214_SDR104=1`,
 `NV_T214_HIBERNATE=1`. Pair it with WinX's `SWITCH_LITE_HIBERNATE=1` firmware
 and the same private target header. Windows must enable a **full** hiberfile;
