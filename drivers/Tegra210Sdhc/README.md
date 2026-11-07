@@ -85,4 +85,5 @@ rail may remain on while SDHCI `POWER_CONTROL` has reset to zero. A subsequent
 3.3 V request now restores and checks the controller power bits instead of
 returning early. The regression reproduces that cleared-register state and
 also checks a real power cycle when leaving 1.8 V. This fix passes the host
-regression and ARM64 build; repeat hardware boot is pending.
+regression and ARM64 build; the owner subsequently reached Windows with 0.4.0.1. Negotiated signaling,
+tuning/clock readbacks and measured throughput are still pending.
