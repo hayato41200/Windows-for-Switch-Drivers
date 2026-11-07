@@ -56,3 +56,14 @@
 4. **見るところ:**
    - タスクバーの Wi-Fi のボタンと、その一覧。
    - `netsh wlan show networks` の結果（Status にも出る）。
+
+## 0.5.0 の結果（2026-11-07、ユーザー報告）
+
+- **WiFiCx につながった。**
+  - WifiDeviceInitialize と、能力の報告 4 つ（device、station、band、phy）が、すべて 0（成功）。
+  - OS の WDI バージョンは 0x00020003。
+  - ステーションのアダプター（type 1）の作成、初期化、開始も、すべて成功。
+- **Windows がスキャンを頼んできた。** 3 回。1 回 1640 ms で、14 件を報告した。
+- **`netsh wlan show interfaces`:** 「Nintendo Switch Wi-Fi (BCM4356)」が 1 つ。状態は disconnected、Radio は Hardware On / Software On。
+- **`netsh wlan show networks`:** 15 個のネットワークが見えた。認証方式（WPA2-Personal / WPA3-Personal、CCMP）も、IE から正しく読まれている。
+- **残り:** 接続、データの送受信、本体の MAC アドレス（今は 00:90:4c:1a:a0:01 で、Broadcom の既定の値）。
