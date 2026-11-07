@@ -6,7 +6,7 @@ Drivers for the **HDH-001 (Tegra T214)** port of Windows 11 ARM64. They use the 
 
 | Driver | Result on Switch Lite |
 | --- | --- |
-| `nvtsdhc` | Boots from the 80 GiB NTFS `WINARM` volume. Writes and cold reads passed. FAT32 is hidden by default. The [SDR104 / ADMA2 candidate](drivers/Tegra210Sdhc/README.md#t214-sdr104-candidate) 0.4.0.1 reaches Windows; negotiated SDR104 mode and throughput still need readback. |
+| `nvtsdhc` | WINARM boots Windows; FAT32 is hidden by default. [SDR104 / ADMA2 0.4.0.1](drivers/Tegra210Sdhc/README.md#t214-sdr104-candidate) reports 199.68 MHz / 4-bit / 1.8 V, successful tuning and no recorded ADMA errors. Sustained throughput remains unmeasured. |
 | `switchwifi` 0.5.5 | Automatically reconnected to a saved WPA2-Personal network. Windows obtained a DHCP lease and default gateway, and the owner confirmed Internet access. |
 | `switchbt` 1.0.0.13 | Bluetooth works on the trimmed Pro installation. Range remains unmeasured. |
 | GPIO, I²C3 and FTM4 touch | The shared controllers and Lite touch driver handle taps in Windows Setup. |

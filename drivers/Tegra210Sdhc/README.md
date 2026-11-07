@@ -67,14 +67,17 @@ completion; the default WINARM-only view is unchanged. Allocation or mapping
 constraints keep PIO available. Controller errors are returned to SDPORT
 and a failed DMA operation requires a completed DAT reset before reuse.
 
-Status: ARM64 build and host DMA/filter/bounds tests pass. The first physical
-trial of 0.4.0.0 failed with `INACCESSIBLE_BOOT_DEVICE` before the desktop.
-Persisted diagnostics still belong to the previous legacy-driver boot; they
-do not identify the failing SDR104 stage. Investigation is in progress.
-Physical SDR104 negotiation, card I/O and throughput are not verified. Read `Signaling18V`,
+Hardware result for 0.4.0.1: Windows reached the desktop and the returned
+SYSTEM hive reports `BusSpeed=7` (SDR104), `Signaling18V=1`, `BusWidth=4`,
+`ClockKhzActual=199680`, `Tuned=1`, `TuneStatus=0`, 128 tuning iterations
+and tap 64. ADMA2 completed 1,867,466 blocks with `AdmaErrors=0`; voltage
+switching and pad calibration recorded no failures or fallbacks. These are
+driver/host readbacks from the observed run, not a standalone throughput
+benchmark or extended integrity/stress qualification.
+
+ARM64 builds and host DMA/filter/write-bound tests pass. Read `Signaling18V`,
 `Tuned`, `TuningTap`, `ClockKhzActual`, `AdmaBlocks` and `AdmaErrors` under
-`Services\nvtsdhc\Parameters\Diag`. These counters do not replace a
-file-integrity check or a measured throughput result.
+`Services\nvtsdhc\Parameters\Diag`.
 
 Hardware references: [Hekate SDMMC](https://github.com/CTCaer/hekate/blob/v6.5.3/bdk/storage/sdmmc_driver.c),
 [Hekate clock setup](https://github.com/CTCaer/hekate/blob/v6.5.3/bdk/soc/clock.c),
@@ -85,5 +88,5 @@ rail may remain on while SDHCI `POWER_CONTROL` has reset to zero. A subsequent
 3.3 V request now restores and checks the controller power bits instead of
 returning early. The regression reproduces that cleared-register state and
 also checks a real power cycle when leaving 1.8 V. This fix passes the host
-regression and ARM64 build; the owner subsequently reached Windows with 0.4.0.1. Negotiated signaling,
-tuning/clock readbacks and measured throughput are still pending.
+regression and ARM64 build; the owner subsequently reached Windows with 0.4.0.1. Its signaling, tuning
+and ADMA readbacks are recorded above; sustained throughput is still unmeasured.
