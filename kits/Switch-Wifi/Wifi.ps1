@@ -68,10 +68,17 @@ function Show-Status {
     Log ("fw     : stage={0} size={1} nvram={2} verifyBad={3} rstvec={4} halted ioctl={5} reset={6}" -f $p.FwStage, $p.FwSize, $p.NvSize, $p.FwVerifyBad, (Hex $p.FwResetVector), (Hex $p.Cr4IoctlHalted), (Hex $p.Cr4ResetHalted))
     Log ("fw     : shared before={0} after={1} in {2} ms flags={3} console={4}" -f (Hex $p.FwSharedBefore), (Hex $p.FwShared), $p.FwUpMs, (Hex $p.FwSharedFlags), (Hex $p.FwConsoleAddr))
   }
-  if ($null -ne $p.MsgResult) {
+  if ($null -ne $p.MsgRingInfo) {
     Log ("msg    : {0}" -f $p.MsgResult)
     Log ("msg    : ringinfo={0} ringmem={1} h2dW={2} d2hW={3} subq={4} rxoff={5} dma={6} posted={7} ctlR={8} mbint={9}" -f (Hex $p.MsgRingInfo), (Hex $p.MsgRingMem), (Hex $p.MsgH2dW), (Hex $p.MsgD2hW), $p.MsgMaxSubQueues, $p.MsgRxDataOffset, (Hex $p.MsgDmaPa), $p.MsgPosted, $p.MsgCtlSubmitR, (Hex $p.MsgMailboxInt))
     Log ("msg    : completions={0} events={1} unknown={2} lasttype={3} scratch={4}" -f $p.MsgCompletions, $p.MsgEvents, $p.MsgUnknown, $p.MsgLastType, (Hex $p.MsgScratch))
+    foreach ($pf in 'Pre', 'Post', 'Ioctl') {
+      if ($null -ne $p."${pf}CtlSubR") {
+        Log ("diag {0,-5}: ctlR={1} ctlW={2} cmplW={3} mbint={4} afi={5}/{6} mc int={7} err={8} adr={9} smmu={10} afiasid={11}" -f $pf,
+          $p."${pf}CtlSubR", $p."${pf}CtlSubW", $p."${pf}CtlCmplW", (Hex $p."${pf}MbInt"), (Hex $p."${pf}AfiCode"), (Hex $p."${pf}AfiSig"),
+          (Hex $p."${pf}McInt"), (Hex $p."${pf}McErr"), (Hex $p."${pf}McErrAdr"), (Hex $p."${pf}SmmuCfg"), (Hex $p."${pf}SmmuAfi"))
+      }
+    }
     Log ("ioctl  : GET_VERSION ret={0} st={1} value={2}" -f $p.IoctlVersionRet, $p.IoctlVersionStatus, $p.IoctlVersion)
     Log ("ioctl  : ver ret={0} st={1} '{2}'" -f $p.IoctlVerRet, $p.IoctlVerStatus, $p.IoctlVer)
     Log ("ioctl  : cur_etheraddr ret={0} st={1} {2}" -f $p.IoctlMacRet, $p.IoctlMacStatus, $p.IoctlMacOui)
@@ -97,6 +104,11 @@ switch ($Mode) {
     Log ''
     Log "=== Wi-Fi Install  $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
     [void](Copy-Firmware)
+    # A new driver is a new attempt: drop the old trace (and its Busy flag).
+    if (Test-Path $Key) {
+      $k = Get-Item $Key
+      foreach ($n in $k.GetValueNames()) { Remove-ItemProperty $Key -Name $n -ErrorAction SilentlyContinue }
+    }
     $inf = Join-Path $Here 'switchwifi.inf'
     (& $Pnputil /add-driver $inf /install 2>&1) | ForEach-Object { Log "  $_" }
     Log "  exit=$LASTEXITCODE"

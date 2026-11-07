@@ -26,7 +26,7 @@
 #include <ntstrsafe.h>
 #include <wdf.h>
 
-#define SWWIFI_VERSION      0x00030000u     /* 0.3.0 */
+#define SWWIFI_VERSION      0x00030001u     /* 0.3.1 */
 
 #define RP_LINK_STATUS      0x090           /* bit 29: data link up */
 #define RP_XP_VC0           0xF00           /* bit 30: DL up */
@@ -595,7 +595,8 @@ static const ULONG RingOffset[5] = { 0x0000, 0x1000, 0x5000, 0x6000, 0xA000 };
 
 static SWWIFI_RING mRing[5];
 static ULONG mRxDataOffset, mEvents, mCompletions, mUnknown, mLastType;
-static ULONG mIoctlDone, mIoctlStatus, mIoctlLen, mIoctlPktId;
+static ULONG mIoctlDone, mIoctlStatus, mIoctlLen, mIoctlPktId, mShared, mIoctlCount;
+static VOID SwWifiDiag(PSWWIFI_DEVICE Dev, ULONG Shared, PCWSTR Prefix);
 
 static USHORT Rd16(volatile ULONG *Base, ULONG Offset)
 {
@@ -717,6 +718,13 @@ static LONG SwWifiIoctl(PSWWIFI_DEVICE Dev, ULONG Cmd, const VOID *In, ULONG InL
     Put32(Item, 28, 0);
     mIoctlDone = 0;
     SwWifiRingCommit(Dev, &mRing[0]);
+    if (mIoctlCount++ == 0) {
+        /* 0.3.1: first ioctl: the state 20 ms after the doorbell, saved before waiting. */
+        LARGE_INTEGER Delay;
+        Delay.QuadPart = -20 * 10000LL;
+        KeDelayExecutionThread(KernelMode, FALSE, &Delay);
+        SwWifiDiag(Dev, mShared, L"Ioctl");
+    }
 
     for (Ms = 0; Ms < 2000 && !mIoctlDone; Ms += 10) {
         LARGE_INTEGER Delay;
@@ -738,6 +746,48 @@ static LONG SwWifiIoctl(PSWWIFI_DEVICE Dev, ULONG Cmd, const VOID *In, ULONG InL
     return (LONG)Copy;
 }
 
+/* 0.3.1: memory controller (MC) error log and SMMU state, AFI error code,
+ * ring indices and the firmware console, saved and flushed under a prefix. */
+#define MC_BASE             0x70019000u
+#define MC_INTSTATUS        0x000
+#define MC_ERR_STATUS       0x008
+#define MC_ERR_ADR          0x00C
+#define MC_SMMU_CONFIG      0x010
+#define MC_SMMU_AFI_ASID    0x238
+#define AFI_INTR_CODE       0x0B8
+#define AFI_INTR_SIGNATURE  0x0BC
+
+static VOID SwWifiDiag(PSWWIFI_DEVICE Dev, ULONG Shared, PCWSTR Prefix)
+{
+    PHYSICAL_ADDRESS Pa;
+    volatile ULONG *Mc;
+    WCHAR Name[48];
+
+#define DIAG(N, V) do { (VOID)RtlStringCbPrintfW(Name, sizeof(Name), L"%s%s", Prefix, N); SwWifiTrace(Name, (V)); } while (0)
+    Pa.QuadPart = MC_BASE;
+    Mc = (volatile ULONG *)MmMapIoSpaceEx(Pa, 0x1000, PAGE_READWRITE | PAGE_NOCACHE);
+    if (Mc != NULL) {
+        DIAG(L"McInt", Rd(Mc, MC_INTSTATUS));
+        DIAG(L"McErr", Rd(Mc, MC_ERR_STATUS));
+        DIAG(L"McErrAdr", Rd(Mc, MC_ERR_ADR));
+        DIAG(L"SmmuCfg", Rd(Mc, MC_SMMU_CONFIG));
+        DIAG(L"SmmuAfi", Rd(Mc, MC_SMMU_AFI_ASID));
+        MmUnmapIoSpace((PVOID)Mc, 0x1000);
+    }
+    DIAG(L"AfiCode", Rd(Dev->Afi, AFI_INTR_CODE));
+    DIAG(L"AfiSig", Rd(Dev->Afi, AFI_INTR_SIGNATURE));
+    DIAG(L"CtlSubR", Rd16(Dev->Bar2, mRing[0].RIdxAddr));
+    DIAG(L"CtlSubW", mRing[0].W);
+    DIAG(L"CtlCmplW", Rd16(Dev->Bar2, mRing[2].WIdxAddr));
+    DIAG(L"Scratch", Get32(Dev->Dma, OFF_SCRATCH));
+    SwWifiSetWindow(Dev, PCIE2_CORE);
+    DIAG(L"MbInt", Rd(Dev->Bar0, PCIE2_MAILBOXINT));
+    SwWifiSetWindow(Dev, SI_ENUM_BASE);
+#undef DIAG
+    SwWifiConsole(Dev, Shared);
+    SwWifiFlush();
+}
+
 static VOID SwWifiMsgbuf(PSWWIFI_DEVICE Dev, ULONG Shared)
 {
     PHYSICAL_ADDRESS Low, High, Skip;
@@ -748,6 +798,9 @@ static VOID SwWifiMsgbuf(PSWWIFI_DEVICE Dev, ULONG Shared)
     WCHAR Text[300];
 
     SwWifiStep(20);
+    mShared = Shared;
+    mIoctlCount = 0;
+    mEvents = mCompletions = mUnknown = mLastType = 0;
     Flags = Rd(Dev->Bar2, Shared);
     if ((Flags & 0xFFu) != 5 || (Flags & 0x10000u) != 0) {
         SwWifiTraceText(L"MsgResult", L"not tried: shared version is not 5, or the firmware wants DMA indices (not done yet)");
@@ -822,6 +875,8 @@ static VOID SwWifiMsgbuf(PSWWIFI_DEVICE Dev, ULONG Shared)
     SwWifiTrace(L"MsgMailboxInt", Rd(Dev->Bar0, PCIE2_MAILBOXINT));
     SwWifiSetWindow(Dev, SI_ENUM_BASE);
 
+    SwWifiDiag(Dev, Shared, L"Pre");
+
     /* Event and ioctl response buffers (brcmf_proto_msgbuf_attach). */
     SwWifiStep(22);
     Posted = SwWifiPostCtlBufs(Dev, TRUE, N_RESP_BUFS, N_EVENT_BUFS);
@@ -833,6 +888,18 @@ static VOID SwWifiMsgbuf(PSWWIFI_DEVICE Dev, ULONG Shared)
         KeDelayExecutionThread(KernelMode, FALSE, &Delay);
     }
     SwWifiTrace(L"MsgCtlSubmitR", Rd16(Dev->Bar2, mRing[0].RIdxAddr));
+
+    /* 0.3.1: 0.3.0 stopped Windows (WHEA_INTERNAL_ERROR) at step 23, the first
+     * ioctl. Look before going on: did the firmware take the posted items (its
+     * read index moved, so its DMA read of host memory worked), did the memory
+     * controller or the AFI log an error, what does the firmware console say. */
+    SwWifiDiag(Dev, Shared, L"Post");
+    if (Rd16(Dev->Bar2, mRing[0].RIdxAddr) != mRing[0].W) {
+        SwWifiTraceText(L"MsgResult", L"stopped: the firmware did not take the posted control items (its DMA read of host memory did not work); no ioctl sent");
+        return;
+    }
+    SwWifiTraceText(L"MsgResult", L"(in progress: posted buffers taken, sending ioctls)");
+    SwWifiFlush();
 
     /* ioctls */
     SwWifiStep(23);
