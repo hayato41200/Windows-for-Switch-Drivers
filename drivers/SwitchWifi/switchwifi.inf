@@ -1,0 +1,55 @@
+;
+; switchwifi.inf - Nintendo Switch Wi-Fi (BCM4356 on PCIe), stage 2a probe
+;
+
+[Version]
+Signature   = "$WINDOWS NT$"
+Class       = System
+ClassGuid   = {4d36e97d-e325-11ce-bfc1-08002be10318}
+Provider    = %Mfg%
+CatalogFile = switchwifi.cat
+DriverVer   = 11/07/2026,0.1.0.0
+PnpLockdown = 1
+
+[DestinationDirs]
+DefaultDestDir = 12
+
+[SourceDisksNames]
+1 = %DiskName%
+
+[SourceDisksFiles]
+switchwifi.sys = 1
+
+[Manufacturer]
+%Mfg% = Std, NTarm64
+
+[Std.NTarm64]
+%DeviceDesc% = SwWifi_Inst, ACPI\SWOA0D01
+
+[SwWifi_Inst.NT]
+CopyFiles = SwWifi_Copy
+
+[SwWifi_Copy]
+switchwifi.sys
+
+[SwWifi_Inst.NT.Services]
+AddService = switchwifi, 0x00000002, SwWifi_Service
+
+[SwWifi_Service]
+DisplayName   = %ServiceDesc%
+ServiceType   = 1
+StartType     = 3
+ErrorControl  = 1
+ServiceBinary = %12%\switchwifi.sys
+
+[SwWifi_Inst.NT.Wdf]
+KmdfService = switchwifi, SwWifi_WdfSection
+
+[SwWifi_WdfSection]
+KmdfLibraryVersion = 1.15
+
+[Strings]
+Mfg         = "SwitchWOA"
+DiskName    = "SwitchWOA Wi-Fi"
+DeviceDesc  = "Nintendo Switch Wi-Fi (BCM4356, probe)"
+ServiceDesc = "Nintendo Switch Wi-Fi"
