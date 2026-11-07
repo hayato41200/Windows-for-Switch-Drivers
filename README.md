@@ -14,7 +14,7 @@ Drivers for the **HDH-001 (Tegra T214)** port of Windows 11 ARM64. They use the 
 | `switchsio` desktop controls | Left stick moves the pointer and ZR/ZL click. Capture toggles desktop mode and **+** opens the On-Screen Keyboard (0.2.2 on the card). Version 0.2.3 adds right-stick scrolling, R3 middle click and D-pad keyboard arrows. Hardware test pending. [Button mapping](drivers/SwitchSensor/README.md) |
 | `switchaudio` 1.0.0.9 | The built-in speakers play audio. Headphones and jack switching await testing. |
 | `switchfan` 1.0.0.5 | The fan and panel brightness controls work. Readbacks showed 1996.8 MHz CPU and 1866 MHz RAM. |
-| `switchbattery` 1.0.0.8 / shutdown | Normal Windows shutdown powered off the tested Lite with Wi-Fi, Bluetooth, audio and gamepad enabled. The battery driver now hands IRPs to battc before KMDF owns them. Restart is tested separately. [Power status](https://github.com/ruje0504-2/winx/blob/hdh001-hekate-sd/docs/hdh001-home/power-performance.md) |
+| `switchbattery` 1.0.0.8 / shutdown | Normal Windows shutdown powered off the tested Lite with Wi-Fi, Bluetooth, audio and gamepad enabled. The battery driver now hands IRPs to battc before KMDF owns them. Native restart subsequently passed on the normal R6 firmware without fan pulses. [Power status](https://github.com/ruje0504-2/winx/blob/hdh001-hekate-sd/docs/hdh001-home/power-performance.md) |
 
 Windows uses CPU software rendering only. The Tegra GPU driver for Windows has not been implemented.
 

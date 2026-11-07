@@ -128,8 +128,9 @@ The shared long-term scope, including Switchroot-based Wi-Fi and Lite SIO, is tr
 Normal Windows shutdown powered off the tested HDH-001 after installing
 SwitchBattery **1.0.0.8**, with Wi-Fi, Bluetooth, audio and the gamepad enabled.
 The owner observed the R6 diagnostic firmware's two fan pulses followed by
-complete power removal. No device-isolation utility was needed. The normal firmware now selects native restart to Hekate and disables the
-diagnostic fan pulses; native restart remains a separate pending result.
+complete power removal. No device-isolation utility was needed. The normal R6 firmware selects native PMC/Hekate restart and disables the
+diagnostic fan pulses. The owner subsequently confirmed that Windows Restart
+also completed normally.
 
 The previous battery IOCTL handler passed the underlying IRP of a KMDF-owned
 request to `BatteryClassIoctl`, which can complete or retain that IRP itself.
