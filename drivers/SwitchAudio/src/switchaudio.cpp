@@ -67,6 +67,14 @@
  * Windows still shows one endpoint. With an older UEFI (HPO MIX without
  * HPOVOL, or PV6 not a GPIO) the thread is not started: speaker only.
  * Traces: HpoMixer, JackGpio, Jack (1 = headphones), JackSwitches, JackSpb.
+ *
+ * 1.0.0.8: record codec power, mixer, clock and private bias/tuning state
+ * after a jack-route change. This diagnoses Lite speaker silence when ADMA
+ * and I2S already advance, without adding work to the render callback.
+ *
+ * 1.0.0.9: read the pad/clock and digital mixer state for the Lite Linux
+ * initialization comparison. Record PCM peak/nonzero counts at existing
+ * start/stop snapshots; this reads application audio and generates no tone.
  */
 
 #define INITGUID
@@ -513,6 +521,27 @@ public:
         }
         m_LastPoll = Now;
     }
+
+    /* Existing passive-level start/stop diagnostics only, never GetPosition. */
+    VOID SnapshotPcm(PCWSTR Prefix)
+    {
+        if (m_Mdl == NULL || KeGetCurrentIrql() != PASSIVE_LEVEL) return;
+        volatile SHORT *Samples = (volatile SHORT *)m_PortStream->MapAllocatedPages(m_Mdl, MmWriteCombined);
+        if (Samples == NULL) { SaTraceAs(Prefix, L"PcmMapped", 0); return; }
+        ULONG Count = m_BufferSize / sizeof(SHORT), Peak = 0, Nonzero = 0;
+        if (Count > 32768) Count = 32768;
+        for (ULONG I = 0; I < Count; ++I) {
+            LONG Sample = Samples[I];
+            ULONG Magnitude = (ULONG)(Sample < 0 ? -Sample : Sample);
+            if (Magnitude != 0) ++Nonzero;
+            if (Magnitude > Peak) Peak = Magnitude;
+        }
+        m_PortStream->UnmapAllocatedPages((PVOID)Samples, m_Mdl);
+        SaTraceAs(Prefix, L"PcmMapped", 1);
+        SaTraceAs(Prefix, L"PcmSamples", Count);
+        SaTraceAs(Prefix, L"PcmPeak", Peak);
+        SaTraceAs(Prefix, L"PcmNonzero", Nonzero);
+    }
 };
 
 STDMETHODIMP_(NTSTATUS) CSaStream::SetFormat(PKSDATAFORMAT DataFormat)
@@ -607,12 +636,14 @@ STDMETHODIMP_(NTSTATUS) CSaStream::SetState(KSSTATE State)
             SaSnapshot(L"Run0");
             SaSleepMs(100);
             SaSnapshot(L"Run100");
+            SnapshotPcm(L"Run100");
         } else if (State == KSSTATE_STOP || State == KSSTATE_ACQUIRE) {
             if (Stopping) {
                 SaTrace(L"StopPeriods", (ULONG)StoppedPeriods);
                 SaTrace(L"StopPositionCalls", m_PosCalls);
                 SaTrace(L"StopGaps", m_Gaps);
                 SaSnapshot(L"Stop");
+                SnapshotPcm(L"Stop");
             }
         }
     }
@@ -924,6 +955,41 @@ static NTSTATUS SaCodecRead(UCHAR Reg, USHORT *Value)
     return Status;
 }
 
+static VOID SaCodecSnapshot(VOID)
+{
+    static const struct { UCHAR Reg; PCWSTR Name; } Registers[] = {
+        { 0x19, L"CodecDacVolume" }, { 0x29, L"CodecAdcDacMixer" },
+        { 0x2A, L"CodecStereoDacMixer" }, { 0x73, L"CodecAddaClock" },
+        { 0x83, L"CodecAsrc1" }, { 0x84, L"CodecAsrc2" },
+        { 0x01, L"CodecSpkVolume" }, { 0x46, L"CodecSpkLeftMixer" },
+        { 0x47, L"CodecSpkRightMixer" }, { 0x48, L"CodecSpkLeftOut" },
+        { 0x49, L"CodecSpkRightOut" }, { 0x61, L"CodecPowerDigital" },
+        { 0x63, L"CodecPowerAnalog1" }, { 0x64, L"CodecPowerAnalog2" },
+        { 0x65, L"CodecPowerMixer" }, { 0x66, L"CodecPowerVolume" },
+        { 0x70, L"CodecI2s1" }, { 0x80, L"CodecGlobalClock" },
+        { 0x81, L"CodecPll1" }, { 0x82, L"CodecPll2" }
+    };
+    static const struct { UCHAR Index; PCWSTR Name; } Private[] = {
+        { 0x1D, L"CodecPrivate1D" }, { 0x14, L"CodecBiasCur3" },
+        { 0x20, L"CodecClassDTuning" }
+    };
+    USHORT Value;
+    NTSTATUS Status;
+    ULONG Index;
+    for (Index = 0; Index < ARRAYSIZE(Registers); ++Index) {
+        Status = SaCodecRead(Registers[Index].Reg, &Value);
+        if (!NT_SUCCESS(Status)) { SaTrace(L"CodecReadStatus", (ULONG)Status); return; }
+        SaTrace(Registers[Index].Name, Value);
+    }
+    for (Index = 0; Index < ARRAYSIZE(Private); ++Index) {
+        Status = SaCodecWrite(0x6A, Private[Index].Index);
+        if (NT_SUCCESS(Status)) Status = SaCodecRead(0x6C, &Value);
+        if (!NT_SUCCESS(Status)) { SaTrace(L"CodecReadStatus", (ULONG)Status); return; }
+        SaTrace(Private[Index].Name, Value);
+    }
+    SaTrace(L"CodecReadStatus", STATUS_SUCCESS);
+}
+
 static NTSTATUS SaSpbOpen(PRESOURCELIST ResourceList)
 {
     PCM_PARTIAL_RESOURCE_DESCRIPTOR Conn = ResourceList->FindTranslatedEntry(CmResourceTypeConnection, 0);
@@ -977,6 +1043,7 @@ static VOID SaJackThread(PVOID Context)
                 Applied = Now;
                 SaTrace(L"Jack", Now);
                 SaTrace(L"JackSwitches", ++Switches);
+                SaCodecSnapshot();
             }
         }
         Last = Now;
@@ -1056,6 +1123,7 @@ static NTSTATUS SaStartDevice(PDEVICE_OBJECT DeviceObject, PIRP Irp, PRESOURCELI
 
     (VOID)RtlCreateRegistryKey(RTL_REGISTRY_SERVICES, g_ParamsPath);
     SaTrace(L"Stage", 1);
+    SaTrace(L"DriverVersion", 9);
     Mem0 = ResourceList->FindTranslatedEntry(CmResourceTypeMemory, 0);
     Mem1 = ResourceList->FindTranslatedEntry(CmResourceTypeMemory, 1);
     if (Mem0 == NULL || Mem1 == NULL || Mem0->u.Memory.Length < AHUB_LENGTH || Mem1->u.Memory.Length < ADMA_LENGTH) {
@@ -1088,6 +1156,20 @@ static NTSTATUS SaStartDevice(PDEVICE_OBJECT DeviceObject, PIRP Irp, PRESOURCELI
         return STATUS_DEVICE_NOT_READY;
     }
     SaTrace(L"Stage", 2);
+    // These always-on registers expose the electrical/clock state inherited
+    // from firmware; AHUB activity alone cannot prove signals reach the codec.
+    SaTrace(L"PadPower", ReadPhys(PMC_PHYS + 0x44));
+    SaTrace(L"PadVoltageEnable", ReadPhys(PMC_PHYS + 0x48));
+    SaTrace(L"PadVoltage", ReadPhys(PMC_PHYS + 0xE4));
+    SaTrace(L"PadDpd", ReadPhys(PMC_PHYS + 0x1BC));
+    SaTrace(L"PadDpd2", ReadPhys(PMC_PHYS + 0x1C4));
+    SaTrace(L"PinDap1Fs", ReadPhys(0x70003124ULL));
+    SaTrace(L"PinDap1Dout", ReadPhys(0x7000312CULL));
+    SaTrace(L"PinDap1Sclk", ReadPhys(0x70003130ULL));
+    SaTrace(L"Dap1GpioCnf", ReadPhys(GPIO_PHYS + 0x004));
+    SaTrace(L"I2sClockSource", ReadPhys(CAR_PHYS + 0x1D8));
+    SaTrace(L"ClockSpare", ReadPhys(CAR_PHYS + 0x55C));
+    SaTrace(L"I2sTiming", RdAhub(0x10A4));
     SaSnapshot(L"Start");
     if (SaReadParam(L"TestTone") != 0) {
         SaTestTone();
