@@ -15,7 +15,7 @@ Drivers for the **HDH-001 (Tegra T214)** port of Windows 11 ARM64. They use the 
 
 Windows uses CPU software rendering only. The Tegra GPU driver for Windows has not been implemented.
 
-Battery, RTC, built-in controls and Windows USB-C host support are tracked in the [porting notes](https://github.com/ruje0504-2/winx/blob/hdh001-hekate-sd/docs/hdh001-home/PORTING.md).
+The [built-in controller and mouse](drivers/SwitchSensor/README.md) and [USB-C host](drivers/TegraXusb/README.md) are staged on the Windows 23H2 card. Both await hardware testing. Battery, RTC and power-lifecycle results are tracked in the [porting notes](https://github.com/ruje0504-2/winx/blob/hdh001-hekate-sd/docs/hdh001-home/PORTING.md).
 
 ## Building and installing
 
