@@ -319,8 +319,8 @@ typedef struct _NV_DIAG {
 #define NV_PIO_POLL_BLOCKS 32
 
 // Clock and bus settings written to <service>\Parameters\Diag when the port
-// sets them (passive level, never in crashdump mode): no thread, no flush,
-// no register access of its own. Read on the Switch with reg query.
+// sets them: a queued worker writes a copied snapshot, never in a port
+// callback or crashdump mode. No timer, flush, or extra hardware register reads.
 #ifndef NV_DIAG_CLOCK
 #define NV_DIAG_CLOCK 1
 #endif
@@ -414,20 +414,44 @@ NvDiagSetValue(
 #endif
 
 #if NV_DIAG_CLOCK
-static VOID NvDiagSaveClock(_In_ PSDHC_EXTENSION SdhcExtension);
-
+/* Snapshot only from the port callback. The worker owns an immutable copy:
+ * registry I/O can re-enter this boot miniport even at PASSIVE_LEVEL, and
+ * must never execute synchronously inside a bus/request callback. */
 static WORK_QUEUE_ITEM NvDiagSaveItem;
 static volatile LONG NvDiagSaveQueued;
-static PSDHC_EXTENSION NvDiagSaveExtension;
+static volatile LONG64 NvDiagNextPeriodicSave;
+static struct { PCWSTR Name; ULONG Value; } NvDiagSnapshot[64];
+static ULONG NvDiagSnapshotCount;
+
+static VOID NvDiagCapture(PCWSTR Name, ULONG Value)
+{
+    NT_ASSERT(NvDiagSnapshotCount < RTL_NUMBER_OF(NvDiagSnapshot));
+    NvDiagSnapshot[NvDiagSnapshotCount].Name = Name;
+    NvDiagSnapshot[NvDiagSnapshotCount++].Value = Value;
+}
 
 static VOID
 NvDiagSaveWorker(
     _In_ PVOID Context
     )
 {
+    static ULONG Saves;
+    UNICODE_STRING Path;
+    OBJECT_ATTRIBUTES Attributes;
+    HANDLE Key;
     UNREFERENCED_PARAMETER(Context);
 
-    NvDiagSaveClock(NvDiagSaveExtension);
+    RtlInitUnicodeString(&Path, NvDiag.RegistryPath);
+    InitializeObjectAttributes(&Attributes, &Path,
+                               OBJ_KERNEL_HANDLE | OBJ_CASE_INSENSITIVE, NULL, NULL);
+    if (NT_SUCCESS(ZwCreateKey(&Key, KEY_SET_VALUE, &Attributes, 0, NULL,
+                               REG_OPTION_NON_VOLATILE, NULL))) {
+        NvDiagSetValue(Key, L"Saves", ++Saves);
+        for (ULONG i = 0; i < NvDiagSnapshotCount; ++i) {
+            NvDiagSetValue(Key, NvDiagSnapshot[i].Name, NvDiagSnapshot[i].Value);
+        }
+        ZwClose(Key);
+    }
     InterlockedExchange(&NvDiagSaveQueued, 0);
 }
 
@@ -436,97 +460,83 @@ NvDiagSaveClock(
     _In_ PSDHC_EXTENSION SdhcExtension
     )
 {
-    static ULONG Saves;
-    UNICODE_STRING Path;
-    OBJECT_ATTRIBUTES Attributes;
-    HANDLE Key;
-
-    if (SdhcExtension->CrashdumpMode ||
-        (NvDiag.RegistryPath[0] == L'\0')) {
+    if (SdhcExtension->CrashdumpMode || NvDiag.RegistryPath[0] == L'\0' ||
+        InterlockedCompareExchange(&NvDiagSaveQueued, 1, 0) != 0) {
         return;
     }
 
-    //
-    // The port sets the final clock and bus width above passive level, where
-    // the registry cannot be written (0.3.0 kept only the 375 kHz setup).
-    // Write those later from a system worker thread.
-    //
-
-    if (KeGetCurrentIrql() != PASSIVE_LEVEL) {
-        NvDiagSaveExtension = SdhcExtension;
-        if (InterlockedExchange(&NvDiagSaveQueued, 1) == 0) {
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wdeprecated-declarations"
-            ExInitializeWorkItem(&NvDiagSaveItem, NvDiagSaveWorker, NULL);
-            ExQueueWorkItem(&NvDiagSaveItem, DelayedWorkQueue);
-#pragma clang diagnostic pop
-        }
-
-        return;
-    }
-
-    RtlInitUnicodeString(&Path, NvDiag.RegistryPath);
-    InitializeObjectAttributes(&Attributes, &Path,
-                               OBJ_KERNEL_HANDLE | OBJ_CASE_INSENSITIVE, NULL, NULL);
-    if (!NT_SUCCESS(ZwCreateKey(&Key, KEY_SET_VALUE, &Attributes, 0, NULL,
-                                REG_OPTION_NON_VOLATILE, NULL))) {
-        return;
-    }
-
-    Saves += 1;
-    NvDiagSetValue(Key, L"Saves", Saves);
+    /* No periodic timer: active I/O may refresh this fixed snapshot at most
+     * once per 30 seconds. Clock/identity/error transitions remain explicit. */
+    InterlockedExchange64(&NvDiagNextPeriodicSave,
+                          (LONG64)KeQueryInterruptTime() + 300000000LL);
+    NvDiagSnapshotCount = 0;
 #if NV_T214_SDR104
-    NvDiagSetValue(Key, L"Sdr104Build", 1);
-    NvDiagSetValue(Key, L"AdmaAvailable", SdhcExtension->T214Bounce != NULL);
-    NvDiagSetValue(Key, L"Signaling18V", SdhcExtension->T214Voltage18);
-    NvDiagSetValue(Key, L"VoltageStatus", SdhcExtension->T214VoltageStatus);
-    NvDiagSetValue(Key, L"VoltageFailures", SdhcExtension->T214VoltageFailures);
-    NvDiagSetValue(Key, L"Tuned", SdhcExtension->T214Tuned);
-    NvDiagSetValue(Key, L"TuneStatus", SdhcExtension->T214TuneStatus);
-    NvDiagSetValue(Key, L"TuningRuns", SdhcExtension->T214TuningRuns);
-    NvDiagSetValue(Key, L"TuningIterations", SdhcExtension->T214TuningIterations);
-    NvDiagSetValue(Key, L"TuningTap", SdhcExtension->T214Tap);
-    NvDiagSetValue(Key, L"PadCalFallbacks", SdhcExtension->T214CalFallbacks);
-    NvDiagSetValue(Key, L"AdmaBlocks", SdhcExtension->T214DmaBlocks);
-    NvDiagSetValue(Key, L"AdmaErrors", SdhcExtension->T214DmaErrors);
-    NvDiagSetValue(Key, L"SmmuSdmmc1", SdhcExtension->T214Smmu);
-    NvDiagSetValue(Key, L"ContextSaves", SdhcExtension->T214Saves);
-    NvDiagSetValue(Key, L"ContextRestores", SdhcExtension->T214Restores);
-    NvDiagSetValue(Key, L"ResumeStatus", SdhcExtension->T214ResumeStatus);
+    NvDiagCapture( L"Sdr104Build", 1);
+    NvDiagCapture( L"AdmaAvailable", SdhcExtension->T214Bounce != NULL);
+    NvDiagCapture( L"Signaling18V", SdhcExtension->T214Voltage18);
+    NvDiagCapture( L"VoltageStatus", SdhcExtension->T214VoltageStatus);
+    NvDiagCapture( L"VoltageFailures", SdhcExtension->T214VoltageFailures);
+    NvDiagCapture( L"Tuned", SdhcExtension->T214Tuned);
+    NvDiagCapture( L"TuneStatus", SdhcExtension->T214TuneStatus);
+    NvDiagCapture( L"TuningRuns", SdhcExtension->T214TuningRuns);
+    NvDiagCapture( L"TuningIterations", SdhcExtension->T214TuningIterations);
+    NvDiagCapture( L"TuningTap", SdhcExtension->T214Tap);
+    NvDiagCapture( L"PadCalFallbacks", SdhcExtension->T214CalFallbacks);
+    NvDiagCapture( L"AdmaBlocks", SdhcExtension->T214DmaBlocks);
+    NvDiagCapture( L"AdmaErrors", SdhcExtension->T214DmaErrors);
+    NvDiagCapture( L"SmmuSdmmc1", SdhcExtension->T214Smmu);
+    NvDiagCapture( L"ContextSaves", SdhcExtension->T214Saves);
+    NvDiagCapture( L"ContextRestores", SdhcExtension->T214Restores);
+    NvDiagCapture( L"ResumeStatus", SdhcExtension->T214ResumeStatus);
 #endif
 #if NV_T210_LITE_WINARM_WRITE
-    NvDiagSetValue(Key, L"App42Done", NvDiag.App42Done);
-    NvDiagSetValue(Key, L"DeniedCount", NvDiag.DeniedCount);
-    NvDiagSetValue(Key, L"LastDenied", NvDiag.LastDeniedCommand);
-    NvDiagSetValue(Key, L"DeniedArg", NvDiag.LastDeniedArgument);
-    NvDiagSetValue(Key, L"DeniedShape", NvDiag.DeniedShape);
-    NvDiagSetValue(Key, L"TargetFacts", (ULONG)SdhcExtension->TargetFacts);
+    NvDiagCapture( L"App42Done", NvDiag.App42Done);
+    NvDiagCapture( L"DeniedCount", NvDiag.DeniedCount);
+    NvDiagCapture( L"LastDenied", NvDiag.LastDeniedCommand);
+    NvDiagCapture( L"DeniedArg", NvDiag.LastDeniedArgument);
+    NvDiagCapture( L"DeniedShape", NvDiag.DeniedShape);
+    NvDiagCapture( L"TargetFacts", (ULONG)SdhcExtension->TargetFacts);
 #endif
-    NvDiagSetValue(Key, L"LastCommand", NvDiag.LastCommand);
-    NvDiagSetValue(Key, L"ClockKhzRequested", NvDiag.ClockKhzRequested);
-    NvDiagSetValue(Key, L"ClockKhzActual", NvDiag.ClockKhzActual);
-    NvDiagSetValue(Key, L"BaseClockKhz",
+    NvDiagCapture( L"LastCommand", NvDiag.LastCommand);
+    NvDiagCapture( L"ClockKhzRequested", NvDiag.ClockKhzRequested);
+    NvDiagCapture( L"ClockKhzActual", NvDiag.ClockKhzActual);
+    NvDiagCapture( L"BaseClockKhz",
                    SdhcExtension->Capabilities.BaseClockFrequencyKhz);
-    NvDiagSetValue(Key, L"RegCapabilities", NvDiag.RegCapabilities);
-    NvDiagSetValue(Key, L"RegClockControl", NvDiag.RegClockControl);
-    NvDiagSetValue(Key, L"RegHostControl", NvDiag.RegHostControl);
-    NvDiagSetValue(Key, L"BusWidth", NvDiag.BusWidth);
-    NvDiagSetValue(Key, L"BusSpeed", NvDiag.BusSpeed);
-    NvDiagSetValue(Key, L"Commands", NvDiag.Commands);
-    NvDiagSetValue(Key, L"BlocksRead", NvDiag.BlocksRead);
-    NvDiagSetValue(Key, L"CarSdmmc1Before", NvDiag.CarSdmmc1Before);
-    NvDiagSetValue(Key, L"CarSdmmc1After", NvDiag.CarSdmmc1After);
-    NvDiagSetValue(Key, L"BlocksWritten", NvDiag.BlocksWritten);
-    NvDiagSetValue(Key, L"Interrupts", NvDiag.Interrupts);
-    NvDiagSetValue(Key, L"ErrorInterrupts", NvDiag.ErrorInterrupts);
-    NvDiagSetValue(Key, L"CommandErrors", NvDiag.CommandErrors);
-    NvDiagSetValue(Key, L"LastErrors", NvDiag.LastErrors);
-    NvDiagSetValue(Key, L"LastErrorCommand", NvDiag.LastErrorCommand);
-    NvDiagSetValue(Key, L"DataCommands", NvDiag.DataCommands);
-    NvDiagSetValue(Key, L"DataBlocks", NvDiag.DataBlocks);
-    NvDiagSetValue(Key, L"DataUs", NvDiag.DataUs);
-    NvDiagSetValue(Key, L"GapUs", NvDiag.GapUs);
-    ZwClose(Key);
+    NvDiagCapture( L"RegCapabilities", NvDiag.RegCapabilities);
+    NvDiagCapture( L"RegClockControl", NvDiag.RegClockControl);
+    NvDiagCapture( L"RegHostControl", NvDiag.RegHostControl);
+    NvDiagCapture( L"BusWidth", NvDiag.BusWidth);
+    NvDiagCapture( L"BusSpeed", NvDiag.BusSpeed);
+    NvDiagCapture( L"Commands", NvDiag.Commands);
+    NvDiagCapture( L"BlocksRead", NvDiag.BlocksRead);
+    NvDiagCapture( L"CarSdmmc1Before", NvDiag.CarSdmmc1Before);
+    NvDiagCapture( L"CarSdmmc1After", NvDiag.CarSdmmc1After);
+    NvDiagCapture( L"BlocksWritten", NvDiag.BlocksWritten);
+    NvDiagCapture( L"Interrupts", NvDiag.Interrupts);
+    NvDiagCapture( L"ErrorInterrupts", NvDiag.ErrorInterrupts);
+    NvDiagCapture( L"CommandErrors", NvDiag.CommandErrors);
+    NvDiagCapture( L"LastErrors", NvDiag.LastErrors);
+    NvDiagCapture( L"LastErrorCommand", NvDiag.LastErrorCommand);
+    NvDiagCapture( L"DataCommands", NvDiag.DataCommands);
+    NvDiagCapture( L"DataBlocks", NvDiag.DataBlocks);
+    NvDiagCapture( L"DataUs", NvDiag.DataUs);
+    NvDiagCapture( L"GapUs", NvDiag.GapUs);
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+    ExInitializeWorkItem(&NvDiagSaveItem, NvDiagSaveWorker, NULL);
+    ExQueueWorkItem(&NvDiagSaveItem, DelayedWorkQueue);
+#pragma clang diagnostic pop
+}
+
+static VOID
+NvDiagSavePeriodic(
+    _In_ PSDHC_EXTENSION SdhcExtension
+    )
+{
+    if ((LONG64)KeQueryInterruptTime() >=
+        InterlockedCompareExchange64(&NvDiagNextPeriodicSave, 0, 0)) {
+        NvDiagSaveClock(SdhcExtension);
+    }
 }
 #endif
 
@@ -1747,7 +1757,7 @@ Return value:
         NvDiag.DataBlocks += NvDiag.DataStartBlocks;
 #if NV_DIAG_CLOCK
         if ((NvDiag.DataCommands % 1024) == 0) {
-            NvDiagSaveClock(SdhcExtension);
+            NvDiagSavePeriodic(SdhcExtension);
         }
 #endif
     }

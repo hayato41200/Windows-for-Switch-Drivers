@@ -91,7 +91,7 @@ also checks a real power cycle when leaving 1.8 V. This fix passes the host
 regression and ARM64 build; the owner subsequently reached Windows with 0.4.0.1. Its signaling, tuning
 and ADMA readbacks are recorded above; sustained throughput is still unmeasured.
 
-### FAT32-visible and resume candidate (0.4.0.2)
+### FAT32-visible and resume candidate (0.4.0.3)
 
 The owner requested another FAT32-visible trial using SDR104/ADMA2, preserving
 the hidden profile. Both builds share the same validated write bounds. DMA
@@ -100,6 +100,14 @@ metadata sectors, rather than once per returned sector. Tests compare the
 result with the previous sector-by-sector path across 1–128-block reads in
 both partition layouts. The card's FAT32 FSInfo signatures and free-count
 field were valid; no FSInfo metadata is rewritten or fabricated.
+
+Version 0.4.0.3 also removes synchronous registry writes from SDPORT callbacks.
+A queued worker writes an immutable copy, so it never retains the slot extension
+or re-enters the boot disk from a bus/request callback. I/O statistics refresh
+at most once per 30 seconds of active traffic, rather than every 1,024 commands.
+Clock, identity and error transitions still request a snapshot. There is no
+new timer or log file. The focused queue test covers callback re-entry, snapshot
+lifetime, busy-traffic throttling and registry-open failure.
 
 The miniport also saves the quiesced SDHCI host/power/clock/interrupt settings
 and T214 tuning registers. Resume restores configuration with SDCLK held off
