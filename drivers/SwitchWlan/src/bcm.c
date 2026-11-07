@@ -12,7 +12,7 @@
 #include <wdf.h>
 #include "bcm.h"
 
-#define SWWIFI_VERSION      0x00050000u     /* switchwlan 0.5.0 */
+#define SWWIFI_VERSION      0x00060000u     /* switchwlan 0.6.0 */
 
 #define RP_LINK_STATUS      0x090           /* bit 29: data link up */
 #define RP_XP_VC0           0xF00           /* bit 30: DL up */
@@ -565,6 +565,7 @@ static VOID SwWifiConsole(PSWWIFI_DEVICE Dev, ULONG Shared)
 
 typedef struct _SWWIFI_RING {
     ULONG Offset;           /* in the DMA block */
+    PUCHAR Base;            /* 0.6.0: host address of item 0 (common rings and the flowring) */
     USHORT Depth, ItemLen;
     ULONG WIdxAddr, RIdxAddr;   /* device RAM addresses of the indices */
     USHORT W, R;
@@ -610,7 +611,7 @@ static PUCHAR SwWifiRingReserve(PSWWIFI_DEVICE Dev, SWWIFI_RING *Ring)
     Ring->R = Rd16(Dev->Bar2, Ring->RIdxAddr);
     Avail = (Ring->R <= Ring->W) ? (USHORT)(Ring->Depth - Ring->W + Ring->R) : (USHORT)(Ring->R - Ring->W);
     if (Avail <= 1) return NULL;
-    Item = Dev->Dma + Ring->Offset + (ULONG)Ring->W * Ring->ItemLen;
+    Item = Ring->Base + (ULONG)Ring->W * Ring->ItemLen;
     RtlZeroMemory(Item, Ring->ItemLen);
     if (++Ring->W == Ring->Depth) Ring->W = 0;
     return Item;
@@ -704,6 +705,69 @@ static VOID SwWifiAddBss(PUCHAR Bi, ULONG Len)
     mBssCount++;
 }
 
+/* 0.6.0: connection events (brcmf_is_linkup / _is_linkdown / _is_nonetwork):
+ * LINK with the link flag = up; LINK without it, DEAUTH, DEAUTH_IND,
+ * DISASSOC_IND = down; SET_SSID, AUTH, ASSOC with a failure status while
+ * joining = the join failed. The last events are kept for the trace. */
+#define BRCMF_E_SET_SSID    0
+#define BRCMF_E_AUTH        3
+#define BRCMF_E_DEAUTH      5
+#define BRCMF_E_DEAUTH_IND  6
+#define BRCMF_E_ASSOC       7
+#define BRCMF_E_REASSOC     9
+#define BRCMF_E_DISASSOC    11
+#define BRCMF_E_DISASSOC_IND 12
+#define BRCMF_E_LINK        16
+#define BRCMF_E_MIC_ERROR   17
+#define EV_LOG_MAX          16
+
+static volatile ULONG mLinkState;           /* BCM_LINK_* */
+static ULONG mLinkEvent, mLinkStatus, mLinkReason, mLinkEvents;
+static ULONG mEvLog[EV_LOG_MAX][4], mEvLogN;
+
+static VOID SwWifiLinkEvent(PUCHAR Buf, ULONG Type, ULONG Status)
+{
+    ULONG Flags = ((ULONG)Buf[EV_HDR + 2] << 8) | Buf[EV_HDR + 3];
+    ULONG Reason = Be32(Buf, EV_HDR + 12);
+    ULONG *L = mEvLog[mEvLogN++ % EV_LOG_MAX];
+    BOOLEAN Fail = FALSE, Down = FALSE;
+
+    L[0] = Type; L[1] = Status; L[2] = Reason; L[3] = Flags;
+    mLinkEvents++;
+    switch (Type) {
+    case BRCMF_E_LINK:
+        if (Flags & 1u) {
+            if (mLinkState == BCM_LINK_JOINING || mLinkState == BCM_LINK_UP) mLinkState = BCM_LINK_UP;
+        } else {
+            Down = TRUE;
+        }
+        break;
+    case BRCMF_E_SET_SSID:
+    case BRCMF_E_AUTH:
+    case BRCMF_E_ASSOC:
+    case BRCMF_E_REASSOC:
+        Fail = (Status != 0 && Status != 6 && Status != 7);    /* not SUCCESS / UNSOLICITED / ATTEMPT */
+        break;
+    case BRCMF_E_DEAUTH:
+    case BRCMF_E_DEAUTH_IND:
+    case BRCMF_E_DISASSOC_IND:
+        Down = TRUE;
+        break;
+    default:
+        break;
+    }
+    if ((Fail || Down) && mLinkState == BCM_LINK_JOINING) {
+        mLinkState = BCM_LINK_FAILED;
+    } else if (Down && mLinkState == BCM_LINK_UP) {
+        mLinkState = BCM_LINK_LOST;
+    } else {
+        return;
+    }
+    mLinkEvent = Type;
+    mLinkStatus = Status;
+    mLinkReason = Reason;
+}
+
 static VOID SwWifiEvent(PUCHAR Buf, ULONG Len)
 {
     ULONG Type, Status, DataLen, Count, Off, I;
@@ -714,6 +778,7 @@ static VOID SwWifiEvent(PUCHAR Buf, ULONG Len)
     Status = Be32(Buf, EV_HDR + 8);
     DataLen = Be32(Buf, EV_HDR + 20);
     mLastEventType = Type;
+    if (Type <= BRCMF_E_MIC_ERROR) { SwWifiLinkEvent(Buf, Type, Status); return; }
     if (Type != BRCMF_E_ESCAN_RESULT) { mOtherEvents++; return; }
     mEscanEvents++;
     if (Status != 8) {                      /* not partial: the scan ended */
@@ -733,48 +798,169 @@ static VOID SwWifiEvent(PUCHAR Buf, ULONG Len)
     }
 }
 
-/* Drain the D2H control complete ring (brcmf_msgbuf_process_rx). */
-static VOID SwWifiPollCtl(PSWWIFI_DEVICE Dev)
+/* ------------------------------------------------- data path (stage 4c)
+ *
+ * As brcmfmac msgbuf.c: receive buffers posted on the H2D rx post ring
+ * (MSGBUF_TYPE_RXBUF_POST, request_id = buffer index) come back on the D2H rx
+ * complete ring (RX_CMPLT: data_len, data_offset); frames are Ethernet
+ * (802.3), the firmware does the 802.11 side. Transmit goes through one H2D
+ * flowring (ring id 2, the first after the two common submit rings), created
+ * with FLOW_RING_CREATE on the control ring once the link is up; each TX_POST
+ * carries the 14-byte Ethernet header in the item and points at the rest of
+ * the frame; TX_STATUS on the D2H tx complete ring gives the buffer back.
+ * All buffers are copies in a second contiguous block (below 4 GB,
+ * write-combined, as the rings).
+ */
+#define MSG_FLOW_CREATE     0x03
+#define MSG_FLOW_CREATE_CMPLT 0x04
+#define MSG_FLOW_DELETE     0x05
+#define MSG_FLOW_DELETE_CMPLT 0x06
+#define MSG_TX_POST         0x0F
+#define MSG_TX_STATUS       0x10
+#define MSG_RXBUF_POST      0x11
+#define MSG_RX_CMPLT        0x12
+
+#define DATA_SIZE           0x90000u
+#define OFF_FLOWRING        0x00000u        /* FLOW_DEPTH x FLOW_ITEM */
+#define FLOW_DEPTH          512
+#define FLOW_ITEM           48
+#define FLOW_RING_ID        2               /* BRCMF_NROF_H2D_COMMON_MSGRINGS + 0 */
+#define OFF_RXBUF           0x08000u
+#define N_RXBUF             128
+#define OFF_TXBUF           0x48000u
+#define N_TXBUF             128
+#define PKT_BUF_SIZE        2048u           /* BRCMF_MSGBUF_MAX_PKT_SIZE */
+#define ETH_HLEN            14
+
+enum { FLOW_NONE = 0, FLOW_CREATING, FLOW_OPEN, FLOW_FAILED, FLOW_DELETING };
+
+static PUCHAR mData;
+static ULONG mDataPa;
+static ULONG mH2dW, mH2dR, mMaxSub, mMaxRxPost;
+static SWWIFI_RING mFlow;
+static volatile ULONG mFlowState, mFlowStatus;
+static UCHAR mTxSlot[N_TXBUF];              /* 0 free, 1 in the firmware, 2 = EAPOL in the firmware */
+static ULONG mTxNext, mTxInFw, mTxPendEapol;
+static BOOLEAN mTxNeedCommit, mRxNeedCommit;
+static ULONG mTxPosted, mTxDone, mTxStatusErr, mTxNoSlot, mTxEapol, mRxFrames, mRxEapol, mRxBad, mRxPosted;
+static ULONG mRxBytes, mTxBytes, mFlowCreates;
+static BCM_RX_HANDLER *mRxHandler;
+static PVOID mRxContext;
+
+static VOID SwWifiEvent(PUCHAR Buf, ULONG Len);
+
+/* Post one receive buffer (brcmf_msgbuf_rxbuf_data_post); committed later. */
+static BOOLEAN SwWifiRxPost(PSWWIFI_DEVICE Dev, ULONG Idx)
 {
-    SWWIFI_RING *Ring = &mRing[2];
-    BOOLEAN Any = FALSE;
+    PUCHAR Item = SwWifiRingReserve(Dev, &mRing[1]);
+    if (Item == NULL) return FALSE;
+    Item[0] = MSG_RXBUF_POST;
+    Put32(Item, 4, Idx);
+    Put16(Item, 8, 0);                      /* metadata_buf_len */
+    Put16(Item, 10, (USHORT)PKT_BUF_SIZE);  /* data_buf_len */
+    Put32(Item, 24, mDataPa + OFF_RXBUF + Idx * PKT_BUF_SIZE);
+    Put32(Item, 28, 0);
+    mRxNeedCommit = TRUE;
+    return TRUE;
+}
+
+static VOID SwWifiRxComplete(PSWWIFI_DEVICE Dev, PUCHAR Item)
+{
+    ULONG Idx = Get32(Item, 4), Len = Get16(Item, 14), Off = Get16(Item, 16);
+    PUCHAR Frame;
+
+    if (Idx >= N_RXBUF || mData == NULL) { mRxBad++; return; }
+    if (Off == 0) Off = mRxDataOffset;
+    if (Off + Len <= PKT_BUF_SIZE && Len >= ETH_HLEN) {
+        Frame = mData + OFF_RXBUF + Idx * PKT_BUF_SIZE + Off;
+        KeMemoryBarrier();
+        mRxFrames++;
+        mRxBytes += Len;
+        if (Frame[12] == 0x88 && Frame[13] == 0x8E) mRxEapol++;
+        if (mRxHandler) mRxHandler(mRxContext, Frame, Len);
+    } else {
+        mRxBad++;
+    }
+    (VOID)SwWifiRxPost(Dev, Idx);           /* the same buffer goes back at once */
+}
+
+static VOID SwWifiTxStatus(PUCHAR Item)
+{
+    ULONG Idx = Get32(Item, 4);
+    if (Get16(Item, 14) != 0) mTxStatusErr++;
+    if (Idx < N_TXBUF && mTxSlot[Idx] != 0) {
+        if (mTxSlot[Idx] == 2 && mTxPendEapol) mTxPendEapol--;
+        mTxSlot[Idx] = 0;
+        if (mTxInFw) mTxInFw--;
+        mTxDone++;
+    }
+}
+
+/* One D2H item (brcmf_msgbuf_process_msgtype). */
+static VOID SwWifiMsg(PSWWIFI_DEVICE Dev, PUCHAR Item)
+{
+    UCHAR Type = Item[0];
+    mCompletions++;
+    mLastType = Type;
+    switch (Type) {
+    case MSG_IOCTLPTR_ACK:
+        break;
+    case MSG_IOCTL_CMPLT:
+        mIoctlStatus = (ULONG)(LONG)(SHORT)Get16(Item, 8);
+        mIoctlLen = Get16(Item, 12);
+        mIoctlPktId = Get32(Item, 4);
+        mIoctlDone = 1;
+        break;
+    case MSG_WL_EVENT: {
+        /* 0.4.0: parse it, then give the buffer back. */
+        ULONG Idx = Get32(Item, 4), Len = Get16(Item, 12);
+        mEvents++;
+        if (Idx >= N_RESP_BUFS && Idx < N_RESP_BUFS + N_EVENT_BUFS) {
+            KeMemoryBarrier();
+            SwWifiEvent(Dev->Dma + OFF_CTLBUF + Idx * CTL_BUF_SIZE + mRxDataOffset,
+                        (Len < CTL_BUF_SIZE - mRxDataOffset) ? Len : CTL_BUF_SIZE - mRxDataOffset);
+            (VOID)SwWifiPostCtlBufs(Dev, TRUE, Idx, 1);
+        }
+        break;
+    }
+    case MSG_FLOW_CREATE_CMPLT:
+        mFlowStatus = Get16(Item, 8);
+        mFlowState = (mFlowStatus == 0) ? FLOW_OPEN : FLOW_FAILED;
+        break;
+    case MSG_FLOW_DELETE_CMPLT:
+        mFlowStatus = Get16(Item, 8);
+        mFlowState = FLOW_NONE;
+        break;
+    case MSG_TX_STATUS:
+        SwWifiTxStatus(Item);
+        break;
+    case MSG_RX_CMPLT:
+        SwWifiRxComplete(Dev, Item);
+        break;
+    default:
+        mUnknown++;
+        break;
+    }
+}
+
+/* Drain one D2H ring (brcmf_msgbuf_process_rx). */
+static VOID SwWifiDrain(PSWWIFI_DEVICE Dev, SWWIFI_RING *Ring)
+{
+    ULONG N = 0;
 
     Ring->W = Rd16(Dev->Bar2, Ring->WIdxAddr);
     KeMemoryBarrier();
-    while (Ring->R != Ring->W && Ring->W < Ring->Depth) {
-        PUCHAR Item = Dev->Dma + Ring->Offset + (ULONG)Ring->R * Ring->ItemLen + mRxDataOffset;
-        UCHAR Type = Item[0];
-        mCompletions++;
-        mLastType = Type;
-        switch (Type) {
-        case MSG_IOCTLPTR_ACK:
-            break;
-        case MSG_IOCTL_CMPLT:
-            mIoctlStatus = (ULONG)(LONG)(SHORT)Get16(Item, 8);
-            mIoctlLen = Get16(Item, 12);
-            mIoctlPktId = Get32(Item, 4);
-            mIoctlDone = 1;
-            break;
-        case MSG_WL_EVENT: {
-            /* 0.4.0: parse it, then give the buffer back. */
-            ULONG Idx = Get32(Item, 4), Len = Get16(Item, 12);
-            mEvents++;
-            if (Idx >= N_RESP_BUFS && Idx < N_RESP_BUFS + N_EVENT_BUFS) {
-                KeMemoryBarrier();
-                SwWifiEvent(Dev->Dma + OFF_CTLBUF + Idx * CTL_BUF_SIZE + mRxDataOffset,
-                            (Len < CTL_BUF_SIZE - mRxDataOffset) ? Len : CTL_BUF_SIZE - mRxDataOffset);
-                (VOID)SwWifiPostCtlBufs(Dev, TRUE, Idx, 1);
-            }
-            break;
-        }
-        default:
-            mUnknown++;
-            break;
-        }
+    while (Ring->R != Ring->W && Ring->W < Ring->Depth && N < Ring->Depth) {
+        SwWifiMsg(Dev, Ring->Base + (ULONG)Ring->R * Ring->ItemLen + mRxDataOffset);
         if (++Ring->R == Ring->Depth) Ring->R = 0;
-        Any = TRUE;
+        N++;
     }
-    if (Any) Wr16(Dev->Bar2, Ring->RIdxAddr, Ring->R);
+    if (N) Wr16(Dev->Bar2, Ring->RIdxAddr, Ring->R);
+}
+
+static VOID SwWifiPollCtl(PSWWIFI_DEVICE Dev)
+{
+    SwWifiDrain(Dev, &mRing[2]);
 }
 
 /* brcmf_msgbuf_query_dcmd: one ioctl, polled up to 2 s. Returns the bytes
@@ -833,12 +1019,113 @@ static LONG SwWifiIoctl(PSWWIFI_DEVICE Dev, ULONG Cmd, const VOID *In, ULONG InL
 #define WLC_SET_VAR         263
 #define EVENT_MASK_LEN      18              /* BRCMF_EVENTING_MASK_LEN: E_LAST 139 */
 
+/* 0.6.0: iovar helpers (brcmf_fil_iovar_data_set/get). One thread only, so
+ * one static buffer. */
+static UCHAR mVarBuf[IOCTL_MAX];
+
+static LONG SwWifiSetVar(PSWWIFI_DEVICE Dev, const char *Name, const VOID *Data, ULONG Len, PULONG St)
+{
+    ULONG N = (ULONG)strlen(Name) + 1;
+    *St = 0;
+    if (N + Len > IOCTL_MAX) return -3;
+    RtlCopyMemory(mVarBuf, Name, N);
+    if (Len) RtlCopyMemory(mVarBuf + N, Data, Len);
+    return SwWifiIoctl(Dev, WLC_SET_VAR, mVarBuf, N + Len, mVarBuf, 4, St);
+}
+
+static LONG SwWifiSetVarInt(PSWWIFI_DEVICE Dev, const char *Name, ULONG Value, PULONG St)
+{
+    return SwWifiSetVar(Dev, Name, &Value, 4, St);
+}
+
+static LONG SwWifiGetVar(PSWWIFI_DEVICE Dev, const char *Name, PVOID Out, ULONG OutLen, PULONG St)
+{
+    ULONG N = (ULONG)strlen(Name) + 1;
+    *St = 0;
+    if (N > OutLen || OutLen > IOCTL_MAX) return -3;
+    RtlZeroMemory(mVarBuf, OutLen);
+    RtlCopyMemory(mVarBuf, Name, N);
+    {
+        LONG R = SwWifiIoctl(Dev, WLC_GET_VAR, mVarBuf, N, mVarBuf, OutLen, St);
+        if (R > 0) RtlCopyMemory(Out, mVarBuf, (ULONG)R);
+        return R;
+    }
+}
+
+/* 0.6.0: the console's own Wi-Fi MAC. The firmware starts with the Broadcom
+ * default (00:90:4C:...); Linux sets the one from the device tree. Here it
+ * comes from Parameters\MacAddress (REG_BINARY, 6 bytes, or REG_SZ
+ * "xx:xx:xx:xx:xx:xx"), written by the kit from the user's own file. */
+static BOOLEAN SwWifiRegMac(UCHAR Mac[6])
+{
+    UNICODE_STRING Path, Name;
+    OBJECT_ATTRIBUTES Oa;
+    HANDLE Key;
+    UCHAR Info[sizeof(KEY_VALUE_PARTIAL_INFORMATION) + 80];
+    PKEY_VALUE_PARTIAL_INFORMATION V = (PKEY_VALUE_PARTIAL_INFORMATION)Info;
+    ULONG Got = 0, I, N = 0, Digit = 0, Acc = 0;
+    BOOLEAN Ok = FALSE;
+
+    if (SwWifiParamsPath[0] == L'\0') return FALSE;
+    RtlInitUnicodeString(&Path, SwWifiParamsPath);
+    RtlInitUnicodeString(&Name, L"MacAddress");
+    InitializeObjectAttributes(&Oa, &Path, OBJ_KERNEL_HANDLE | OBJ_CASE_INSENSITIVE, NULL, NULL);
+    if (!NT_SUCCESS(ZwOpenKey(&Key, KEY_READ, &Oa))) return FALSE;
+    if (NT_SUCCESS(ZwQueryValueKey(Key, &Name, KeyValuePartialInformation, Info, sizeof(Info), &Got))) {
+        if (V->Type == REG_BINARY && V->DataLength == 6) {
+            RtlCopyMemory(Mac, V->Data, 6);
+            Ok = TRUE;
+        } else if (V->Type == REG_SZ) {
+            PCWSTR T = (PCWSTR)V->Data;
+            for (I = 0; I < V->DataLength / sizeof(WCHAR) && T[I] != 0 && N < 6; I++) {
+                WCHAR C = T[I];
+                ULONG H = (C >= L'0' && C <= L'9') ? (ULONG)(C - L'0') : (C >= L'a' && C <= L'f') ? (ULONG)(C - L'a' + 10) :
+                          (C >= L'A' && C <= L'F') ? (ULONG)(C - L'A' + 10) : 0xFFu;
+                if (H == 0xFFu) continue;           /* separators */
+                Acc = (Acc << 4) | H;
+                if (++Digit == 2) { Mac[N++] = (UCHAR)Acc; Digit = 0; Acc = 0; }
+            }
+            Ok = (N == 6);
+        }
+    }
+    ZwClose(Key);
+    if (Ok && ((Mac[0] & 1u) != 0 || (Mac[0] | Mac[1] | Mac[2] | Mac[3] | Mac[4] | Mac[5]) == 0)) Ok = FALSE;
+    return Ok;
+}
+
+static ULONG mMacSource;                    /* 0 firmware default, 1 registry, 2 Windows (DOT11_RESET) */
+
+static BOOLEAN SwWifiApplyMac(PSWWIFI_DEVICE Dev, const UCHAR Mac[6])
+{
+    UCHAR Back[8];
+    ULONG St = 0;
+    LONG N = SwWifiSetVar(Dev, "cur_etheraddr", Mac, 6, &St);
+    SwWifiTrace(L"MacSetSt", (N < 0) ? (ULONG)N : St);
+    if (N < 0 || St != 0) return FALSE;
+    N = SwWifiGetVar(Dev, "cur_etheraddr", Back, 8, &St);
+    if (N >= 6 && RtlCompareMemory(Back, Mac, 6) == 6) {
+        RtlCopyMemory(gMac, Mac, 6);
+        return TRUE;
+    }
+    return FALSE;
+}
+
 static BOOLEAN SwWifiRadioUp(PSWWIFI_DEVICE Dev)
 {
     UCHAR Buf[128];
     ULONG St = 0;
     LONG N;
     LONG One = 1;
+
+    SwWifiStep(29);
+    {
+        UCHAR Mac[6];
+        WCHAR Text[32];
+        if (SwWifiRegMac(Mac) && SwWifiApplyMac(Dev, Mac)) mMacSource = 1;
+        SwWifiTrace(L"MacSource", mMacSource);
+        (VOID)RtlStringCbPrintfW(Text, sizeof(Text), L"%02X:%02X:%02X:xx:xx:xx", gMac[0], gMac[1], gMac[2]);
+        SwWifiTraceText(L"MacOui", Text);
+    }
 
     SwWifiStep(30);
     N = SwWifiIoctl(Dev, WLC_SET_INFRA, &One, 4, Buf, 4, &St);
@@ -856,6 +1143,13 @@ static BOOLEAN SwWifiRadioUp(PSWWIFI_DEVICE Dev)
     SwWifiTrace(L"ScanEvGetSt", (N < 0) ? (ULONG)N : St);
     if (N < EVENT_MASK_LEN) RtlZeroMemory(Buf + 64, EVENT_MASK_LEN);
     Buf[64 + BRCMF_E_ESCAN_RESULT / 8] |= (UCHAR)(1u << (BRCMF_E_ESCAN_RESULT % 8));
+    {
+        /* 0.6.0: the connection events too */
+        static const UCHAR Ev[] = { BRCMF_E_SET_SSID, BRCMF_E_AUTH, BRCMF_E_DEAUTH, BRCMF_E_DEAUTH_IND, BRCMF_E_ASSOC,
+                                    BRCMF_E_REASSOC, BRCMF_E_DISASSOC, BRCMF_E_DISASSOC_IND, BRCMF_E_LINK, BRCMF_E_MIC_ERROR };
+        ULONG E;
+        for (E = 0; E < sizeof(Ev); E++) Buf[64 + Ev[E] / 8] |= (UCHAR)(1u << (Ev[E] % 8));
+    }
     RtlCopyMemory(Buf + 11, Buf + 64, EVENT_MASK_LEN);
     N = SwWifiIoctl(Dev, WLC_SET_VAR, Buf, 11 + EVENT_MASK_LEN, Buf, 4, &St);
     SwWifiTrace(L"ScanEvSetSt", (N < 0) ? (ULONG)N : St);
@@ -901,7 +1195,11 @@ NTSTATUS BcmScanBegin(VOID)
 
 VOID BcmPoll(VOID)
 {
-    if (gReady) SwWifiPollCtl(&gDev);
+    if (!gReady) return;
+    SwWifiDrain(&gDev, &mRing[2]);          /* control: ioctls, events, flowring */
+    SwWifiDrain(&gDev, &mRing[3]);          /* tx status */
+    SwWifiDrain(&gDev, &mRing[4]);          /* rx */
+    if (mRxNeedCommit) { SwWifiRingCommit(&gDev, &mRing[1]); mRxNeedCommit = FALSE; }
 }
 
 BOOLEAN BcmScanFinished(VOID) { return mScanDone != 0; }
@@ -1070,6 +1368,10 @@ static VOID SwWifiMsgbuf(PSWWIFI_DEVICE Dev, ULONG Shared)
     SwWifiTrace(L"MsgH2dW", H2dW);
     SwWifiTrace(L"MsgD2hW", D2hW);
     SwWifiTrace(L"MsgMaxSubQueues", MaxSub);
+    mH2dW = H2dW;
+    mH2dR = H2dR;
+    mMaxSub = MaxSub;
+    mMaxRxPost = Rd16(Dev->Bar2, Shared + SH_MAX_RXBUFPOST);
     if (MemLoc < TCM_RAMBASE || MemLoc + 5 * RING_MEM_SZ > TCM_RAMBASE + mRamBytes ||
         H2dW < TCM_RAMBASE || D2hW < TCM_RAMBASE || H2dR < TCM_RAMBASE || D2hR < TCM_RAMBASE) {
         SwWifiTraceText(L"MsgResult", L"not tried: ring addresses outside device RAM");
@@ -1090,11 +1392,20 @@ static VOID SwWifiMsgbuf(PSWWIFI_DEVICE Dev, ULONG Shared)
     RtlZeroMemory(Dev->Dma, DMA_SIZE);
     SwWifiTrace(L"MsgDmaPa", Dev->DmaPa);
 
+    /* 0.6.0: packet buffers and the flowring. */
+    mData = (PUCHAR)MmAllocateContiguousMemorySpecifyCache(DATA_SIZE, Low, High, Skip, MmWriteCombined);
+    if (mData != NULL) {
+        mDataPa = (ULONG)MmGetPhysicalAddress(mData).QuadPart;
+        RtlZeroMemory(mData, DATA_SIZE);
+    }
+    SwWifiTrace(L"DataPa", mDataPa);
+
     /* Ring descriptors in device RAM, indices as brcmf_pcie_init_ringbuffers. */
     SwWifiStep(21);
     for (I = 0; I < 5; I++) {
         ULONG Desc = MemLoc + I * RING_MEM_SZ;
         mRing[I].Offset = RingOffset[I];
+        mRing[I].Base = Dev->Dma + RingOffset[I];
         mRing[I].Depth = RingDepth[I];
         mRing[I].ItemLen = RingItem[I];
         mRing[I].W = mRing[I].R = 0;
@@ -1213,6 +1524,15 @@ static VOID SwWifiMsgbuf(PSWWIFI_DEVICE Dev, ULONG Shared)
                     (N == -1) ? L"ioctl timed out (no completion seen)" :
                     (N == -2) ? L"control ring full (the firmware did not take the items)" : L"ioctl answered but short");
     SwWifiFlush();
+
+    /* 0.6.0: receive buffers (brcmf_msgbuf_rxbuf_data_fill). */
+    if (N >= 6 && mData != NULL) {
+        ULONG Want = (mMaxRxPost == 0 || mMaxRxPost > N_RXBUF) ? N_RXBUF : mMaxRxPost;
+        for (I = 0; I < Want && SwWifiRxPost(Dev, I); I++) { }
+        mRxPosted = I;
+        if (mRxNeedCommit) { SwWifiRingCommit(Dev, &mRing[1]); mRxNeedCommit = FALSE; }
+        SwWifiTrace(L"DataRxPosted", mRxPosted);
+    }
     if (N >= 6 && SwWifiRadioUp(Dev)) {
         gReady = TRUE;
         SwWifiTraceText(L"WlanResult", L"ok: firmware up, radio up, waiting for WiFiCx");
@@ -1337,6 +1657,392 @@ Out:
     if (Nv) ExFreePoolWithTag(Nv, POOL_TAG);
 }
 
+/* ------------------------------------------------- connect (stage 4c)
+ *
+ * As brcmfmac brcmf_cfg80211_connect (Linux 4.9) for a station: security
+ * first ("wpa_auth", "auth", "wsec"; no "wpaie": the firmware writes its own
+ * RSN element from these, and the association request it sent is reported
+ * to Windows), the firmware supplicant off ("sup_wpa" 0: Windows does the
+ * 4-way handshake over the data path), then "join" (brcmf_ext_join_params_le)
+ * with the BSSID and one 20 MHz chanspec, or WLC_SET_SSID if "join" is
+ * refused. The result comes as events (SwWifiLinkEvent).
+ */
+#define WLC_DOWN            3
+#define WLC_SET_SSID        26
+#define WLC_DISASSOC        52
+#define WLC_GET_RSSI        127
+#define CHSPEC_BW20         0x1000u         /* d11ac encoding (io type 2: WLC_GET_VERSION = 2) */
+#define CHSPEC_5G           0xC000u
+
+static ULONG mJoins, mJoinSt, mJoinVia, mSecSt[4];
+
+static USHORT SwWifiChanspec(UCHAR Channel)
+{
+    return (USHORT)(Channel | CHSPEC_BW20 | ((Channel > 14) ? CHSPEC_5G : 0));
+}
+
+NTSTATUS BcmJoin(const BCM_JOIN *J)
+{
+    PSWWIFI_DEVICE Dev = &gDev;
+    static UCHAR P[80];
+    ULONG St = 0;
+    LONG N;
+
+    if (!gReady) return STATUS_DEVICE_NOT_READY;
+    mJoins++;
+    mLinkState = BCM_LINK_JOINING;
+    mLinkEvent = mLinkStatus = mLinkReason = 0;
+    N = SwWifiSetVarInt(Dev, "wpa_auth", J->WpaAuth, &St);  mSecSt[0] = (N < 0) ? (ULONG)N : St;
+    N = SwWifiSetVarInt(Dev, "auth", 0, &St);               mSecSt[1] = (N < 0) ? (ULONG)N : St;
+    N = SwWifiSetVarInt(Dev, "wsec", J->Wsec, &St);         mSecSt[2] = (N < 0) ? (ULONG)N : St;
+    N = SwWifiSetVarInt(Dev, "sup_wpa", 0, &St);            mSecSt[3] = (N < 0) ? (ULONG)N : St;   /* may be unknown: ignored */
+    if (mSecSt[0] != 0 || mSecSt[2] != 0) {
+        mLinkState = BCM_LINK_FAILED;
+        mJoinSt = 0xE0000000u | (mSecSt[0] & 0xFFu) | ((mSecSt[2] & 0xFFu) << 8);
+        return STATUS_UNSUCCESSFUL;
+    }
+
+    /* brcmf_ext_join_params_le: ssid_le 0..35, scan_le 36..55, assoc_le 56..69 */
+    RtlZeroMemory(P, sizeof(P));
+    Put32(P, 0, J->SsidLen);
+    RtlCopyMemory(P + 4, J->Ssid, J->SsidLen);
+    P[36] = 0xFF;                           /* scan_type -1: default */
+    Put32(P, 40, 16);                       /* nprobes: active time / 20 ms probe interval */
+    Put32(P, 44, 320);                      /* BRCMF_SCAN_JOIN_ACTIVE_DWELL_TIME_MS */
+    Put32(P, 48, 400);                      /* BRCMF_SCAN_JOIN_PASSIVE_DWELL_TIME_MS */
+    Put32(P, 52, 0xFFFFFFFFu);              /* home_time: default */
+    RtlCopyMemory(P + 56, J->Bssid, 6);
+    Put32(P, 64, 1);
+    Put16(P, 68, SwWifiChanspec(J->Channel));
+    N = SwWifiSetVar(Dev, "join", P, 70, &St);
+    mJoinVia = 1;
+    mJoinSt = (N < 0) ? (ULONG)N : St;
+    if (N < 0 || St != 0) {
+        /* brcmf_join_params: ssid_le 0..35, assoc_params_le 36..49 */
+        RtlZeroMemory(P, sizeof(P));
+        Put32(P, 0, J->SsidLen);
+        RtlCopyMemory(P + 4, J->Ssid, J->SsidLen);
+        RtlCopyMemory(P + 36, J->Bssid, 6);
+        Put32(P, 44, 1);
+        Put16(P, 48, SwWifiChanspec(J->Channel));
+        N = SwWifiIoctl(Dev, WLC_SET_SSID, P, 52, P, 52, &St);
+        mJoinVia = 2;
+        mJoinSt = (N < 0) ? (ULONG)N : St;
+        if (N < 0 || St != 0) {
+            mLinkState = BCM_LINK_FAILED;
+            return STATUS_UNSUCCESSFUL;
+        }
+    }
+    return STATUS_SUCCESS;
+}
+
+ULONG BcmLinkState(VOID) { return mLinkState; }
+
+VOID BcmLinkResult(PULONG Event, PULONG Status, PULONG Reason)
+{
+    *Event = mLinkEvent;
+    *Status = mLinkStatus;
+    *Reason = mLinkReason;
+}
+
+/* The association request/response IEs the firmware kept (brcmf_get_assoc_ies). */
+static ULONG mAssocReqLen, mAssocRespLen;
+
+VOID BcmGetAssocIes(PUCHAR Req, ULONG ReqMax, PULONG ReqLen, PUCHAR Resp, ULONG RespMax, PULONG RespLen)
+{
+    PSWWIFI_DEVICE Dev = &gDev;
+    UCHAR Len[8];
+    ULONG St = 0, R = 0, A = 0;
+    LONG N;
+
+    *ReqLen = *RespLen = 0;
+    if (!gReady) return;
+    N = SwWifiGetVar(Dev, "assoc_info", Len, 8, &St);
+    if (N >= 8 && St == 0) { R = Get32(Len, 0); A = Get32(Len, 4); }
+    mAssocReqLen = R;
+    mAssocRespLen = A;
+    if (R) {
+        N = SwWifiGetVar(Dev, "assoc_req_ies", Req, (ReqMax < 512) ? ReqMax : 512, &St);
+        if (N > 0 && St == 0) *ReqLen = (R < (ULONG)N) ? R : (ULONG)N;
+    }
+    if (A) {
+        N = SwWifiGetVar(Dev, "assoc_resp_ies", Resp, (RespMax < 512) ? RespMax : 512, &St);
+        if (N > 0 && St == 0) *RespLen = (A < (ULONG)N) ? A : (ULONG)N;
+    }
+}
+
+LONG BcmGetRssi(VOID)
+{
+    LONG Rssi = 0;
+    ULONG St = 0;
+    if (!gReady) return 0;
+    if (SwWifiIoctl(&gDev, WLC_GET_RSSI, &Rssi, 4, &Rssi, 4, &St) < 4 || St != 0) return 0;
+    return Rssi;
+}
+
+/* WLC_DISASSOC (brcmf_link_down); the data path goes first. */
+VOID BcmLeave(VOID)
+{
+    ULONG St = 0;
+    UCHAR Zero[8];
+    if (!gReady) return;
+    BcmDataStop();
+    if (mLinkState != BCM_LINK_IDLE) {
+        RtlZeroMemory(Zero, sizeof(Zero));
+        (VOID)SwWifiIoctl(&gDev, WLC_DISASSOC, Zero, 8, Zero, 8, &St);
+    }
+    mLinkState = BCM_LINK_IDLE;
+}
+
+/* Windows' randomised or configured address (DOT11_RESET). */
+NTSTATUS BcmSetMac(const UCHAR Mac[6])
+{
+    PSWWIFI_DEVICE Dev = &gDev;
+    ULONG St = 0;
+    UCHAR Buf[4] = { 0 };
+    BOOLEAN Ok;
+
+    if (!gReady) return STATUS_DEVICE_NOT_READY;
+    if (RtlCompareMemory(Mac, gMac, 6) == 6) return STATUS_SUCCESS;
+    Ok = SwWifiApplyMac(Dev, Mac);
+    if (!Ok) {
+        /* some firmware takes it only while down */
+        (VOID)SwWifiIoctl(Dev, WLC_DOWN, Buf, 4, Buf, 4, &St);
+        Ok = SwWifiApplyMac(Dev, Mac);
+        (VOID)SwWifiIoctl(Dev, WLC_UP, Buf, 4, Buf, 4, &St);
+    }
+    if (Ok) mMacSource = 2;
+    SwWifiTrace(L"MacSource", mMacSource);
+    return Ok ? STATUS_SUCCESS : STATUS_UNSUCCESSFUL;
+}
+
+/* ------------------------------------------------- keys (stage 4c)
+ *
+ * brcmf_cfg80211_add_key / brcmf_add_keyext: struct brcmf_wsec_key_le
+ * (index 0, len 4, data 8, algo 112, flags 116, iv_initialized 132, rxiv 140,
+ * ea 156; 164 bytes) as the "wsec_key" iovar. Pairwise key: the AP's address
+ * in ea. Group key: its index, BRCMF_PRIMARY_KEY, the receive PN in rxiv.
+ * Before a key goes in, the EAPOL frames already queued must have left
+ * (brcmf_netdev_wait_pend8021x): message 4 goes out unencrypted.
+ * Length 0 deletes the key.
+ */
+#define CRYPTO_ALGO_AES_CCM 4
+#define BRCMF_PRIMARY_KEY   2u
+static ULONG mKeysSet, mKeySt, mKeyWaitMs;
+
+NTSTATUS BcmSetKey(const BCM_KEY *K)
+{
+    PSWWIFI_DEVICE Dev = &gDev;
+    static UCHAR W[164];
+    ULONG St = 0, Ms;
+    LONG N;
+
+    if (!gReady) return STATUS_DEVICE_NOT_READY;
+    if (K->Len > 32) return STATUS_INVALID_PARAMETER;
+    if (K->Len != 0) {
+        for (Ms = 0; Ms < 950 && mTxPendEapol != 0; Ms += 10) {
+            LARGE_INTEGER Delay;
+            Delay.QuadPart = -10 * 10000LL;
+            KeDelayExecutionThread(KernelMode, FALSE, &Delay);
+            BcmPoll();
+        }
+        mKeyWaitMs = Ms;
+    }
+    RtlZeroMemory(W, sizeof(W));
+    Put32(W, 0, K->Index);
+    Put32(W, 4, K->Len);
+    RtlCopyMemory(W + 8, K->Data, K->Len);
+    Put32(W, 112, (K->Len != 0) ? CRYPTO_ALGO_AES_CCM : 0);
+    Put32(W, 116, K->Pairwise ? 0 : BRCMF_PRIMARY_KEY);
+    if (K->HaveRsc) {
+        const UCHAR *Iv = K->Rsc;
+        Put32(W, 132, 1);                   /* iv_initialized */
+        Put32(W, 140, ((ULONG)Iv[5] << 24) | ((ULONG)Iv[4] << 16) | ((ULONG)Iv[3] << 8) | Iv[2]);
+        Put16(W, 144, (USHORT)(((ULONG)Iv[1] << 8) | Iv[0]));
+    }
+    if (K->Pairwise) RtlCopyMemory(W + 156, K->Peer, 6);
+    N = SwWifiSetVar(Dev, "wsec_key", W, sizeof(W), &St);
+    mKeySt = (N < 0) ? (ULONG)N : St;
+    if (N < 0 || St != 0) return STATUS_UNSUCCESSFUL;
+    if (K->Len) mKeysSet++;
+    return STATUS_SUCCESS;
+}
+
+/* ------------------------------------------------- data path API */
+
+VOID BcmSetRxHandler(BCM_RX_HANDLER *Handler, PVOID Context)
+{
+    mRxContext = Context;
+    mRxHandler = Handler;
+}
+
+/* brcmf_msgbuf_flowring_create_worker: one flowring, polled until the
+ * firmware answers (up to 1 s). */
+NTSTATUS BcmDataStart(const UCHAR Peer[6])
+{
+    PSWWIFI_DEVICE Dev = &gDev;
+    PUCHAR Item;
+    ULONG Ms;
+
+    if (!gReady || mData == NULL) return STATUS_DEVICE_NOT_READY;
+    if (mFlowState == FLOW_OPEN) return STATUS_SUCCESS;
+    if (mMaxSub < FLOW_RING_ID + 1) return STATUS_NOT_SUPPORTED;
+    RtlZeroMemory(mData + OFF_FLOWRING, FLOW_DEPTH * FLOW_ITEM);
+    RtlZeroMemory(mTxSlot, sizeof(mTxSlot));
+    mTxInFw = mTxPendEapol = 0;
+    mFlow.Offset = OFF_FLOWRING;
+    mFlow.Base = mData + OFF_FLOWRING;
+    mFlow.Depth = FLOW_DEPTH;
+    mFlow.ItemLen = FLOW_ITEM;
+    mFlow.WIdxAddr = mH2dW + FLOW_RING_ID * 4;
+    mFlow.RIdxAddr = mH2dR + FLOW_RING_ID * 4;
+    mFlow.W = 0;
+    Wr16(Dev->Bar2, mFlow.WIdxAddr, 0);
+    mFlow.R = Rd16(Dev->Bar2, mFlow.RIdxAddr);
+    SwWifiTrace(L"FlowRIdxStart", mFlow.R);
+
+    Item = SwWifiRingReserve(Dev, &mRing[0]);
+    if (Item == NULL) return STATUS_INSUFFICIENT_RESOURCES;
+    Item[0] = MSG_FLOW_CREATE;
+    Item[1] = 0;                            /* ifidx */
+    Put32(Item, 4, 0);
+    RtlCopyMemory(Item + 8, Peer, 6);       /* da */
+    RtlCopyMemory(Item + 14, gMac, 6);      /* sa */
+    Item[20] = 0;                           /* tid */
+    Put16(Item, 22, FLOW_RING_ID);
+    Put16(Item, 28, FLOW_DEPTH);
+    Put16(Item, 30, FLOW_ITEM);
+    Put32(Item, 32, mDataPa + OFF_FLOWRING);
+    Put32(Item, 36, 0);
+    mFlowState = FLOW_CREATING;
+    mFlowCreates++;
+    SwWifiRingCommit(Dev, &mRing[0]);
+    for (Ms = 0; Ms < 1000 && mFlowState == FLOW_CREATING; Ms += 10) {
+        LARGE_INTEGER Delay;
+        Delay.QuadPart = -10 * 10000LL;
+        KeDelayExecutionThread(KernelMode, FALSE, &Delay);
+        BcmPoll();
+    }
+    SwWifiTrace(L"FlowCreateMs", Ms);
+    SwWifiTrace(L"FlowStatus", (mFlowState == FLOW_CREATING) ? 0xFFFFFFFFu : mFlowStatus);
+    if (mFlowState == FLOW_CREATING) mFlowState = FLOW_FAILED;
+    return (mFlowState == FLOW_OPEN) ? STATUS_SUCCESS : STATUS_UNSUCCESSFUL;
+}
+
+VOID BcmDataStop(VOID)
+{
+    PSWWIFI_DEVICE Dev = &gDev;
+    PUCHAR Item;
+    ULONG Ms;
+
+    if (!gReady || mFlowState != FLOW_OPEN) { mFlowState = FLOW_NONE; return; }
+    Item = SwWifiRingReserve(Dev, &mRing[0]);
+    if (Item != NULL) {
+        Item[0] = MSG_FLOW_DELETE;
+        Put16(Item, 8, FLOW_RING_ID);
+        Put16(Item, 10, 0);
+        mFlowState = FLOW_DELETING;
+        SwWifiRingCommit(Dev, &mRing[0]);
+        for (Ms = 0; Ms < 500 && mFlowState == FLOW_DELETING; Ms += 10) {
+            LARGE_INTEGER Delay;
+            Delay.QuadPart = -10 * 10000LL;
+            KeDelayExecutionThread(KernelMode, FALSE, &Delay);
+            BcmPoll();
+        }
+    }
+    /* The firmware flushed the ring; TX_STATUS for what was left may not come. */
+    mFlowState = FLOW_NONE;
+    RtlZeroMemory(mTxSlot, sizeof(mTxSlot));
+    mTxInFw = mTxPendEapol = 0;
+}
+
+BOOLEAN BcmDataReady(VOID) { return mFlowState == FLOW_OPEN; }
+
+/* brcmf_msgbuf_txflow: copy, one TX_POST; BcmTxCommit rings the bell. */
+BOOLEAN BcmTxFrame(const UCHAR *Frame, ULONG Len, UCHAR Priority)
+{
+    PSWWIFI_DEVICE Dev = &gDev;
+    PUCHAR Item, Buf;
+    ULONG I, Idx = N_TXBUF;
+
+    if (mFlowState != FLOW_OPEN || Len < ETH_HLEN || Len > PKT_BUF_SIZE) return FALSE;
+    for (I = 0; I < N_TXBUF; I++) {
+        ULONG J = (mTxNext + I) % N_TXBUF;
+        if (mTxSlot[J] == 0) { Idx = J; break; }
+    }
+    if (Idx == N_TXBUF) { mTxNoSlot++; return FALSE; }
+    Item = SwWifiRingReserve(Dev, &mFlow);
+    if (Item == NULL) { mTxNoSlot++; return FALSE; }
+    mTxNext = (Idx + 1) % N_TXBUF;
+    Buf = mData + OFF_TXBUF + Idx * PKT_BUF_SIZE;
+    RtlCopyMemory(Buf, Frame, Len);
+    mTxSlot[Idx] = (Frame[12] == 0x88 && Frame[13] == 0x8E) ? 2 : 1;
+    if (mTxSlot[Idx] == 2) { mTxPendEapol++; mTxEapol++; }
+    mTxInFw++;
+    Item[0] = MSG_TX_POST;
+    Item[1] = 0;
+    Put32(Item, 4, Idx);
+    RtlCopyMemory(Item + 8, Frame, ETH_HLEN);
+    Item[22] = (UCHAR)(0x01u | ((Priority & 7u) << 5));    /* BRCMF_MSGBUF_PKT_FLAGS_FRAME_802_3 | prio */
+    Item[23] = 1;                           /* seg_cnt */
+    Put32(Item, 32, mDataPa + OFF_TXBUF + Idx * PKT_BUF_SIZE + ETH_HLEN);
+    Put32(Item, 36, 0);
+    Put16(Item, 42, (USHORT)(Len - ETH_HLEN));
+    mTxPosted++;
+    mTxBytes += Len;
+    mTxNeedCommit = TRUE;
+    return TRUE;
+}
+
+VOID BcmTxCommit(VOID)
+{
+    if (mTxNeedCommit && mFlowState == FLOW_OPEN) SwWifiRingCommit(&gDev, &mFlow);
+    mTxNeedCommit = FALSE;
+}
+
+VOID BcmSaveTrace(VOID)
+{
+    static WCHAR Text[EV_LOG_MAX * 40];
+    size_t Left = sizeof(Text);
+    PWSTR Out = Text;
+    ULONG I, N = (mEvLogN < EV_LOG_MAX) ? mEvLogN : EV_LOG_MAX;
+
+    SwWifiTrace(L"ConnJoins", mJoins);
+    SwWifiTrace(L"ConnJoinSt", mJoinSt);
+    SwWifiTrace(L"ConnJoinVia", mJoinVia);
+    SwWifiTraceBinary(L"ConnSecSt", mSecSt, sizeof(mSecSt));
+    SwWifiTrace(L"ConnLinkState", mLinkState);
+    SwWifiTrace(L"ConnLinkEvent", mLinkEvent);
+    SwWifiTrace(L"ConnLinkStatus", mLinkStatus);
+    SwWifiTrace(L"ConnLinkReason", mLinkReason);
+    SwWifiTrace(L"ConnLinkEvents", mLinkEvents);
+    SwWifiTrace(L"ConnAssocReqLen", mAssocReqLen);
+    SwWifiTrace(L"ConnAssocRespLen", mAssocRespLen);
+    SwWifiTrace(L"KeysSet", mKeysSet);
+    SwWifiTrace(L"KeySt", mKeySt);
+    SwWifiTrace(L"KeyWaitMs", mKeyWaitMs);
+    SwWifiTrace(L"FlowState", mFlowState);
+    SwWifiTrace(L"FlowCreates", mFlowCreates);
+    SwWifiTrace(L"TxPosted", mTxPosted);
+    SwWifiTrace(L"TxDone", mTxDone);
+    SwWifiTrace(L"TxStatusErr", mTxStatusErr);
+    SwWifiTrace(L"TxNoSlot", mTxNoSlot);
+    SwWifiTrace(L"TxEapol", mTxEapol);
+    SwWifiTrace(L"TxBytes", mTxBytes);
+    SwWifiTrace(L"RxFrames", mRxFrames);
+    SwWifiTrace(L"RxEapol", mRxEapol);
+    SwWifiTrace(L"RxBad", mRxBad);
+    SwWifiTrace(L"RxBytes", mRxBytes);
+    SwWifiTrace(L"MsgUnknown", mUnknown);
+    SwWifiTrace(L"MsgLastType", mLastType);
+    Text[0] = L'\0';
+    for (I = 0; I < N; I++) {
+        ULONG *L = mEvLog[(mEvLogN - N + I) % EV_LOG_MAX];
+        (VOID)RtlStringCbPrintfExW(Out, Left, &Out, &Left, 0, L"%u/%u/%u/%x ", L[0], L[1], L[2], L[3]);
+    }
+    SwWifiTraceText(L"ConnEvents", Text);
+}
+
 /* ------------------------------------------------------------- API for wlan.cpp */
 
 VOID BcmSetRegistryPath(PCUNICODE_STRING RegistryPath)
@@ -1401,6 +2107,13 @@ VOID BcmReleaseHardware(VOID)
         Dev->FwRunning = FALSE;
     }
     if (Dev->Dma) { MmFreeContiguousMemorySpecifyCache(Dev->Dma, Dev->DmaLen, MmWriteCombined); Dev->Dma = NULL; }
+    if (mData) {
+        MmFreeContiguousMemorySpecifyCache(mData, DATA_SIZE, MmWriteCombined);     /* the CPU is halted (above) */
+        mData = NULL;
+    }
+    mFlowState = FLOW_NONE;
+    mLinkState = BCM_LINK_IDLE;
+    mRxHandler = NULL;
     if (Dev->Bar0) { MmUnmapIoSpace((PVOID)Dev->Bar0, Dev->Bar0Len); Dev->Bar0 = NULL; }
     if (Dev->Bar2) { MmUnmapIoSpace((PVOID)Dev->Bar2, Dev->Bar2Len); Dev->Bar2 = NULL; }
     if (Dev->Cfg)  { MmUnmapIoSpace((PVOID)Dev->Cfg, Dev->CfgLen);   Dev->Cfg = NULL; }

@@ -44,6 +44,47 @@ ULONG BcmScanCount(VOID);
 const BCM_BSS *BcmScanEntry(ULONG Index);
 VOID BcmScanSaveList(VOID);                     /* Parameters\ScanList, for Wifi.ps1 */
 
+/* 0.6.0: connect (stage 4c) */
+enum { BCM_LINK_IDLE = 0, BCM_LINK_JOINING = 1, BCM_LINK_UP = 2, BCM_LINK_FAILED = 3, BCM_LINK_LOST = 4 };
+
+typedef struct _BCM_JOIN {
+    UCHAR Ssid[32];
+    ULONG SsidLen;
+    UCHAR Bssid[6];
+    UCHAR Channel;
+    ULONG Wsec;             /* 0 open, 2 TKIP, 4 AES (brcmf wsec bits) */
+    ULONG WpaAuth;          /* 0 disabled, 0x04 WPA-PSK, 0x80 WPA2-PSK */
+} BCM_JOIN;
+
+typedef struct _BCM_KEY {
+    ULONG Index;
+    ULONG Len;              /* 0 = delete */
+    UCHAR Data[32];
+    BOOLEAN Pairwise;
+    UCHAR Peer[6];
+    BOOLEAN HaveRsc;
+    UCHAR Rsc[6];           /* receive PN, little-endian */
+} BCM_KEY;
+
+NTSTATUS BcmJoin(const BCM_JOIN *Join);          /* security + join; the result comes from BcmPoll */
+ULONG BcmLinkState(VOID);                       /* BCM_LINK_* */
+VOID BcmLinkResult(PULONG Event, PULONG Status, PULONG Reason);
+VOID BcmGetAssocIes(PUCHAR Req, ULONG ReqMax, PULONG ReqLen, PUCHAR Resp, ULONG RespMax, PULONG RespLen);
+LONG BcmGetRssi(VOID);
+VOID BcmLeave(VOID);                            /* disassociate, data path down */
+NTSTATUS BcmSetMac(const UCHAR Mac[6]);
+NTSTATUS BcmSetKey(const BCM_KEY *Key);         /* waits for queued EAPOL frames to leave first */
+
+/* 0.6.0: data path (Ethernet frames) */
+typedef VOID BCM_RX_HANDLER(PVOID Context, const UCHAR *Frame, ULONG Len);
+VOID BcmSetRxHandler(BCM_RX_HANDLER *Handler, PVOID Context);   /* called from BcmPoll */
+NTSTATUS BcmDataStart(const UCHAR Peer[6]);     /* create the tx flowring */
+VOID BcmDataStop(VOID);
+BOOLEAN BcmDataReady(VOID);
+BOOLEAN BcmTxFrame(const UCHAR *Frame, ULONG Len, UCHAR Priority);  /* copies; FALSE = no room */
+VOID BcmTxCommit(VOID);
+VOID BcmSaveTrace(VOID);
+
 #ifdef __cplusplus
 }
 #endif
