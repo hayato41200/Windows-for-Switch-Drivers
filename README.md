@@ -8,12 +8,13 @@ Drivers for the **HDH-001 (Tegra T214)** port of Windows 11 ARM64. They use the 
 | --- | --- |
 | `nvtsdhc` | WINARM boots Windows; FAT32 is hidden by default. [SDR104 / ADMA2 0.4.0.1](drivers/Tegra210Sdhc/README.md#t214-sdr104-candidate) reports 199.68 MHz / 4-bit / 1.8 V, successful tuning and no recorded ADMA errors. Sustained throughput remains unmeasured. |
 | `switchwifi` 0.5.5 | Automatically reconnected to a saved WPA2-Personal network. Windows obtained a DHCP lease and default gateway, and the owner confirmed Internet access. |
-| `switchbt` 1.0.0.13 | Bluetooth works on the trimmed Pro installation. Range remains unmeasured. |
+| `switchbt` 1.0.0.15 | Bluetooth works on the trimmed Pro installation. The current package handles in-flight HCI write cancellation and was enabled during the successful shutdown test. Range remains unmeasured. |
 | GPIO, I²C3 and FTM4 touch | The shared controllers and Lite touch driver handle taps in Windows Setup. |
 | `switchsio` (analog sticks and gamepad) | Windows detected the HID gamepad and mouse and the driver received controller input. Both sticks are exposed to generic HID games. In-game use awaits testing. |
 | `switchsio` desktop controls | Left stick moves the pointer and ZR/ZL click. Capture toggles desktop mode and **+** opens the On-Screen Keyboard (0.2.2 on the card). Version 0.2.3 adds right-stick scrolling, R3 middle click and D-pad keyboard arrows. Hardware test pending. [Button mapping](drivers/SwitchSensor/README.md) |
 | `switchaudio` 1.0.0.9 | The built-in speakers play audio. Headphones and jack switching await testing. |
 | `switchfan` 1.0.0.5 | The fan and panel brightness controls work. Readbacks showed 1996.8 MHz CPU and 1866 MHz RAM. |
+| `switchbattery` 1.0.0.8 / shutdown | Normal Windows shutdown powered off the tested Lite with Wi-Fi, Bluetooth, audio and gamepad enabled. The battery driver now hands IRPs to battc before KMDF owns them. Restart is tested separately. [Power status](https://github.com/ruje0504-2/winx/blob/hdh001-hekate-sd/docs/hdh001-home/power-performance.md) |
 
 Windows uses CPU software rendering only. The Tegra GPU driver for Windows has not been implemented.
 

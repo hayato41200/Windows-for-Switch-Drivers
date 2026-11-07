@@ -125,9 +125,23 @@ The shared long-term scope, including Switchroot-based Wi-Fi and Lite SIO, is tr
 
 **Wi-Fi works on Switch Lite (HDH-001).** SwitchWifi 0.5.5 connected automatically to a saved WPA2-Personal network on Windows 11 ARM64 23H2. Windows recorded successful authentication, an IPv4 DHCP lease and a default gateway. The owner confirmed Internet access. [Driver and hardware results](../../drivers/SwitchWifi/README.md)
 
-Windows shutdown/restart still black-screen with the fan running. A pre-Windows
-shutdown using the same Power R4 BL31 succeeded, so final Windows exit and
-runtime hardware state remain under investigation.
+Normal Windows shutdown powered off the tested HDH-001 after installing
+SwitchBattery **1.0.0.8**, with Wi-Fi, Bluetooth, audio and the gamepad enabled.
+The owner observed the R6 diagnostic firmware's two fan pulses followed by
+complete power removal. No device-isolation utility was needed. The normal firmware now selects native restart to Hekate and disables the
+diagnostic fan pulses; native restart remains a separate pending result.
+
+The previous battery IOCTL handler passed the underlying IRP of a KMDF-owned
+request to `BatteryClassIoctl`, which can complete or retain that IRP itself.
+Version 1.0.0.8 uses a WDM preprocess callback before KMDF takes ownership, as in
+[Microsoft's battery sample](https://github.com/microsoft/Windows-driver-samples/blob/main/simbatt/func/wdf.c).
+A separate lock protects the battery class handle without blocking the I2C
+lock used by its callbacks. Only unhandled IRPs continue into KMDF. The actual
+handler's immediate, pending, failed and fallback paths passed an ASan/UBSan
+host test; the ARM64 package and signatures were checked before deployment.
+Run `python3 drivers/SwitchBattery/tests/test-irp-ownership.py` for that test.
+The installed Bluetooth 1.0.0.15 cancellation fix is also retained; it did not
+resolve the full shutdown failure on its own. [Firmware and physical evidence](https://github.com/ruje0504-2/winx/blob/hdh001-hekate-sd/docs/hdh001-home/power-performance.md)
 
 ## Windows Wi-Fi packet core
 

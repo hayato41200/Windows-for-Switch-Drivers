@@ -100,6 +100,7 @@ typedef struct _SWBAT_DEVICE {
     ULONG Connections, PdBoard;
     BOOLEAN PdConfigured;
     WDFWAITLOCK Lock;
+    WDFWAITLOCK ClassLock;
     PVOID ClassHandle;
     WDFTIMER Timer;
     WDFTIMER UsbcTimer;
@@ -126,7 +127,7 @@ EVT_WDF_DEVICE_SELF_MANAGED_IO_INIT SwBatEvtSelfManagedIoInit;
 EVT_WDF_DEVICE_SELF_MANAGED_IO_SUSPEND SwBatEvtSelfManagedIoSuspend;
 EVT_WDF_DEVICE_SELF_MANAGED_IO_RESTART SwBatEvtSelfManagedIoRestart;
 EVT_WDF_DEVICE_SELF_MANAGED_IO_CLEANUP SwBatEvtSelfManagedIoCleanup;
-EVT_WDF_IO_QUEUE_IO_DEVICE_CONTROL SwBatEvtIoDeviceControl;
+EVT_WDFDEVICE_WDM_IRP_PREPROCESS SwBatPreprocessDeviceControl;
 EVT_WDF_TIMER SwBatEvtTimer;
 EVT_WDF_TIMER SwBatEvtUsbcTimer;
 BCLASS_QUERY_TAG_CALLBACK SwBatQueryTag;
@@ -800,10 +801,12 @@ NTSTATUS SwBatEvtSelfManagedIoInit(WDFDEVICE Device)
     Info.DisableStatusNotify = SwBatDisableStatusNotify;
     Info.Pdo = WdfDeviceWdmGetPhysicalDevice(Device);
     Info.DeviceName = NULL;
+    WdfWaitLockAcquire(Dev->ClassLock, NULL);
     Status = BatteryClassInitializeDevice(&Info, &Dev->ClassHandle);
+    if (!NT_SUCCESS(Status)) Dev->ClassHandle = NULL;
+    WdfWaitLockRelease(Dev->ClassLock);
     SwBatTrace(L"ClassInitStatus", (ULONG)Status);
     if (!NT_SUCCESS(Status)) {
-        Dev->ClassHandle = NULL;
         return Status;
     }
 
@@ -898,34 +901,40 @@ NTSTATUS SwBatEvtSelfManagedIoSuspend(WDFDEVICE Device)
 VOID SwBatEvtSelfManagedIoCleanup(WDFDEVICE Device)
 {
     PSWBAT_DEVICE Dev = SwBatGetDevice(Device);
+    WdfWaitLockAcquire(Dev->ClassLock, NULL);
     if (Dev->ClassHandle != NULL) {
         (VOID)BatteryClassUnload(Dev->ClassHandle);
         Dev->ClassHandle = NULL;
     }
+    WdfWaitLockRelease(Dev->ClassLock);
 }
 
-VOID SwBatEvtIoDeviceControl(WDFQUEUE Queue, WDFREQUEST Request, size_t OutputLength, size_t InputLength, ULONG IoControlCode)
+NTSTATUS SwBatPreprocessDeviceControl(WDFDEVICE Device, PIRP Irp)
 {
-    PSWBAT_DEVICE Dev = SwBatGetDevice(WdfIoQueueGetDevice(Queue));
+    PSWBAT_DEVICE Dev = SwBatGetDevice(Device);
     NTSTATUS Status = STATUS_NOT_SUPPORTED;
-    UNREFERENCED_PARAMETER(OutputLength);
-    UNREFERENCED_PARAMETER(InputLength);
-    UNREFERENCED_PARAMETER(IoControlCode);
 
+    /* battc owns and completes handled IRPs, including pending status waits.
+     * Give it the IRP before KMDF creates a WDFREQUEST: completing the WDM IRP
+     * from EvtIoDeviceControl leaves the framework queue waiting at power-down.
+     * ClassLock is separate from Lock because battc calls our I2C callbacks.
+     */
+    WdfWaitLockAcquire(Dev->ClassLock, NULL);
     if (Dev->ClassHandle != NULL) {
-        /* battc completes the IRP itself unless it does not handle it. */
-        Status = BatteryClassIoctl(Dev->ClassHandle, WdfRequestWdmGetIrp(Request));
+        Status = BatteryClassIoctl(Dev->ClassHandle, Irp);
     }
+    WdfWaitLockRelease(Dev->ClassLock);
     if (Status == STATUS_NOT_SUPPORTED) {
-        WdfRequestComplete(Request, Status);
+        IoSkipCurrentIrpStackLocation(Irp);
+        Status = WdfDeviceWdmDispatchPreprocessedIrp(Device, Irp);
     }
+    return Status;
 }
 
 NTSTATUS SwBatEvtDeviceAdd(WDFDRIVER Driver, PWDFDEVICE_INIT DeviceInit)
 {
     WDF_PNPPOWER_EVENT_CALLBACKS Pnp;
     WDF_OBJECT_ATTRIBUTES Attributes;
-    WDF_IO_QUEUE_CONFIG QueueConfig;
     WDFDEVICE Device;
     PSWBAT_DEVICE Dev;
     NTSTATUS Status;
@@ -938,6 +947,9 @@ NTSTATUS SwBatEvtDeviceAdd(WDFDRIVER Driver, PWDFDEVICE_INIT DeviceInit)
     Pnp.EvtDeviceSelfManagedIoRestart = SwBatEvtSelfManagedIoRestart;
     Pnp.EvtDeviceSelfManagedIoCleanup = SwBatEvtSelfManagedIoCleanup;
     WdfDeviceInitSetPnpPowerEventCallbacks(DeviceInit, &Pnp);
+    Status = WdfDeviceInitAssignWdmIrpPreprocessCallback(DeviceInit,
+        SwBatPreprocessDeviceControl, IRP_MJ_DEVICE_CONTROL, NULL, 0);
+    if (!NT_SUCCESS(Status)) return Status;
 
     WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&Attributes, SWBAT_DEVICE);
     Status = WdfDeviceCreate(&DeviceInit, &Attributes, &Device);
@@ -945,14 +957,14 @@ NTSTATUS SwBatEvtDeviceAdd(WDFDRIVER Driver, PWDFDEVICE_INIT DeviceInit)
         return Status;
     }
     Dev = SwBatGetDevice(Device);
-    Status = WdfWaitLockCreate(WDF_NO_OBJECT_ATTRIBUTES, &Dev->Lock);
+    WDF_OBJECT_ATTRIBUTES_INIT(&Attributes);
+    Attributes.ParentObject = Device;
+    Status = WdfWaitLockCreate(&Attributes, &Dev->Lock);
     if (!NT_SUCCESS(Status)) {
         return Status;
     }
 
-    WDF_IO_QUEUE_CONFIG_INIT_DEFAULT_QUEUE(&QueueConfig, WdfIoQueueDispatchParallel);
-    QueueConfig.EvtIoDeviceControl = SwBatEvtIoDeviceControl;
-    return WdfIoQueueCreate(Device, &QueueConfig, WDF_NO_OBJECT_ATTRIBUTES, WDF_NO_HANDLE);
+    return WdfWaitLockCreate(&Attributes, &Dev->ClassLock);
 }
 
 NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
@@ -964,7 +976,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
         RtlCopyMemory(&SwBatParamsPath[RegistryPath->Length / sizeof(WCHAR)], L"\\Parameters", sizeof(L"\\Parameters"));
         (VOID)RtlCreateRegistryKey(RTL_REGISTRY_ABSOLUTE, SwBatParamsPath);
     }
-    SwBatTrace(L"DriverVersion", 7);
+    SwBatTrace(L"DriverVersion", 8);
 
     WDF_DRIVER_CONFIG_INIT(&Config, SwBatEvtDeviceAdd);
     return WdfDriverCreate(DriverObject, RegistryPath, WDF_NO_OBJECT_ATTRIBUTES, &Config, WDF_NO_HANDLE);
