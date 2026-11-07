@@ -51,3 +51,11 @@
 - **ファームウェアは同梱しない（再配布できない）。** 自分で `brcmfmac4356-pcie.bin` を用意する。NVRAM の `brcmfmac4356-pcie.txt` があれば、それも使う。入手先は、Switch の Linux の `/lib/firmware/brcm/` か linux-firmware。
 - **置き場所:** `Firmware.cmd`（または `Install.cmd`）が、このフォルダー（か `firmware\`）にあるファイルを `System32\drivers\switchwifi` にコピーする。
 - **ファイルが無いとき:** 段階 2b は飛ばす。段階 2a の結果だけが出る。
+
+## 0.2.0 の結果（2026-11-07、ユーザー報告）
+
+- **ファームウェアが動いた。** 自分の Switchroot のバックアップから取り出した 7.35.252.108 を使った。
+  - 書き込んだ内容は読み返しても誤りなし（verifyBad=0）。
+  - CPU を動かしてから 50 ms で、共有領域のアドレス（0x1DF298）が書かれた。flags=0x20005（msgbuf プロトコル版 5）。
+- **ファームウェアのコンソール（チップ自身のログ）が読めた。** 「RTE (USB-SDIO-PCIE-MSG_BUF) 7.35.252.108 on BCM4356 r3」「pciemsgbuf0: Broadcom PCIE MSGBUF driver」「wl0: Broadcom BCM4356 802.11 Wireless Controller」と出た。
+- **次:** msgbuf のリング（DMA）を作り、最初のコマンド（MAC アドレスの読み出しなど）をファームウェアに送る。
