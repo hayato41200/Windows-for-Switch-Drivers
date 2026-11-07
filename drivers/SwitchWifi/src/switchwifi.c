@@ -26,7 +26,7 @@
 #include <ntstrsafe.h>
 #include <wdf.h>
 
-#define SWWIFI_VERSION      0x00010001u     /* 0.1.1 */
+#define SWWIFI_VERSION      0x00020000u     /* 0.2.0 */
 
 #define RP_LINK_STATUS      0x090           /* bit 29: data link up */
 #define RP_XP_VC0           0xF00           /* bit 30: DL up */
@@ -143,7 +143,9 @@ static VOID SwWifiSetWindow(PSWWIFI_DEVICE Dev, ULONG Address)
 #define CR4_BANKIDX         0x40
 #define CR4_BANKINFO        0x44            /* bits 5:0 size in 8 KB units - 1 */
 
-static ULONG mCr4Base, mCr4Rev, mPcie2Rev;
+#define CORE_80211          0x812
+
+static ULONG mCr4Base, mCr4Rev, mPcie2Rev, mCr4Wrap, mD11Wrap, mRamBytes;
 
 /* RAM size as brcmfmac brcmf_chip_cr4_set_ram_size: sum of the ATCM and BTCM
  * banks of the ARM CR4 core. The firmware is later copied into this RAM. */
@@ -163,6 +165,7 @@ static VOID SwWifiCr4Ram(PSWWIFI_DEVICE Dev)
     SwWifiTrace(L"Cr4Base", mCr4Base);
     SwWifiTrace(L"Cr4Rev", mCr4Rev);
     SwWifiTrace(L"Cr4Cap", Cap);
+    mRamBytes = Total;
     SwWifiTrace(L"RamBytes", Total);
     SwWifiTrace(L"Pcie2Rev", mPcie2Rev);
 }
@@ -180,6 +183,7 @@ static VOID SwWifiScanErom(PSWWIFI_DEVICE Dev, ULONG EromPtr)
     PWSTR Out = Text;
 
     Text[0] = L'\0';
+    mCr4Base = mCr4Rev = mPcie2Rev = mCr4Wrap = mD11Wrap = mRamBytes = 0;
     while (Count < EROM_MAX_WORDS) {
         ULONG Addr = EromPtr + Count * 4;
         if ((Addr & ~0xFFFu) != Page) {
@@ -197,7 +201,8 @@ static VOID SwWifiScanErom(PSWWIFI_DEVICE Dev, ULONG EromPtr)
 
 #define FLUSH_CORE() do { if (Have) { \
         (VOID)RtlStringCbPrintfExW(Out, Left, &Out, &Left, 0, L"%03x:%u@%08x/%08x ", CurId, CurRev, CurBase, CurWrap); \
-        if (CurId == CORE_ARM_CR4 && mCr4Base == 0) { mCr4Base = CurBase; mCr4Rev = CurRev; } \
+        if (CurId == CORE_ARM_CR4 && mCr4Base == 0) { mCr4Base = CurBase; mCr4Rev = CurRev; mCr4Wrap = CurWrap; } \
+        if (CurId == CORE_80211 && mD11Wrap == 0) { mD11Wrap = CurWrap; } \
         if (CurId == CORE_PCIE2 && mPcie2Rev == 0) { mPcie2Rev = CurRev; } \
         Cores++; } } while (0)
 
@@ -234,6 +239,8 @@ static VOID SwWifiScanErom(PSWWIFI_DEVICE Dev, ULONG EromPtr)
     SwWifiTrace(L"Cores", Cores);
     SwWifiTraceText(L"CoreList", Text);
 }
+
+static VOID SwWifiFirmware(PSWWIFI_DEVICE Dev);
 
 static VOID SwWifiProbe(PSWWIFI_DEVICE Dev)
 {
@@ -312,9 +319,322 @@ static VOID SwWifiProbe(PSWWIFI_DEVICE Dev)
     }
 
     SwWifiStep(7);
-    SwWifiTrace(L"Busy", 0);
-    SwWifiTraceText(L"Result", ((Chip & 0xFFFFu) == 0x4356u) ? L"ok: BCM4356 answers in Windows" : L"chip ID is not 4356");
+    if ((Chip & 0xFFFFu) != 0x4356u) {
+        SwWifiTrace(L"Busy", 0);
+        SwWifiTraceText(L"Result", L"chip ID is not 4356");
+        SwWifiFlush();
+        return;
+    }
+    SwWifiTraceText(L"Result", L"ok: BCM4356 answers in Windows");
     SwWifiFlush();
+
+    /* 0.2.0: stage 2b, firmware download (only when the files are there). */
+    SwWifiFirmware(Dev);
+    SwWifiTrace(L"Busy", 0);
+    SwWifiFlush();
+}
+
+/* ------------------------------------------------- firmware (stage 2b)
+ *
+ * As brcmfmac (Linux 4.9) brcmf_chip_attach + brcmf_pcie_download_fw_nvram:
+ * halt the ARM CR4 and reset the D11 core (set_passive), copy the firmware to
+ * device RAM at rambase, clear the last RAM word, put the NVRAM at the end of
+ * RAM, write the reset vector at TCM 0 and release the CPU (set_active). The
+ * firmware then writes the address of its shared area to the last RAM word.
+ * The files are the user's own (not distributed): brcmfmac4356-pcie.bin and,
+ * if there is one, brcmfmac4356-pcie.txt, in System32\drivers\switchwifi.
+ * Not done (yet): the chip watchdog reset of brcmf_pcie_reset_device; UEFI
+ * has just powered the chip, so it is still in its boot ROM.
+ */
+#define FW_DIR              L"\\SystemRoot\\System32\\drivers\\switchwifi\\"
+#define FW_MAX              (1024u * 1024u)
+#define NVRAM_MAX           (64u * 1024u)
+#define POOL_TAG            'iWwS'
+#define TCM_RAMBASE         0x180000u       /* brcmf_chip_tcm_rambase: BCM4356 */
+#define AI_IOCTL            0x408
+#define AI_RESET_CTL        0x800
+#define AI_IOCTL_CLK        0x1u
+#define AI_IOCTL_FGC        0x2u
+#define CR4_IOCTL_CPUHALT   0x20u
+#define D11_IOCTL_PHYCLOCKEN 0x4u
+#define D11_IOCTL_PHYRESET  0x8u
+#define PCIE2_CONFIGADDR    0x120
+#define PCIE2_CONFIGDATA    0x124
+#define FW_UP_MS            5000
+#define SHARED_CONSOLE      20
+#define CONSOLE_BUFADDR     8
+#define CONSOLE_BUFSIZE     12
+#define CONSOLE_WRITEIDX    16
+#define CONSOLE_MAX         3000
+
+static NTSTATUS SwWifiReadFile(PCWSTR Name, PUCHAR *Data, ULONG *Size, ULONG Max)
+{
+    WCHAR Path[128];
+    UNICODE_STRING U;
+    OBJECT_ATTRIBUTES Oa;
+    IO_STATUS_BLOCK Io;
+    FILE_STANDARD_INFORMATION Info;
+    HANDLE File;
+    PUCHAR Buf;
+    NTSTATUS Status;
+
+    *Data = NULL;
+    *Size = 0;
+    Status = RtlStringCbPrintfW(Path, sizeof(Path), L"%s%s", FW_DIR, Name);
+    if (!NT_SUCCESS(Status)) return Status;
+    RtlInitUnicodeString(&U, Path);
+    InitializeObjectAttributes(&Oa, &U, OBJ_KERNEL_HANDLE | OBJ_CASE_INSENSITIVE, NULL, NULL);
+    Status = ZwCreateFile(&File, GENERIC_READ | SYNCHRONIZE, &Oa, &Io, NULL, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ,
+                          FILE_OPEN, FILE_SYNCHRONOUS_IO_NONALERT | FILE_NON_DIRECTORY_FILE, NULL, 0);
+    if (!NT_SUCCESS(Status)) return Status;
+    Status = ZwQueryInformationFile(File, &Io, &Info, sizeof(Info), FileStandardInformation);
+    if (NT_SUCCESS(Status) && (Info.EndOfFile.QuadPart <= 0 || Info.EndOfFile.QuadPart > Max)) {
+        Status = STATUS_FILE_TOO_LARGE;
+    }
+    if (NT_SUCCESS(Status)) {
+        ULONG Len = (ULONG)Info.EndOfFile.QuadPart;
+        Buf = (PUCHAR)ExAllocatePool2(POOL_FLAG_NON_PAGED, Len + 8, POOL_TAG);
+        if (Buf == NULL) {
+            Status = STATUS_INSUFFICIENT_RESOURCES;
+        } else {
+            RtlZeroMemory(Buf, Len + 8);
+            Status = ZwReadFile(File, NULL, NULL, NULL, &Io, Buf, Len, NULL, NULL);
+            if (NT_SUCCESS(Status) && Io.Information != Len) Status = STATUS_END_OF_FILE;
+            if (NT_SUCCESS(Status)) { *Data = Buf; *Size = Len; } else { ExFreePoolWithTag(Buf, POOL_TAG); }
+        }
+    }
+    ZwClose(File);
+    return Status;
+}
+
+static BOOLEAN NvKeyChar(UCHAR C)
+{
+    return (C >= 'a' && C <= 'z') || (C >= 'A' && C <= 'Z') || (C >= '0' && C <= '9') || C == '_';
+}
+
+/* Text NVRAM to what the firmware reads (brcmf_fw_nvram_strip): one
+ * "key=value\0" per entry, an extra NUL, padded to 4 bytes, then the length
+ * token. Comments and blank lines go; "pcie/x/y/" and "N:" prefixes are cut. */
+static ULONG SwWifiNvram(const UCHAR *In, ULONG InLen, UCHAR *Out, ULONG OutMax)
+{
+    static const char BoardRev[] = "boardrev=0xff";
+    ULONG I = 0, O = 0, Len, Token;
+    BOOLEAN HaveBoardRev = FALSE;
+
+    while (I < InLen) {
+        ULONG S = I, E, K;
+        while (I < InLen && In[I] != '\n') I++;
+        E = I;
+        if (I < InLen) I++;
+        while (S < E && (In[S] == ' ' || In[S] == '\t' || In[S] == '\r')) S++;
+        while (E > S && (In[E - 1] == ' ' || In[E - 1] == '\t' || In[E - 1] == '\r')) E--;
+        if (S == E || In[S] == '#') continue;
+        if (E - S > 5 && RtlCompareMemory(In + S, "pcie/", 5) == 5) {
+            ULONG Slashes = 0;
+            while (S < E && Slashes < 3) { if (In[S] == '/') Slashes++; S++; }
+        } else if (E - S > 2 && In[S] >= '0' && In[S] <= '9' && In[S + 1] == ':') {
+            S += 2;
+        }
+        for (K = S; K < E && NvKeyChar(In[K]); K++) { }
+        if (K == S || K >= E || In[K] != '=') continue;
+        if (K - S == 7 && RtlCompareMemory(In + S, "devpath", 7) == 7) continue;
+        if (K - S == 8 && RtlCompareMemory(In + S, "boardrev", 8) == 8) HaveBoardRev = TRUE;
+        if (O + (E - S) + 1 + sizeof(BoardRev) + 8 > OutMax) break;
+        RtlCopyMemory(Out + O, In + S, E - S);
+        O += E - S;
+        Out[O++] = 0;
+    }
+    if (!HaveBoardRev) {
+        RtlCopyMemory(Out + O, BoardRev, sizeof(BoardRev));     /* includes the NUL */
+        O += sizeof(BoardRev);
+    }
+    Len = (O + 1 + 3) & ~3u;
+    while (O < Len) Out[O++] = 0;
+    Token = Len / 4;
+    Token = (~Token << 16) | (Token & 0xFFFFu);
+    RtlCopyMemory(Out + O, &Token, 4);
+    return O + 4;
+}
+
+static VOID SwWifiCoreDisable(PSWWIFI_DEVICE Dev, ULONG Wrap, ULONG PreReset, ULONG Reset)
+{
+    ULONG I;
+    SwWifiSetWindow(Dev, Wrap);
+    if ((Rd(Dev->Bar0, AI_RESET_CTL) & 1u) == 0) {
+        Wr(Dev->Bar0, AI_IOCTL, PreReset | AI_IOCTL_FGC | AI_IOCTL_CLK);
+        (VOID)Rd(Dev->Bar0, AI_IOCTL);
+        Wr(Dev->Bar0, AI_RESET_CTL, 1u);
+        KeStallExecutionProcessor(10);
+        for (I = 0; I < 300 && (Rd(Dev->Bar0, AI_RESET_CTL) & 1u) == 0; I++) KeStallExecutionProcessor(1);
+    }
+    Wr(Dev->Bar0, AI_IOCTL, Reset | AI_IOCTL_FGC | AI_IOCTL_CLK);
+    (VOID)Rd(Dev->Bar0, AI_IOCTL);
+}
+
+/* brcmf_chip_ai_resetcore */
+static VOID SwWifiCoreReset(PSWWIFI_DEVICE Dev, ULONG Wrap, ULONG PreReset, ULONG Reset, ULONG PostReset)
+{
+    ULONG I;
+    SwWifiCoreDisable(Dev, Wrap, PreReset, Reset);
+    for (I = 0; I < 50 && (Rd(Dev->Bar0, AI_RESET_CTL) & 1u) != 0; I++) {
+        Wr(Dev->Bar0, AI_RESET_CTL, 0);
+        KeStallExecutionProcessor(40);
+    }
+    Wr(Dev->Bar0, AI_IOCTL, PostReset | AI_IOCTL_CLK);
+    (VOID)Rd(Dev->Bar0, AI_IOCTL);
+}
+
+static VOID SwWifiTcmWrite(PSWWIFI_DEVICE Dev, ULONG Address, const UCHAR *Data, ULONG Len)
+{
+    ULONG I, W;
+    for (I = 0; I + 4 <= Len; I += 4) {
+        RtlCopyMemory(&W, Data + I, 4);
+        Wr(Dev->Bar2, Address + I, W);
+    }
+    if (I < Len) {
+        W = 0;
+        RtlCopyMemory(&W, Data + I, Len - I);
+        Wr(Dev->Bar2, Address + I, W);
+    }
+}
+
+/* The firmware console (struct rte_console): a ring buffer of text in RAM. */
+static VOID SwWifiConsole(PSWWIFI_DEVICE Dev, ULONG Shared)
+{
+    static WCHAR Text[CONSOLE_MAX + 1];
+    ULONG Console, Buf, Size, Widx, N, I, Start, T = 0;
+
+    Console = Rd(Dev->Bar2, Shared + SHARED_CONSOLE);
+    SwWifiTrace(L"FwConsoleAddr", Console);
+    if (Console == 0 || Console + 32 > Dev->Bar2Len) return;
+    Buf = Rd(Dev->Bar2, Console + CONSOLE_BUFADDR);
+    Size = Rd(Dev->Bar2, Console + CONSOLE_BUFSIZE);
+    Widx = Rd(Dev->Bar2, Console + CONSOLE_WRITEIDX);
+    SwWifiTrace(L"FwConsoleBuf", Buf);
+    SwWifiTrace(L"FwConsoleSize", Size);
+    SwWifiTrace(L"FwConsoleIdx", Widx);
+    if (Size == 0 || Size > 0x10000 || Widx >= Size || Buf + Size > Dev->Bar2Len) return;
+    N = (Size < CONSOLE_MAX) ? Size : CONSOLE_MAX;
+    Start = (Widx + Size - N) % Size;
+    for (I = 0; I < N; I++) {
+        ULONG Off = (Start + I) % Size;
+        UCHAR C = (UCHAR)(Rd(Dev->Bar2, Buf + (Off & ~3u)) >> ((Off & 3u) * 8));
+        if (C == '\n') Text[T++] = L'\n';
+        else if (C >= 0x20 && C < 0x7F) Text[T++] = (WCHAR)C;
+    }
+    Text[T] = L'\0';
+    SwWifiTraceText(L"FwConsole", Text);
+}
+
+static VOID SwWifiFirmware(PSWWIFI_DEVICE Dev)
+{
+    PUCHAR Fw = NULL, NvText = NULL, Nv = NULL;
+    ULONG FwLen = 0, NvTextLen = 0, NvLen = 0, ResetVector, I, Bad = 0, Written, Shared, Ms;
+    ULONG RamEnd;
+    NTSTATUS Status;
+
+    SwWifiTrace(L"FwStage", 0);
+    if (Dev->Bar2 == NULL || mCr4Wrap == 0 || mD11Wrap == 0 || mRamBytes == 0 ||
+        TCM_RAMBASE + mRamBytes > Dev->Bar2Len) {
+        SwWifiTraceText(L"FwResult", L"not tried: BAR2, the CR4/D11 wrappers or the RAM size are missing");
+        return;
+    }
+    RamEnd = TCM_RAMBASE + mRamBytes;
+    Status = SwWifiReadFile(L"brcmfmac4356-pcie.bin", &Fw, &FwLen, FW_MAX);
+    SwWifiTrace(L"FwFileStatus", (ULONG)Status);
+    if (!NT_SUCCESS(Status)) {
+        SwWifiTraceText(L"FwResult", L"not tried: no firmware file (System32\\drivers\\switchwifi\\brcmfmac4356-pcie.bin)");
+        return;
+    }
+    SwWifiTrace(L"FwSize", FwLen);
+    Status = SwWifiReadFile(L"brcmfmac4356-pcie.txt", &NvText, &NvTextLen, NVRAM_MAX);
+    SwWifiTrace(L"NvFileStatus", (ULONG)Status);
+    if (NT_SUCCESS(Status)) {
+        Nv = (PUCHAR)ExAllocatePool2(POOL_FLAG_NON_PAGED, NVRAM_MAX + 64, POOL_TAG);
+        if (Nv != NULL) NvLen = SwWifiNvram(NvText, NvTextLen, Nv, NVRAM_MAX + 64);
+    }
+    SwWifiTrace(L"NvSize", NvLen);
+    if (FwLen + NvLen + 4 > mRamBytes) {
+        SwWifiTraceText(L"FwResult", L"not tried: firmware + NVRAM do not fit in device RAM");
+        goto Out;
+    }
+
+    /* "BAR1 window may not be sized properly" (brcmf_pcie_attach). */
+    SwWifiStep(10);
+    SwWifiTrace(L"FwStage", 10);
+    SwWifiSetWindow(Dev, 0x18003000u);
+    Wr(Dev->Bar0, PCIE2_CONFIGADDR, 0x4E0);
+    Wr(Dev->Bar0, PCIE2_CONFIGDATA, Rd(Dev->Bar0, PCIE2_CONFIGDATA));
+
+    /* set_passive: halt the CR4 (keeping its halt bit), reset D11. */
+    SwWifiSetWindow(Dev, mCr4Wrap);
+    I = Rd(Dev->Bar0, AI_IOCTL) & CR4_IOCTL_CPUHALT;
+    SwWifiCoreReset(Dev, mCr4Wrap, I, CR4_IOCTL_CPUHALT, CR4_IOCTL_CPUHALT);
+    SwWifiCoreReset(Dev, mD11Wrap, D11_IOCTL_PHYRESET | D11_IOCTL_PHYCLOCKEN, D11_IOCTL_PHYCLOCKEN, D11_IOCTL_PHYCLOCKEN);
+    SwWifiSetWindow(Dev, mCr4Wrap);
+    SwWifiTrace(L"Cr4IoctlHalted", Rd(Dev->Bar0, AI_IOCTL));
+    SwWifiTrace(L"Cr4ResetHalted", Rd(Dev->Bar0, AI_RESET_CTL));
+    SwWifiSetWindow(Dev, SI_ENUM_BASE);
+
+    /* Firmware to RAM, verified. */
+    SwWifiStep(11);
+    SwWifiTrace(L"FwStage", 11);
+    SwWifiTcmWrite(Dev, TCM_RAMBASE, Fw, FwLen);
+    for (I = 0; I + 4 <= FwLen; I += 4096) {
+        ULONG W;
+        RtlCopyMemory(&W, Fw + I, 4);
+        if (Rd(Dev->Bar2, TCM_RAMBASE + I) != W) Bad++;
+    }
+    SwWifiTrace(L"FwVerifyBad", Bad);
+    RtlCopyMemory(&ResetVector, Fw, 4);
+    SwWifiTrace(L"FwResetVector", ResetVector);
+
+    SwWifiStep(12);
+    SwWifiTrace(L"FwStage", 12);
+    Wr(Dev->Bar2, RamEnd - 4, 0);
+    if (NvLen != 0) {
+        SwWifiTcmWrite(Dev, RamEnd - NvLen, Nv, NvLen);
+    }
+    Written = Rd(Dev->Bar2, RamEnd - 4);
+    SwWifiTrace(L"FwSharedBefore", Written);
+
+    /* set_active: reset vector at TCM 0, then release the CPU. */
+    SwWifiStep(13);
+    SwWifiTrace(L"FwStage", 13);
+    Wr(Dev->Bar2, 0, ResetVector);
+    SwWifiCoreReset(Dev, mCr4Wrap, CR4_IOCTL_CPUHALT, 0, 0);
+    SwWifiSetWindow(Dev, SI_ENUM_BASE);
+
+    SwWifiStep(14);
+    SwWifiTrace(L"FwStage", 14);
+    Shared = Written;
+    for (Ms = 0; Ms < FW_UP_MS && Shared == Written; Ms += 50) {
+        LARGE_INTEGER Delay;
+        Delay.QuadPart = -50 * 10000LL;
+        KeDelayExecutionThread(KernelMode, FALSE, &Delay);
+        Shared = Rd(Dev->Bar2, RamEnd - 4);
+    }
+    SwWifiTrace(L"FwUpMs", Ms);
+    SwWifiTrace(L"FwShared", Shared);
+    if (Shared == Written) {
+        SwWifiTraceText(L"FwResult", L"firmware did not start (the shared address never changed)");
+        goto Out;
+    }
+
+    SwWifiStep(15);
+    SwWifiTrace(L"FwStage", 15);
+    if (Shared >= TCM_RAMBASE && Shared + 64 <= RamEnd) {
+        SwWifiTrace(L"FwSharedFlags", Rd(Dev->Bar2, Shared));
+        SwWifiConsole(Dev, Shared);
+        SwWifiTraceText(L"FwResult", L"ok: the firmware is running");
+    } else {
+        SwWifiTraceText(L"FwResult", L"the shared address is outside device RAM");
+    }
+
+Out:
+    if (Fw) ExFreePoolWithTag(Fw, POOL_TAG);
+    if (NvText) ExFreePoolWithTag(NvText, POOL_TAG);
+    if (Nv) ExFreePoolWithTag(Nv, POOL_TAG);
 }
 
 /* ------------------------------------------------------------- PnP */

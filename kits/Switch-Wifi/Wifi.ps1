@@ -7,10 +7,15 @@
   -Mode Status  : report WLN0 and what the driver read (link, chip ID, cores)
   -Mode Retry   : clear the Busy flag left by an attempt that stopped Windows, then restart the device
   -Mode Remove  : remove the driver package
+  -Mode Firmware: copy your own brcmfmac4356-pcie.bin (and .txt, if you have one)
+                  from this folder to System32\drivers\switchwifi, then restart the device
+
+  The firmware is not included (it may not be redistributed): copy it from the
+  Linux on your Switch (/lib/firmware/brcm/) or from linux-firmware.
 
   Log: C:\SwitchWOA-Wifi.txt
 #>
-param([Parameter(Mandatory = $true)][ValidateSet('Install', 'Status', 'Retry', 'Remove')][string]$Mode)
+param([Parameter(Mandatory = $true)][ValidateSet('Install', 'Status', 'Retry', 'Remove', 'Firmware')][string]$Mode)
 
 $ErrorActionPreference = 'Continue'
 # Windows PowerShell on Windows 10 ARM64 is x86: reach System32 via Sysnative.
@@ -24,6 +29,21 @@ $Hwid = 'ACPI\SWOA0D01'
 function Log([string]$s) { Write-Host $s; Add-Content -Path $Log -Value $s -Encoding UTF8 }
 $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 if (-not $isAdmin) { Write-Host 'Run this as Administrator (right-click the .cmd > Run as administrator).'; exit 1 }
+
+$FwDir = Join-Path $Sys 'drivers\switchwifi'
+function Copy-Firmware {
+  $n = 0
+  foreach ($f in 'brcmfmac4356-pcie.bin', 'brcmfmac4356-pcie.txt') {
+    $src = @((Join-Path $Here $f), (Join-Path $Here "firmware\$f")) | Where-Object { Test-Path $_ } | Select-Object -First 1
+    if ($src) {
+      New-Item -ItemType Directory -Force $FwDir | Out-Null
+      Copy-Item $src (Join-Path $FwDir $f) -Force
+      Log ("firmware: copied {0} ({1} bytes)" -f $f, (Get-Item $src).Length); $n++
+    }
+  }
+  if ($n -eq 0) { Log 'firmware: no brcmfmac4356-pcie.bin in this folder (stage 2b is skipped without it)' }
+  return $n
+}
 
 function Hex($v) { if ($null -eq $v) { '-' } else { '{0:X8}' -f [uint32]$v } }
 
@@ -43,6 +63,11 @@ function Show-Status {
   if ($null -ne $p.RamBytes) {
     Log ("arm cr4: base={0} rev={1} cap={2} RAM={3} KB  pcie2 rev={4}" -f (Hex $p.Cr4Base), $p.Cr4Rev, (Hex $p.Cr4Cap), [int]($p.RamBytes / 1024), $p.Pcie2Rev)
   }
+  if ($null -ne $p.FwResult) {
+    Log ("fw     : {0}" -f $p.FwResult)
+    Log ("fw     : stage={0} size={1} nvram={2} verifyBad={3} rstvec={4} halted ioctl={5} reset={6}" -f $p.FwStage, $p.FwSize, $p.NvSize, $p.FwVerifyBad, (Hex $p.FwResetVector), (Hex $p.Cr4IoctlHalted), (Hex $p.Cr4ResetHalted))
+    Log ("fw     : shared before={0} after={1} in {2} ms flags={3} console={4}" -f (Hex $p.FwSharedBefore), (Hex $p.FwShared), $p.FwUpMs, (Hex $p.FwSharedFlags), (Hex $p.FwConsoleAddr))
+  }
   if ($p.CoreList) {
     Log 'cores (id:rev@base/wrapper):'
     $line = ''
@@ -52,16 +77,34 @@ function Show-Status {
     }
     if ($line) { Log "  $line" }
   }
+  if ($p.FwConsole) {
+    Log 'firmware console (last lines):'
+    $lines = @($p.FwConsole -split "`n" | Where-Object { $_.Trim() })
+    $lines | Select-Object -Last 15 | ForEach-Object { Log "  $_" }
+  }
 }
 
 switch ($Mode) {
   'Install' {
     Log ''
     Log "=== Wi-Fi Install  $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
+    [void](Copy-Firmware)
     $inf = Join-Path $Here 'switchwifi.inf'
     (& $Pnputil /add-driver $inf /install 2>&1) | ForEach-Object { Log "  $_" }
     Log "  exit=$LASTEXITCODE"
     Start-Sleep -Seconds 5
+    Show-Status
+  }
+  'Firmware' {
+    Log ''
+    Log "=== Wi-Fi Firmware  $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
+    if ((Copy-Firmware) -gt 0) {
+      if (Test-Path $Key) { Set-ItemProperty $Key -Name Busy -Value 0 -Type DWord }
+      foreach ($d in @(Get-CimInstance Win32_PnPEntity -ErrorAction SilentlyContinue | Where-Object { $_.PNPDeviceID -like "$Hwid*" })) {
+        (& $Pnputil /restart-device $d.PNPDeviceID 2>&1) | ForEach-Object { Log "  $_" }
+      }
+      Start-Sleep -Seconds 8
+    }
     Show-Status
   }
   'Status' { Log ''; Log "=== Wi-Fi Status  $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"; Show-Status }
