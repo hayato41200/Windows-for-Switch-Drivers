@@ -8,7 +8,7 @@ import tempfile
 
 source = (Path(__file__).resolve().parents[1] / 'src/switchfan.c').read_text()
 names = ['SwFanSetDuty', 'SwFanDutyForTemp', 'SwFanEvtTimer',
-         'SwFanEvtD0Entry', 'SwFanEvtD0Exit']
+         'SwFanEvtD0Entry', 'SwFanEvtD0Exit', 'SwFanApplyBacklight', 'SwFanDisplayStateCallback']
 
 def function(name):
     match = re.search(r'^(?:static )?(?:VOID|ULONG|NTSTATUS) ' + name + r'\([^;]*?\)\n\{', source, re.M)
@@ -31,6 +31,10 @@ typedef uint32_t ULONG; typedef uint8_t UCHAR; typedef int32_t LONG;
 typedef int32_t NTSTATUS; typedef bool BOOLEAN; typedef void VOID;
 typedef ULONG *PULONG; typedef void *WDFDEVICE; typedef void *WDFTIMER;
 typedef unsigned WDF_POWER_DEVICE_STATE;
+typedef void *PVOID; typedef const int *LPCGUID;
+static const int SwFanDisplayStateGuid=1;
+#define IsEqualGUID(a,b) ((a)==(b))
+#define PWM_CSR_0 0
 #define WdfPowerDeviceD3Final 5
 typedef enum {PowerActionNone,PowerActionSleep,PowerActionHibernate,
               PowerActionShutdown,PowerActionShutdownReset} POWER_ACTION;
@@ -49,7 +53,7 @@ typedef enum {PowerActionNone,PowerActionSleep,PowerActionHibernate,
 #define POLL_MS 2000
 #define WDF_REL_TIMEOUT_IN_MS(n) (n)
 typedef struct {
- UCHAR *Pwm,*Car; ULONG FanOffset,Duty,DisplayState,LastTemp,BootCpuKhz;
+ UCHAR *Pwm,*Car,*BacklightPwm; ULONG FanOffset,Duty,DisplayState,LastTemp,BootCpuKhz,Brightness;
  void *Sensor,*Timer,*BacklightLock,*Device;
  BOOLEAN IsLite,Stopping,BacklightReady,CpuConfigured,CpuApplied,TempValid;
  struct {ULONG CpuKhz;} Config;
@@ -59,10 +63,11 @@ static PSWFAN_DEVICE SwFanGetDevice(void *d){return d;}
 static PSWFAN_DEVICE SwFanGetTimer(void *d){return d;}
 static ULONG temp=35,sleep_off; static bool sensor_fail,clock_fail;
 static POWER_ACTION action; static char order[64];static unsigned next;
+static bool backlight_locked;static unsigned registry_writes;
 static void event(char c){assert(next<sizeof(order));order[next++]=c;}
-static void SwFanTrace(const wchar_t *n,ULONG v){if(!wcscmp(n,L"SleepFanOff"))sleep_off=v;}
-static void WdfWaitLockAcquire(void *l,void *t){(void)l;(void)t;}
-static void WdfWaitLockRelease(void *l){(void)l;}
+static void SwFanTrace(const wchar_t *n,ULONG v){assert(!backlight_locked);registry_writes++;if(!wcscmp(n,L"SleepFanOff"))sleep_off=v;}
+static void WdfWaitLockAcquire(void *l,void *t){(void)l;(void)t;assert(!backlight_locked);backlight_locked=true;}
+static void WdfWaitLockRelease(void *l){(void)l;assert(backlight_locked);backlight_locked=false;}
 static NTSTATUS SwFanReadReg(void *s,UCHAR reg,UCHAR *v){
  (void)s;assert(reg==0||reg==1);if(sensor_fail)return -1;*v=(UCHAR)temp;return 0;
 }
@@ -75,6 +80,7 @@ static void SwCpuTemperature(PSWFAN_DEVICE d,ULONG t,BOOLEAN valid){
 }
 static void write_pwm(PULONG p,ULONG v){*p=v;event(v==(PWM_CSR_EN|PWM_ABSOLUTE_OFF)?'f':'F');}
 #define WRITE_REGISTER_ULONG(p,v) write_pwm((p),(v))
+#define READ_REGISTER_ULONG(p) (*(p))
 static LONG InterlockedIncrement(volatile LONG *p){return ++*p;}
 static void WdfTimerStart(void *t,unsigned ms){(void)t;assert(ms==2000);}
 static POWER_ACTION WdfDeviceGetSystemPowerAction(void *d){(void)d;return action;}
@@ -118,13 +124,23 @@ int main(void){
  d.TempValid=true;SwFanEvtD0Exit(&d,WdfPowerDeviceD3Final);assert(d.Duty==76);
  d.Duty=0;sleep_off=1;SwFanEvtD0Entry(&d,3);assert(d.Duty==76&&!d.TempValid&&!sleep_off);
  init(&d);d.Stopping=true;SwFanEvtTimer(&d);assert(next==0);
+ /* The power callback never writes a registry hive while holding its lock. */
+ init(&d);ULONG backlight=0x80000031;d.BacklightPwm=(UCHAR*)&backlight;d.Brightness=150;
+ unsigned before=registry_writes;
+ for(unsigned i=0;i<40;i++){
+  ULONG state=i%2;next=0;
+  assert(SwFanDisplayStateCallback(&SwFanDisplayStateGuid,&state,sizeof(state),&d)==0);
+  assert(d.DisplayState==state&&((backlight>>16)&0x7fff)==(state?150u:0u));
+  assert((backlight&0xffff)==0x31&&!backlight_locked&&registry_writes==before);
+ }
  puts("PASS: screen-off cooling, CPU/fan ordering, thermal failures, D0 sleep/wake and shutdown isolation");
 }
 '''
 with tempfile.TemporaryDirectory(prefix='switchfan-test-') as tmp:
     c = Path(tmp) / 'screenoff.c'
     exe = Path(tmp) / 'screenoff'
-    c.write_text(prefix + '\n'.join(function(n) for n in names) + tests)
+    backlight = (Path(__file__).resolve().parents[1] / 'src/backlight.h').read_text()
+    c.write_text(prefix + backlight + '\n'.join(function(n) for n in names) + tests)
     subprocess.run([os.environ.get('CC', 'clang'), '-std=c11', '-Wall', '-Wextra', '-Werror',
                     '-fsanitize=address,undefined', str(c), '-o', str(exe)], check=True)
     subprocess.run([str(exe)], check=True)

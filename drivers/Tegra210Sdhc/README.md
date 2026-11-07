@@ -90,3 +90,26 @@ returning early. The regression reproduces that cleared-register state and
 also checks a real power cycle when leaving 1.8 V. This fix passes the host
 regression and ARM64 build; the owner subsequently reached Windows with 0.4.0.1. Its signaling, tuning
 and ADMA readbacks are recorded above; sustained throughput is still unmeasured.
+
+### FAT32-visible and resume candidate (0.4.0.2)
+
+The owner requested another FAT32-visible trial using SDR104/ADMA2, preserving
+the hidden profile. Both builds share the same validated write bounds. DMA
+read completion now dispatches identity checks only for the few relevant
+metadata sectors, rather than once per returned sector. Tests compare the
+result with the previous sector-by-sector path across 1–128-block reads in
+both partition layouts. The card's FAT32 FSInfo signatures and free-count
+field were valid; no FSInfo metadata is rewritten or fabricated.
+
+The miniport also saves the quiesced SDHCI host/power/clock/interrupt settings
+and T214 tuning registers. Resume restores configuration with SDCLK held off
+until the internal clock is stable; commands, FIFO contents, DMA pointers and
+old interrupt status are never replayed. A clock failure closes the DMA gate.
+This covers controller context loss with card power retained, not a card power
+cycle or a complete SC7 platform restore. Fixed `ContextSaves`,
+`ContextRestores` and `ResumeStatus` values join the existing diagnostic key.
+
+The ARM64 builds and ASan/UBSan DMA/filter/write-bound/context regressions pass.
+This is a performance and resume candidate: physical desktop responsiveness
+and repeated sleep/wake still require measurement. Use the matching
+FAT32-visible header in BL33 and the miniport; do not mix the two layouts.

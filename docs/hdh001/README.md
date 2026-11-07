@@ -35,9 +35,54 @@ Use the matching firmware's `cpu_oc`/`ram_oc` INI options and its LitePerformanc
 
 Version 1.0.0.6 handles Lite screen-off cooling using the existing display-power notification. It restores the saved boot CPU clock before removing the overclock fan floor. The normal temperature curve stops the fan at 39 C or below and restarts it at 42 C; hot screen-off workloads still get cooling. Failed clock restoration retains the fan floor, and a failed temperature read restarts an already stopped fan immediately. On display wake the fan is set before CPU overclock can resume. A cool system sleep/hibernate D0 exit can also stop the fan; final removal, shutdown and device-only idle retain their existing cooling behavior.
 
-The ARM64 build, CPU/backlight checks, and `python3 drivers/SwitchFan/tests/test-screenoff.py` pass. The latter exercises the actual timer and D0 callbacks, including clock/fan ordering, invalid temperatures, wake and shutdown isolation. Native catalog generation, signing and offline installation readback passed. On 2026-11-07, the owner confirmed that 1.0.0.6 stops the fan with the screen off and restores it after wake. `ScreenOffCooling`, `SleepFanOff`, `CpuOverclockActive`, `Duty` and `DriverVersion` update fixed values under the driver's existing Parameters key; no periodic log files are created.
+The ARM64 build, CPU/backlight checks, and `python3 drivers/SwitchFan/tests/test-screenoff.py` pass. The latter exercises the actual timer and D0 callbacks, including clock/fan ordering, invalid temperatures, wake and shutdown isolation. Native catalog generation, signing and offline installation readback passed. On 2026-11-07, the owner confirmed one successful screen-off fan stop and wake recovery with 1.0.0.6, then reported lock-screen/black-screen stalls after repeated cycles. Repeated wake is not accepted. `ScreenOffCooling`, `SleepFanOff`, `CpuOverclockActive`, `Duty` and `DriverVersion` update fixed values under the driver's existing Parameters key; no periodic log files are created.
 
 Screen-off cooling does not establish SoC low-power sleep. The observed Modern Standby records had no DRIPS residency, and S4 hibernation is disabled in the tested installation. Physical CPU readback on 1.0.0.5 is 1996.8 MHz and RAM is 1866 MHz, below the requested 2100 MHz. Normal shutdown and native restart have separate owner-confirmed results in the [power status](https://github.com/ruje0504-2/winx/blob/hdh001-hekate-sd/docs/hdh001-home/power-performance.md).
+
+## Sleep/wake repair in progress
+
+Input candidates **switchsio 0.2.4.0** and **switchtouch 1.0.1.1** use the
+shared `drivers/common/display_idle.h` policy. Display-off releases their KMDF
+runtime-power references; display-on requests D0 without waiting inside a
+power notification. Their existing suspend/resume callbacks stop polling,
+release input and reinitialize hardware. The power button remains the wake
+source. These changes are compiled and host-tested, not hardware accepted.
+
+The current candidate pairs fan **1.0.0.7**, power button **1.0.0.2**, RTC
+**1.0.0.3**, Bluetooth **1.0.0.17**, and SDR104 **0.4.0.2**. The fan's display
+power callback no longer writes registry hives while holding its backlight
+lock. The power button drains its timer before I2C power-down and optionally
+uses a passive wake interrupt instead of polling. The RTC unregisters and
+drains its time-change work before its I2C dependency powers down.
+
+The optional `SWITCH_LITE_SLEEP=1` firmware exposes PMU_EXT GSI 118 as a wake
+interrupt and the `SWOA0C01` processor power extension. Power-button setup
+applies Switchroot's PMC interrupt inversion, preserves unrelated PMIC masks,
+and restores its original interrupt mask bits at final shutdown. The
+[T214 processor backend](../../drivers/Tegra214Power/README.md) uses PoFx for
+CPU context save/restore and PSCI C7/CC6. SC7 and S4 are not advertised as
+working. Successful compilation and mocked transitions do not prove physical
+sleep, wake, display recovery or lower battery consumption.
+
+Bluetooth 1.0.0.17 addresses a returned-card failure with SafeMode=0 and
+BootPending=0: patch record 150 timed out, but 1.0.0.15 continued and exposed
+a radio that answered no subsequent commands. The replacement validates the
+firmware stream and every command status, uses flow control during download,
+permits one complete retry only after an acknowledged reset, and verifies
+baud-rate fallback. A verified patch is reused across D0 transitions. A failed
+probe reports a device error instead of publishing a working radio.
+
+Focused regressions use the actual driver callbacks:
+
+```sh
+python3 drivers/SwitchBluetooth/tests/test-probe.py
+python3 drivers/SwitchBluetooth/tests/test-cancel.py
+python3 drivers/SwitchPowerButton/tests/test-suspend.py
+python3 drivers/SwitchPowerButton/tests/test-wake.py
+python3 drivers/Tegra214Power/tests/test-processor.py
+python3 drivers/common/tests/test-display-idle.py
+python3 drivers/SwitchFan/tests/test-screenoff.py
+```
 
 ## Shared battery, RTC, and volume-button support
 

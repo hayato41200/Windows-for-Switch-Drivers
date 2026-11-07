@@ -103,6 +103,30 @@ static VOID LiteObserveRead(PSDHC_EXTENSION slot, PSDPORT_COMMAND cmd)
     }
 }
 
+/* DMA returns a complete range at once. Only the partition-table and volume
+ * boot sectors affect the write guard; ordinary FAT/NTFS data need no
+ * per-sector dispatch at DPC level. Keep the same identity checks in one place. */
+static VOID LiteObserveReadRange(PSDHC_EXTENSION slot, PSDPORT_COMMAND cmd, ULONG blocks)
+{
+    const ULONG interesting[] = {0, 1, 4, WINARM_FIRST,
+#ifdef FAT32_FIRST
+        FAT32_FIRST,
+#endif
+    };
+    ULONG first = slot->NextReadLba;
+    if (first == MAXULONG || blocks == 0 || cmd->BlockSize != 512 || cmd->DataBuffer == NULL) return;
+    for (ULONG i = 0; i < RTL_NUMBER_OF(interesting); ++i) {
+        ULONG lba = interesting[i];
+        if (lba >= first && lba - first < blocks) {
+            SDPORT_COMMAND one = *cmd;
+            one.DataBuffer = cmd->DataBuffer + (SIZE_T)(lba - first) * 512;
+            slot->NextReadLba = lba;
+            LiteObserveRead(slot, &one);
+        }
+    }
+    slot->NextReadLba = blocks > MAXULONG - first ? MAXULONG : first + blocks;
+}
+
 static BOOLEAN LiteBlocksInExtent(ULONG lba, ULONG count, ULONG first, ULONG length)
 {
     return count != 0 && lba >= first && lba - first < length &&
@@ -466,6 +490,9 @@ NvDiagSaveClock(
     NvDiagSetValue(Key, L"AdmaBlocks", SdhcExtension->T214DmaBlocks);
     NvDiagSetValue(Key, L"AdmaErrors", SdhcExtension->T214DmaErrors);
     NvDiagSetValue(Key, L"SmmuSdmmc1", SdhcExtension->T214Smmu);
+    NvDiagSetValue(Key, L"ContextSaves", SdhcExtension->T214Saves);
+    NvDiagSetValue(Key, L"ContextRestores", SdhcExtension->T214Restores);
+    NvDiagSetValue(Key, L"ResumeStatus", SdhcExtension->T214ResumeStatus);
 #endif
 #if NV_T210_LITE_WINARM_WRITE
     NvDiagSetValue(Key, L"App42Done", NvDiag.App42Done);
@@ -1832,7 +1859,11 @@ Return value:
 --*/
 
 {
+#if NV_T214_SDR104
+    T214SaveContext((PSDHC_EXTENSION)PrivateExtension);
+#else
     UNREFERENCED_PARAMETER(PrivateExtension);
+#endif
 }
 
 VOID
@@ -1857,7 +1888,11 @@ Return value:
 --*/
 
 {
+#if NV_T214_SDR104
+    T214RestoreContext((PSDHC_EXTENSION)PrivateExtension);
+#else
     UNREFERENCED_PARAMETER(PrivateExtension);
+#endif
 }
 
 NTSTATUS

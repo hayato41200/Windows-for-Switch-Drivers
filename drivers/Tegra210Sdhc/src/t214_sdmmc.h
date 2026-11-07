@@ -318,9 +318,7 @@ static VOID T214DmaDone(PSDHC_EXTENSION s, PSDPORT_REQUEST r)
 #if NV_T210_LITE_WINARM_WRITE
         SDPORT_COMMAND block = r->Command;
         block.DataBuffer = s->T214DmaBuffer;
-        for (ULONG off = 0; off < s->T214DmaLength; off += 512) {
-            LiteObserveRead(s, &block); block.DataBuffer += 512;
-        }
+        LiteObserveReadRange(s, &block, s->T214DmaLength / 512);
 #endif
         NvDiag.BlocksRead += s->T214DmaLength / 512;
     } else NvDiag.BlocksWritten += s->T214DmaLength / 512;
@@ -336,6 +334,63 @@ static VOID T214Release(PSDHC_EXTENSION s)
     if (s->T214Pmc) { MmUnmapIoSpace(s->T214Pmc, 0x1000); s->T214Pmc = NULL; }
     if (s->T214I2c) { MmUnmapIoSpace(s->T214I2c, 0x1000); s->T214I2c = NULL; }
     if (s->T214Gpio) { MmUnmapIoSpace(s->T214Gpio, 0x1000); s->T214Gpio = NULL; }
+}
+
+/* SDPORT calls these only with the slot quiesced. Do not replay the command,
+ * data, interrupt-status or DMA-address registers: they describe old I/O.
+ * This supports controller context loss with card power retained. A real
+ * card power loss still requires SDPORT's normal card reinitialization. */
+static const ULONG T214ContextOffsets[] = {0x100, 0x1ac, 0x1c0, 0x1c4, 0x1f0};
+static VOID T214SaveContext(PSDHC_EXTENSION s)
+{
+    s->T214ContextValid = FALSE;
+    if (s->T214DmaActive || (SdhcReadRegisterUlong(s, SDHC_PRESENT_STATE) & 3)) {
+        s->T214ResumeStatus = STATUS_DEVICE_BUSY;
+        return;
+    }
+    for (ULONG i=0; i<RTL_NUMBER_OF(T214ContextOffsets); ++i)
+        s->T214SavedVendor[i] = T214Read(s->BaseAddress, T214ContextOffsets[i]);
+    s->T214SavedEnables = SdhcReadRegisterUlong(s, 0x34);
+    s->T214SavedSignals = SdhcReadRegisterUlong(s, 0x38);
+    s->T214SavedClock = SdhcReadRegisterUshort(s, SDHC_CLOCK_CONTROL) & ~SDHC_CC_CLOCK_STABLE;
+    s->T214SavedControl2 = SdhcReadRegisterUshort(s, SDHC_HOST_CONTROL2) & ~SDHC_HC2_EXECUTE_TUNING;
+    s->T214SavedHost = SdhcReadRegisterUchar(s, SDHC_HOST_CONTROL);
+    s->T214SavedPower = SdhcReadRegisterUchar(s, SDHC_POWER_CONTROL);
+    s->T214SavedTimeout = SdhcReadRegisterUchar(s, SDHC_TIMEOUT_CONTROL);
+    s->T214ContextValid = TRUE;
+    s->T214Saves++;
+}
+static VOID T214RestoreContext(PSDHC_EXTENSION s)
+{
+    if (!s->T214ContextValid) return;
+    SdhcWriteRegisterUlong(s, 0x38, 0);
+    SdhcWriteRegisterUshort(s, SDHC_CLOCK_CONTROL, 0);
+    NTSTATUS status = T214ParentClock(s);
+    if (!NT_SUCCESS(status)) goto failed;
+    for (ULONG i=0; i<RTL_NUMBER_OF(T214ContextOffsets); ++i)
+        T214Write(s->BaseAddress, T214ContextOffsets[i], s->T214SavedVendor[i]);
+    SdhcWriteRegisterUchar(s, SDHC_HOST_CONTROL, s->T214SavedHost);
+    SdhcWriteRegisterUshort(s, SDHC_HOST_CONTROL2, s->T214SavedControl2);
+    SdhcWriteRegisterUchar(s, SDHC_POWER_CONTROL, s->T214SavedPower);
+    SdhcWriteRegisterUchar(s, SDHC_TIMEOUT_CONTROL, s->T214SavedTimeout);
+    SdhcWriteRegisterUshort(s, SDHC_CLOCK_CONTROL, s->T214SavedClock & ~SDHC_CC_CLOCK_ENABLE);
+    if (s->T214SavedClock & SDHC_CC_INTERNAL_CLOCK_ENABLE) {
+        ULONG i;
+        for (i=0; i<10000; i+=10) {
+            if (SdhcReadRegisterUshort(s, SDHC_CLOCK_CONTROL) & SDHC_CC_CLOCK_STABLE) break;
+            KeStallExecutionProcessor(10);
+        }
+        if (i==10000) {status=STATUS_IO_TIMEOUT;goto failed;}
+    }
+    SdhcWriteRegisterUshort(s, SDHC_CLOCK_CONTROL, s->T214SavedClock);
+    SdhcWriteRegisterUlong(s, 0x34, s->T214SavedEnables);
+    SdhcWriteRegisterUlong(s, 0x38, s->T214SavedSignals);
+    s->T214Restores++;
+    s->T214ResumeStatus = STATUS_SUCCESS;
+    return;
+failed:
+    s->T214ResumeStatus = status;
+    s->T214DmaFault = TRUE;
 }
 static NTSTATUS T214Initialize(PSDHC_EXTENSION s)
 {

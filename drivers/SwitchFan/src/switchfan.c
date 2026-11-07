@@ -198,11 +198,16 @@ VOID SwFanEvtTimer(WDFTIMER Timer)
     UCHAR Local = 0, Remote = 0;
     NTSTATUS Status, ClockStatus = STATUS_SUCCESS;
     BOOLEAN ScreenOff, ClockRestored;
+    ULONG DisplayState, BacklightDuty;
 
     if (Dev->Stopping) return;
     WdfWaitLockAcquire(Dev->BacklightLock, NULL);
     ScreenOff = Dev->IsLite && Dev->BacklightReady && Dev->DisplayState == 0;
+    DisplayState = Dev->DisplayState;
+    BacklightDuty = SwBacklightDuty(Dev->Brightness, DisplayState);
     WdfWaitLockRelease(Dev->BacklightLock);
+    SwFanTrace(L"DisplayState", DisplayState);
+    SwFanTrace(L"BacklightDuty", BacklightDuty);
     /* Screen-off can remain in S0. Keep temperature polling, but release the
        optional CPU overclock before allowing the fan to stop. */
     if (ScreenOff) {
@@ -277,7 +282,6 @@ static ULONG SwFanApplyBacklight(PSWFAN_DEVICE Dev)
         PULONG Csr = (PULONG)(Dev->BacklightPwm + PWM_CSR_0);
         WRITE_REGISTER_ULONG(Csr, SwBacklightCsr(READ_REGISTER_ULONG(Csr), Duty));
     }
-    SwFanTrace(L"BacklightDuty", Duty);
     return Duty;
 }
 
@@ -287,7 +291,8 @@ NTSTATUS SwFanDisplayStateCallback(LPCGUID Setting, PVOID Value, ULONG Length, P
     if (Length >= sizeof(ULONG) && IsEqualGUID(Setting, &SwFanDisplayStateGuid)) {
         WdfWaitLockAcquire(Dev->BacklightLock, NULL);
         Dev->DisplayState = *(PULONG)Value;
-        SwFanTrace(L"DisplayState", Dev->DisplayState);
+        /* Power notification must not wait for registry/storage I/O. The
+           existing temperature timer records this snapshot after the lock. */
         (VOID)SwFanApplyBacklight(Dev);
         WdfWaitLockRelease(Dev->BacklightLock);
     }
@@ -299,6 +304,7 @@ VOID SwFanEvtIoDeviceControl(WDFQUEUE Queue, WDFREQUEST Request, size_t OutLengt
     PSWFAN_DEVICE Dev = SwFanGetDevice(WdfIoQueueGetDevice(Queue));
     NTSTATUS Status = STATUS_INVALID_DEVICE_REQUEST;
     ULONG_PTR Info = 0;
+    ULONG SavedBrightness = 0;
     UNREFERENCED_PARAMETER(OutLength);
     UNREFERENCED_PARAMETER(InLength);
 
@@ -321,11 +327,14 @@ VOID SwFanEvtIoDeviceControl(WDFQUEUE Queue, WDFREQUEST Request, size_t OutLengt
         if (NT_SUCCESS(Status)) {
             ULONG Level = *In;
             Dev->Brightness = SwBacklightClamp(Level);
-            SwFanTrace(L"Brightness", Dev->Brightness);     /* also what the next boot restores */
+            SavedBrightness = Dev->Brightness;
             (VOID)SwFanApplyBacklight(Dev);
         }
     }
     WdfWaitLockRelease(Dev->BacklightLock);
+    /* The sequential queue preserves setter order without holding the
+       display-notification lock while a registry hive is written. */
+    if (SavedBrightness != 0) SwFanTrace(L"Brightness", SavedBrightness);
     WdfRequestCompleteWithInformation(Request, Status, Info);
 }
 
@@ -627,7 +636,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
         RtlCopyMemory(&SwFanParamsPath[RegistryPath->Length / sizeof(WCHAR)], L"\\Parameters", sizeof(L"\\Parameters"));
         (VOID)RtlCreateRegistryKey(RTL_REGISTRY_ABSOLUTE, SwFanParamsPath);
     }
-    SwFanTrace(L"DriverVersion", 6);
+    SwFanTrace(L"DriverVersion", 7);
     WDF_DRIVER_CONFIG_INIT(&Config, SwFanEvtDeviceAdd);
     return WdfDriverCreate(DriverObject, RegistryPath, WDF_NO_OBJECT_ATTRIBUTES, &Config, WDF_NO_HANDLE);
 }

@@ -20,6 +20,7 @@
 #include <ntddk.h>
 #include <ntstrsafe.h>
 #include <wdf.h>
+#include "../../common/display_idle.h"
 #include <spb.h>
 #include <vhf.h>
 
@@ -91,6 +92,7 @@ typedef struct _TOUCH_CONTACT {
 } TOUCH_CONTACT;
 
 typedef struct _SWTOUCH_DEVICE {
+    SW_DISPLAY_IDLE DisplayIdle;
     LARGE_INTEGER I2cId;
     WDFIOTARGET I2c;
     WDFINTERRUPT Interrupt;
@@ -620,6 +622,7 @@ NTSTATUS SwTouchEvtSelfManagedIoInit(WDFDEVICE Device)
         SwTouchGetTimer(Dev->Timer)->Device = Device;
     }
     Status = SwTouchEvtRestart(Device);
+    if (NT_SUCCESS(Status)) Status = SwDisplayIdleStart(&Dev->DisplayIdle);
     if (!NT_SUCCESS(Status)) SwTouchEvtSelfManagedIoCleanup(Device);
     return Status;
 }
@@ -627,6 +630,7 @@ NTSTATUS SwTouchEvtSelfManagedIoInit(WDFDEVICE Device)
 VOID SwTouchEvtSelfManagedIoCleanup(WDFDEVICE Device)
 {
     PSWTOUCH_DEVICE Dev = SwTouchGetDevice(Device);
+    SwDisplayIdleStop(&Dev->DisplayIdle);
     (VOID)SwTouchEvtSuspend(Device);
     Dev->VhfReady = FALSE;
     if (Dev->Vhf != NULL) {
@@ -659,6 +663,8 @@ NTSTATUS SwTouchEvtDeviceAdd(WDFDRIVER Driver, PWDFDEVICE_INIT DeviceInit)
         return Status;
     }
     Dev = SwTouchGetDevice(Device);
+    Status = SwDisplayIdleConfigure(Device, &Dev->DisplayIdle);
+    if (!NT_SUCCESS(Status)) return Status;
     Dev->Stopping = TRUE;
     WDF_OBJECT_ATTRIBUTES_INIT(&Attributes);
     Attributes.ParentObject = Device;
@@ -686,7 +692,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
         RtlCopyMemory(&SwTouchParamsPath[RegistryPath->Length / sizeof(WCHAR)], L"\\Parameters", sizeof(L"\\Parameters"));
         (VOID)RtlCreateRegistryKey(RTL_REGISTRY_ABSOLUTE, SwTouchParamsPath);
     }
-    SwTouchTrace(L"DriverVersion", 5);
+    SwTouchTrace(L"DriverVersion", 6);
     WDF_DRIVER_CONFIG_INIT(&Config, SwTouchEvtDeviceAdd);
     return WdfDriverCreate(DriverObject, RegistryPath, WDF_NO_OBJECT_ATTRIBUTES, &Config, WDF_NO_HANDLE);
 }

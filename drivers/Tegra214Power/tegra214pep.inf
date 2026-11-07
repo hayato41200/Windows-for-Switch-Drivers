@@ -1,0 +1,39 @@
+[Version]
+Signature="$WINDOWS NT$"
+Class=System
+ClassGuid={4d36e97d-e325-11ce-bfc1-08002be10318}
+Provider=%Mfg%
+CatalogFile=tegra214pep.cat
+DriverVer=11/07/2026,0.1.0.0
+PnpLockdown=1
+[DestinationDirs]
+DefaultDestDir=12
+[SourceDisksNames]
+1=%Disk%
+[SourceDisksFiles]
+tegra214pep.sys=1
+[Manufacturer]
+%Mfg%=Models,NTarm64
+[Models.NTarm64]
+%Device%=Install,ACPI\SWOA0C01
+[Install.NT]
+CopyFiles=Files
+[Files]
+tegra214pep.sys
+[Install.NT.Services]
+AddService=tegra214pep,0x2,Service
+[Service]
+DisplayName=%Device%
+ServiceType=1
+StartType=0
+ErrorControl=1
+ServiceBinary=%12%\tegra214pep.sys
+LoadOrderGroup=Core Platform Extensions
+[Install.NT.Wdf]
+KmdfService=tegra214pep,Wdf
+[Wdf]
+KmdfLibraryVersion=1.15
+[Strings]
+Mfg="SwitchWOA"
+Disk="Switch Lite processor power"
+Device="Tegra T214 processor power extension"

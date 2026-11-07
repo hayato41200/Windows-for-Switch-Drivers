@@ -21,3 +21,13 @@ Capture releases held desktop keys and mouse buttons. Press them again after res
 Use the ARM64 package with the existing Lite SIO firmware (`SWITCH_LITE_SIO=1`, `ACPI\SWOA0902`). To update the controller alone, use `Install-LiteSystem.cmd online input` in an elevated command prompt or `Install-LiteSystem.cmd offline W:\ input` from Windows PE. [Shared installer and signing](../TegraXusb/README.md#package-and-install)
 
 Windows enumerated the gamepad and mouse and received SIO input on this Lite. Version 0.2.2.0 with the Plus shortcut was installed on the test card. The 0.2.3.0 wheel, middle button and D-pad keyboard mappings passed host report tests and were built for ARM64. Physical desktop navigation and in-game input await confirmation.
+
+
+Version **0.2.4.0** is a sleep/wake candidate. Display-off releases the KMDF
+runtime-power reference so the existing D0 exit stops UART polling and powers
+down SIO. Display-on requests D0 asynchronously, then the existing handshake
+and neutral-input path restores the controller. Capture mode and all mappings
+remain unchanged. Wake is provided by the separate power button; sticks do
+not wake the display while SIO is asleep. The shared reference-lifetime test,
+input report regressions and ARM64 build pass; physical repeated wake remains
+pending.

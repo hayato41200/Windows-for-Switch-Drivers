@@ -24,9 +24,12 @@ def function(text, name, result):
 prefix = r'''
 #include <assert.h>
 #include <stdint.h>
+#include <stdbool.h>
 #include <string.h>
 #include <stdio.h>
 typedef uint32_t ULONG, *PULONG; typedef int32_t LONG;
+typedef size_t SIZE_T;
+#define RTL_NUMBER_OF(x) (sizeof(x)/sizeof((x)[0]))
 typedef uint16_t USHORT; typedef uint8_t UCHAR, BOOLEAN, *PUCHAR;
 #define VOID void
 #define TRUE 1
@@ -40,6 +43,18 @@ typedef uint16_t USHORT; typedef uint8_t UCHAR, BOOLEAN, *PUCHAR;
 #define SDHC_MAX_CLOCK_DIVISOR 256
 #define SDHC_MAX_CLOCK_DIVISOR_SPEC_3 2046
 #define SDHC_VERSION 0xfe
+#define SDHC_PRESENT_STATE 0x24
+#define SDHC_CLOCK_CONTROL 0x2c
+#define SDHC_HOST_CONTROL2 0x3e
+#define SDHC_TIMEOUT_CONTROL 0x2e
+#define SDHC_CC_INTERNAL_CLOCK_ENABLE 1
+#define SDHC_CC_CLOCK_STABLE 2
+#define SDHC_CC_CLOCK_ENABLE 4
+#define SDHC_HC2_EXECUTE_TUNING 0x40
+#define STATUS_DEVICE_BUSY -2
+#define STATUS_IO_TIMEOUT -3
+#define NT_SUCCESS(s) ((s)>=0)
+#define KeStallExecutionProcessor(x) ((void)(x))
 #define SDHC_HOST_CONTROL 0x28
 #define SDHC_POWER_CONTROL 0x29
 #define SDHC_PC_3_3V 14
@@ -76,23 +91,35 @@ typedef struct { LONG TargetFacts; ULONG NextReadLba,IssuedWriteLba; USHORT Issu
  BOOLEAN T214CardOn,T214Voltage18,T214DmaActive,T214DmaComplete,T214DmaFault;
  PUCHAR T214Bounce,T214DmaBuffer; struct { ULONG LowPart; } T214BouncePa;
  ULONG T214DmaLength,T214DmaBlocks; struct { ULONG BaseClockFrequencyKhz; } Capabilities;
- UCHAR regs[512]; } SDHC_EXTENSION,*PSDHC_EXTENSION;
+ ULONG T214SavedVendor[5],T214SavedEnables,T214SavedSignals;
+ USHORT T214SavedClock,T214SavedControl2;
+ UCHAR T214SavedHost,T214SavedPower,T214SavedTimeout;
+ BOOLEAN T214ContextValid;ULONG T214Saves,T214Restores,T214ResumeStatus;
+ PUCHAR BaseAddress;UCHAR regs[512]; } SDHC_EXTENSION,*PSDHC_EXTENSION;
 static struct { ULONG BlocksRead,BlocksWritten; } NvDiag;
 static LONG InterlockedExchange(LONG *p,LONG n){LONG o=*p;*p=n;return o;}
 static LONG InterlockedOr(LONG *p,LONG n){return *p|=n;}
 static LONG InterlockedAnd(LONG *p,LONG n){return *p&=n;}
+static bool clock_fail;
+static ULONG SdhcReadRegisterUlong(PSDHC_EXTENSION s,ULONG off){ULONG v;memcpy(&v,s->regs+off,4);return v;}
+static ULONG T214Read(PUCHAR b,ULONG off){ULONG v;memcpy(&v,b+off,4);return v;}
+static void T214Write(PUCHAR b,ULONG off,ULONG v){memcpy(b+off,&v,4);}
+static NTSTATUS T214ParentClock(PSDHC_EXTENSION s){(void)s;return 0;}
 static UCHAR SdhcReadRegisterUchar(PSDHC_EXTENSION s,ULONG off){return s->regs[off];}
 static USHORT SdhcReadRegisterUshort(PSDHC_EXTENSION s,ULONG off){USHORT v;memcpy(&v,s->regs+off,2);return v;}
 static void SdhcWriteRegisterUchar(PSDHC_EXTENSION s,ULONG off,UCHAR v){s->regs[off]=v;}
-static void SdhcWriteRegisterUshort(PSDHC_EXTENSION s,ULONG off,USHORT v){memcpy(s->regs+off,&v,2);}
+static void SdhcWriteRegisterUshort(PSDHC_EXTENSION s,ULONG off,USHORT v){if(off==SDHC_CLOCK_CONTROL&&(v&1)&&!clock_fail)v|=2;memcpy(s->regs+off,&v,2);}
 static void SdhcWriteRegisterUlong(PSDHC_EXTENSION s,ULONG off,ULONG v){memcpy(s->regs+off,&v,4);}
 '''
 code = prefix + target + r'''
 +static unsigned power_cycles;
 +static NTSTATUS T214Power(PSDHC_EXTENSION s,BOOLEAN on){power_cycles++;s->T214CardOn=on;s->T214Voltage18=0;return 0;}
 +'''.replace('\n+','\n')
+code += 'static const ULONG T214ContextOffsets[]={0x100,0x1ac,0x1c0,0x1c4,0x1f0};\n'
 code += function(board, 'T214SetBusVoltage', 'NTSTATUS')
-for name, result in [('LiteForgetCard','void'),('LiteObserveRead','void'),('LiteBlocksInExtent','BOOLEAN'),('LiteAllowRequest','BOOLEAN')]:
+code += function(board, 'T214SaveContext', 'void')
+code += function(board, 'T214RestoreContext', 'void')
+for name, result in [('LiteForgetCard','void'),('LiteObserveRead','void'),('LiteObserveReadRange','void'),('LiteBlocksInExtent','BOOLEAN'),('LiteAllowRequest','BOOLEAN')]:
     code += function(source, name, result)
 for name, result in [('T214BuildDma','BOOLEAN'),('T214DmaDone','void')]:
     code += function(board, name, result)
@@ -115,7 +142,12 @@ int main(void){
  memset(bounce,0,512);memcpy(bounce+440,physical_tail,70);bounce[510]=0x55;bounce[511]=0xaa;
  T214DmaDone(&s,&r);
  assert(s.TargetFacts&LiteMbr);assert(data[446]==0x80&&data[450]==7);
+#ifdef FAT32_FIRST
+ assert(data[466]==0x0c&&LiteU32(data+470)==FAT32_FIRST);
+ for(unsigned i=478;i<510;i++)assert(data[i]==0);
+#else
  for(unsigned i=462;i<510;i++)assert(data[i]==0);
+#endif
  assert(bounce[450]==0x0c); /* Only the OS-visible buffer was filtered. */
  assert(s.T214DmaComplete&&!s.T214DmaActive);
  s.NextReadLba=WINARM_FIRST;r.Command.Argument=WINARM_FIRST;
@@ -149,6 +181,45 @@ int main(void){
  assert(reg==0&&actual==199680);
  for(ULONG target=400;target<200000;target+=137){SdhcCalcClockFrequency(&s,target,&actual);assert(actual<=target);}
  SdhcCalcClockFrequency(&s,25000,&actual);assert(actual==24960);
+ /* Range filtering must match the previous per-sector path at every guard
+    boundary, including a boot sector in the middle of a multi-block read. */
+ ULONG edges[]={0,1,4,WINARM_FIRST,
+#ifdef FAT32_FIRST
+ FAT32_FIRST,
+#endif
+ };
+ for(unsigned e=0;e<RTL_NUMBER_OF(edges);e++)for(unsigned count=1;count<=128;count++){
+  ULONG first=edges[e]>2?edges[e]-2:0;
+  UCHAR a[65536],b[65536];memset(a,0x5a,sizeof(a));
+  for(unsigned j=0;j<count;j++){
+   ULONG lba=first+j;UCHAR *q=a+j*512;
+   if(lba==0){memset(q,0,512);memcpy(q+440,physical_tail,70);q[510]=0x55;q[511]=0xaa;}
+   if(lba==WINARM_FIRST){memset(q,0,512);memcpy(q+3,"NTFS    ",8);q[12]=2;q[13]=8;q[510]=0x55;q[511]=0xaa;u32(q+28,WINARM_FIRST);u64(q+40,WINARM_COUNT-1);u64(q+72,WINARM_SERIAL);}
+#ifdef FAT32_FIRST
+   if(lba==FAT32_FIRST){memset(q,0,512);q[12]=2;q[13]=64;q[510]=0x55;q[511]=0xaa;u32(q+28,FAT32_FIRST);u32(q+32,FAT32_COUNT);u32(q+36,128);memcpy(q+82,"FAT32   ",8);}
+#endif
+  }
+  memcpy(b,a,sizeof(a));SDHC_EXTENSION old={0},bulk={0};old.NextReadLba=bulk.NextReadLba=first;
+  SDPORT_COMMAND one={0};one.BlockSize=512;
+  for(unsigned j=0;j<count;j++){one.DataBuffer=a+j*512;LiteObserveRead(&old,&one);}
+  one.DataBuffer=b;LiteObserveReadRange(&bulk,&one,count);
+  assert(old.TargetFacts==bulk.TargetFacts&&old.NextReadLba==bulk.NextReadLba&&!memcmp(a,b,count*512));
+ }
+ /* Controller retention loss restores only configuration, never old I/O. */
+ memset(&s,0,sizeof(s));s.BaseAddress=s.regs;
+ s.regs[0x28]=0x12;s.regs[0x29]=0xb;s.regs[0x2e]=0xe;
+ SdhcWriteRegisterUshort(&s,0x2c,7);SdhcWriteRegisterUshort(&s,0x3e,0x8b);
+ SdhcWriteRegisterUlong(&s,0x34,0x12345678);SdhcWriteRegisterUlong(&s,0x38,0x87654321);
+ for(unsigned i=0;i<5;i++)T214Write(s.regs,T214ContextOffsets[i],0x55+i);
+ T214SaveContext(&s);assert(s.T214ContextValid&&s.T214Saves==1);
+ memset(s.regs,0,sizeof(s.regs));T214RestoreContext(&s);
+ assert(s.T214Restores==1&&s.T214ResumeStatus==0&&s.regs[0x28]==0x12&&s.regs[0x29]==0xb);
+ assert(SdhcReadRegisterUshort(&s,0x2c)==7&&SdhcReadRegisterUshort(&s,0x3e)==0x8b);
+ assert(SdhcReadRegisterUlong(&s,0x34)==0x12345678&&SdhcReadRegisterUlong(&s,0x38)==0x87654321);
+ for(unsigned i=0;i<5;i++)assert(T214Read(s.regs,T214ContextOffsets[i])==0x55+i);
+ assert(SdhcReadRegisterUlong(&s,0x08)==0&&SdhcReadRegisterUlong(&s,0x0c)==0&&SdhcReadRegisterUlong(&s,0x20)==0&&SdhcReadRegisterUlong(&s,0x30)==0);
+ clock_fail=true;T214RestoreContext(&s);assert(s.T214DmaFault&&s.T214ResumeStatus==(ULONG)STATUS_IO_TIMEOUT&&T214Read(s.regs,0x38)==0);clock_fail=false;
+ s.T214DmaActive=true;T214SaveContext(&s);assert(!s.T214ContextValid&&s.T214Saves==1);
  puts("PASS: real DMA/filter/write bounds, descriptor limits, error gate, 199.68 MHz divisor, reset-all power restoration");
 }
 '''

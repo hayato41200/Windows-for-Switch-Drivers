@@ -7,6 +7,7 @@
 #include <vhf.h>
 #include "sensor_status.h"
 #include "sio_protocol.h"
+#include "../../common/display_idle.h"
 
 enum { Data = 0, Ier, Fifo, Lcr, Mcr, Lsr, Msr, Scratch, Irda };
 enum { RxCapacity = 1024, PollMs = 8, ResponseMs = 300 };
@@ -48,6 +49,7 @@ C_ASSERT(sizeof(SIO_KEYBOARD_REPORT) == 9);
 
 typedef struct {
     WDFDEVICE Device;
+    SW_DISPLAY_IDLE DisplayIdle;
     WDFINTERRUPT Interrupt;
     WDFTIMER Timer;
     WDFIOTARGET Home;
@@ -404,7 +406,7 @@ static NTSTATUS Start(WDFDEVICE Device, WDF_POWER_DEVICE_STATE Previous)
     D->Running = TRUE;
     WdfTimerStart(D->Timer, WDF_REL_TIMEOUT_IN_MS(1));
     KeReleaseSpinLock(&D->TimerLock, Irql);
-    return STATUS_SUCCESS;
+    return SwDisplayIdleStart(&D->DisplayIdle);
 }
 
 static NTSTATUS Stop(WDFDEVICE Device, WDF_POWER_DEVICE_STATE Target)
@@ -432,6 +434,7 @@ static NTSTATUS Release(WDFDEVICE Device, WDFCMRESLIST Translated)
 {
     SIO_DEVICE *D = SioDevice(Device);
     UNREFERENCED_PARAMETER(Translated);
+    SwDisplayIdleStop(&D->DisplayIdle);
     if (D->Vhf) { VhfDelete(D->Vhf, TRUE); D->Vhf = NULL; }
     if (D->Home) { WdfObjectDelete(D->Home); D->Home = NULL; }
     if (D->Uart) { MmUnmapIoSpace((PVOID)D->Uart, 0x40); D->Uart = NULL; }
@@ -501,6 +504,8 @@ static NTSTATUS Add(WDFDRIVER Driver, PWDFDEVICE_INIT Init)
     if (!NT_SUCCESS(Status)) return Status;
     SIO_DEVICE *D = SioDevice(Device);
     D->Device = Device;
+    Status = SwDisplayIdleConfigure(Device, &D->DisplayIdle);
+    if (!NT_SUCCESS(Status)) return Status;
     KeInitializeSpinLock(&D->TimerLock);
     WDF_OBJECT_ATTRIBUTES_INIT(&A);
     A.ParentObject = Device;
