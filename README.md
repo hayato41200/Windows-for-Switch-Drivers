@@ -11,7 +11,7 @@ Drivers for the **HDH-001 (Tegra T214)** port of Windows 11 ARM64. They use the 
 | `switchbt` 1.0.0.13 | Bluetooth works on the trimmed Pro installation. Range remains unmeasured. |
 | GPIO, I²C3 and FTM4 touch | The shared controllers and Lite touch driver handle taps in Windows Setup. |
 | `switchsio` (analog sticks and gamepad) | Windows detected the HID gamepad and mouse and the driver received controller input. Both sticks are exposed to generic HID games. In-game use awaits testing. |
-| `switchsio` desktop controls | Left stick moves the pointer. ZR left-clicks and ZL right-clicks. Capture toggles desktop mappings in 0.2.1 (on the card). Signed 0.2.2 maps **+** to the On-Screen Keyboard in desktop mode. The shortcut awaits a hardware test. [Button mapping](drivers/SwitchSensor/README.md) |
+| `switchsio` desktop controls | Left stick moves the pointer and ZR/ZL click. Capture toggles desktop mode and **+** opens the On-Screen Keyboard (0.2.2 on the card). Version 0.2.3 adds right-stick scrolling, R3 middle click and D-pad keyboard arrows. Hardware test pending. [Button mapping](drivers/SwitchSensor/README.md) |
 | `switchaudio` 1.0.0.9 | The built-in speakers play audio. Headphones and jack switching await testing. |
 | `switchfan` 1.0.0.5 | The fan and panel brightness controls work. Readbacks showed 1996.8 MHz CPU and 1866 MHz RAM. |
 
