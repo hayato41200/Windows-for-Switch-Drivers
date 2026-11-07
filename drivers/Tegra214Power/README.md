@@ -13,14 +13,27 @@ package**. The accompanying SwitchPowerButton 1.0.0.2 candidate supplies the
 PMIC wake interrupt and preserves the original polling profile for older firmware. The backend alone is not a complete
 low-power sleep implementation.
 
-The ACPI binding is `SWOA0C01`; the boot service belongs to `Core Platform
+The ACPI binding is `SWOA0E01`; the boot service belongs to `Core Platform
 Extensions`. PoFx cannot unregister a PEP, so servicing requires a restart.
 `HaltAttempts`, `HaltReturns`, `LastHaltStatus` and `ProcessorCount` are fixed
 registry values updated on display transitions by a worker. An acknowledged
 PSCI return is not proof that the firmware granted cluster power-down.
 
-The ARM64 build and actual-callback PoFx dependency/clock/PSCI host test pass. The PEP is not yet installed or physically
-validated. Continue the shared work in the firmware repository's
+The ARM64 build and actual-callback PoFx dependency/clock/PSCI host test pass,
+but the installed 0.1.0.0 boot-start package blocked cold boot with
+`0xc000000f` before any hibernation attempt. A read-only card replay with RAM
+overlays reproduced the failure; changing only this service's `Start` from 0
+to 4 allowed the loader to reach kernel startup. This isolates the boot-start
+PEP as a blocker, not the exact loader/dependency failure or physical wake
+behavior. S4 does not require this backend.
+
+Exclude this package from S4 installations. The shared build script skips it
+unless `BUILD_T214_PEP=1` is explicitly set, and the firmware requires a
+separate `SWITCH_LITE_PROCESSOR_IDLE=1` flag to expose `SWOA0E01`.
+The 0.1.0.1 source INF also corrects the old `SWOA0C01` ID, which belongs to
+audio. That ID correction alone does not establish boot compatibility; the
+package stays excluded from the installed S4 candidate.
+The implementation remains for deferred C7/CC6 and SC7 work. Continue in the firmware repository's
 [porting status](https://github.com/ruje0504-2/winx/blob/hdh001-hekate-sd/docs/hdh001-home/PORTING.md).
 
 References: [Microsoft i.MX PEP](https://github.com/ms-iot/imx-iotcore/tree/public_preview/driver/power/imx6pep),

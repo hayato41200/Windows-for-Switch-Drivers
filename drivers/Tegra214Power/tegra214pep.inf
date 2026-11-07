@@ -4,7 +4,7 @@ Class=System
 ClassGuid={4d36e97d-e325-11ce-bfc1-08002be10318}
 Provider=%Mfg%
 CatalogFile=tegra214pep.cat
-DriverVer=11/07/2026,0.1.0.0
+DriverVer=11/07/2026,0.1.0.1
 PnpLockdown=1
 [DestinationDirs]
 DefaultDestDir=12
@@ -15,7 +15,7 @@ tegra214pep.sys=1
 [Manufacturer]
 %Mfg%=Models,NTarm64
 [Models.NTarm64]
-%Device%=Install,ACPI\SWOA0C01
+%Device%=Install,ACPI\SWOA0E01
 [Install.NT]
 CopyFiles=Files
 [Files]
