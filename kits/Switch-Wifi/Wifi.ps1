@@ -72,6 +72,11 @@ function Show-Status {
     Log ("msg    : {0}" -f $p.MsgResult)
     Log ("msg    : ringinfo={0} ringmem={1} h2dW={2} d2hW={3} subq={4} rxoff={5} dma={6} posted={7} ctlR={8} mbint={9}" -f (Hex $p.MsgRingInfo), (Hex $p.MsgRingMem), (Hex $p.MsgH2dW), (Hex $p.MsgD2hW), $p.MsgMaxSubQueues, $p.MsgRxDataOffset, (Hex $p.MsgDmaPa), $p.MsgPosted, $p.MsgCtlSubmitR, (Hex $p.MsgMailboxInt))
     Log ("msg    : completions={0} events={1} unknown={2} lasttype={3} scratch={4}" -f $p.MsgCompletions, $p.MsgEvents, $p.MsgUnknown, $p.MsgLastType, (Hex $p.MsgScratch))
+    if ($null -ne $p.EpCmdMaster) { Log ("msg    : endpoint CMD after bus master on = {0}" -f (Hex $p.EpCmdMaster)) }
+    if ($null -ne $p.Bell1RpLink) {
+      Log ("bell1  : LNK={0} XP={1} DEVSTA={2} afi={3}/{4} mc int={5} err={6} adr={7}" -f (Hex $p.Bell1RpLink), (Hex $p.Bell1RpXp), (Hex $p.Bell1RpDevSta),
+        (Hex $p.Bell1AfiCode), (Hex $p.Bell1AfiSig), (Hex $p.Bell1McInt), (Hex $p.Bell1McErr), (Hex $p.Bell1McErrAdr))
+    }
     foreach ($pf in 'Pre', 'Post', 'Ioctl') {
       if ($null -ne $p."${pf}CtlSubR") {
         Log ("diag {0,-5}: ctlR={1} ctlW={2} cmplW={3} mbint={4} afi={5}/{6} mc int={7} err={8} adr={9} smmu={10} afiasid={11}" -f $pf,

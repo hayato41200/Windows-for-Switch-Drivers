@@ -26,7 +26,7 @@
 #include <ntstrsafe.h>
 #include <wdf.h>
 
-#define SWWIFI_VERSION      0x00030001u     /* 0.3.1 */
+#define SWWIFI_VERSION      0x00030002u     /* 0.3.2 */
 
 #define RP_LINK_STATUS      0x090           /* bit 29: data link up */
 #define RP_XP_VC0           0xF00           /* bit 30: DL up */
@@ -788,6 +788,56 @@ static VOID SwWifiDiag(PSWWIFI_DEVICE Dev, ULONG Shared, PCWSTR Prefix)
     SwWifiFlush();
 }
 
+/* 0.3.2: after a doorbell, look only at Tegra registers (root port, AFI, MC)
+ * first: if the link went down or the AFI logged an error, an endpoint access
+ * would raise an SError and stop Windows, so the caller stops instead. */
+static BOOLEAN SwWifiSafeCheck(PSWWIFI_DEVICE Dev, PCWSTR Prefix)
+{
+    PHYSICAL_ADDRESS Pa;
+    volatile ULONG *Mc;
+    WCHAR Name[48];
+    ULONG Lnk, Xp, Code;
+    LARGE_INTEGER Delay;
+
+    Delay.QuadPart = -50 * 10000LL;
+    KeDelayExecutionThread(KernelMode, FALSE, &Delay);
+#define DIAG(N, V) do { (VOID)RtlStringCbPrintfW(Name, sizeof(Name), L"%s%s", Prefix, N); SwWifiTrace(Name, (V)); } while (0)
+    Lnk = Rd(Dev->Rp, RP_LINK_STATUS);
+    Xp = Rd(Dev->Rp, RP_XP_VC0);
+    Code = Rd(Dev->Afi, AFI_INTR_CODE);
+    DIAG(L"RpLink", Lnk);
+    DIAG(L"RpXp", Xp);
+    DIAG(L"RpDevSta", Rd(Dev->Rp, 0x088));
+    DIAG(L"AfiCode", Code);
+    DIAG(L"AfiSig", Rd(Dev->Afi, AFI_INTR_SIGNATURE));
+    Pa.QuadPart = MC_BASE;
+    Mc = (volatile ULONG *)MmMapIoSpaceEx(Pa, 0x1000, PAGE_READWRITE | PAGE_NOCACHE);
+    if (Mc != NULL) {
+        DIAG(L"McInt", Rd(Mc, MC_INTSTATUS));
+        DIAG(L"McErr", Rd(Mc, MC_ERR_STATUS));
+        DIAG(L"McErrAdr", Rd(Mc, MC_ERR_ADR));
+        MmUnmapIoSpace((PVOID)Mc, 0x1000);
+    }
+#undef DIAG
+    SwWifiFlush();
+    return (Lnk & (1u << 29)) != 0 && (Xp & (1u << 30)) != 0 && Code == 0;
+}
+
+/* Clear the MC and AFI error logs, so what follows is ours. */
+static VOID SwWifiClearErrors(PSWWIFI_DEVICE Dev)
+{
+    PHYSICAL_ADDRESS Pa;
+    volatile ULONG *Mc;
+
+    Pa.QuadPart = MC_BASE;
+    Mc = (volatile ULONG *)MmMapIoSpaceEx(Pa, 0x1000, PAGE_READWRITE | PAGE_NOCACHE);
+    if (Mc != NULL) {
+        Wr(Mc, MC_INTSTATUS, Rd(Mc, MC_INTSTATUS));     /* write 1 to clear */
+        MmUnmapIoSpace((PVOID)Mc, 0x1000);
+    }
+    Wr(Dev->Afi, AFI_INTR_CODE, 0);
+}
+
 static VOID SwWifiMsgbuf(PSWWIFI_DEVICE Dev, ULONG Shared)
 {
     PHYSICAL_ADDRESS Low, High, Skip;
@@ -877,9 +927,25 @@ static VOID SwWifiMsgbuf(PSWWIFI_DEVICE Dev, ULONG Shared)
 
     SwWifiDiag(Dev, Shared, L"Pre");
 
-    /* Event and ioctl response buffers (brcmf_proto_msgbuf_attach). */
+    /* 0.3.2: bus master on (pci_set_master). Up to 0.3.1 the endpoint command
+     * register was 0x0002 (memory only): the chip could not DMA, and Windows
+     * stopped right after the first doorbell. */
+    Wr(Dev->Cfg, 0x04, (Rd(Dev->Cfg, 0x04) & 0xFFFFu) | 0x6u);
+    SwWifiTrace(L"EpCmdMaster", Rd(Dev->Cfg, 0x04));
+    SwWifiClearErrors(Dev);
+    SwWifiFlush();
+
+    /* Event and ioctl response buffers (brcmf_proto_msgbuf_attach). One post
+     * first, then a Tegra-side check before the endpoint is touched again. */
     SwWifiStep(22);
     Posted = SwWifiPostCtlBufs(Dev, TRUE, N_RESP_BUFS, N_EVENT_BUFS);
+    if (!SwWifiSafeCheck(Dev, L"Bell1")) {
+        SwWifiTraceText(L"MsgResult", L"stopped after the first doorbell: link down or AFI error (see Bell1 values); the endpoint is left alone");
+        SwWifiFlush();
+        Dev->FwRunning = FALSE;     /* do not touch it in ReleaseHardware either */
+        Dev->Dma = NULL;            /* and never free memory the chip may still write */
+        return;
+    }
     Posted += SwWifiPostCtlBufs(Dev, FALSE, 0, N_RESP_BUFS);
     SwWifiTrace(L"MsgPosted", Posted);
     {
