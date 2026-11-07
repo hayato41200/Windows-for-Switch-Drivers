@@ -85,3 +85,17 @@
   - GET_VERSION は st=0、値は 2。
   - `ver` は st=0、「wl0: Aug 29 2021 19:23:35 version 7.35.252.108 (c216b7c) FWID 01-65333037」。
   - `cur_etheraddr` は st=0、00:90:4C:xx:xx:xx（Broadcom の既定の OUI）。Switchroot の NVRAM の macaddr は仮の値で、Linux は本体の MAC を DT から設定している。Windows でも、本体の MAC を別に設定する必要がある。
+
+## 0.4.0: 段階 4a（スキャン）
+
+- **目的:** Windows の Wi-Fi 画面に対応する（WiFiCx か WDI）前に、チップの無線が本当に動くかを確かめる。
+- **流れ（brcmfmac と同じ）:**
+  1. WLC_SET_INFRA 1 と WLC_UP を送る。
+  2. `event_msgs` を読み、ESCAN_RESULT（69）のビットを足して書き戻す。
+  3. iovar `escan` を、全チャンネルのアクティブスキャンで送る。
+- **イベントの受け取り:**
+  - WL_EVENT の完了を受け取ったら、そのイベントバッファーの中身（brcmf_event、ビッグエンディアン）を読んでから、同じバッファーを渡し直す。
+  - ESCAN_RESULT の status 8（途中）では、BSS の記録（SSID、チャンネル、RSSI）を集める。それ以外の status が来たら、スキャンの終わり。
+  - 最長 10 秒待つ。
+- **表示:** 見つかったネットワークを、強い順に 12 件まで表示する（SSID は UTF-8 から変換）。
+- **あわせて表示するもの:** Windows のビルドと、wificx.sys / wdiwifi.sys の有無（WiFiCx を使えるかを決めるため）。

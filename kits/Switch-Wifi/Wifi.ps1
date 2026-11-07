@@ -78,7 +78,7 @@ function Show-Status {
         (Hex $p.Bell1AfiCode), (Hex $p.Bell1AfiSig), (Hex $p.Bell1McInt), (Hex $p.Bell1McErr), (Hex $p.Bell1McErrAdr))
     }
     foreach ($pf in 'Pre', 'Post', 'Ioctl') {
-      if ($null -ne $p."${pf}CtlSubR") {
+      if ($null -ne $p."${pf}CtlSubR" -and "$($p.MsgResult)" -notlike 'ok:*') {
         Log ("diag {0,-5}: ctlR={1} ctlW={2} cmplW={3} mbint={4} afi={5}/{6} mc int={7} err={8} adr={9} smmu={10} afiasid={11}" -f $pf,
           $p."${pf}CtlSubR", $p."${pf}CtlSubW", $p."${pf}CtlCmplW", (Hex $p."${pf}MbInt"), (Hex $p."${pf}AfiCode"), (Hex $p."${pf}AfiSig"),
           (Hex $p."${pf}McInt"), (Hex $p."${pf}McErr"), (Hex $p."${pf}McErrAdr"), (Hex $p."${pf}SmmuCfg"), (Hex $p."${pf}SmmuAfi"))
@@ -87,6 +87,11 @@ function Show-Status {
     Log ("ioctl  : GET_VERSION ret={0} st={1} value={2}" -f $p.IoctlVersionRet, $p.IoctlVersionStatus, $p.IoctlVersion)
     Log ("ioctl  : ver ret={0} st={1} '{2}'" -f $p.IoctlVerRet, $p.IoctlVerStatus, $p.IoctlVer)
     Log ("ioctl  : cur_etheraddr ret={0} st={1} {2}" -f $p.IoctlMacRet, $p.IoctlMacStatus, $p.IoctlMacOui)
+  }
+  if ($null -ne $p.ScanCount) {
+    Log ("scan   : found={0} done={1} status={2} in {3} ms  escan events={4} other={5}  st infra={6} up={7} evget={8} evset={9} start={10}" -f $p.ScanCount, $p.ScanDone, $p.ScanStatus, $p.ScanMs,
+      $p.ScanEscanEvents, $p.ScanOtherEvents, $p.ScanInfraSt, $p.ScanUpSt, $p.ScanEvGetSt, $p.ScanEvSetSt, $p.ScanStartSt)
+    @($p.ScanList -split "`n" | Where-Object { $_.Trim() }) | Select-Object -First 12 | ForEach-Object { Log "  $_" }
   }
   if ($p.CoreList -and $null -eq $p.FwResult) {
     Log 'cores (id:rev@base/wrapper):'
@@ -100,8 +105,13 @@ function Show-Status {
   if ($p.FwConsole) {
     Log 'firmware console (last lines):'
     $lines = @($p.FwConsole -split "`n" | Where-Object { $_.Trim() })
-    $lines | Select-Object -Last 12 | ForEach-Object { Log "  $_" }
+    $lines | Select-Object -Last 6 | ForEach-Object { Log "  $_" }
   }
+  # For the WiFiCx / WDI choice: the Windows build and whether WiFiCx is there.
+  $cv = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' -ErrorAction SilentlyContinue
+  $wcx = Test-Path (Join-Path $Sys 'drivers\wificx.sys')
+  $wdi = Test-Path (Join-Path $Sys 'drivers\wdiwifi.sys')
+  Log ("windows: {0} build {1}.{2}  wificx.sys={3} wdiwifi.sys={4}" -f $cv.DisplayVersion, $cv.CurrentBuild, $cv.UBR, $wcx, $wdi)
 }
 
 switch ($Mode) {

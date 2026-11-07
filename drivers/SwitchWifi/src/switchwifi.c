@@ -26,7 +26,7 @@
 #include <ntstrsafe.h>
 #include <wdf.h>
 
-#define SWWIFI_VERSION      0x00030002u     /* 0.3.2 */
+#define SWWIFI_VERSION      0x00040000u     /* 0.4.0 */
 
 #define RP_LINK_STATUS      0x090           /* bit 29: data link up */
 #define RP_XP_VC0           0xF00           /* bit 30: DL up */
@@ -660,6 +660,85 @@ static ULONG SwWifiPostCtlBufs(PSWWIFI_DEVICE Dev, BOOLEAN Event, ULONG First, U
     return I;
 }
 
+/* ------------------------------------------------- scan (stage 4a)
+ *
+ * Firmware events come as MSGBUF_TYPE_WL_EVENT completions naming one of the
+ * posted event buffers. Each buffer holds a Broadcom event packet (struct
+ * brcmf_event, big-endian): Ethernet header (type 0x886C), brcm_ethhdr, then
+ * brcmf_event_msg_be at 24 and the event data at 72. ESCAN_RESULT (69) data is
+ * struct brcmf_escan_result_le: buflen, version, sync_id, bss_count, then
+ * brcmf_bss_info_le records (SSID_len at 18, SSID at 19, chanspec at 72, RSSI
+ * at 78). Status 8 (partial) = more to come, anything else = scan over.
+ */
+#define EV_HDR              24
+#define EV_DATA             72
+#define BRCMF_E_ESCAN_RESULT 69
+#define SCAN_MAX            40
+
+typedef struct _SWWIFI_BSS {
+    UCHAR Bssid[6];
+    UCHAR SsidLen;
+    UCHAR Ssid[32];
+    USHORT Chanspec;
+    SHORT Rssi;
+} SWWIFI_BSS;
+
+static SWWIFI_BSS mBss[SCAN_MAX];
+static ULONG mBssCount, mScanDone, mScanStatus, mEscanEvents, mOtherEvents, mLastEventType;
+
+static ULONG Be32(PUCHAR P, ULONG Off)
+{
+    return ((ULONG)P[Off] << 24) | ((ULONG)P[Off + 1] << 16) | ((ULONG)P[Off + 2] << 8) | P[Off + 3];
+}
+
+static VOID SwWifiAddBss(PUCHAR Bi, ULONG Len)
+{
+    ULONG I;
+    if (Len < 80) return;
+    for (I = 0; I < mBssCount; I++) {
+        if (RtlCompareMemory(mBss[I].Bssid, Bi + 8, 6) == 6) {
+            mBss[I].Rssi = (SHORT)Get16(Bi, 78);        /* keep the latest */
+            return;
+        }
+    }
+    if (mBssCount >= SCAN_MAX) return;
+    RtlCopyMemory(mBss[mBssCount].Bssid, Bi + 8, 6);
+    mBss[mBssCount].SsidLen = (Bi[18] <= 32) ? Bi[18] : 32;
+    RtlCopyMemory(mBss[mBssCount].Ssid, Bi + 19, mBss[mBssCount].SsidLen);
+    mBss[mBssCount].Chanspec = Get16(Bi, 72);
+    mBss[mBssCount].Rssi = (SHORT)Get16(Bi, 78);
+    mBssCount++;
+}
+
+static VOID SwWifiEvent(PUCHAR Buf, ULONG Len)
+{
+    ULONG Type, Status, DataLen, Count, Off, I;
+    PUCHAR D;
+
+    if (Len < EV_DATA || Buf[12] != 0x88 || Buf[13] != 0x6C) { mOtherEvents++; return; }
+    Type = Be32(Buf, EV_HDR + 4);
+    Status = Be32(Buf, EV_HDR + 8);
+    DataLen = Be32(Buf, EV_HDR + 20);
+    mLastEventType = Type;
+    if (Type != BRCMF_E_ESCAN_RESULT) { mOtherEvents++; return; }
+    mEscanEvents++;
+    if (Status != 8) {                      /* not partial: the scan ended */
+        mScanDone = 1;
+        mScanStatus = Status;
+        return;
+    }
+    if (DataLen < 12 || EV_DATA + DataLen > Len) return;
+    D = Buf + EV_DATA;
+    Count = Get16(D, 10);
+    Off = 12;
+    for (I = 0; I < Count && Off + 8 <= DataLen; I++) {
+        ULONG BiLen = Get32(D, Off + 4);
+        if (BiLen < 80 || Off + BiLen > DataLen) break;
+        SwWifiAddBss(D + Off, BiLen);
+        Off += BiLen;
+    }
+}
+
 /* Drain the D2H control complete ring (brcmf_msgbuf_process_rx). */
 static VOID SwWifiPollCtl(PSWWIFI_DEVICE Dev)
 {
@@ -682,9 +761,18 @@ static VOID SwWifiPollCtl(PSWWIFI_DEVICE Dev)
             mIoctlPktId = Get32(Item, 4);
             mIoctlDone = 1;
             break;
-        case MSG_WL_EVENT:
+        case MSG_WL_EVENT: {
+            /* 0.4.0: parse it, then give the buffer back. */
+            ULONG Idx = Get32(Item, 4), Len = Get16(Item, 12);
             mEvents++;
+            if (Idx >= N_RESP_BUFS && Idx < N_RESP_BUFS + N_EVENT_BUFS) {
+                KeMemoryBarrier();
+                SwWifiEvent(Dev->Dma + OFF_CTLBUF + Idx * CTL_BUF_SIZE + mRxDataOffset,
+                            (Len < CTL_BUF_SIZE - mRxDataOffset) ? Len : CTL_BUF_SIZE - mRxDataOffset);
+                (VOID)SwWifiPostCtlBufs(Dev, TRUE, Idx, 1);
+            }
             break;
+        }
         default:
             mUnknown++;
             break;
@@ -744,6 +832,100 @@ static LONG SwWifiIoctl(PSWWIFI_DEVICE Dev, ULONG Cmd, const VOID *In, ULONG InL
         (VOID)SwWifiPostCtlBufs(Dev, FALSE, mIoctlPktId, 1);
     }
     return (LONG)Copy;
+}
+
+#define WLC_UP              2
+#define WLC_SET_INFRA       20
+#define WLC_SET_VAR         263
+#define EVENT_MASK_LEN      18              /* BRCMF_EVENTING_MASK_LEN: E_LAST 139 */
+
+static VOID SwWifiScan(PSWWIFI_DEVICE Dev)
+{
+    static WCHAR List[4096];
+    UCHAR Buf[128];
+    ULONG St = 0, I, Ms, Order[SCAN_MAX], J;
+    LONG N;
+    size_t Left = sizeof(List);
+    PWSTR Out = List;
+    LONG One = 1;
+
+    mBssCount = mScanDone = mScanStatus = mEscanEvents = mOtherEvents = mLastEventType = 0;
+    SwWifiStep(30);
+    N = SwWifiIoctl(Dev, WLC_SET_INFRA, &One, 4, Buf, 4, &St);
+    SwWifiTrace(L"ScanInfraSt", (N < 0) ? (ULONG)N : St);
+    RtlZeroMemory(Buf, sizeof(Buf));
+    N = SwWifiIoctl(Dev, WLC_UP, Buf, 4, Buf, 4, &St);
+    SwWifiTrace(L"ScanUpSt", (N < 0) ? (ULONG)N : St);
+
+    /* event_msgs: read, add ESCAN_RESULT, write back (brcmf_fweh_activate_events). */
+    SwWifiStep(31);
+    RtlZeroMemory(Buf, sizeof(Buf));
+    RtlCopyMemory(Buf, "event_msgs", 11);
+    N = SwWifiIoctl(Dev, WLC_GET_VAR, Buf, 11 + EVENT_MASK_LEN, Buf + 64, EVENT_MASK_LEN, &St);
+    SwWifiTrace(L"ScanEvGetSt", (N < 0) ? (ULONG)N : St);
+    if (N < EVENT_MASK_LEN) RtlZeroMemory(Buf + 64, EVENT_MASK_LEN);
+    Buf[64 + BRCMF_E_ESCAN_RESULT / 8] |= (UCHAR)(1u << (BRCMF_E_ESCAN_RESULT % 8));
+    RtlCopyMemory(Buf + 11, Buf + 64, EVENT_MASK_LEN);
+    N = SwWifiIoctl(Dev, WLC_SET_VAR, Buf, 11 + EVENT_MASK_LEN, Buf, 4, &St);
+    SwWifiTrace(L"ScanEvSetSt", (N < 0) ? (ULONG)N : St);
+
+    /* escan start: "escan\0" + brcmf_escan_params_le (76 bytes). */
+    SwWifiStep(32);
+    RtlZeroMemory(Buf, sizeof(Buf));
+    RtlCopyMemory(Buf, "escan", 6);
+    {
+        PUCHAR P = Buf + 6;
+        Put32(P, 0, 1);                     /* BRCMF_ESCAN_REQ_VERSION */
+        Put16(P, 4, 1);                     /* WL_ESCAN_ACTION_START */
+        Put16(P, 6, 0x1234);                /* sync_id */
+        P += 8;                             /* brcmf_scan_params_le */
+        RtlFillMemory(P + 36, 6, 0xFF);     /* bssid: broadcast */
+        P[42] = 2;                          /* DOT11_BSSTYPE_ANY */
+        P[43] = 0;                          /* active scan */
+        Put32(P, 44, 0xFFFFFFFFu);          /* nprobes: default */
+        Put32(P, 48, 0xFFFFFFFFu);          /* active_time */
+        Put32(P, 52, 0xFFFFFFFFu);          /* passive_time */
+        Put32(P, 56, 0xFFFFFFFFu);          /* home_time */
+        Put32(P, 60, 0);                    /* channel_num: all */
+    }
+    N = SwWifiIoctl(Dev, WLC_SET_VAR, Buf, 6 + 76, Buf, 4, &St);
+    SwWifiTrace(L"ScanStartSt", (N < 0) ? (ULONG)N : St);
+
+    SwWifiStep(33);
+    for (Ms = 0; N >= 0 && St == 0 && Ms < 10000 && !mScanDone; Ms += 20) {
+        LARGE_INTEGER Delay;
+        Delay.QuadPart = -20 * 10000LL;
+        KeDelayExecutionThread(KernelMode, FALSE, &Delay);
+        SwWifiPollCtl(Dev);
+    }
+    SwWifiTrace(L"ScanMs", Ms);
+    SwWifiTrace(L"ScanDone", mScanDone);
+    SwWifiTrace(L"ScanStatus", mScanStatus);
+    SwWifiTrace(L"ScanEscanEvents", mEscanEvents);
+    SwWifiTrace(L"ScanOtherEvents", mOtherEvents);
+    SwWifiTrace(L"ScanLastEvent", mLastEventType);
+    SwWifiTrace(L"ScanCount", mBssCount);
+
+    /* Strongest first. */
+    for (I = 0; I < mBssCount; I++) Order[I] = I;
+    for (I = 0; I < mBssCount; I++)
+        for (J = I + 1; J < mBssCount; J++)
+            if (mBss[Order[J]].Rssi > mBss[Order[I]].Rssi) { ULONG T = Order[I]; Order[I] = Order[J]; Order[J] = T; }
+    List[0] = L'\0';
+    for (I = 0; I < mBssCount; I++) {
+        SWWIFI_BSS *B = &mBss[Order[I]];
+        WCHAR Name[40];
+        ULONG Got = 0;
+        if (B->SsidLen == 0 || !NT_SUCCESS(RtlUTF8ToUnicodeN(Name, sizeof(Name) - sizeof(WCHAR), &Got, (PCCH)B->Ssid, B->SsidLen))) {
+            (VOID)RtlStringCbCopyW(Name, sizeof(Name), L"(hidden)");
+        } else {
+            Name[Got / sizeof(WCHAR)] = L'\0';
+        }
+        (VOID)RtlStringCbPrintfExW(Out, Left, &Out, &Left, 0, L"%d dBm  ch %u  %s\n",
+                                   (LONG)B->Rssi, (ULONG)(B->Chanspec & 0xFFu), Name);
+    }
+    SwWifiTraceText(L"ScanList", List);
+    SwWifiFlush();
 }
 
 /* 0.3.1: memory controller (MC) error log and SMMU state, AFI error code,
@@ -1014,6 +1196,10 @@ static VOID SwWifiMsgbuf(PSWWIFI_DEVICE Dev, ULONG Shared)
     SwWifiTraceText(L"MsgResult", (N >= 6) ? L"ok: ioctls answered over DMA" :
                     (N == -1) ? L"ioctl timed out (no completion seen)" :
                     (N == -2) ? L"control ring full (the firmware did not take the items)" : L"ioctl answered but short");
+    SwWifiFlush();
+    if (N >= 6) {
+        SwWifiScan(Dev);
+    }
 }
 
 static VOID SwWifiFirmware(PSWWIFI_DEVICE Dev)
