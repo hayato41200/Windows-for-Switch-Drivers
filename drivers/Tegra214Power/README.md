@@ -26,6 +26,8 @@ overlays reproduced the failure; changing only this service's `Start` from 0
 to 4 allowed the loader to reach kernel startup. This isolates the boot-start
 PEP as a blocker, not the exact loader/dependency failure or physical wake
 behavior. S4 does not require this backend.
+The owner subsequently confirmed normal desktop boot after offline removal
+of this package and installation of the paired firmware without the PEP device.
 
 Exclude this package from S4 installations. The shared build script skips it
 unless `BUILD_T214_PEP=1` is explicitly set, and the firmware requires a
