@@ -140,6 +140,20 @@ static NTSTATUS T214Power(PSDHC_EXTENSION s, BOOLEAN On)
     SdhcWriteRegisterUshort(s, SDHC_CLOCK_CONTROL, clock);
     return STATUS_SUCCESS;
 }
+/* A reset-all clears SDHCI POWER_CONTROL without switching GPIO E4/LDO2.
+ * Physical card power and the host's output-power bit are different states.
+ */
+static NTSTATUS T214SetBusVoltage(PSDHC_EXTENSION s, SDPORT_BUS_VOLTAGE Voltage)
+{
+    if (Voltage == SdBusVoltage33 && s->T214CardOn && !s->T214Voltage18) {
+        SdhcWriteRegisterUchar(s, SDHC_POWER_CONTROL, SDHC_PC_3_3V | SDHC_PC_BUS_POWER);
+        SdPortWait(1000);
+        return (SdhcReadRegisterUchar(s, SDHC_POWER_CONTROL) &
+                (SDHC_PC_VOLTAGE_MASK | SDHC_PC_BUS_POWER)) ==
+                (SDHC_PC_3_3V | SDHC_PC_BUS_POWER) ? STATUS_SUCCESS : STATUS_DEVICE_POWER_FAILURE;
+    }
+    return T214Power(s, Voltage == SdBusVoltage33);
+}
 static NTSTATUS T214Signaling(PSDHC_EXTENSION s, BOOLEAN Enable)
 {
     if (Enable == s->T214Voltage18) return STATUS_SUCCESS;

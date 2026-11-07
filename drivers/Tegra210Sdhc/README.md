@@ -79,3 +79,10 @@ file-integrity check or a measured throughput result.
 Hardware references: [Hekate SDMMC](https://github.com/CTCaer/hekate/blob/v6.5.3/bdk/storage/sdmmc_driver.c),
 [Hekate clock setup](https://github.com/CTCaer/hekate/blob/v6.5.3/bdk/soc/clock.c),
 and [Switchroot Linux](https://github.com/CTCaer/switch-l4t-kernel-4.9/blob/linux-dev/drivers/mmc/host/sdhci-tegra.c).
+
+Version 0.4.0.1 repairs a reset-all power-state mismatch: the card's external
+rail may remain on while SDHCI `POWER_CONTROL` has reset to zero. A subsequent
+3.3 V request now restores and checks the controller power bits instead of
+returning early. The regression reproduces that cleared-register state and
+also checks a real power cycle when leaving 1.8 V. This fix passes the host
+regression and ARM64 build; repeat hardware boot is pending.

@@ -41,6 +41,15 @@ typedef uint16_t USHORT; typedef uint8_t UCHAR, BOOLEAN, *PUCHAR;
 #define SDHC_MAX_CLOCK_DIVISOR_SPEC_3 2046
 #define SDHC_VERSION 0xfe
 #define SDHC_HOST_CONTROL 0x28
+#define SDHC_POWER_CONTROL 0x29
+#define SDHC_PC_3_3V 14
+#define SDHC_PC_BUS_POWER 1
+#define SDHC_PC_VOLTAGE_MASK 14
+#define STATUS_SUCCESS 0
+#define STATUS_DEVICE_POWER_FAILURE -1
+#define SdPortWait(us) ((void)(us))
+typedef int NTSTATUS, SDPORT_BUS_VOLTAGE;
+enum { SdBusVoltage33=1, SdBusVoltage30=2, SdBusVoltage18=3, SdBusVoltageOff=4 };
 #define SDHC_HC_DMA_SELECT_MASK 0x18
 #define SDHC_HC_DMA_SELECT_ADMA32 0x10
 #define SDHC_ADMA_SYSADDR_LOW 0x58
@@ -64,7 +73,7 @@ typedef struct { ULONG Index,Class,ResponseType,TransferDirection,TransferMethod
 typedef struct { ULONG Type; SDPORT_COMMAND Command; } SDPORT_REQUEST,*PSDPORT_REQUEST;
 typedef struct { LONG TargetFacts; ULONG NextReadLba,IssuedWriteLba; USHORT IssuedWriteCount;
  UCHAR IssuedWriteIndex; BOOLEAN AppPrefixAccepted,CrashdumpMode;
- BOOLEAN T214DmaActive,T214DmaComplete,T214DmaFault;
+ BOOLEAN T214CardOn,T214Voltage18,T214DmaActive,T214DmaComplete,T214DmaFault;
  PUCHAR T214Bounce,T214DmaBuffer; struct { ULONG LowPart; } T214BouncePa;
  ULONG T214DmaLength,T214DmaBlocks; struct { ULONG BaseClockFrequencyKhz; } Capabilities;
  UCHAR regs[512]; } SDHC_EXTENSION,*PSDHC_EXTENSION;
@@ -78,7 +87,11 @@ static void SdhcWriteRegisterUchar(PSDHC_EXTENSION s,ULONG off,UCHAR v){s->regs[
 static void SdhcWriteRegisterUshort(PSDHC_EXTENSION s,ULONG off,USHORT v){memcpy(s->regs+off,&v,2);}
 static void SdhcWriteRegisterUlong(PSDHC_EXTENSION s,ULONG off,ULONG v){memcpy(s->regs+off,&v,4);}
 '''
-code = prefix + target
+code = prefix + target + r'''
++static unsigned power_cycles;
++static NTSTATUS T214Power(PSDHC_EXTENSION s,BOOLEAN on){power_cycles++;s->T214CardOn=on;s->T214Voltage18=0;return 0;}
++'''.replace('\n+','\n')
+code += function(board, 'T214SetBusVoltage', 'NTSTATUS')
 for name, result in [('LiteForgetCard','void'),('LiteObserveRead','void'),('LiteBlocksInExtent','BOOLEAN'),('LiteAllowRequest','BOOLEAN')]:
     code += function(source, name, result)
 for name, result in [('T214BuildDma','BOOLEAN'),('T214DmaDone','void')]:
@@ -126,11 +139,17 @@ int main(void){
  r.Command.DataBuffer=NULL;assert(!T214BuildDma(&s,&r));r.Command.DataBuffer=data;
  s.NextReadLba=WINARM_FIRST;memset(bounce,0,512);T214DmaDone(&s,&r);assert(!(s.TargetFacts&LiteNtfs));
  s.Capabilities.BaseClockFrequencyKhz=199680;s.regs[SDHC_VERSION]=SDHC_SPEC_VERSION_3;
+ s.T214CardOn=1;s.T214Voltage18=0;s.regs[SDHC_POWER_CONTROL]=0;
+ assert(T214SetBusVoltage(&s,SdBusVoltage33)==0);
+ assert(s.regs[SDHC_POWER_CONTROL]==15&&power_cycles==0);
+ s.T214Voltage18=1;assert(T214SetBusVoltage(&s,SdBusVoltage33)==0&&power_cycles==1);
+ assert(!s.T214Voltage18&&s.T214CardOn);
+ assert(T214SetBusVoltage(&s,SdBusVoltageOff)==0&&power_cycles==2&&!s.T214CardOn);
  ULONG actual;USHORT reg=SdhcCalcClockFrequency(&s,200000,&actual);
  assert(reg==0&&actual==199680);
  for(ULONG target=400;target<200000;target+=137){SdhcCalcClockFrequency(&s,target,&actual);assert(actual<=target);}
  SdhcCalcClockFrequency(&s,25000,&actual);assert(actual==24960);
- puts("PASS: real DMA/filter/write bounds, descriptor limits, error gate, 199.68 MHz divisor");
+ puts("PASS: real DMA/filter/write bounds, descriptor limits, error gate, 199.68 MHz divisor, reset-all power restoration");
 }
 '''
 with tempfile.TemporaryDirectory(prefix='t214-sd-test-') as d:

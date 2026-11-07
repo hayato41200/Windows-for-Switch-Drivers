@@ -2214,9 +2214,7 @@ Return value:
 
 #if NV_T214_SDR104
     if (Voltage != SdBusVoltage33 && Voltage != SdBusVoltageOff) return STATUS_NOT_SUPPORTED;
-    if (Voltage == SdBusVoltage33 && SdhcExtension->T214CardOn) return STATUS_SUCCESS;
-    LiteForgetCard(SdhcExtension);
-    return T214Power(SdhcExtension, Voltage == SdBusVoltage33);
+    return T214SetBusVoltage(SdhcExtension, Voltage);
 #endif
     //
     // Wait 10ms if the slot is removable; otherwise, only wait 50us.
