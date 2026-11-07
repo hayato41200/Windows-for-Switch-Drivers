@@ -244,6 +244,20 @@ namespace SwitchPatcher
                                 MessageBoxButtons.OKCancel, o.InstallImage ? MessageBoxIcon.Warning : MessageBoxIcon.Question) != DialogResult.OK) return;
             if (newSd ? !ConfirmErase(disk.Size, T("SD 全体", "the whole SD")) : o.InstallImage && !ConfirmErase(part.Size, T("Windows の区画", "the Windows partition"))) return;
 
+            // The release can be read only by invited GitHub accounts: sign in first if needed.
+            try { await SwitchCenter.ReleaseClient.FetchAsync(null); }
+            catch (SwitchCenter.SignInRequiredException)
+            {
+                using var signIn = new SwitchCenter.GitHubSignInForm();
+                if (signIn.ShowDialog(this) != DialogResult.OK)
+                {
+                    MessageBox.Show(this, T("GitHub にサインインしないと、リリースを読めません。", "The release cannot be read without a GitHub sign-in."), Text,
+                                    MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    return;
+                }
+            }
+            catch (Exception) { /* network problems are reported by the run below */ }
+
             running = true;
             UpdateEnabled();
             logBox.Clear();

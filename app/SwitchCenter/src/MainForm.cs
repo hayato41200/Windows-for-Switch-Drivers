@@ -387,6 +387,9 @@ namespace SwitchCenter
         readonly ComboBox channel = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = 330 };
         const string ChannelKey = @"Software\SwitchWOA\SwitchClock";     // DriverChannel: 0 stable, 1 beta
         Release latest;                       // set by "Check for updates"
+        // GitHub sign-in: the releases can be read only by invited accounts (GitHubAuth).
+        readonly Label signStatus = new Label { AutoSize = true, MaximumSize = new Size(330, 0), Margin = new Padding(3, 10, 3, 3) };
+        readonly Button signButton = new Button { Width = 180, Height = 40 };
         List<UpdateRow> updates;
 
         TabPage BuildDrivers()
@@ -415,6 +418,12 @@ namespace SwitchCenter
             channelRow.Controls.Add(new Label { Text = T("更新の種類:", "Channel:"), AutoSize = true, Margin = new Padding(3, 10, 3, 3) });
             channelRow.Controls.Add(channel);
             bottom.Controls.Add(channelRow);
+            var signRow = new FlowLayoutPanel { AutoSize = true };
+            signButton.Click += async (_, _) => await SignInOrOut();
+            signRow.Controls.Add(signButton);
+            signRow.Controls.Add(signStatus);
+            bottom.Controls.Add(signRow);
+            ShowSignIn();
             var buttons = new FlowLayoutPanel { AutoSize = true };
             buttons.Controls.Add(reload);
             buttons.Controls.Add(checkButton);
@@ -428,6 +437,33 @@ namespace SwitchCenter
             page.Controls.Add(driverList);
             page.Controls.Add(bottom);
             return page;
+        }
+
+        void ShowSignIn()
+        {
+            string login = GitHubAuth.SignedIn ? GitHubAuth.Login : null;
+            signButton.Text = login != null ? T("サインアウト", "Sign out") : T("GitHub でサインイン", "Sign in with GitHub");
+            signStatus.Text = login != null ? T($"GitHub: {login} でサインイン中", $"GitHub: signed in as {login}")
+                                            : T("GitHub: サインインしていません", "GitHub: not signed in");
+        }
+
+        async System.Threading.Tasks.Task SignInOrOut()
+        {
+            if (GitHubAuth.SignedIn)
+            {
+                if (MessageBox.Show(this, T("GitHub からサインアウトしますか？ 更新を確認するには、もう一度サインインが必要になります。",
+                                            "Sign out of GitHub? Checking for updates will need a sign-in again."),
+                                    T("サインアウト", "Sign out"), MessageBoxButtons.OKCancel, MessageBoxIcon.Question) != DialogResult.OK) return;
+                GitHubAuth.SignOut();
+                ShowSignIn();
+                return;
+            }
+            using (var form = new GitHubSignInForm())
+            {
+                if (form.ShowDialog(this) != DialogResult.OK) { ShowSignIn(); return; }
+            }
+            ShowSignIn();
+            await CheckUpdates();
         }
 
         /// <summary>Edge if it is installed: the default browser of this Windows is still IE11, which GitHub no longer supports.</summary>
@@ -526,6 +562,14 @@ namespace SwitchCenter
                 appButton.Text = T($"コントロールセンターを {latest.AppVersion} に更新", $"Update the control center to {latest.AppVersion}");
                 releaseLink.Visible = true;
             }
+            catch (SignInRequiredException e)
+            {
+                updateStatus.ForeColor = Color.Firebrick;
+                updateStatus.Text = e.Message + "\n" +
+                    T("「GitHub でサインイン」を押してください。招待されていないアカウントでは読めません。",
+                      "Press \"Sign in with GitHub\". Accounts that were not invited cannot read it.");
+                ShowSignIn();
+            }
             catch (Exception e) when (e is System.Net.Http.HttpRequestException || e is System.Threading.Tasks.TaskCanceledException ||
                                       e is System.Text.Json.JsonException || e is System.IO.InvalidDataException || e is KeyNotFoundException)
             {
@@ -584,7 +628,8 @@ namespace SwitchCenter
                 Application.Exit();
             }
             catch (Exception e) when (e is System.Net.Http.HttpRequestException || e is System.Threading.Tasks.TaskCanceledException ||
-                                      e is System.IO.IOException || e is UnauthorizedAccessException || e is System.ComponentModel.Win32Exception)
+                                      e is System.IO.IOException || e is UnauthorizedAccessException || e is System.ComponentModel.Win32Exception ||
+                                      e is SignInRequiredException)
             {
                 updateStatus.ForeColor = Color.Firebrick;
                 updateStatus.Text = T("コントロールセンターを更新できませんでした: ", "Could not update the control center: ") + e.Message;

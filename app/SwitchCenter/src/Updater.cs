@@ -62,7 +62,6 @@ namespace SwitchCenter
 
         public static Task<Release> FetchAsync(string tag) => ReleaseClient.FetchAsync(tag);
         public static Task<Release> FetchChannelAsync(bool beta) => ReleaseClient.FetchChannelAsync(beta);
-        static HttpClient NewClient() => ReleaseClient.NewClient();
         static string Sha256(string path) => ReleaseClient.Sha256(path);
 
         // ------------------------------------------------------------ compare
@@ -165,10 +164,7 @@ namespace SwitchCenter
             {
                 string zip = Path.Combine(work, "drivers.zip");
                 log(T($"{release.DriversFile} をダウンロードしています…", $"Downloading {release.DriversFile}..."));
-                using (HttpClient http = NewClient())
-                using (Stream src = await http.GetStreamAsync(release.DriversUrl))
-                using (FileStream dst = File.Create(zip))
-                    await src.CopyToAsync(dst);
+                await ReleaseClient.DownloadToFileAsync(release.DriversUrl, zip);
                 string hash = Sha256(zip);
                 if (hash != release.DriversSha256)
                     throw new InvalidDataException(T($"ZIP の SHA-256 が manifest と合いません（{hash}）。", $"The ZIP's SHA-256 does not match the manifest ({hash})."));
@@ -290,10 +286,7 @@ namespace SwitchCenter
             try
             {
                 string zip = Path.Combine(dir, "app.zip");
-                using (HttpClient http = NewClient())
-                using (Stream src = await http.GetStreamAsync(release.AppUrl))
-                using (FileStream dst = File.Create(zip))
-                    await src.CopyToAsync(dst);
+                await ReleaseClient.DownloadToFileAsync(release.AppUrl, zip);
                 string hash = Sha256(zip);
                 if (hash != release.AppSha256)
                     throw new InvalidDataException(T($"ZIP の SHA-256 が manifest と合いません（{hash}）。", $"The ZIP's SHA-256 does not match the manifest ({hash})."));
