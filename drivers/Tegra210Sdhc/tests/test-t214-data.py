@@ -39,6 +39,7 @@ typedef uint16_t USHORT; typedef uint8_t UCHAR, BOOLEAN, *PUCHAR;
 #define _Out_opt_
 #define NT_ASSERT assert
 #define NV_T210_LITE_WINARM_WRITE 1
+#define NV_T214_HIBERNATE 0
 #define SDHC_SPEC_VERSION_3 2
 #define SDHC_MAX_CLOCK_DIVISOR 256
 #define SDHC_MAX_CLOCK_DIVISOR_SPEC_3 2046
@@ -90,7 +91,7 @@ typedef struct { LONG TargetFacts; ULONG NextReadLba,IssuedWriteLba; USHORT Issu
  UCHAR IssuedWriteIndex; BOOLEAN AppPrefixAccepted,CrashdumpMode;
  BOOLEAN T214CardOn,T214Voltage18,T214DmaActive,T214DmaComplete,T214DmaFault;
  PUCHAR T214Bounce,T214DmaBuffer; struct { ULONG LowPart; } T214BouncePa;
- ULONG T214DmaLength,T214DmaBlocks; struct { ULONG BaseClockFrequencyKhz; } Capabilities;
+ ULONG T214DmaLength,T214DmaBlocks,T214DmaCapacity,T214DmaRequests,T214DmaMaxBlocks,T214PioFallbacks; struct { ULONG BaseClockFrequencyKhz; } Capabilities;
  ULONG T214SavedVendor[5],T214SavedEnables,T214SavedSignals;
  USHORT T214SavedClock,T214SavedControl2;
  UCHAR T214SavedHost,T214SavedPower,T214SavedTimeout;
@@ -133,7 +134,7 @@ int main(void){
  SDHC_EXTENSION s={0};SDPORT_REQUEST r={0};
  _Alignas(16) UCHAR bounce[69632],data[65536];
  memset(bounce,0xcc,sizeof(bounce)); memset(data,0xa5,sizeof(data));
- s.T214Bounce=bounce;s.T214BouncePa.LowPart=0x8a000000;
+ s.T214Bounce=bounce;s.T214BouncePa.LowPart=0x8a000000;s.T214DmaCapacity=65536;
  r.Type=SdRequestTypeCommandWithTransfer;r.Command.Index=17;r.Command.BlockSize=512;
  r.Command.BlockCount=1;r.Command.Length=512;r.Command.DataBuffer=data;
  r.Command.TransferMethod=SdTransferMethodPio;r.Command.TransferDirection=SdTransferDirectionRead;
@@ -205,6 +206,19 @@ int main(void){
   one.DataBuffer=b;LiteObserveReadRange(&bulk,&one,count);
   assert(old.TargetFacts==bulk.TargetFacts&&old.NextReadLba==bulk.NextReadLba&&!memcmp(a,b,count*512));
  }
+ /* Normal I/O can span sixteen ADMA descriptors; dump uses 16 KiB separately. */
+ static _Alignas(16) UCHAR large_bounce[528384],large_data[524288];
+ memset(&s,0,sizeof(s));memset(&r,0,sizeof(r));
+ s.T214Bounce=large_bounce;s.T214BouncePa.LowPart=0x8a000000;s.T214DmaCapacity=524288;
+ r.Command.DataBuffer=large_data;r.Command.Length=524288;r.Command.BlockCount=1024;
+ r.Command.BlockSize=512;r.Command.Index=18;r.Command.TransferMethod=SdTransferMethodPio;
+ r.Command.TransferDirection=SdTransferDirectionRead;s.NextReadLba=1000;
+ memset(large_bounce,0xa5,524288);assert(T214BuildDma(&s,&r));
+ PULONG table=(PULONG)(large_bounce+524288);
+ for(unsigned i=0;i<16;i++){assert(table[i*2]==(0x80000021u|(i==15?2:0)));assert(table[i*2+1]==0x8a000000+i*32768);}
+ T214DmaDone(&s,&r);assert(!memcmp(large_bounce,large_data,524288));
+ assert(s.NextReadLba==2024&&s.T214DmaMaxBlocks==1024&&s.T214DmaRequests==1);
+ r.Command.BlockCount=1025;assert(!T214BuildDma(&s,&r)&&s.T214PioFallbacks==1);
  /* Controller retention loss restores only configuration, never old I/O. */
  memset(&s,0,sizeof(s));s.BaseAddress=s.regs;
  s.regs[0x28]=0x12;s.regs[0x29]=0xb;s.regs[0x2e]=0xe;

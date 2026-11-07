@@ -1392,6 +1392,7 @@ typedef struct _SDHC_EXTENSION {
     PUCHAR T214Bounce, T214DmaBuffer;
     PHYSICAL_ADDRESS T214BouncePa;
     ULONG T214DmaLength, T214DmaBlocks, T214DmaErrors, T214Smmu;
+    ULONG T214DmaCapacity, T214DmaRequests, T214DmaMaxBlocks, T214PioFallbacks;
     ULONG T214VoltageStatus, T214VoltageFailures, T214TuneStatus;
     ULONG T214TuningRuns, T214TuningIterations, T214Tap, T214CalFallbacks;
     ULONG T214SavedVendor[5], T214SavedEnables, T214SavedSignals;

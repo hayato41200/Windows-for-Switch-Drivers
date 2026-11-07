@@ -4,7 +4,7 @@
  * This file is included only by the HDH-001 SDR104 build of nvtsdhc.c.
  */
 #include "../../common/tegra_i2c5_gate.h"
-#define T214_DMA_BYTES (128u * 512u)
+#define T214_DMA_BYTES (1024u * 512u)
 #define T214_DMA_ALLOC (T214_DMA_BYTES + PAGE_SIZE)
 #define T214_IO_BIT (1u << 12)
 
@@ -48,7 +48,9 @@ static NTSTATUS T214PmicMessage(PSDHC_EXTENSION s, BOOLEAN Read, ULONG *Word, UL
 }
 static NTSTATUS T214Ldo2(PSDHC_EXTENSION s, ULONG Millivolts, BOOLEAN On)
 {
-    NTSTATUS st = TegraI2c5Acquire(s->T214Gate);
+    /* Dump entry runs after the normal stack has quiesced. Its I2C gate
+     * can be owned by a stopped thread: use bounded register polling only. */
+    NTSTATUS st = s->CrashdumpMode ? STATUS_SUCCESS : TegraI2c5Acquire(s->T214Gate);
     ULONG cfg, mask, value = 0x27, check = 0x27;
     if (!NT_SUCCESS(st)) return st;
     cfg = T214Read(s->T214I2c, 0); mask = T214Read(s->T214I2c, 0x64);
@@ -69,7 +71,7 @@ done:
     T214Write(s->T214I2c, 0x8c, 0x25);
     if (!T214WaitClear(s->T214I2c, 0x8c, 1, 10000)) st = STATUS_IO_TIMEOUT;
     T214Write(s->T214I2c, 0x64, mask);
-    TegraI2c5Release(s->T214Gate);
+    if (!s->CrashdumpMode) TegraI2c5Release(s->T214Gate);
     return st;
 }
 
@@ -145,7 +147,7 @@ static NTSTATUS T214Power(PSDHC_EXTENSION s, BOOLEAN On)
  */
 static NTSTATUS T214SetBusVoltage(PSDHC_EXTENSION s, SDPORT_BUS_VOLTAGE Voltage)
 {
-    if (Voltage == SdBusVoltage33 && s->T214CardOn && !s->T214Voltage18) {
+    if (!s->CrashdumpMode && Voltage == SdBusVoltage33 && s->T214CardOn && !s->T214Voltage18) {
         SdhcWriteRegisterUchar(s, SDHC_POWER_CONTROL, SDHC_PC_3_3V | SDHC_PC_BUS_POWER);
         SdPortWait(1000);
         return (SdhcReadRegisterUchar(s, SDHC_POWER_CONTROL) &
@@ -286,14 +288,17 @@ static BOOLEAN T214BuildDma(PSDHC_EXTENSION s, PSDPORT_REQUEST r)
 {
     PSDPORT_COMMAND c = &r->Command;
     s->T214DmaActive = FALSE; s->T214DmaComplete = FALSE;
+    if (c->Index != 17 && c->Index != 18 && c->Index != 24 && c->Index != 25) return FALSE;
+    ULONG size = c->BlockCount * 512u;
     if (s->T214DmaFault || s->T214Bounce == NULL || c->DataBuffer == NULL ||
         c->TransferMethod != SdTransferMethodPio || c->BlockSize != 512 ||
-        !c->BlockCount || c->BlockCount > 128 ||
-        (c->Index != 17 && c->Index != 18 && c->Index != 24 && c->Index != 25)) return FALSE;
-    ULONG size = c->BlockCount * 512u;
-    if (c->Length < size) return FALSE;
+        !c->BlockCount || c->BlockCount > s->T214DmaCapacity / 512 || c->Length < size) {
+        s->T214PioFallbacks++; return FALSE;
+    }
+    s->T214DmaRequests++;
+    s->T214DmaMaxBlocks = MAX(s->T214DmaMaxBlocks, c->BlockCount);
     if (c->TransferDirection == SdTransferDirectionWrite) RtlCopyMemory(s->T214Bounce, c->DataBuffer, size);
-    PULONG table = (PULONG)(s->T214Bounce + T214_DMA_BYTES);
+    PULONG table = (PULONG)(s->T214Bounce + s->T214DmaCapacity);
     ULONG done = 0, i = 0;
     while (done < size) {
         ULONG n = min(size - done, 32768u);
@@ -304,7 +309,7 @@ static BOOLEAN T214BuildDma(PSDHC_EXTENSION s, PSDPORT_REQUEST r)
     KeMemoryBarrier();
     UCHAR hc = SdhcReadRegisterUchar(s, SDHC_HOST_CONTROL);
     SdhcWriteRegisterUchar(s, SDHC_HOST_CONTROL, (hc & ~SDHC_HC_DMA_SELECT_MASK) | SDHC_HC_DMA_SELECT_ADMA32);
-    SdhcWriteRegisterUlong(s, SDHC_ADMA_SYSADDR_LOW, s->T214BouncePa.LowPart + T214_DMA_BYTES);
+    SdhcWriteRegisterUlong(s, SDHC_ADMA_SYSADDR_LOW, s->T214BouncePa.LowPart + s->T214DmaCapacity);
     SdhcWriteRegisterUshort(s, SDHC_TRANSFER_MODE, SdhcReadRegisterUshort(s, SDHC_TRANSFER_MODE) | SDHC_TM_DMA_ENABLE);
     s->T214DmaBuffer = c->DataBuffer; s->T214DmaLength = size;
     s->T214DmaActive = TRUE;
@@ -415,15 +420,134 @@ static NTSTATUS T214Initialize(PSDHC_EXTENSION s)
         if (!(s->T214Smmu & (1u << 31))) {
             PHYSICAL_ADDRESS low, high, boundary;
             low.QuadPart = 0x80000000; high.QuadPart = 0xffffffffu; boundary.QuadPart = 0;
+            /* Switchroot batches multi-MiB requests. Start with 512 KiB on
+             * Windows, retaining the proven 64 KiB allocation fallback. */
+            s->T214DmaCapacity = T214_DMA_BYTES;
             s->T214Bounce = MmAllocateContiguousMemorySpecifyCache(T214_DMA_ALLOC, low, high, boundary, MmNonCached);
+            if (!s->T214Bounce) {
+                s->T214DmaCapacity = 65536;
+                s->T214Bounce = MmAllocateContiguousMemorySpecifyCache(
+                    s->T214DmaCapacity + PAGE_SIZE, low, high, boundary, MmNonCached);
+            }
             if (s->T214Bounce) s->T214BouncePa = MmGetPhysicalAddress(s->T214Bounce);
+            else s->T214DmaCapacity = 0;
         }
     }
-    s->Capabilities.MaximumBlockCount = 128;
+    s->Capabilities.MaximumBlockCount = (USHORT)(s->T214Bounce ? s->T214DmaCapacity / 512 : 128);
     s->Capabilities.MaximumBlockSize = 512;
     s->T214CardOn = !!(SdhcReadRegisterUchar(s, SDHC_POWER_CONTROL) & SDHC_PC_BUS_POWER);
     s->T214Voltage18 = !!(SdhcReadRegisterUshort(s, SDHC_HOST_CONTROL2) & SDHC_HC2_1_8V_SIGNALING);
     return STATUS_SUCCESS;
 fail:
     T214Release(s); return st;
+}
+
+/* Dumpsdport calls Initialize while loading its miniport, before the final
+ * polled write. Map/allocate here, never from the dump bus/request callbacks.
+ * Do not reset, power-cycle or retune the live SD controller at this point. */
+static NTSTATUS T214InitializeDump(PSDHC_EXTENSION s)
+{
+    if (!NV_T214_HIBERNATE || KeGetCurrentIrql() != PASSIVE_LEVEL)
+        return STATUS_NOT_SUPPORTED;
+    s->T214Car = T214Map(0x60006000, 0x1000);
+    s->T214Misc = T214Map(0x70000000, 0x4000);
+    s->T214Pmc = T214Map(0x7000e000, 0x1000);
+    s->T214I2c = T214Map(0x7000d000, 0x1000);
+    s->T214Gpio = T214Map(0x6000d000, 0x1000);
+    if (!s->T214Car || !s->T214Misc || !s->T214Pmc || !s->T214I2c || !s->T214Gpio) {
+        T214Release(s); return STATUS_INSUFFICIENT_RESOURCES;
+    }
+    if ((T214Read(s->T214Misc, 0x804) & 0xfff0u) != 0x2120u) {
+        T214Release(s); return STATUS_NOT_SUPPORTED;
+    }
+    /* Keep dump data memory below 32 KiB including the slot extension. */
+    s->T214DmaCapacity = 16384;
+    s->Capabilities.MaximumBlockCount = 32;
+    s->Capabilities.MaximumBlockSize = 512;
+    PUCHAR mc = T214Map(0x70019000, 0x1000);
+    if (mc) {
+        s->T214Smmu = T214Read(mc, 0xa94);
+        MmUnmapIoSpace(mc, 0x1000);
+        if (!(s->T214Smmu & (1u << 31))) {
+            PHYSICAL_ADDRESS low, high, boundary;
+            low.QuadPart = 0x80000000; high.QuadPart = 0xffffffffu; boundary.QuadPart = 0;
+            s->T214Bounce = MmAllocateContiguousMemorySpecifyCache(
+                s->T214DmaCapacity + PAGE_SIZE, low, high, boundary, MmNonCached);
+            if (s->T214Bounce) {
+                s->T214BouncePa = MmGetPhysicalAddress(s->T214Bounce);
+                PoSetHiberRange(NULL, PO_MEM_BOOT_PHASE, s->T214Bounce,
+                               s->T214DmaCapacity + PAGE_SIZE, 'HdtS');
+            }
+        }
+    }
+    PoSetHiberRange(NULL, PO_MEM_BOOT_PHASE, s, sizeof(*s), 'HdtS');
+    s->T214CardOn = !!(SdhcReadRegisterUchar(s, SDHC_POWER_CONTROL) & SDHC_PC_BUS_POWER);
+    s->T214Voltage18 = !!(SdhcReadRegisterUshort(s, SDHC_HOST_CONTROL2) & SDHC_HC2_1_8V_SIGNALING);
+    return STATUS_SUCCESS;
+}
+
+/* A bounded, single-sector read outside SDPORT's request queue. Interrupt
+ * signaling is masked and restored by the caller; no allocation, wait object,
+ * worker, registry access or call into another driver is permitted here. */
+static NTSTATUS T214ReadIdentitySector(PSDHC_EXTENSION s, ULONG Lba, PUCHAR Buffer)
+{
+    if (!T214WaitClear(s->BaseAddress, SDHC_PRESENT_STATE, 3, 100000))
+        return STATUS_DEVICE_BUSY;
+    T214Write(s->BaseAddress, 0x30, 0xffffffff);
+    T214Write(s->BaseAddress, 0x34, 0x037f8023);
+    SdhcWriteRegisterUchar(s, SDHC_TIMEOUT_CONTROL, SDHC_TC_MAX_DATA_TIMEOUT);
+    SdhcWriteRegisterUshort(s, SDHC_BLOCK_SIZE, 512);
+    SdhcWriteRegisterUshort(s, SDHC_BLOCK_COUNT, 1);
+    SdhcWriteRegisterUshort(s, SDHC_TRANSFER_MODE, SDHC_TM_TRANSFER_READ | SDHC_TM_BLKCNT_ENABLE);
+    SdhcWriteRegisterUlong(s, SDHC_ARGUMENT, Lba);
+    SdhcWriteRegisterUshort(s, SDHC_COMMAND, (17u << 8) | 0x3a);
+    BOOLEAN received = FALSE, commandDone = FALSE;
+    for (ULONG elapsed = 0; elapsed < 1000000; elapsed += 5) {
+        ULONG events = T214Read(s->BaseAddress, 0x30);
+        if (events & 0xffff8000u) return STATUS_IO_DEVICE_ERROR;
+        if (events & SDHC_IS_CMD_COMPLETE) commandDone = TRUE;
+        if ((events & SDHC_IS_BUFFER_READ_READY) && !received) {
+            for (ULONG i = 0; i < 512; i += 4) {
+                ULONG word = SdhcReadRegisterUlong(s, SDHC_DATA_PORT);
+                RtlCopyMemory(Buffer + i, &word, sizeof(word));
+            }
+            received = TRUE;
+        }
+        SdhcWriteRegisterUshort(s, SDHC_INTERRUPT_STATUS, (USHORT)events);
+        if (received && commandDone && (events & SDHC_IS_TRANSFER_COMPLETE)) return STATUS_SUCCESS;
+        KeStallExecutionProcessor(5);
+    }
+    return STATUS_IO_TIMEOUT;
+}
+static NTSTATUS T214ValidateHibernateTarget(PSDHC_EXTENSION s)
+{
+    if (!(s->TargetFacts & LiteSdxc) || s->T214DmaActive || s->AppPrefixAccepted)
+        return STATUS_MEDIA_WRITE_PROTECTED;
+    ULONG signal = T214Read(s->BaseAddress, 0x38), enable = T214Read(s->BaseAddress, 0x34);
+    ULONG next = s->NextReadLba;
+    UCHAR block[512]; SDPORT_COMMAND command = {0};
+    command.BlockSize = 512; command.DataBuffer = block;
+    T214Write(s->BaseAddress, 0x38, 0);
+    NTSTATUS status = T214ReadIdentitySector(s, 0, block);
+    if (NT_SUCCESS(status)) {
+        s->NextReadLba = 0; LiteObserveRead(s, &command);
+        status = (s->TargetFacts & LiteMbr) ? STATUS_SUCCESS : STATUS_MEDIA_WRITE_PROTECTED;
+    }
+    if (NT_SUCCESS(status)) {
+        status = T214ReadIdentitySector(s, WINARM_FIRST, block);
+        if (NT_SUCCESS(status)) {
+            s->NextReadLba = WINARM_FIRST; LiteObserveRead(s, &command);
+            if ((s->TargetFacts & LiteWriteFacts) != LiteWriteFacts) status = STATUS_MEDIA_WRITE_PROTECTED;
+        }
+    }
+    if (!NT_SUCCESS(status)) {
+        InterlockedAnd(&s->TargetFacts, ~LiteWriteFacts);
+        SdhcWriteRegisterUchar(s, SDHC_RESET, SDHC_RESET_CMD | SDHC_RESET_DAT);
+        for (ULONG n=0; n<1000 && (SdhcReadRegisterUchar(s, SDHC_RESET) & 6); n+=5)
+            KeStallExecutionProcessor(5);
+    }
+    s->NextReadLba = next;
+    T214Write(s->BaseAddress, 0x30, 0xffffffff);
+    T214Write(s->BaseAddress, 0x34, enable); T214Write(s->BaseAddress, 0x38, signal);
+    return status;
 }
