@@ -40,6 +40,9 @@ function Show-Status {
   Log ("link   : RP LNK={0} XP={1} AFI FPCI={2}" -f (Hex $p.RpLink), (Hex $p.RpXp), (Hex $p.AfiFpci))
   Log ("config : ID={0} CMD={1} CLASS={2} BAR0={3} BAR2={4} WIN={5}" -f (Hex $p.EpId), (Hex $p.EpCmd), (Hex $p.EpClass), (Hex $p.EpBar0), (Hex $p.EpBar2), (Hex $p.EpWindow))
   Log ("chip   : ID={0} CAPS={1} EROM={2} words={3} cores={4}" -f (Hex $p.ChipId), (Hex $p.ChipCaps), (Hex $p.EromPtr), $p.EromWords, $p.Cores)
+  if ($null -ne $p.RamBytes) {
+    Log ("arm cr4: base={0} rev={1} cap={2} RAM={3} KB  pcie2 rev={4}" -f (Hex $p.Cr4Base), $p.Cr4Rev, (Hex $p.Cr4Cap), [int]($p.RamBytes / 1024), $p.Pcie2Rev)
+  }
   if ($p.CoreList) {
     Log 'cores (id:rev@base/wrapper):'
     $line = ''

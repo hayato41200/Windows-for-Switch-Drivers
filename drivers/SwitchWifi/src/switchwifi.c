@@ -26,7 +26,7 @@
 #include <ntstrsafe.h>
 #include <wdf.h>
 
-#define SWWIFI_VERSION      0x00010000u     /* 0.1.0 */
+#define SWWIFI_VERSION      0x00010001u     /* 0.1.1 */
 
 #define RP_LINK_STATUS      0x090           /* bit 29: data link up */
 #define RP_XP_VC0           0xF00           /* bit 30: DL up */
@@ -137,6 +137,36 @@ static VOID SwWifiSetWindow(PSWWIFI_DEVICE Dev, ULONG Address)
     (VOID)Rd(Dev->Cfg, BCM_BAR0_WINDOW);
 }
 
+#define CORE_ARM_CR4        0x83E
+#define CORE_PCIE2          0x83C
+#define CR4_CAP             0x04            /* bits 3:0 banks A (ATCM), 7:4 banks B (BTCM) */
+#define CR4_BANKIDX         0x40
+#define CR4_BANKINFO        0x44            /* bits 5:0 size in 8 KB units - 1 */
+
+static ULONG mCr4Base, mCr4Rev, mPcie2Rev;
+
+/* RAM size as brcmfmac brcmf_chip_cr4_set_ram_size: sum of the ATCM and BTCM
+ * banks of the ARM CR4 core. The firmware is later copied into this RAM. */
+static VOID SwWifiCr4Ram(PSWWIFI_DEVICE Dev)
+{
+    ULONG Cap, Banks, Bank, Total = 0;
+
+    SwWifiSetWindow(Dev, mCr4Base);
+    Cap = Rd(Dev->Bar0, CR4_CAP);
+    Banks = (Cap & 0xFu) + ((Cap >> 4) & 0xFu);
+    if (Banks > 16) Banks = 16;
+    for (Bank = 0; Bank < Banks; Bank++) {
+        Wr(Dev->Bar0, CR4_BANKIDX, Bank);
+        Total += ((Rd(Dev->Bar0, CR4_BANKINFO) & 0x3Fu) + 1) * 8192u;
+    }
+    SwWifiSetWindow(Dev, SI_ENUM_BASE);
+    SwWifiTrace(L"Cr4Base", mCr4Base);
+    SwWifiTrace(L"Cr4Rev", mCr4Rev);
+    SwWifiTrace(L"Cr4Cap", Cap);
+    SwWifiTrace(L"RamBytes", Total);
+    SwWifiTrace(L"Pcie2Rev", mPcie2Rev);
+}
+
 /* Walk the EROM (the AXI/DMP descriptor table, as brcmfmac
  * brcmf_chip_dmp_erom_scan) and list "core:rev@base" for each component. */
 static VOID SwWifiScanErom(PSWWIFI_DEVICE Dev, ULONG EromPtr)
@@ -167,6 +197,8 @@ static VOID SwWifiScanErom(PSWWIFI_DEVICE Dev, ULONG EromPtr)
 
 #define FLUSH_CORE() do { if (Have) { \
         (VOID)RtlStringCbPrintfExW(Out, Left, &Out, &Left, 0, L"%03x:%u@%08x/%08x ", CurId, CurRev, CurBase, CurWrap); \
+        if (CurId == CORE_ARM_CR4 && mCr4Base == 0) { mCr4Base = CurBase; mCr4Rev = CurRev; } \
+        if (CurId == CORE_PCIE2 && mPcie2Rev == 0) { mPcie2Rev = CurRev; } \
         Cores++; } } while (0)
 
     while (I < Count) {
@@ -269,11 +301,17 @@ static VOID SwWifiProbe(PSWWIFI_DEVICE Dev)
     SwWifiTrace(L"EromPtr", Erom);
 
     SwWifiStep(4);
-    if (Erom >= SI_ENUM_BASE && Erom < SI_ENUM_BASE + 0x00100000u) {
+    /* 0.1.1: 0.1.0 accepted only 0x180xxxxx; the BCM4356 EROM is at 0x1810D000. */
+    if ((Erom & 0xFF000000u) == SI_ENUM_BASE) {
         SwWifiScanErom(Dev, Erom);
     }
 
-    SwWifiStep(5);
+    SwWifiStep(6);
+    if (mCr4Base != 0) {
+        SwWifiCr4Ram(Dev);
+    }
+
+    SwWifiStep(7);
     SwWifiTrace(L"Busy", 0);
     SwWifiTraceText(L"Result", ((Chip & 0xFFFFu) == 0x4356u) ? L"ok: BCM4356 answers in Windows" : L"chip ID is not 4356");
     SwWifiFlush();
