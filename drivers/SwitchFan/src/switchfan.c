@@ -58,6 +58,8 @@ typedef struct _SWFAN_DEVICE {
     volatile BOOLEAN Stopping;
     ULONG Duty;
     ULONG Failures;
+    ULONG LastTemp;
+    BOOLEAN TempValid;
     LONG Runs;
 } SWFAN_DEVICE, *PSWFAN_DEVICE;
 WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(SWFAN_DEVICE, SwFanGetDevice)
@@ -71,6 +73,8 @@ DRIVER_INITIALIZE DriverEntry;
 EVT_WDF_DRIVER_DEVICE_ADD SwFanEvtDeviceAdd;
 EVT_WDF_DEVICE_PREPARE_HARDWARE SwFanEvtPrepareHardware;
 EVT_WDF_DEVICE_RELEASE_HARDWARE SwFanEvtReleaseHardware;
+EVT_WDF_DEVICE_D0_ENTRY SwFanEvtD0Entry;
+EVT_WDF_DEVICE_D0_EXIT SwFanEvtD0Exit;
 EVT_WDF_DEVICE_SELF_MANAGED_IO_INIT SwFanEvtSelfManagedIoInit;
 EVT_WDF_DEVICE_SELF_MANAGED_IO_CLEANUP SwFanEvtSelfManagedIoCleanup;
 EVT_WDF_TIMER SwFanEvtTimer;
@@ -192,27 +196,45 @@ VOID SwFanEvtTimer(WDFTIMER Timer)
 {
     PSWFAN_DEVICE Dev = SwFanGetDevice(SwFanGetTimer(Timer)->Device);
     UCHAR Local = 0, Remote = 0;
-    NTSTATUS Status;
+    NTSTATUS Status, ClockStatus = STATUS_SUCCESS;
+    BOOLEAN ScreenOff, ClockRestored;
 
     if (Dev->Stopping) return;
+    WdfWaitLockAcquire(Dev->BacklightLock, NULL);
+    ScreenOff = Dev->IsLite && Dev->BacklightReady && Dev->DisplayState == 0;
+    WdfWaitLockRelease(Dev->BacklightLock);
+    /* Screen-off can remain in S0. Keep temperature polling, but release the
+       optional CPU overclock before allowing the fan to stop. */
+    if (ScreenOff) {
+        ClockStatus = SwCpuApply(Dev, FALSE);
+        SwFanTrace(L"CpuLastError", (ULONG)ClockStatus);
+    }
+    ClockRestored = Dev->CpuConfigured && !Dev->CpuApplied &&
+                    NT_SUCCESS(ClockStatus) && SwCpuKhz(Dev) == Dev->BootCpuKhz;
+    SwFanTrace(L"ScreenOffCooling", ScreenOff);
     Status = SwFanReadReg(Dev->Sensor, TMP451_REMOTE, &Remote);
     if (NT_SUCCESS(Status)) {
         Status = SwFanReadReg(Dev->Sensor, TMP451_LOCAL, &Local);
     }
     if (NT_SUCCESS(Status)) {
         ULONG Temp = (Remote > Local) ? Remote : Local;
+        Dev->LastTemp = Temp;
+        Dev->TempValid = TRUE;
         Dev->Failures = 0;
         ULONG Duty = SwFanDutyForTemp(Temp, Dev->Duty);
-        // Keep cooling enabled for a requested Lite overclock even if EMC or
-        // CPU preparation failed; diagnostics must not silently stop the fan.
-        if (Dev->IsLite && Dev->Config.CpuKhz == LITE_CPU_KHZ && Duty < 51) Duty = 51;
+        // Retain the overclock floor until stock CPU clock is confirmed. On
+        // wake, restore cooling before SwCpuTemperature can reapply overclock.
+        if (Dev->IsLite && Dev->Config.CpuKhz == LITE_CPU_KHZ &&
+            (!ScreenOff || !ClockRestored) && Duty < 51) Duty = 51;
         SwFanSetDuty(Dev, Duty);
-        SwCpuTemperature(Dev, Temp, TRUE);
+        if (!ScreenOff) SwCpuTemperature(Dev, Temp, TRUE);
         SwFanTrace(L"TempSoC", Remote);
         SwFanTrace(L"TempBoard", Local);
     } else {
+        Dev->TempValid = FALSE;
         SwFanTrace(L"LastSensorError", (ULONG)Status);
-        if (++Dev->Failures >= 3) {
+        /* A stopped fan needs cooling on the first lost temperature sample. */
+        if (++Dev->Failures >= 3 || Dev->Duty == 0) {
             SwFanSetDuty(Dev, FAILSAFE_DUTY);
             SwCpuTemperature(Dev, 0, FALSE);
         }
@@ -308,6 +330,35 @@ VOID SwFanEvtIoDeviceControl(WDFQUEUE Queue, WDFREQUEST Request, size_t OutLengt
 }
 
 /* ------------------------------------------------------------------- PnP */
+
+NTSTATUS SwFanEvtD0Entry(WDFDEVICE Device, WDF_POWER_DEVICE_STATE PreviousState)
+{
+    PSWFAN_DEVICE Dev = SwFanGetDevice(Device);
+    UNREFERENCED_PARAMETER(PreviousState);
+    Dev->TempValid = FALSE;
+    /* Cooling resumes before the passive timer can restore CPU overclock. */
+    if (Dev->IsLite && Dev->Pwm != NULL) SwFanSetDuty(Dev, 76);
+    SwFanTrace(L"SleepFanOff", 0);
+    return STATUS_SUCCESS;
+}
+
+NTSTATUS SwFanEvtD0Exit(WDFDEVICE Device, WDF_POWER_DEVICE_STATE TargetState)
+{
+    PSWFAN_DEVICE Dev = SwFanGetDevice(Device);
+    POWER_ACTION Action = WdfDeviceGetSystemPowerAction(Device);
+    BOOLEAN Sleeping = Action == PowerActionSleep || Action == PowerActionHibernate;
+    BOOLEAN Stock = Dev->Config.CpuKhz != LITE_CPU_KHZ ||
+                    (Dev->CpuConfigured && !Dev->CpuApplied && SwCpuKhz(Dev) == Dev->BootCpuKhz);
+    /* SelfManagedIoSuspend has drained the timer and released CPU overclock.
+       Device removal, shutdown and S0 device idle keep the existing cooling.
+       Only a cool system sleep transition can stop polling with the fan off. */
+    if (Dev->IsLite && Dev->Pwm != NULL && TargetState != WdfPowerDeviceD3Final && Sleeping && Stock &&
+        Dev->TempValid && Dev->LastTemp <= 39) {
+        SwFanSetDuty(Dev, 0);
+        SwFanTrace(L"SleepFanOff", 1);
+    }
+    return STATUS_SUCCESS;
+}
 
 NTSTATUS SwFanEvtPrepareHardware(WDFDEVICE Device, WDFCMRESLIST Raw, WDFCMRESLIST Translated)
 {
@@ -535,6 +586,8 @@ NTSTATUS SwFanEvtDeviceAdd(WDFDRIVER Driver, PWDFDEVICE_INIT DeviceInit)
     WDF_PNPPOWER_EVENT_CALLBACKS_INIT(&Pnp);
     Pnp.EvtDevicePrepareHardware = SwFanEvtPrepareHardware;
     Pnp.EvtDeviceReleaseHardware = SwFanEvtReleaseHardware;
+    Pnp.EvtDeviceD0Entry = SwFanEvtD0Entry;
+    Pnp.EvtDeviceD0Exit = SwFanEvtD0Exit;
     Pnp.EvtDeviceSelfManagedIoInit = SwFanEvtSelfManagedIoInit;
     Pnp.EvtDeviceSelfManagedIoCleanup = SwFanEvtSelfManagedIoCleanup;
     Pnp.EvtDeviceSelfManagedIoSuspend = SwFanEvtSuspend;
@@ -574,7 +627,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
         RtlCopyMemory(&SwFanParamsPath[RegistryPath->Length / sizeof(WCHAR)], L"\\Parameters", sizeof(L"\\Parameters"));
         (VOID)RtlCreateRegistryKey(RTL_REGISTRY_ABSOLUTE, SwFanParamsPath);
     }
-    SwFanTrace(L"DriverVersion", 5);
+    SwFanTrace(L"DriverVersion", 6);
     WDF_DRIVER_CONFIG_INIT(&Config, SwFanEvtDeviceAdd);
     return WdfDriverCreate(DriverObject, RegistryPath, WDF_NO_OBJECT_ATTRIBUTES, &Config, WDF_NO_HANDLE);
 }
