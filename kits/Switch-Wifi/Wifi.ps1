@@ -68,7 +68,15 @@ function Show-Status {
     Log ("fw     : stage={0} size={1} nvram={2} verifyBad={3} rstvec={4} halted ioctl={5} reset={6}" -f $p.FwStage, $p.FwSize, $p.NvSize, $p.FwVerifyBad, (Hex $p.FwResetVector), (Hex $p.Cr4IoctlHalted), (Hex $p.Cr4ResetHalted))
     Log ("fw     : shared before={0} after={1} in {2} ms flags={3} console={4}" -f (Hex $p.FwSharedBefore), (Hex $p.FwShared), $p.FwUpMs, (Hex $p.FwSharedFlags), (Hex $p.FwConsoleAddr))
   }
-  if ($p.CoreList) {
+  if ($null -ne $p.MsgResult) {
+    Log ("msg    : {0}" -f $p.MsgResult)
+    Log ("msg    : ringinfo={0} ringmem={1} h2dW={2} d2hW={3} subq={4} rxoff={5} dma={6} posted={7} ctlR={8} mbint={9}" -f (Hex $p.MsgRingInfo), (Hex $p.MsgRingMem), (Hex $p.MsgH2dW), (Hex $p.MsgD2hW), $p.MsgMaxSubQueues, $p.MsgRxDataOffset, (Hex $p.MsgDmaPa), $p.MsgPosted, $p.MsgCtlSubmitR, (Hex $p.MsgMailboxInt))
+    Log ("msg    : completions={0} events={1} unknown={2} lasttype={3} scratch={4}" -f $p.MsgCompletions, $p.MsgEvents, $p.MsgUnknown, $p.MsgLastType, (Hex $p.MsgScratch))
+    Log ("ioctl  : GET_VERSION ret={0} st={1} value={2}" -f $p.IoctlVersionRet, $p.IoctlVersionStatus, $p.IoctlVersion)
+    Log ("ioctl  : ver ret={0} st={1} '{2}'" -f $p.IoctlVerRet, $p.IoctlVerStatus, $p.IoctlVer)
+    Log ("ioctl  : cur_etheraddr ret={0} st={1} {2}" -f $p.IoctlMacRet, $p.IoctlMacStatus, $p.IoctlMacOui)
+  }
+  if ($p.CoreList -and $null -eq $p.FwResult) {
     Log 'cores (id:rev@base/wrapper):'
     $line = ''
     foreach ($c in ($p.CoreList -split ' ' | Where-Object { $_ })) {
@@ -80,7 +88,7 @@ function Show-Status {
   if ($p.FwConsole) {
     Log 'firmware console (last lines):'
     $lines = @($p.FwConsole -split "`n" | Where-Object { $_.Trim() })
-    $lines | Select-Object -Last 15 | ForEach-Object { Log "  $_" }
+    $lines | Select-Object -Last 12 | ForEach-Object { Log "  $_" }
   }
 }
 

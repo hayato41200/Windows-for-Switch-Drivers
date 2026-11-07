@@ -26,7 +26,7 @@
 #include <ntstrsafe.h>
 #include <wdf.h>
 
-#define SWWIFI_VERSION      0x00020000u     /* 0.2.0 */
+#define SWWIFI_VERSION      0x00030000u     /* 0.3.0 */
 
 #define RP_LINK_STATUS      0x090           /* bit 29: data link up */
 #define RP_XP_VC0           0xF00           /* bit 30: DL up */
@@ -46,6 +46,9 @@ typedef struct _SWWIFI_DEVICE {
     volatile ULONG *Cfg;   ULONG CfgLen;
     volatile ULONG *Rp;    ULONG RpLen;
     volatile ULONG *Afi;   ULONG AfiLen;
+    PUCHAR Dma;            ULONG DmaLen;     /* 0.3.0: rings and buffers the chip reads/writes */
+    ULONG DmaPa;                             /* its physical (= PCIe) address, below 4 GB */
+    BOOLEAN FwRunning;
 } SWWIFI_DEVICE, *PSWWIFI_DEVICE;
 WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(SWWIFI_DEVICE, SwWifiGetDevice)
 
@@ -526,6 +529,360 @@ static VOID SwWifiConsole(PSWWIFI_DEVICE Dev, ULONG Shared)
     SwWifiTraceText(L"FwConsole", Text);
 }
 
+/* ------------------------------------------------- msgbuf (stage 3)
+ *
+ * As brcmfmac pcie.c brcmf_pcie_init_ringbuffers/_init_scratchbuffers and
+ * msgbuf.c: five common rings in host memory (H2D control submit, H2D rx post,
+ * D2H control complete, D2H tx complete, D2H rx complete), their read/write
+ * indices in device RAM (this firmware has no DMA index support: shared flags
+ * 0x20005), control buffers posted for ioctl responses and events, then a few
+ * ioctls on the control ring. Polled, no interrupt.
+ *
+ * Host memory: one physically contiguous block below 4 GB, mapped
+ * write-combined (Normal non-cacheable: no stale cache lines, no alignment
+ * faults). Its physical address is given to the chip as is (the Tegra AFI
+ * does not translate inbound addresses; the SMMU is off).
+ */
+#define SH_MAX_RXBUFPOST    34
+#define SH_RX_DATAOFFSET    36
+#define SH_RING_INFO        48
+#define SH_SCRATCH_LEN      52
+#define SH_SCRATCH_ADDR     56
+#define SH_RINGUPD_LEN      64
+#define SH_RINGUPD_ADDR     68
+#define RI_MEMLOC           0
+#define RI_H2D_W            4
+#define RI_H2D_R            8
+#define RI_D2H_W            12
+#define RI_D2H_R            16
+#define RI_MAX_SUB_QUEUES   52
+#define RING_MEM_SZ         16
+#define PCIE2_CORE          0x18003000u
+#define PCIE2_H2D_MAILBOX_0 0x140
+#define PCIE2_MAILBOXINT    0x48
+
+#define MSG_GEN_STATUS      0x01
+#define MSG_RING_STATUS     0x02
+#define MSG_IOCTLPTR_REQ    0x09
+#define MSG_IOCTLPTR_ACK    0x0A
+#define MSG_IOCTLRESP_POST  0x0B
+#define MSG_IOCTL_CMPLT     0x0C
+#define MSG_EVENT_POST      0x0D
+#define MSG_WL_EVENT        0x0E
+
+#define DMA_SIZE            0x20000u
+#define CTL_BUF_SIZE        0x2000u         /* BRCMF_MSGBUF_MAX_CTL_PKT_SIZE */
+#define N_RESP_BUFS         4
+#define N_EVENT_BUFS        4
+#define IOCTL_MAX           1518u           /* BRCMF_TX_IOCTL_MAX_MSG_SIZE */
+#define WLC_GET_VERSION     1
+#define WLC_GET_VAR         262
+
+typedef struct _SWWIFI_RING {
+    ULONG Offset;           /* in the DMA block */
+    USHORT Depth, ItemLen;
+    ULONG WIdxAddr, RIdxAddr;   /* device RAM addresses of the indices */
+    USHORT W, R;
+} SWWIFI_RING;
+
+static const USHORT RingDepth[5] = { 64, 512, 64, 1024, 512 };
+static const USHORT RingItem[5]  = { 40, 32, 24, 16, 32 };
+static const ULONG RingOffset[5] = { 0x0000, 0x1000, 0x5000, 0x6000, 0xA000 };
+#define OFF_SCRATCH         0xE000u
+#define OFF_RINGUPD         0xE100u
+#define OFF_IOCTBUF         0xF000u
+#define OFF_CTLBUF          0x10000u        /* N_RESP_BUFS + N_EVENT_BUFS x CTL_BUF_SIZE */
+
+static SWWIFI_RING mRing[5];
+static ULONG mRxDataOffset, mEvents, mCompletions, mUnknown, mLastType;
+static ULONG mIoctlDone, mIoctlStatus, mIoctlLen, mIoctlPktId;
+
+static USHORT Rd16(volatile ULONG *Base, ULONG Offset)
+{
+    return READ_REGISTER_USHORT((PUSHORT)((volatile UCHAR *)Base + Offset));
+}
+
+static VOID Wr16(volatile ULONG *Base, ULONG Offset, USHORT Value)
+{
+    WRITE_REGISTER_USHORT((PUSHORT)((volatile UCHAR *)Base + Offset), Value);
+}
+
+static VOID SwWifiBell(PSWWIFI_DEVICE Dev)
+{
+    KeMemoryBarrier();
+    SwWifiSetWindow(Dev, PCIE2_CORE);
+    Wr(Dev->Bar0, PCIE2_H2D_MAILBOX_0, 1);
+    SwWifiSetWindow(Dev, SI_ENUM_BASE);
+}
+
+/* Reserve the next H2D item, or NULL if the ring is full. */
+static PUCHAR SwWifiRingReserve(PSWWIFI_DEVICE Dev, SWWIFI_RING *Ring)
+{
+    USHORT Avail;
+    PUCHAR Item;
+
+    Ring->R = Rd16(Dev->Bar2, Ring->RIdxAddr);
+    Avail = (Ring->R <= Ring->W) ? (USHORT)(Ring->Depth - Ring->W + Ring->R) : (USHORT)(Ring->R - Ring->W);
+    if (Avail <= 1) return NULL;
+    Item = Dev->Dma + Ring->Offset + (ULONG)Ring->W * Ring->ItemLen;
+    RtlZeroMemory(Item, Ring->ItemLen);
+    if (++Ring->W == Ring->Depth) Ring->W = 0;
+    return Item;
+}
+
+static VOID SwWifiRingCommit(PSWWIFI_DEVICE Dev, SWWIFI_RING *Ring)
+{
+    KeMemoryBarrier();
+    Wr16(Dev->Bar2, Ring->WIdxAddr, Ring->W);
+    SwWifiBell(Dev);
+}
+
+static VOID Put16(PUCHAR P, ULONG Off, USHORT V) { RtlCopyMemory(P + Off, &V, 2); }
+static VOID Put32(PUCHAR P, ULONG Off, ULONG V)  { RtlCopyMemory(P + Off, &V, 4); }
+static USHORT Get16(PUCHAR P, ULONG Off) { USHORT V; RtlCopyMemory(&V, P + Off, 2); return V; }
+static ULONG Get32(PUCHAR P, ULONG Off)  { ULONG V; RtlCopyMemory(&V, P + Off, 4); return V; }
+
+/* brcmf_msgbuf_rxbuf_ctrl_post: request_id = buffer index. */
+static ULONG SwWifiPostCtlBufs(PSWWIFI_DEVICE Dev, BOOLEAN Event, ULONG First, ULONG Count)
+{
+    ULONG I;
+    for (I = 0; I < Count; I++) {
+        PUCHAR Item = SwWifiRingReserve(Dev, &mRing[0]);
+        if (Item == NULL) break;
+        Item[0] = Event ? MSG_EVENT_POST : MSG_IOCTLRESP_POST;
+        Put32(Item, 4, First + I);
+        Put16(Item, 8, (USHORT)CTL_BUF_SIZE);
+        Put32(Item, 16, Dev->DmaPa + OFF_CTLBUF + (First + I) * CTL_BUF_SIZE);
+        Put32(Item, 20, 0);
+    }
+    if (I) SwWifiRingCommit(Dev, &mRing[0]);
+    return I;
+}
+
+/* Drain the D2H control complete ring (brcmf_msgbuf_process_rx). */
+static VOID SwWifiPollCtl(PSWWIFI_DEVICE Dev)
+{
+    SWWIFI_RING *Ring = &mRing[2];
+    BOOLEAN Any = FALSE;
+
+    Ring->W = Rd16(Dev->Bar2, Ring->WIdxAddr);
+    KeMemoryBarrier();
+    while (Ring->R != Ring->W && Ring->W < Ring->Depth) {
+        PUCHAR Item = Dev->Dma + Ring->Offset + (ULONG)Ring->R * Ring->ItemLen + mRxDataOffset;
+        UCHAR Type = Item[0];
+        mCompletions++;
+        mLastType = Type;
+        switch (Type) {
+        case MSG_IOCTLPTR_ACK:
+            break;
+        case MSG_IOCTL_CMPLT:
+            mIoctlStatus = (ULONG)(LONG)(SHORT)Get16(Item, 8);
+            mIoctlLen = Get16(Item, 12);
+            mIoctlPktId = Get32(Item, 4);
+            mIoctlDone = 1;
+            break;
+        case MSG_WL_EVENT:
+            mEvents++;
+            break;
+        default:
+            mUnknown++;
+            break;
+        }
+        if (++Ring->R == Ring->Depth) Ring->R = 0;
+        Any = TRUE;
+    }
+    if (Any) Wr16(Dev->Bar2, Ring->RIdxAddr, Ring->R);
+}
+
+/* brcmf_msgbuf_query_dcmd: one ioctl, polled up to 2 s. Returns the bytes
+ * copied to Out, or -1 (timeout) / -2 (ring full). */
+static LONG SwWifiIoctl(PSWWIFI_DEVICE Dev, ULONG Cmd, const VOID *In, ULONG InLen, PVOID Out, ULONG OutLen, PULONG FwStatus)
+{
+    static USHORT TransId;
+    PUCHAR Item, Buf = Dev->Dma + OFF_IOCTBUF;
+    ULONG Len = (OutLen > InLen) ? OutLen : InLen, Ms, Copy;
+
+    if (Len > IOCTL_MAX) Len = IOCTL_MAX;
+    RtlZeroMemory(Buf, IOCTL_MAX);
+    if (In && InLen) RtlCopyMemory(Buf, In, (InLen < Len) ? InLen : Len);
+    Item = SwWifiRingReserve(Dev, &mRing[0]);
+    if (Item == NULL) return -2;
+    Item[0] = MSG_IOCTLPTR_REQ;
+    Put32(Item, 4, 0xFFFE);                 /* BRCMF_IOCTL_REQ_PKTID */
+    Put32(Item, 8, Cmd);
+    Put16(Item, 12, ++TransId);
+    Put16(Item, 14, (USHORT)Len);           /* input_buf_len */
+    Put16(Item, 16, (USHORT)Len);           /* output_buf_len */
+    Put32(Item, 24, Dev->DmaPa + OFF_IOCTBUF);
+    Put32(Item, 28, 0);
+    mIoctlDone = 0;
+    SwWifiRingCommit(Dev, &mRing[0]);
+
+    for (Ms = 0; Ms < 2000 && !mIoctlDone; Ms += 10) {
+        LARGE_INTEGER Delay;
+        Delay.QuadPart = -10 * 10000LL;
+        KeDelayExecutionThread(KernelMode, FALSE, &Delay);
+        SwWifiPollCtl(Dev);
+    }
+    if (!mIoctlDone) return -1;
+    *FwStatus = mIoctlStatus;
+    Copy = 0;
+    if (mIoctlPktId < N_RESP_BUFS + N_EVENT_BUFS) {
+        Copy = (mIoctlLen < OutLen) ? mIoctlLen : OutLen;
+        if (Copy > CTL_BUF_SIZE) Copy = CTL_BUF_SIZE;
+        KeMemoryBarrier();
+        RtlCopyMemory(Out, Dev->Dma + OFF_CTLBUF + mIoctlPktId * CTL_BUF_SIZE, Copy);
+        /* give the buffer back (brcmf_msgbuf_rxbuf_ioctlresp_post) */
+        (VOID)SwWifiPostCtlBufs(Dev, FALSE, mIoctlPktId, 1);
+    }
+    return (LONG)Copy;
+}
+
+static VOID SwWifiMsgbuf(PSWWIFI_DEVICE Dev, ULONG Shared)
+{
+    PHYSICAL_ADDRESS Low, High, Skip;
+    ULONG Flags, RingInfo, MemLoc, H2dW, H2dR, D2hW, D2hR, I, St = 0, Posted;
+    USHORT MaxSub;
+    LONG N;
+    UCHAR Out[260];
+    WCHAR Text[300];
+
+    SwWifiStep(20);
+    Flags = Rd(Dev->Bar2, Shared);
+    if ((Flags & 0xFFu) != 5 || (Flags & 0x10000u) != 0) {
+        SwWifiTraceText(L"MsgResult", L"not tried: shared version is not 5, or the firmware wants DMA indices (not done yet)");
+        return;
+    }
+    mRxDataOffset = Rd(Dev->Bar2, Shared + SH_RX_DATAOFFSET);
+    RingInfo = Rd(Dev->Bar2, Shared + SH_RING_INFO);
+    SwWifiTrace(L"MsgMaxRxBufPost", Rd16(Dev->Bar2, Shared + SH_MAX_RXBUFPOST));
+    SwWifiTrace(L"MsgRxDataOffset", mRxDataOffset);
+    SwWifiTrace(L"MsgRingInfo", RingInfo);
+    if (RingInfo < TCM_RAMBASE || RingInfo + 64 > TCM_RAMBASE + mRamBytes || mRxDataOffset > 16) {
+        SwWifiTraceText(L"MsgResult", L"not tried: ring info address or rx data offset looks wrong");
+        return;
+    }
+    MemLoc = Rd(Dev->Bar2, RingInfo + RI_MEMLOC);
+    H2dW = Rd(Dev->Bar2, RingInfo + RI_H2D_W);
+    H2dR = Rd(Dev->Bar2, RingInfo + RI_H2D_R);
+    D2hW = Rd(Dev->Bar2, RingInfo + RI_D2H_W);
+    D2hR = Rd(Dev->Bar2, RingInfo + RI_D2H_R);
+    MaxSub = Rd16(Dev->Bar2, RingInfo + RI_MAX_SUB_QUEUES);
+    SwWifiTrace(L"MsgRingMem", MemLoc);
+    SwWifiTrace(L"MsgH2dW", H2dW);
+    SwWifiTrace(L"MsgD2hW", D2hW);
+    SwWifiTrace(L"MsgMaxSubQueues", MaxSub);
+    if (MemLoc < TCM_RAMBASE || MemLoc + 5 * RING_MEM_SZ > TCM_RAMBASE + mRamBytes ||
+        H2dW < TCM_RAMBASE || D2hW < TCM_RAMBASE || H2dR < TCM_RAMBASE || D2hR < TCM_RAMBASE) {
+        SwWifiTraceText(L"MsgResult", L"not tried: ring addresses outside device RAM");
+        return;
+    }
+
+    /* Host memory. */
+    Low.QuadPart = 0;
+    High.QuadPart = 0xFFFFFFFFLL;
+    Skip.QuadPart = 0;
+    Dev->Dma = (PUCHAR)MmAllocateContiguousMemorySpecifyCache(DMA_SIZE, Low, High, Skip, MmWriteCombined);
+    if (Dev->Dma == NULL) {
+        SwWifiTraceText(L"MsgResult", L"no contiguous memory below 4 GB");
+        return;
+    }
+    Dev->DmaLen = DMA_SIZE;
+    Dev->DmaPa = (ULONG)MmGetPhysicalAddress(Dev->Dma).QuadPart;
+    RtlZeroMemory(Dev->Dma, DMA_SIZE);
+    SwWifiTrace(L"MsgDmaPa", Dev->DmaPa);
+
+    /* Ring descriptors in device RAM, indices as brcmf_pcie_init_ringbuffers. */
+    SwWifiStep(21);
+    for (I = 0; I < 5; I++) {
+        ULONG Desc = MemLoc + I * RING_MEM_SZ;
+        mRing[I].Offset = RingOffset[I];
+        mRing[I].Depth = RingDepth[I];
+        mRing[I].ItemLen = RingItem[I];
+        mRing[I].W = mRing[I].R = 0;
+        if (I < 2) {
+            mRing[I].WIdxAddr = H2dW + I * 4;
+            mRing[I].RIdxAddr = H2dR + I * 4;
+        } else {
+            mRing[I].WIdxAddr = D2hW + (I - 2) * 4;
+            mRing[I].RIdxAddr = D2hR + (I - 2) * 4;
+        }
+        Wr(Dev->Bar2, Desc + 8, Dev->DmaPa + RingOffset[I]);
+        Wr(Dev->Bar2, Desc + 12, 0);
+        Wr16(Dev->Bar2, Desc + 4, RingDepth[I]);
+        Wr16(Dev->Bar2, Desc + 6, RingItem[I]);
+    }
+    Wr(Dev->Bar2, Shared + SH_SCRATCH_ADDR, Dev->DmaPa + OFF_SCRATCH);
+    Wr(Dev->Bar2, Shared + SH_SCRATCH_ADDR + 4, 0);
+    Wr(Dev->Bar2, Shared + SH_SCRATCH_LEN, 8);
+    Wr(Dev->Bar2, Shared + SH_RINGUPD_ADDR, Dev->DmaPa + OFF_RINGUPD);
+    Wr(Dev->Bar2, Shared + SH_RINGUPD_ADDR + 4, 0);
+    Wr(Dev->Bar2, Shared + SH_RINGUPD_LEN, 1024);
+    SwWifiSetWindow(Dev, PCIE2_CORE);
+    SwWifiTrace(L"MsgMailboxInt", Rd(Dev->Bar0, PCIE2_MAILBOXINT));
+    SwWifiSetWindow(Dev, SI_ENUM_BASE);
+
+    /* Event and ioctl response buffers (brcmf_proto_msgbuf_attach). */
+    SwWifiStep(22);
+    Posted = SwWifiPostCtlBufs(Dev, TRUE, N_RESP_BUFS, N_EVENT_BUFS);
+    Posted += SwWifiPostCtlBufs(Dev, FALSE, 0, N_RESP_BUFS);
+    SwWifiTrace(L"MsgPosted", Posted);
+    {
+        LARGE_INTEGER Delay;
+        Delay.QuadPart = -100 * 10000LL;
+        KeDelayExecutionThread(KernelMode, FALSE, &Delay);
+    }
+    SwWifiTrace(L"MsgCtlSubmitR", Rd16(Dev->Bar2, mRing[0].RIdxAddr));
+
+    /* ioctls */
+    SwWifiStep(23);
+    RtlZeroMemory(Out, sizeof(Out));
+    N = SwWifiIoctl(Dev, WLC_GET_VERSION, NULL, 0, Out, 4, &St);
+    SwWifiTrace(L"IoctlVersionRet", (ULONG)N);
+    SwWifiTrace(L"IoctlVersionStatus", St);
+    if (N == 4) SwWifiTrace(L"IoctlVersion", Get32(Out, 0));
+
+    if (N >= 0) {
+        SwWifiStep(24);
+        RtlZeroMemory(Out, sizeof(Out));
+        RtlCopyMemory(Out, "ver", 4);
+        N = SwWifiIoctl(Dev, WLC_GET_VAR, Out, 4, Out, 256, &St);
+        SwWifiTrace(L"IoctlVerRet", (ULONG)N);
+        SwWifiTrace(L"IoctlVerStatus", St);
+        if (N > 0) {
+            ULONG T = 0;
+            for (I = 0; I < (ULONG)N && I < 255 && Out[I] != 0; I++) {
+                if (Out[I] >= 0x20 && Out[I] < 0x7F) Text[T++] = (WCHAR)Out[I];
+            }
+            Text[T] = L'\0';
+            SwWifiTraceText(L"IoctlVer", Text);
+        }
+
+        SwWifiStep(25);
+        RtlZeroMemory(Out, sizeof(Out));
+        RtlCopyMemory(Out, "cur_etheraddr", 14);
+        N = SwWifiIoctl(Dev, WLC_GET_VAR, Out, 14, Out, 20, &St);
+        SwWifiTrace(L"IoctlMacRet", (ULONG)N);
+        SwWifiTrace(L"IoctlMacStatus", St);
+        if (N >= 6) {
+            /* Only the vendor half is shown; the whole address stays in the registry. */
+            (VOID)RtlStringCbPrintfW(Text, sizeof(Text), L"%02X:%02X:%02X:xx:xx:xx", Out[0], Out[1], Out[2]);
+            SwWifiTraceText(L"IoctlMacOui", Text);
+            SwWifiTraceBinary(L"IoctlMac", Out, 6);
+        }
+    }
+    SwWifiPollCtl(Dev);
+    SwWifiTrace(L"MsgCompletions", mCompletions);
+    SwWifiTrace(L"MsgEvents", mEvents);
+    SwWifiTrace(L"MsgUnknown", mUnknown);
+    SwWifiTrace(L"MsgLastType", mLastType);
+    SwWifiTrace(L"MsgScratch", Get32(Dev->Dma, OFF_SCRATCH));
+    SwWifiConsole(Dev, Shared);
+    SwWifiTraceText(L"MsgResult", (N >= 6) ? L"ok: ioctls answered over DMA" :
+                    (N == -1) ? L"ioctl timed out (no completion seen)" :
+                    (N == -2) ? L"control ring full (the firmware did not take the items)" : L"ioctl answered but short");
+}
+
 static VOID SwWifiFirmware(PSWWIFI_DEVICE Dev)
 {
     PUCHAR Fw = NULL, NvText = NULL, Nv = NULL;
@@ -627,6 +984,9 @@ static VOID SwWifiFirmware(PSWWIFI_DEVICE Dev)
         SwWifiTrace(L"FwSharedFlags", Rd(Dev->Bar2, Shared));
         SwWifiConsole(Dev, Shared);
         SwWifiTraceText(L"FwResult", L"ok: the firmware is running");
+        Dev->FwRunning = TRUE;
+        SwWifiFlush();
+        SwWifiMsgbuf(Dev, Shared);
     } else {
         SwWifiTraceText(L"FwResult", L"the shared address is outside device RAM");
     }
@@ -674,6 +1034,13 @@ NTSTATUS SwWifiEvtReleaseHardware(WDFDEVICE Device, WDFCMRESLIST Translated)
     PSWWIFI_DEVICE Dev = SwWifiGetDevice(Device);
     UNREFERENCED_PARAMETER(Translated);
 
+    /* 0.3.0: stop the chip's CPU first, so it cannot DMA into freed memory. */
+    if (Dev->FwRunning && Dev->Bar0 != NULL && mCr4Wrap != 0) {
+        SwWifiCoreReset(Dev, mCr4Wrap, CR4_IOCTL_CPUHALT, CR4_IOCTL_CPUHALT, CR4_IOCTL_CPUHALT);
+        SwWifiSetWindow(Dev, SI_ENUM_BASE);
+        Dev->FwRunning = FALSE;
+    }
+    if (Dev->Dma) { MmFreeContiguousMemorySpecifyCache(Dev->Dma, Dev->DmaLen, MmWriteCombined); Dev->Dma = NULL; }
     if (Dev->Bar0) { MmUnmapIoSpace((PVOID)Dev->Bar0, Dev->Bar0Len); Dev->Bar0 = NULL; }
     if (Dev->Bar2) { MmUnmapIoSpace((PVOID)Dev->Bar2, Dev->Bar2Len); Dev->Bar2 = NULL; }
     if (Dev->Cfg)  { MmUnmapIoSpace((PVOID)Dev->Cfg, Dev->CfgLen);   Dev->Cfg = NULL; }
