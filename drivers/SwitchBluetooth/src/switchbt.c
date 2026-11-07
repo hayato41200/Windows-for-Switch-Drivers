@@ -112,6 +112,10 @@
  * 1.0.0.14: poll for Retry and dispatch HCI traffic only while UART-D's
  * interrupt is connected. Drain the timer before D0 exit. Count the boot
  * guard from successful child creation, including a child added on retry.
+ *
+ * 1.0.0.15: allow BthMini to cancel an in-flight write before parent D0
+ * exit. Keep the copied H4 frame until the ISR finishes it, even after
+ * the request is canceled, so the next write cannot overwrite its tail.
  */
 #include <ntddk.h>
 #include <ntstrsafe.h>
@@ -254,6 +258,7 @@ typedef struct _SWBT_DEVICE {
     WDFQUEUE AclQueue;
     WDFREQUEST TxRequest;
     ULONG TxRequestLength;
+    BOOLEAN TxFrameActive;          /* Lock: ISR completion has not been consumed */
     LIST_ENTRY KeptEvents;
     LIST_ENTRY KeptAcl;
     ULONG KeptCount;
@@ -318,6 +323,7 @@ EVT_WDF_INTERRUPT_DISABLE SwBtEvtInterruptDisable;
 EVT_WDF_IO_QUEUE_IO_DEVICE_CONTROL SwBtEvtIoDeviceControl;
 EVT_WDF_IO_QUEUE_IO_DEVICE_CONTROL SwBtEvtChildIoDeviceControl;
 EVT_WDF_TIMER SwBtEvtTimer;
+EVT_WDF_REQUEST_CANCEL SwBtEvtTxCancel;
 EVT_WDF_DEVICE_D0_ENTRY SwBtEvtChildD0Entry;
 static NTSTATUS SwBtCreateChild(WDFDEVICE Device);
 static BOOLEAN SwBtSafeModeCleared(PSWBT_DEVICE Dev);
@@ -978,7 +984,7 @@ static VOID SwBtStartTx(PSWBT_DEVICE Dev, PSWBT_DONE Done)
     size_t Size = 0;
     PBTHX_HCI_READ_WRITE_CONTEXT Ctx = NULL;
 
-    while (Dev->TxRequest == NULL && !SwBtDoneFull(Done) &&
+    while (Dev->D0Active && !Dev->TxFrameActive && !SwBtDoneFull(Done) &&
            NT_SUCCESS(WdfIoQueueRetrieveNextRequest(Dev->TxQueue, &Request))) {
         NTSTATUS Status = WdfRequestRetrieveInputMemory(Request, &Memory);
         if (NT_SUCCESS(Status)) {
@@ -996,6 +1002,13 @@ static VOID SwBtStartTx(PSWBT_DEVICE Dev, PSWBT_DONE Done)
         }
         Dev->TxRequest = Request;
         Dev->TxRequestLength = Ctx->DataLen;
+        Status = WdfRequestMarkCancelableEx(Request, SwBtEvtTxCancel);
+        if (!NT_SUCCESS(Status)) {
+            Dev->TxRequest = NULL;
+            SwBtDoneAdd(Done, Request, Status, 0);
+            continue;
+        }
+        Dev->TxFrameActive = TRUE;
         if (Ctx->Type == HciPacketCommand) {
             Dev->CmdsOut++;
             Dev->CmdLog[Dev->CmdLogNext++ % RTL_NUMBER_OF(Dev->CmdLog)] =
@@ -1021,14 +1034,41 @@ static VOID SwBtStartTx(PSWBT_DEVICE Dev, PSWBT_DONE Done)
     }
 }
 
+/* Detach under Lock. If cancellation won, only its callback can complete. */
+static WDFREQUEST SwBtTakeTx(PSWBT_DEVICE Dev)
+{
+    WDFREQUEST Request = Dev->TxRequest;
+    Dev->TxRequest = NULL;
+    if (Request != NULL && WdfRequestUnmarkCancelable(Request) == STATUS_CANCELLED) {
+        return NULL;
+    }
+    return Request;
+}
+
+VOID SwBtEvtTxCancel(WDFREQUEST Request)
+{
+    PSWBT_DEVICE Dev = SwBtGetDevice(WdfIoQueueGetDevice(WdfRequestGetIoQueue(Request)));
+    WdfSpinLockAcquire(Dev->Lock);
+    if (Dev->TxRequest == Request) {
+        Dev->TxRequest = NULL;
+    }
+    /* TxBuffer is driver-owned. Finish an already-started H4 packet without
+       retaining the canceled IRP or allowing a new packet to replace it. */
+    WdfSpinLockRelease(Dev->Lock);
+    WdfRequestComplete(Request, STATUS_CANCELLED);
+}
+
 /* The ISR sent the whole packet. Lock held. */
 static VOID SwBtCompleteTx(PSWBT_DEVICE Dev, PSWBT_DONE Done)
 {
-    WDFREQUEST Request = Dev->TxRequest;
+    WDFREQUEST Request = SwBtTakeTx(Dev);
     WDFMEMORY Memory;
     size_t Size = 0;
     ULONG_PTR Info = 0;
-    Dev->TxRequest = NULL;
+    Dev->TxFrameActive = FALSE;
+    if (Request == NULL) {
+        return;
+    }
     if (NT_SUCCESS(WdfRequestRetrieveOutputMemory(Request, &Memory))) {
         PULONG Out = (PULONG)WdfMemoryGetBuffer(Memory, &Size);
         if (Size >= sizeof(ULONG)) {
@@ -1066,7 +1106,7 @@ VOID SwBtEvtDpc(WDFINTERRUPT Interrupt, WDFOBJECT AssociatedObject)
         for (Index = 0; Index < Count; ++Index) {
             SwBtParse(Dev, &Done, Chunk[Index]);
         }
-        if (TxDone && Dev->TxRequest != NULL) {
+        if (TxDone) {
             SwBtCompleteTx(Dev, &Done);
             SwBtStartTx(Dev, &Done);
         }
@@ -1480,8 +1520,8 @@ NTSTATUS SwBtEvtD0Stopping(WDFDEVICE Device, WDF_POWER_DEVICE_STATE TargetState)
 
     WdfSpinLockAcquire(Dev->Lock);
     Dev->D0Active = FALSE;
-    Request = Dev->TxRequest;
-    Dev->TxRequest = NULL;
+    Request = SwBtTakeTx(Dev);
+    Dev->TxFrameActive = FALSE;
     WdfSpinLockRelease(Dev->Lock);
     WdfTimerStop(Dev->Timer, TRUE);
 
@@ -1667,7 +1707,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
         RtlCopyMemory(&SwBtParamsPath[RegistryPath->Length / sizeof(WCHAR)], L"\\Parameters", sizeof(L"\\Parameters"));
         (VOID)RtlCreateRegistryKey(RTL_REGISTRY_ABSOLUTE, SwBtParamsPath);
     }
-    SwBtTrace(L"DriverVersion", 14);
+    SwBtTrace(L"DriverVersion", 15);
     WDF_DRIVER_CONFIG_INIT(&Config, SwBtEvtDeviceAdd);
     return WdfDriverCreate(DriverObject, RegistryPath, WDF_NO_OBJECT_ATTRIBUTES, &Config, WDF_NO_HANDLE);
 }
