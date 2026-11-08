@@ -122,3 +122,9 @@
 - 切断してつなぎ直すと、1 秒以内に 1 回目で接続できた（12:24:17 開始 → 12:24:18 security succeeded）。`eapolHeld=2`：AP の M1 が Windows への接続通知より先に 2 回届いていて、それを取っておいて渡せた。
 - 接続中も `netsh wlan show networks` に 11 個のネットワークが出た（0.6.11 までは 1 個だけだった）。
 - 0.6.12：join から CONNECT_COMPLETE までは受信フレームを Windows に渡さずに取っておく。接続中の Windows からのスキャンは、接続が終わってから実行する。
+
+## 0.6.13 の実機結果（2026-11-08、ユーザー報告）
+
+- 本体の Wi-Fi MAC（98:B6:E9:…）で動くようになった（Status `mac … 98:B6:E9:xx:xx:xx nvram=1`、設定画面の物理アドレスも同じ）。接続・鍵（keys set=4）も問題なし。
+- 0.6.13：Install が `wifi-mac.txt` から書いた `Parameters\MacAddress` を、ファームウェアに渡す前の NVRAM の `macaddr=` に書き込む（なければ追加）。0.6.3〜の cur_etheraddr の設定は受け付けられるが読み返すと変わっておらず、Status の `source=0` / `try=2` はそのため（表示だけの問題）。
+- `wifi-mac.txt` は手元専用キットにだけ入れる。リポジトリと配布物には入れない。

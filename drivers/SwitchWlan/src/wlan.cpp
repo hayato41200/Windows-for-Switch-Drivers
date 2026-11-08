@@ -25,7 +25,7 @@
 #include "bcm.h"
 #include <ntstrsafe.h>
 
-#define WLAN_VERSION        0x00060C00u     /* 0.6.12 */
+#define WLAN_VERSION        0x00060D00u     /* 0.6.13 */
 #define WLAN_TAG            'nlWS'
 #define WLAN_FRAME_MAX      2048u
 #define WLAN_FRAME_QUEUE    256u    /* 0.6.9: 32 frames per poll capped Rx at ~12 Mbit/s */

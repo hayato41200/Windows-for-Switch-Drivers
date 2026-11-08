@@ -92,7 +92,7 @@ function Show-Status {
   if ($p.WlanRxDst) { Log ("rx dst : {0}  (unicast to the adapter MAC / multicast / unicast to another MAC)" -f $p.WlanRxDst) }
   @($p.ScanList -split "`n" | Where-Object { $_.Trim() }) | Select-Object -First 6 | ForEach-Object { Log "  $_" }
   # 0.6.x: MAC, connection, keys, data path (the chip layer writes these every few seconds while it runs)
-  Log ("mac    : source={0} (0 firmware default, 1 MacAddress, 2 Windows)  {1}  setSt={2} try={3}" -f $p.MacSource, $p.MacOui, (Hex $p.MacSetSt), $p.MacTry)
+  Log ("mac    : source={0} (0 firmware default, 1 MacAddress, 2 Windows)  {1}  setSt={2} try={3} nvram={4}" -f $p.MacSource, $p.MacOui, (Hex $p.MacSetSt), $p.MacTry, $p.MacNvram)
   Log ("join   : joins={0} st={1} via={2} sec={3}  link state={4} event={5} status={6} reason={7} events={8}" -f $p.ConnJoins, (Hex $p.ConnJoinSt), $p.ConnJoinVia,
     $(if ($p.ConnSecSt) { ($p.ConnSecSt | ForEach-Object { '{0:X2}' -f $_ }) -join '' } else { '-' }), $p.ConnLinkState, $p.ConnLinkEvent, $p.ConnLinkStatus, $p.ConnLinkReason, $p.ConnLinkEvents)
   Log ("assoc  : req ie {0} B, resp ie {1} B   keys set={2} st={3} eapolWait={4} ms" -f $p.ConnAssocReqLen, $p.ConnAssocRespLen, $p.KeysSet, (Hex $p.KeySt), $p.KeyWaitMs)

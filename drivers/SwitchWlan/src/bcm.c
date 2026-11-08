@@ -400,14 +400,27 @@ static BOOLEAN NvKeyChar(UCHAR C)
     return (C >= 'a' && C <= 'z') || (C >= 'A' && C <= 'Z') || (C >= '0' && C <= '9') || C == '_';
 }
 
+static BOOLEAN SwWifiRegMac(UCHAR Mac[6]);
+
 /* Text NVRAM to what the firmware reads (brcmf_fw_nvram_strip): one
  * "key=value\0" per entry, an extra NUL, padded to 4 bytes, then the length
  * token. Comments and blank lines go; "pcie/x/y/" and "N:" prefixes are cut. */
-static ULONG SwWifiNvram(const UCHAR *In, ULONG InLen, UCHAR *Out, ULONG OutMax)
+static ULONG SwWifiNvram(const UCHAR *In, ULONG InLen, UCHAR *Out, ULONG OutMax, const UCHAR *Mac)
 {
     static const char BoardRev[] = "boardrev=0xff";
-    ULONG I = 0, O = 0, Len, Token;
-    BOOLEAN HaveBoardRev = FALSE;
+    static const char Hex[] = "0123456789abcdef";
+    char MacLine[] = "macaddr=00:00:00:00:00:00";
+    ULONG I = 0, O = 0, Len, Token, M;
+    BOOLEAN HaveBoardRev = FALSE, HaveMac = FALSE;
+
+    /* 0.6.13: the console's own address goes into the NVRAM "macaddr" the
+     * firmware boots with (cur_etheraddr set later reads back unchanged). */
+    if (Mac != NULL) {
+        for (M = 0; M < 6; M++) {
+            MacLine[8 + M * 3] = Hex[Mac[M] >> 4];
+            MacLine[9 + M * 3] = Hex[Mac[M] & 15];
+        }
+    }
 
     while (I < InLen) {
         ULONG S = I, E, K;
@@ -427,7 +440,14 @@ static ULONG SwWifiNvram(const UCHAR *In, ULONG InLen, UCHAR *Out, ULONG OutMax)
         if (K == S || K >= E || In[K] != '=') continue;
         if (K - S == 7 && RtlCompareMemory(In + S, "devpath", 7) == 7) continue;
         if (K - S == 8 && RtlCompareMemory(In + S, "boardrev", 8) == 8) HaveBoardRev = TRUE;
-        if (O + (E - S) + 1 + sizeof(BoardRev) + 8 > OutMax) break;
+        if (Mac != NULL && K - S == 7 && RtlCompareMemory(In + S, "macaddr", 7) == 7) {
+            if (O + sizeof(MacLine) + sizeof(BoardRev) + 8 > OutMax) break;
+            RtlCopyMemory(Out + O, MacLine, sizeof(MacLine));       /* includes the NUL */
+            O += sizeof(MacLine);
+            HaveMac = TRUE;
+            continue;
+        }
+        if (O + (E - S) + 1 + sizeof(BoardRev) + sizeof(MacLine) + 8 > OutMax) break;
         RtlCopyMemory(Out + O, In + S, E - S);
         O += E - S;
         Out[O++] = 0;
@@ -435,6 +455,10 @@ static ULONG SwWifiNvram(const UCHAR *In, ULONG InLen, UCHAR *Out, ULONG OutMax)
     if (!HaveBoardRev) {
         RtlCopyMemory(Out + O, BoardRev, sizeof(BoardRev));     /* includes the NUL */
         O += sizeof(BoardRev);
+    }
+    if (Mac != NULL && !HaveMac) {
+        RtlCopyMemory(Out + O, MacLine, sizeof(MacLine));
+        O += sizeof(MacLine);
     }
     Len = (O + 1 + 3) & ~3u;
     while (O < Len) Out[O++] = 0;
@@ -1582,7 +1606,13 @@ static VOID SwWifiFirmware(PSWWIFI_DEVICE Dev)
     SwWifiTrace(L"NvFileStatus", (ULONG)Status);
     if (NT_SUCCESS(Status)) {
         Nv = (PUCHAR)ExAllocatePool2(POOL_FLAG_NON_PAGED, NVRAM_MAX + 64, POOL_TAG);
-        if (Nv != NULL) NvLen = SwWifiNvram(NvText, NvTextLen, Nv, NVRAM_MAX + 64);
+        if (Nv != NULL) {
+            UCHAR Mac[6];
+            BOOLEAN HaveMac = SwWifiRegMac(Mac);
+            SwWifiTrace(L"MacNvram", HaveMac ? 1u : 0u);
+            NvLen = SwWifiNvram(NvText, NvTextLen, Nv, NVRAM_MAX + 64, HaveMac ? Mac : NULL);
+            RtlSecureZeroMemory(Mac, sizeof(Mac));
+        }
     }
     SwWifiTrace(L"NvSize", NvLen);
     if (FwLen + NvLen + 4 > mRamBytes) {
