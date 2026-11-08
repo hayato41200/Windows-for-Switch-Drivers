@@ -820,15 +820,15 @@ static VOID SwWifiEvent(PUCHAR Buf, ULONG Len)
 #define MSG_RXBUF_POST      0x11
 #define MSG_RX_CMPLT        0x12
 
-#define DATA_SIZE           0x90000u
+#define DATA_SIZE           0x108000u       /* 0.6.10: 256 rx + 256 tx buffers */
 #define OFF_FLOWRING        0x00000u        /* FLOW_DEPTH x FLOW_ITEM */
 #define FLOW_DEPTH          512
 #define FLOW_ITEM           48
 #define FLOW_RING_ID        2               /* BRCMF_NROF_H2D_COMMON_MSGRINGS + 0 */
 #define OFF_RXBUF           0x08000u
-#define N_RXBUF             128
-#define OFF_TXBUF           0x48000u
-#define N_TXBUF             128
+#define N_RXBUF             256             /* capped by the firmware's max_rxbufpost */
+#define OFF_TXBUF           0x88000u
+#define N_TXBUF             256
 #define PKT_BUF_SIZE        2048u           /* BRCMF_MSGBUF_MAX_PKT_SIZE */
 #define ETH_HLEN            14
 

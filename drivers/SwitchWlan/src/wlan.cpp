@@ -25,7 +25,7 @@
 #include "bcm.h"
 #include <ntstrsafe.h>
 
-#define WLAN_VERSION        0x00060900u     /* 0.6.9 */
+#define WLAN_VERSION        0x00060A00u     /* 0.6.10 */
 #define WLAN_TAG            'nlWS'
 #define WLAN_FRAME_MAX      2048u
 #define WLAN_FRAME_QUEUE    256u    /* 0.6.9: 32 frames per poll capped Rx at ~12 Mbit/s */
@@ -564,7 +564,10 @@ static VOID WlanReceiveFrame(PVOID Context, const UCHAR *Frame, ULONG Length)
         Ctx->RxQueued++;
         if (Ctx->RxQueue == NULL) Ctx->RxNoQueue++;
         Queue = Ctx->RxNotifyEnabled ? Ctx->RxQueue : NULL;
-        if (Queue != NULL) WdfObjectReference(Queue);
+        if (Queue != NULL) {
+            Ctx->RxNotifyEnabled = FALSE;       /* 0.6.10: one notification per arm */
+            WdfObjectReference(Queue);
+        }
     } else {
         Ctx->RxFull++;
     }
@@ -1128,39 +1131,44 @@ static VOID EvtRxAdvance(NETPACKETQUEUE Queue)
     Ctx->RxAdvance++;
     /* Framework-owned fragments become available to this copy-based receiver. */
     Fragments->NextIndex = Fragments->EndIndex;
-    while (P != Packets->EndIndex && F != Fragments->NextIndex) {
-        WLAN_FRAME Frame;
-        NET_FRAGMENT *Fragment;
-        NET_PACKET *Packet;
-        BOOLEAN HaveFrame;
+    {
+        /* 0.6.10: one lock to see how many frames wait, copy straight from the
+         * slots (single consumer; the producer only writes free slots), one lock
+         * to give them back. 0.6.9 copied each 2 KB slot to the stack first. */
+        ULONG Avail, Head, Done = 0;
         KeAcquireSpinLock(&Ctx->Lock, &Irql);
-        HaveFrame = Ctx->RxCount != 0;
-        if (HaveFrame) Frame = Ctx->RxFrames[Ctx->RxHead];
+        Avail = Ctx->RxCount;
+        Head = Ctx->RxHead;
         KeReleaseSpinLock(&Ctx->Lock, Irql);
-        if (!HaveFrame) break;
-        Fragment = NetRingGetFragmentAtIndex(Fragments, F);
-        if (Frame.Length >= Fragment->Capacity - Fragment->Offset) break;
-        NET_FRAGMENT_VIRTUAL_ADDRESS *Va = NetExtensionGetFragmentVirtualAddress(&Q->VirtualAddress, F);
-        if (Va->VirtualAddress == NULL) break;
-        RtlCopyMemory((UCHAR *)Va->VirtualAddress + Fragment->Offset, Frame.Bytes, Frame.Length);
-        Fragment->ValidLength = Frame.Length;
-        Packet = NetRingGetPacketAtIndex(Packets, P);
-        Packet->FragmentIndex = F;
-        Packet->FragmentCount = 1;
-        RtlZeroMemory(&Packet->Layout, sizeof(Packet->Layout));
-        Packet->Layout.Layer2Type = NetPacketLayer2TypeIeee80211;
-        Packet->Layout.Layer2HeaderLength = WLAN_80211_HDR;
-        Packet->Layout.Layer3Type = NetPacketLayer3TypeUnspecified;
-        Packet->Layout.Layer4Type = NetPacketLayer4TypeUnspecified;
-        Packet->Ignore = 0;
-        Ctx->RxToOs++;
-        if (Frame.Length >= 32 && Frame.Bytes[30] == 0x88 && Frame.Bytes[31] == 0x8E) Ctx->RxEapolToOs++;
-        KeAcquireSpinLock(&Ctx->Lock, &Irql);
-        Ctx->RxHead = (Ctx->RxHead + 1) % WLAN_FRAME_QUEUE;
-        Ctx->RxCount--;
-        KeReleaseSpinLock(&Ctx->Lock, Irql);
-        F = NetRingIncrementIndex(Fragments, F);
-        P = NetRingIncrementIndex(Packets, P);
+        while (Done < Avail && P != Packets->EndIndex && F != Fragments->NextIndex) {
+            const WLAN_FRAME *Frame = &Ctx->RxFrames[(Head + Done) % WLAN_FRAME_QUEUE];
+            NET_FRAGMENT *Fragment = NetRingGetFragmentAtIndex(Fragments, F);
+            NET_PACKET *Packet;
+            NET_FRAGMENT_VIRTUAL_ADDRESS *Va;
+            if (Frame->Length >= Fragment->Capacity - Fragment->Offset) break;
+            Va = NetExtensionGetFragmentVirtualAddress(&Q->VirtualAddress, F);
+            if (Va->VirtualAddress == NULL) break;
+            RtlCopyMemory((UCHAR *)Va->VirtualAddress + Fragment->Offset, Frame->Bytes, Frame->Length);
+            Fragment->ValidLength = Frame->Length;
+            Packet = NetRingGetPacketAtIndex(Packets, P);
+            Packet->FragmentIndex = F;
+            Packet->FragmentCount = 1;
+            RtlZeroMemory(&Packet->Layout, sizeof(Packet->Layout));
+            Packet->Layout.Layer2Type = NetPacketLayer2TypeIeee80211;
+            Packet->Layout.Layer2HeaderLength = WLAN_80211_HDR;
+            Packet->Ignore = 0;
+            Ctx->RxToOs++;
+            if (Frame->Length >= 32 && Frame->Bytes[30] == 0x88 && Frame->Bytes[31] == 0x8E) Ctx->RxEapolToOs++;
+            Done++;
+            F = NetRingIncrementIndex(Fragments, F);
+            P = NetRingIncrementIndex(Packets, P);
+        }
+        if (Done) {
+            KeAcquireSpinLock(&Ctx->Lock, &Irql);
+            Ctx->RxHead = (Ctx->RxHead + Done) % WLAN_FRAME_QUEUE;
+            Ctx->RxCount -= Done;
+            KeReleaseSpinLock(&Ctx->Lock, Irql);
+        }
     }
     Fragments->BeginIndex = F;
     Packets->BeginIndex = P;
