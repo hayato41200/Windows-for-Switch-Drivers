@@ -1,6 +1,6 @@
 ;
 ; switchdisplay.inf - Nintendo Switch built-in panel, WDDM display-only driver
-; (stage 1: the boot framebuffer; DSDT DISP = ACPI\SWOA0E01 from UEFI R408)
+; on the DSDT device DISP (ACPI\SWOA0E01, UEFI R408 or later)
 ;
 
 [Version]
@@ -9,7 +9,7 @@ Class       = Display
 ClassGuid   = {4d36e968-e325-11ce-bfc1-08002be10318}
 Provider    = %Mfg%
 CatalogFile = switchdisplay.cat
-DriverVer   = 11/08/2026,1.0.12.0
+DriverVer   = 11/08/2026,1.1.0.0
 PnpLockdown = 1
 
 [DestinationDirs]
@@ -30,9 +30,6 @@ switchdisplay.sys = 1
 [SwDisp_Inst.NT]
 FeatureScore = F9
 CopyFiles = SwDisp_Copy
-
-; 1.0.0/1.0.1 used a root device; it could not get the framebuffer range
-; (problem 12), so 1.0.2 binds to the DSDT device (UEFI R408).
 
 [SwDisp_Copy]
 switchdisplay.sys

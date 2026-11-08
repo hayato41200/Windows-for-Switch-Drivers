@@ -2,29 +2,32 @@
  * switchdisplay.sys - WDDM display-only (KMDOD) driver for the Nintendo Switch
  * (Tegra210) built-in 720x1280 DSI panel.
  *
- * Stage 1 (this file): replaces the Microsoft Basic Display Driver with the
- * same model (the boot framebuffer that coreboot set up on DC-A window A at
- * 0xdfb80000, A8R8G8B8, pitch 2880), plus:
- *   - the framebuffer is mapped write-combined and only dirty rects are copied
- *   - rotation 0/90/180/270 in the copy (the panel is portrait)
- *   - an EDID with the panel's real timing (78 MHz, 60 Hz) and size (77x137 mm)
- *   - a boot-loop guard: if two starts in a row did not survive 60 s, the next
- *     start fails and Windows keeps the Basic Display Driver
- * No display controller register is written. DC-A is only read once (window A
- * start address, size, stride) for the trace.
+ * Device: the DSDT DISP (ACPI\SWOA0E01, UEFI R408) with DC-A and DSI-A as
+ * memory resources. The framebuffer must not be a resource (UEFI R407 listed it
+ * and Windows did not boot); a root device got an empty POST (1.0.0/1.0.1).
  *
- * The device is the DSDT DISP (ACPI\SWOA0E01, UEFI R408): DC-A and DSI-A as
- * memory resources. Not the framebuffer: R407 listed it and Windows did not
- * boot. 1.0.0/1.0.1 used a root device, which could not get the framebuffer
- * range (problem 12). Stage 3 adds the DC interrupt.
+ * What it does:
+ *   - takes the boot framebuffer that coreboot set up on DC-A window A
+ *     (0xDFB80000, X8R8G8B8, pitch 2880) from the Basic Display Driver (POST)
+ *   - one source mode 720x1280 for every rotation; target and monitor modes with
+ *     frequencies "not specified", as in the KMDOD sample (real frequencies gave
+ *     STATUS_GRAPHICS_INVALID_FREQUENCY, and a 60 Hz monitor mode left GDI with
+ *     no modes, so ChangeDisplaySettingsEx failed with BADMODE)
+ *   - write-combined framebuffer, only dirty rects copied, rotation 0/90/180/270
+ *     in the copy (Flags.Rotate: the DWM surface is 1280x720)
+ *   - screen off (monitor or adapter out of D0): DCS display off + sleep in, then
+ *     the DC stops scanning; screen on: DC restarts, sleep out, display on
+ *     (registry PanelPower=0 / DcStop=0 turn these off)
+ *   - boot-loop guard: two starts in a row that did not survive 60 s make the
+ *     next start fail, so Windows keeps the Basic Display Driver
+ *   - an EDID builder, off unless UseEdid=1 (with it Windows may raise the scale)
  *
  * Trace: HKLM\SYSTEM\CurrentControlSet\Services\switchdisplay\Parameters
- */
-#define DXGKDDI_INTERFACE_VERSION 0x4002 /* DXGKDDI_INTERFACE_VERSION_WDDM1_3 */
+ */#define DXGKDDI_INTERFACE_VERSION 0x4002 /* DXGKDDI_INTERFACE_VERSION_WDDM1_3 */
 #include <ntddk.h>
 #include <dispmprt.h>
 
-#define SWD_VERSION        0x0001000Cu   /* 1.0.12 */
+#define SWD_VERSION        0x00010100u   /* 1.1.0 */
 #define SWD_TAG            'DwsS'
 
 /* Boot framebuffer (coreboot display.c / UEFI MemoryMap.h "Display Reserved") */
@@ -128,12 +131,10 @@ static UNICODE_STRING gParamPath;
 static UCHAR  gEdid[128];
 static BOOLEAN gUseEdid;
 
-/* 1.0.3 diagnostics: per-DDI call count, failure count, last status. */
+/* Per-DDI call count, failure count and last status (Status.cmd shows them). */
 enum { D_QueryChildRelations, D_QueryChildStatus, D_QueryDeviceDescriptor, D_QueryAdapterInfo, D_IsSupportedVidPn, D_RecommendFunctionalVidPn, D_EnumVidPnCofuncModality, D_SetVidPnSourceVisibility, D_CommitVidPn, D_UpdateActiveVidPnPresentPath, D_RecommendMonitorModes, D_QueryVidPnHWCapability, D_SetPowerState, D_SystemDisplayEnable, D_SetPointerPosition, D_Escape, D_COUNT };
 static volatile LONG gCalls[D_COUNT], gFails[D_COUNT], gLastSt[D_COUNT];
-static volatile LONG gTgtSt[10];
-static volatile LONG gSupportSt, gRotatePresents;
-static volatile LONG gTgtVariant, gTgtAddSt, gTgtAssignSt, gMonVariant, gCofuncStep, gQaiTypes, gChildStatusTypes, gNotSupported, gRejCode, gRejA, gRejB, gEdidReads;
+static volatile LONG gNotSupported, gRejCode, gRejA, gRejB, gCofuncStep, gSupportSt;
 static const PCWSTR gNameN[D_COUNT] = { L"N_QueryChildRelations", L"N_QueryChildStatus", L"N_QueryDeviceDescriptor", L"N_QueryAdapterInfo", L"N_IsSupportedVidPn", L"N_RecommendFunctionalVidPn", L"N_EnumVidPnCofuncModality", L"N_SetVidPnSourceVisibility", L"N_CommitVidPn", L"N_UpdateActiveVidPnPresentPath", L"N_RecommendMonitorModes", L"N_QueryVidPnHWCapability", L"N_SetPowerState", L"N_SystemDisplayEnable", L"N_SetPointerPosition", L"N_Escape" };
 static const PCWSTR gNameS[D_COUNT] = { L"S_QueryChildRelations", L"S_QueryChildStatus", L"S_QueryDeviceDescriptor", L"S_QueryAdapterInfo", L"S_IsSupportedVidPn", L"S_RecommendFunctionalVidPn", L"S_EnumVidPnCofuncModality", L"S_SetVidPnSourceVisibility", L"S_CommitVidPn", L"S_UpdateActiveVidPnPresentPath", L"S_RecommendMonitorModes", L"S_QueryVidPnHWCapability", L"S_SetPowerState", L"S_SystemDisplayEnable", L"S_SetPointerPosition", L"S_Escape" };
 static const PCWSTR gNameF[D_COUNT] = { L"F_QueryChildRelations", L"F_QueryChildStatus", L"F_QueryDeviceDescriptor", L"F_QueryAdapterInfo", L"F_IsSupportedVidPn", L"F_RecommendFunctionalVidPn", L"F_EnumVidPnCofuncModality", L"F_SetVidPnSourceVisibility", L"F_CommitVidPn", L"F_UpdateActiveVidPnPresentPath", L"F_RecommendMonitorModes", L"F_QueryVidPnHWCapability", L"F_SetPowerState", L"F_SystemDisplayEnable", L"F_SetPointerPosition", L"F_Escape" };
@@ -196,27 +197,12 @@ static VOID FlushCounters(PSWD_CONTEXT Ctx)
             RegPutDword(gNameF[i], (ULONG)gFails[i]);
             RegPutDword(gNameS[i], (ULONG)gLastSt[i]);
         }
-        RegPutDword(L"QaiTypes", (ULONG)gQaiTypes);
-        RegPutDword(L"ChildStatusTypes", (ULONG)gChildStatusTypes);
         RegPutDword(L"VidPnNotSupported", (ULONG)gNotSupported);
         RegPutDword(L"RejCode", (ULONG)gRejCode);
         RegPutDword(L"RejA", (ULONG)gRejA);
         RegPutDword(L"RejB", (ULONG)gRejB);
-        RegPutDword(L"EdidReads", (ULONG)gEdidReads);
         RegPutDword(L"CofuncStep", (ULONG)gCofuncStep);
-        RegPutDword(L"TgtVariant", (ULONG)gTgtVariant);
-        RegPutDword(L"TgtAddSt", (ULONG)gTgtAddSt);
-        RegPutDword(L"TgtAssignSt", (ULONG)gTgtAssignSt);
-        RegPutDword(L"MonVariant", (ULONG)gMonVariant);
-        RegPutDword(L"SupportSt", (ULONG)gSupportSt);
-        RegPutDword(L"RotatePresents", (ULONG)gRotatePresents);
-        RegPutDword(L"RotatePresents", (ULONG)gRotatePresents);
-        {
-            static const PCWSTR n8[10] = { L"TgtSt0", L"TgtSt1", L"TgtSt2", L"TgtSt3", L"TgtSt4", L"TgtSt5", L"TgtSt6", L"TgtSt7", L"TgtSt8", L"TgtSt9" };
-            int k;
-            for (k = 0; k < 10; k++) RegPutDword(n8[k], (ULONG)gTgtSt[k]);
-        }
-    }
+        RegPutDword(L"SupportSt", (ULONG)gSupportSt);    }
 }
 
 /* Clears the boot-loop guard after GUARD_SECONDS and flushes the counters
@@ -360,70 +346,23 @@ static VOID SourceSizeFor(PSWD_CONTEXT Ctx, D3DKMDT_VIDPN_PRESENT_PATH_ROTATION 
     *W = Ctx->FbWidth; *H = Ctx->FbHeight;
 }
 
-/* 1.0.5: the signal is filled in one of several forms. 1.0.3 (78000000/1300000,
- * divider 0) had the target mode refused with STATUS_GRAPHICS_INVALID_FREQUENCY;
- * 1.0.4 (60/1, divider 1) had the monitor mode refused too (Microsoft: the
- * divider must be 0 for a non-Miracast target). The driver now tries the forms
- * in order and records which one Windows took (TgtVariant / MonVariant).
- *   0: real totals 1000x1300, 60/1 Hz, 78000/1 Hz, 78 MHz
- *   1: totals = active (like the Basic Display sample), 60/1, 76800/1, 55.296 MHz
- *   2: real totals, 78000000/1300000, 78000000/1000 (1.0.3 form)
- *   3: totals = active, 60000/1000 Hz, 76800000/1000 Hz */
-#define SIGNAL_VARIANTS 4
-static VOID FillSignalInfoV(D3DKMDT_VIDEO_SIGNAL_INFO *s, int v)
+/* Target and monitor signal: active = total = 720x1280, frequencies not
+ * specified (as the KMDOD sample). 1.0.3-1.0.10 tried real timings
+ * (78 MHz, 1000x1300, 60 Hz) in several forms; Windows refused all of them for
+ * the target, and a real monitor mode emptied the GDI mode list. */
+static VOID FillSignalInfo(D3DKMDT_VIDEO_SIGNAL_INFO *s)
 {
-    int divider;
-    if (v >= 2 * SIGNAL_VARIANTS) {
-        /* 1.0.7: like the Basic Display sample's target modes: frequencies
-         * "not specified" (8: totals = active, 9: totals not specified). */
-        RtlZeroMemory(s, sizeof(*s));
-        s->VideoStandard = D3DKMDT_VSS_OTHER;
-        s->ActiveSize.cx = SWD_NATIVE_W;
-        s->ActiveSize.cy = SWD_NATIVE_H;
-        if (v == 2 * SIGNAL_VARIANTS) {
-            s->TotalSize = s->ActiveSize;
-        } else {
-            s->TotalSize.cx = D3DKMDT_DIMENSION_NOTSPECIFIED;
-            s->TotalSize.cy = D3DKMDT_DIMENSION_NOTSPECIFIED;
-        }
-        s->VSyncFreq.Numerator = D3DKMDT_FREQUENCY_NOTSPECIFIED;
-        s->VSyncFreq.Denominator = D3DKMDT_FREQUENCY_NOTSPECIFIED;
-        s->HSyncFreq.Numerator = D3DKMDT_FREQUENCY_NOTSPECIFIED;
-        s->HSyncFreq.Denominator = D3DKMDT_FREQUENCY_NOTSPECIFIED;
-        s->PixelRate = D3DKMDT_FREQUENCY_NOTSPECIFIED;
-        s->ScanLineOrdering = D3DDDI_VSSLO_PROGRESSIVE;
-        return;
-    }
-    divider = (v >= SIGNAL_VARIANTS) ? 1 : 0;
-    v %= SIGNAL_VARIANTS;
     RtlZeroMemory(s, sizeof(*s));
     s->VideoStandard = D3DKMDT_VSS_OTHER;
     s->ActiveSize.cx = SWD_NATIVE_W;
     s->ActiveSize.cy = SWD_NATIVE_H;
-    if (v == 1 || v == 3) {
-        s->TotalSize = s->ActiveSize;
-        s->PixelRate = (SIZE_T)SWD_NATIVE_W * SWD_NATIVE_H * 60;
-        if (v == 1) {
-            s->VSyncFreq.Numerator = 60;                 s->VSyncFreq.Denominator = 1;
-            s->HSyncFreq.Numerator = 60 * SWD_NATIVE_H;  s->HSyncFreq.Denominator = 1;
-        } else {
-            s->VSyncFreq.Numerator = 60000;                     s->VSyncFreq.Denominator = 1000;
-            s->HSyncFreq.Numerator = 60000 * SWD_NATIVE_H;      s->HSyncFreq.Denominator = 1000;
-        }
-    } else {
-        s->TotalSize.cx = SWD_HTOTAL;
-        s->TotalSize.cy = SWD_VTOTAL;
-        s->PixelRate = SWD_PCLK;
-        if (v == 0) {
-            s->VSyncFreq.Numerator = SWD_PCLK / (SWD_HTOTAL * SWD_VTOTAL); s->VSyncFreq.Denominator = 1;
-            s->HSyncFreq.Numerator = SWD_PCLK / SWD_HTOTAL;               s->HSyncFreq.Denominator = 1;
-        } else {
-            s->VSyncFreq.Numerator = SWD_PCLK; s->VSyncFreq.Denominator = SWD_HTOTAL * SWD_VTOTAL;
-            s->HSyncFreq.Numerator = SWD_PCLK; s->HSyncFreq.Denominator = SWD_HTOTAL;
-        }
-    }
-    s->ScanLineOrdering = D3DDDI_VSSLO_PROGRESSIVE;
-    s->AdditionalSignalInfo.VSyncFreqDivider = divider;   /* 1.0.6: 1 only in target forms 4-7 */
+    s->TotalSize = s->ActiveSize;
+    s->VSyncFreq.Numerator = D3DKMDT_FREQUENCY_NOTSPECIFIED;
+    s->VSyncFreq.Denominator = D3DKMDT_FREQUENCY_NOTSPECIFIED;
+    s->HSyncFreq.Numerator = D3DKMDT_FREQUENCY_NOTSPECIFIED;
+    s->HSyncFreq.Denominator = D3DKMDT_FREQUENCY_NOTSPECIFIED;
+    s->PixelRate = D3DKMDT_FREQUENCY_NOTSPECIFIED;
+    s->ScanLineOrdering = D3DDDI_VSSLO_PROGRESSIVE;   /* VSyncFreqDivider stays 0 (not Miracast) */
 }
 static VOID FillSourceMode(D3DKMDT_VIDPN_SOURCE_MODE *m, ULONG W, ULONG H)
 {
@@ -642,6 +581,15 @@ NTSTATUS SwdStartDevice(IN_CONST_PVOID MiniportDeviceContext, IN_PDXGK_START_INF
     ctx->Dxgk = *DxgkInterface;
 
     RegPutDword(L"Version", SWD_VERSION);
+    {
+        /* Values only the 1.0.x test builds wrote. */
+        static const PCWSTR old[] = { L"TgtVariant", L"TgtAddSt", L"TgtAssignSt", L"MonVariant", L"QaiTypes",
+            L"ChildStatusTypes", L"EdidReads", L"RotatePresents", L"TgtSt0", L"TgtSt1", L"TgtSt2", L"TgtSt3",
+            L"TgtSt4", L"TgtSt5", L"TgtSt6", L"TgtSt7", L"TgtSt8", L"TgtSt9" };
+        ULONG k;
+        for (k = 0; k < sizeof(old) / sizeof(old[0]); k++)
+            (VOID)RtlDeleteRegistryValue(RTL_REGISTRY_ABSOLUTE, gParamPath.Buffer, old[k]);
+    }
     gUseEdid = RegGetDword(L"UseEdid", 0) != 0;
     RegPutDword(L"EdidGiven", gUseEdid ? 1 : 0);
     starts = RegGetDword(L"StartCount", 0) + 1;
@@ -1150,29 +1098,14 @@ static NTSTATUS EnsureTargetModes(D3DKMDT_HVIDPN hVidPn, const DXGK_VIDPN_INTERF
 
     st = Vidpn->pfnCreateNewTargetModeSet(hVidPn, Path->VidPnTargetId, &hSet, &setIf);
     if (!NT_SUCCESS(st)) return st;
-    {
-        int v;
-        static const int order[10] = { 8, 9, 0, 1, 2, 3, 4, 5, 6, 7 };
-        int k;
-        for (k = 0; k < 10; k++) {
-            v = order[k];
-            st = setIf->pfnCreateNewModeInfo(hSet, &mode);
-            if (!NT_SUCCESS(st)) break;
-            FillSignalInfoV(&mode->VideoSignalInfo, v);
-            mode->Preference = D3DKMDT_MP_PREFERRED;
-            st = setIf->pfnAddMode(hSet, mode);
-            InterlockedExchange(&gTgtSt[v], (LONG)st);
-            if (NT_SUCCESS(st)) { InterlockedExchange(&gTgtVariant, v + 1); break; }
-            setIf->pfnReleaseModeInfo(hSet, mode);
-            InterlockedExchange(&gTgtAddSt, (LONG)st);
-        }
-        if (!NT_SUCCESS(st)) InterlockedExchange(&gTgtVariant, 0xFF);
-    }
+    st = setIf->pfnCreateNewModeInfo(hSet, &mode);
     if (NT_SUCCESS(st)) {
-        st = Vidpn->pfnAssignTargetModeSet(hVidPn, Path->VidPnTargetId, hSet);
-        if (!NT_SUCCESS(st)) InterlockedExchange(&gTgtAssignSt, (LONG)st);
+        FillSignalInfo(&mode->VideoSignalInfo);
+        mode->Preference = D3DKMDT_MP_PREFERRED;
+        st = setIf->pfnAddMode(hSet, mode);
+        if (!NT_SUCCESS(st)) setIf->pfnReleaseModeInfo(hSet, mode);
     }
-    if (!NT_SUCCESS(st)) Vidpn->pfnReleaseTargetModeSet(hVidPn, hSet);
+    if (NT_SUCCESS(st)) st = Vidpn->pfnAssignTargetModeSet(hVidPn, Path->VidPnTargetId, hSet);    if (!NT_SUCCESS(st)) Vidpn->pfnReleaseTargetModeSet(hVidPn, hSet);
     return st;
 }
 
@@ -1361,35 +1294,23 @@ static NTSTATUS ImplRecommendMonitorModes(IN_CONST_HANDLE hAdapter,
     NTSTATUS st;
     UNREFERENCED_PARAMETER(hAdapter);
 
-    {
-        /* 1.0.10: the monitor mode like the target mode and the Basic Display
-         * sample (frequencies not specified, form 8) first. With a 60 Hz monitor
-         * mode and an unspecified target mode, EnumDisplaySettings listed no
-         * modes and ChangeDisplaySettingsEx (SwitchCenter) gave BADMODE. */
-        static const int order[5] = { 8, 0, 1, 2, 3 };
-        int v, k;
-        for (k = 0; k < 5; k++) {
-            v = order[k];
-            st = setIf->pfnCreateNewModeInfo(hSet, &mode);
-            if (!NT_SUCCESS(st)) return st;
-            FillSignalInfoV(&mode->VideoSignalInfo, v);
-            mode->ColorBasis = D3DKMDT_CB_SRGB;
-            mode->ColorCoeffDynamicRanges.FirstChannel = 8;
-            mode->ColorCoeffDynamicRanges.SecondChannel = 8;
-            mode->ColorCoeffDynamicRanges.ThirdChannel = 8;
-            mode->ColorCoeffDynamicRanges.FourthChannel = 0;
-            mode->Origin = D3DKMDT_MCO_DRIVER;
-            mode->Preference = D3DKMDT_MP_PREFERRED;
-            st = setIf->pfnAddMode(hSet, mode);
-            if (NT_SUCCESS(st)) { InterlockedExchange(&gMonVariant, v + 1); break; }
-            setIf->pfnReleaseModeInfo(hSet, mode);
-            if (st == STATUS_GRAPHICS_MODE_ALREADY_IN_MODESET) { InterlockedExchange(&gMonVariant, 0x10 + v + 1); st = STATUS_SUCCESS; break; }
-        }
-        if (!NT_SUCCESS(st)) InterlockedExchange(&gMonVariant, 0xFF);
+    st = setIf->pfnCreateNewModeInfo(hSet, &mode);
+    if (!NT_SUCCESS(st)) return st;
+    FillSignalInfo(&mode->VideoSignalInfo);
+    mode->ColorBasis = D3DKMDT_CB_SRGB;
+    mode->ColorCoeffDynamicRanges.FirstChannel = 8;
+    mode->ColorCoeffDynamicRanges.SecondChannel = 8;
+    mode->ColorCoeffDynamicRanges.ThirdChannel = 8;
+    mode->ColorCoeffDynamicRanges.FourthChannel = 0;
+    mode->Origin = D3DKMDT_MCO_DRIVER;
+    mode->Preference = D3DKMDT_MP_PREFERRED;
+    st = setIf->pfnAddMode(hSet, mode);
+    if (!NT_SUCCESS(st)) {
+        setIf->pfnReleaseModeInfo(hSet, mode);
+        if (st == STATUS_GRAPHICS_MODE_ALREADY_IN_MODESET) st = STATUS_SUCCESS;
     }
     return st;
 }
-
 static NTSTATUS ImplQueryVidPnHWCapability(IN_CONST_HANDLE i_hAdapter, INOUT_PDXGKARG_QUERYVIDPNHWCAPABILITY io_pVidPnHWCaps)
 {
     UNREFERENCED_PARAMETER(i_hAdapter);
@@ -1434,7 +1355,6 @@ NTSTATUS SwdPresentDisplayOnly(IN_CONST_HANDLE hAdapter, IN_CONST_PDXGKARG_PRESE
     rot = pPresent->Flags.Rotate ? ctx->Rotation : D3DKMDT_VPPR_IDENTITY;
     if (IsRotated(rot)) { ws = (LONG)ctx->SrcHeight; hs = (LONG)ctx->SrcWidth; }
     else                { ws = (LONG)ctx->SrcWidth;  hs = (LONG)ctx->SrcHeight; }
-    if (pPresent->Flags.Rotate) InterlockedIncrement(&gRotatePresents);
 
     for (i = 0; i < pPresent->NumMoves; i++) GrowBounds(&top, &bottom, &pPresent->pMoves[i].DestRect);
     for (i = 0; i < pPresent->NumDirtyRects; i++) GrowBounds(&top, &bottom, &pPresent->pDirtyRect[i]);
@@ -1506,7 +1426,7 @@ VOID SwdSystemDisplayWrite(PVOID MiniportDeviceContext, PVOID Source, UINT Sourc
     }
 }
 
-/* ------------------------------------------------------------ 1.0.3 diagnostic wrappers */
+/* ------------------------------------------------------------ DDI wrappers (count / fail / last status) */
 
 DXGKDDI_QUERY_CHILD_RELATIONS SwdQueryChildRelations;
 NTSTATUS SwdQueryChildRelations(IN_CONST_PVOID MiniportDeviceContext, PDXGK_CHILD_DESCRIPTOR ChildRelations, ULONG ChildRelationsSize)
@@ -1515,14 +1435,12 @@ NTSTATUS SwdQueryChildRelations(IN_CONST_PVOID MiniportDeviceContext, PDXGK_CHIL
 DXGKDDI_QUERY_CHILD_STATUS SwdQueryChildStatus;
 NTSTATUS SwdQueryChildStatus(IN_CONST_PVOID MiniportDeviceContext, INOUT_PDXGK_CHILD_STATUS ChildStatus, IN_BOOLEAN NonDestructiveOnly)
 {
-    if (ChildStatus && (ULONG)ChildStatus->Type < 32) InterlockedOr(&gChildStatusTypes, (LONG)(1u << (ULONG)ChildStatus->Type));
     return Note(D_QueryChildStatus, ImplQueryChildStatus(MiniportDeviceContext, ChildStatus, NonDestructiveOnly));
 }
 
 DXGKDDI_QUERY_DEVICE_DESCRIPTOR SwdQueryDeviceDescriptor;
 NTSTATUS SwdQueryDeviceDescriptor(IN_CONST_PVOID MiniportDeviceContext, IN_ULONG ChildUid, INOUT_PDXGK_DEVICE_DESCRIPTOR DeviceDescriptor)
 {
-    InterlockedIncrement(&gEdidReads);
     return Note(D_QueryDeviceDescriptor, ImplQueryDeviceDescriptor(MiniportDeviceContext, ChildUid, DeviceDescriptor));
 }
 
@@ -1533,7 +1451,6 @@ NTSTATUS SwdSetPowerState(IN_CONST_PVOID MiniportDeviceContext, IN_ULONG DeviceU
 DXGKDDI_QUERYADAPTERINFO SwdQueryAdapterInfo;
 NTSTATUS SwdQueryAdapterInfo(IN_CONST_HANDLE hAdapter, IN_CONST_PDXGKARG_QUERYADAPTERINFO pQueryAdapterInfo)
 {
-    if ((ULONG)pQueryAdapterInfo->Type < 32) InterlockedOr(&gQaiTypes, (LONG)(1u << (ULONG)pQueryAdapterInfo->Type));
     return Note(D_QueryAdapterInfo, ImplQueryAdapterInfo(hAdapter, pQueryAdapterInfo));
 }
 
