@@ -1110,6 +1110,8 @@ static BOOLEAN SwWifiApplyMac(PSWWIFI_DEVICE Dev, const UCHAR Mac[6])
     return FALSE;
 }
 
+#define WLC_DOWN_EARLY      3               /* WLC_DOWN */
+
 static BOOLEAN SwWifiRadioUp(PSWWIFI_DEVICE Dev)
 {
     UCHAR Buf[128];
@@ -1121,7 +1123,19 @@ static BOOLEAN SwWifiRadioUp(PSWWIFI_DEVICE Dev)
     {
         UCHAR Mac[6];
         WCHAR Text[32];
-        if (SwWifiRegMac(Mac) && SwWifiApplyMac(Dev, Mac)) mMacSource = 1;
+        if (SwWifiRegMac(Mac)) {
+            SwWifiTrace(L"MacTry", 1);
+            if (SwWifiApplyMac(Dev, Mac)) {
+                mMacSource = 1;
+            } else {
+                /* 0.6.3: 0.6.2 got status 0 but read back the old address: the
+                 * firmware is already up; take it down, set, (WLC_UP follows). */
+                UCHAR Zero[4] = { 0 };
+                (VOID)SwWifiIoctl(Dev, WLC_DOWN_EARLY, Zero, 4, Zero, 4, &St);
+                SwWifiTrace(L"MacTry", 2);
+                if (SwWifiApplyMac(Dev, Mac)) mMacSource = 1;
+            }
+        }
         SwWifiTrace(L"MacSource", mMacSource);
         (VOID)RtlStringCbPrintfW(Text, sizeof(Text), L"%02X:%02X:%02X:xx:xx:xx", gMac[0], gMac[1], gMac[2]);
         SwWifiTraceText(L"MacOui", Text);
@@ -1670,6 +1684,7 @@ Out:
 #define WLC_DOWN            3
 #define WLC_SET_SSID        26
 #define WLC_DISASSOC        52
+#define WLC_GET_RATE        12
 #define WLC_GET_RSSI        127
 #define CHSPEC_BW20         0x1000u         /* d11ac encoding (io type 2: WLC_GET_VERSION = 2) */
 #define CHSPEC_5G           0xC000u
@@ -1745,29 +1760,73 @@ VOID BcmLinkResult(PULONG Event, PULONG Status, PULONG Reason)
     *Reason = mLinkReason;
 }
 
-/* The association request/response IEs the firmware kept (brcmf_get_assoc_ies). */
+/* The association request/response bodies retained by firmware. The *_ies
+ * variables contain only tagged IEs; assoc_info also carries the fixed
+ * capability/listen/status/AID fields required by WDI's frame TLVs. */
 static ULONG mAssocReqLen, mAssocRespLen;
 
 VOID BcmGetAssocIes(PUCHAR Req, ULONG ReqMax, PULONG ReqLen, PUCHAR Resp, ULONG RespMax, PULONG RespLen)
 {
     PSWWIFI_DEVICE Dev = &gDev;
-    UCHAR Len[8];
-    ULONG St = 0, R = 0, A = 0;
+    UCHAR Info[28], Ies[512];
+    ULONG St = 0, R = 0, A = 0, Flags = 0, ReqFixed = 4, RespFixed = 6;
     LONG N;
 
     *ReqLen = *RespLen = 0;
     if (!gReady) return;
-    N = SwWifiGetVar(Dev, "assoc_info", Len, 8, &St);
-    if (N >= 8 && St == 0) { R = Get32(Len, 0); A = Get32(Len, 4); }
+    RtlZeroMemory(Info, sizeof(Info));
+    N = SwWifiGetVar(Dev, "assoc_info", Info, sizeof(Info), &St);
+    if (N >= 28 && St == 0) {
+        R = Get32(Info, 0);
+        A = Get32(Info, 4);
+        Flags = Get32(Info, 8);
+    }
     mAssocReqLen = R;
     mAssocRespLen = A;
-    if (R) {
-        N = SwWifiGetVar(Dev, "assoc_req_ies", Req, (ReqMax < 512) ? ReqMax : 512, &St);
-        if (N > 0 && St == 0) *ReqLen = (R < (ULONG)N) ? R : (ULONG)N;
+    if (Req != NULL) {
+        if (Flags & 1) ReqFixed += 6; /* WLC_ASSOC_REQ_IS_REASSOC: prior BSSID */
+        if (R >= ReqFixed && ReqMax >= ReqFixed) {
+            ULONG IeExpected = R - ReqFixed;
+            if (IeExpected != 0) {
+                ULONG IeMax = ReqMax - ReqFixed;
+                if (IeMax > sizeof(Ies)) IeMax = sizeof(Ies);
+                RtlZeroMemory(Ies, sizeof(Ies));
+                N = SwWifiGetVar(Dev, "assoc_req_ies", Ies, IeMax, &St);
+                if (N > 0 && St == 0) {
+                    ULONG Copy = ((ULONG)N < IeExpected) ? (ULONG)N : IeExpected;
+                    if (Copy > IeMax) Copy = IeMax;
+                    /* wl_assoc_info_t: req at byte 12, reassoc BSSID at byte 16. */
+                    RtlCopyMemory(Req, Info + 12, 4);
+                    if (Flags & 1) RtlCopyMemory(Req + 4, Info + 16, 6);
+                    RtlCopyMemory(Req + ReqFixed, Ies, Copy);
+                    *ReqLen = ReqFixed + Copy;
+                }
+            } else {
+                /* Valid association with an empty IE list. */
+                RtlCopyMemory(Req, Info + 12, 4);
+                if (Flags & 1) RtlCopyMemory(Req + 4, Info + 16, 6);
+                *ReqLen = ReqFixed;
+            }
+        }
     }
-    if (A) {
-        N = SwWifiGetVar(Dev, "assoc_resp_ies", Resp, (RespMax < 512) ? RespMax : 512, &St);
-        if (N > 0 && St == 0) *RespLen = (A < (ULONG)N) ? A : (ULONG)N;
+    if (A >= RespFixed && Resp != NULL && RespMax >= RespFixed) {
+        ULONG IeExpected = A - RespFixed;
+        if (IeExpected == 0) {
+            RtlCopyMemory(Resp, Info + 22, RespFixed); /* response at byte 22 */
+            *RespLen = RespFixed;
+        } else {
+            ULONG IeMax = RespMax - RespFixed;
+            if (IeMax > sizeof(Ies)) IeMax = sizeof(Ies);
+            RtlZeroMemory(Ies, sizeof(Ies));
+            N = SwWifiGetVar(Dev, "assoc_resp_ies", Ies, IeMax, &St);
+            if (N > 0 && St == 0) {
+                ULONG Copy = ((ULONG)N < IeExpected) ? (ULONG)N : IeExpected;
+                if (Copy > IeMax) Copy = IeMax;
+                RtlCopyMemory(Resp, Info + 22, RespFixed);
+                RtlCopyMemory(Resp + RespFixed, Ies, Copy);
+                *RespLen = RespFixed + Copy;
+            }
+        }
     }
 }
 
@@ -1778,6 +1837,15 @@ LONG BcmGetRssi(VOID)
     if (!gReady) return 0;
     if (SwWifiIoctl(&gDev, WLC_GET_RSSI, &Rssi, 4, &Rssi, 4, &St) < 4 || St != 0) return 0;
     return Rssi;
+}
+
+ULONG BcmGetLinkSpeed(VOID)
+{
+    ULONG Rate = 0, St = 0;
+    if (!gReady) return 0;
+    /* WLC_GET_RATE is in 500 kbit/s units; WDI link speed is 100 kbit/s. */
+    if (SwWifiIoctl(&gDev, WLC_GET_RATE, &Rate, 4, &Rate, 4, &St) < 4 || St != 0) return 0;
+    return Rate * 5;
 }
 
 /* WLC_DISASSOC (brcmf_link_down); the data path goes first. */
@@ -2055,6 +2123,7 @@ VOID BcmSetRegistryPath(PCUNICODE_STRING RegistryPath)
 }
 
 VOID BcmTrace(PCWSTR Name, ULONG Value) { SwWifiTrace(Name, Value); }
+VOID BcmTraceText(PCWSTR Name, PCWSTR Text) { SwWifiTraceText(Name, Text); }
 BOOLEAN BcmIsReady(VOID) { return gReady; }
 VOID BcmGetMac(UCHAR Mac[6]) { RtlCopyMemory(Mac, gMac, 6); }
 VOID BcmGetFirmwareVersion(CHAR *Text, ULONG Size)

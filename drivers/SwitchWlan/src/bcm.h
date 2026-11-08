@@ -35,6 +35,7 @@ VOID BcmReleaseHardware(VOID);
 BOOLEAN BcmIsReady(VOID);                       /* firmware up, ioctls work, radio up */
 VOID BcmGetMac(UCHAR Mac[6]);
 VOID BcmGetFirmwareVersion(CHAR *Text, ULONG Size);
+VOID BcmTraceText(PCWSTR Name, PCWSTR Text);
 VOID BcmTrace(PCWSTR Name, ULONG Value);        /* Parameters\<Name> = Value */
 
 NTSTATUS BcmScanBegin(VOID);                    /* escan start, results collected by BcmPoll */
@@ -69,8 +70,10 @@ typedef struct _BCM_KEY {
 NTSTATUS BcmJoin(const BCM_JOIN *Join);          /* security + join; the result comes from BcmPoll */
 ULONG BcmLinkState(VOID);                       /* BCM_LINK_* */
 VOID BcmLinkResult(PULONG Event, PULONG Status, PULONG Reason);
+/* Returns WDI-ready association request/response bodies (fixed fields + IEs, no 802.11 MAC header). */
 VOID BcmGetAssocIes(PUCHAR Req, ULONG ReqMax, PULONG ReqLen, PUCHAR Resp, ULONG RespMax, PULONG RespLen);
 LONG BcmGetRssi(VOID);
+ULONG BcmGetLinkSpeed(VOID);                    /* WDI units: 100 kbit/s */
 VOID BcmLeave(VOID);                            /* disassociate, data path down */
 NTSTATUS BcmSetMac(const UCHAR Mac[6]);
 NTSTATUS BcmSetKey(const BCM_KEY *Key);         /* waits for queued EAPOL frames to leave first */
