@@ -25,7 +25,7 @@
 #include "bcm.h"
 #include <ntstrsafe.h>
 
-#define WLAN_VERSION        0x00060B00u     /* 0.6.11 */
+#define WLAN_VERSION        0x00060C00u     /* 0.6.12 */
 #define WLAN_TAG            'nlWS'
 #define WLAN_FRAME_MAX      2048u
 #define WLAN_FRAME_QUEUE    256u    /* 0.6.9: 32 frames per poll capped Rx at ~12 Mbit/s */
@@ -85,6 +85,10 @@ typedef struct _WLAN_DEVICE {
     ULONG ConnLinkMs, ConnDoneMs;
     ULONG RxDstMine, RxDstGroup, RxDstOther;
     ULONG TxL2Last, TxConverted, TxNot80211;
+    /* 0.6.12: hold received frames from the join until CONNECT_COMPLETE is out,
+     * so the AP's first EAPOL (M1) is not dropped by Windows; no scan meanwhile */
+    volatile BOOLEAN RxHold;
+    ULONG RxEapolHeld, ScanDeferred;
     UCHAR RxOtherOui[3];
 } WLAN_DEVICE, *PWLAN_DEVICE;
 WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(WLAN_DEVICE, WlanGetDevice)
@@ -126,8 +130,8 @@ static VOID WlanSaveTrace(PWLAN_DEVICE Ctx)
         (VOID)RtlStringCbPrintfW(Os, sizeof(Os), L"mine=%u group=%u other=%u (other OUI %02X:%02X:%02X)",
             Ctx->RxDstMine, Ctx->RxDstGroup, Ctx->RxDstOther, Ctx->RxOtherOui[0], Ctx->RxOtherOui[1], Ctx->RxOtherOui[2]);
         BcmTraceText(L"WlanRxDst", Os);
-        (VOID)RtlStringCbPrintfW(Os, sizeof(Os), L"rx as 802.11 | tx l2type=%u converted=%u asIs=%u",
-            Ctx->TxL2Last, Ctx->TxConverted, Ctx->TxNot80211);
+        (VOID)RtlStringCbPrintfW(Os, sizeof(Os), L"rx as 802.11 | tx l2type=%u converted=%u asIs=%u | eapolHeld=%u scanDeferred=%u",
+            Ctx->TxL2Last, Ctx->TxConverted, Ctx->TxNot80211, Ctx->RxEapolHeld, Ctx->ScanDeferred);
         BcmTraceText(L"WlanFormat", Os);
     }
     BcmSaveTrace();
@@ -575,7 +579,8 @@ static VOID WlanReceiveFrame(PVOID Context, const UCHAR *Frame, ULONG Length)
         Ctx->RxCount++;
         Ctx->RxQueued++;
         if (Ctx->RxQueue == NULL) Ctx->RxNoQueue++;
-        Queue = Ctx->RxNotifyEnabled ? Ctx->RxQueue : NULL;
+        if (Ctx->RxHold && Length >= 14 && Frame[12] == 0x88 && Frame[13] == 0x8E) Ctx->RxEapolHeld++;
+        Queue = (Ctx->RxNotifyEnabled && !Ctx->RxHold) ? Ctx->RxQueue : NULL;
         if (Queue != NULL) {
             Ctx->RxNotifyEnabled = FALSE;       /* 0.6.10: one notification per arm */
             WdfObjectReference(Queue);
@@ -642,6 +647,25 @@ static VOID WlanDrainTx(PWLAN_DEVICE Ctx)
     if (Committed) BcmTxCommit();
 }
 
+/* 0.6.12: Windows now knows the association; hand over what arrived meanwhile. */
+static VOID WlanReleaseRx(PWLAN_DEVICE Ctx)
+{
+    KIRQL Irql;
+    NETPACKETQUEUE Queue = NULL;
+    KeAcquireSpinLock(&Ctx->Lock, &Irql);
+    Ctx->RxHold = FALSE;
+    if (Ctx->RxCount != 0 && Ctx->RxNotifyEnabled && Ctx->RxQueue != NULL) {
+        Queue = Ctx->RxQueue;
+        Ctx->RxNotifyEnabled = FALSE;
+        WdfObjectReference(Queue);
+    }
+    KeReleaseSpinLock(&Ctx->Lock, Irql);
+    if (Queue != NULL) {
+        NetRxQueueNotifyMoreReceivedPacketsAvailable(Queue);
+        WdfObjectDereference(Queue);
+    }
+}
+
 static VOID WlanThread(PVOID Context)
 {
     PWLAN_DEVICE Ctx = (PWLAN_DEVICE)Context;
@@ -674,10 +698,15 @@ static VOID WlanThread(PVOID Context)
         }
         if (Ctx->Stop) break;
         KeAcquireSpinLock(&Ctx->Lock, &Irql);
-        Scan = Ctx->ScanPending;
-        Header = Ctx->ScanHeader;
-        Ctx->ScanPending = FALSE;
         Op = Ctx->PendingOp;
+        Scan = Ctx->ScanPending;
+        if (Scan && (Op == WLAN_OP_CONNECT || Op == WLAN_OP_CONNECTING)) {
+            Scan = FALSE;                       /* 0.6.12: run it after the connect */
+            Ctx->ScanDeferred++;
+        } else {
+            Ctx->ScanPending = FALSE;
+        }
+        Header = Ctx->ScanHeader;
         /* 0.6.3: a scan keeps its own header; a pending op waits for the next turn. */
         if (!Scan && Op != WLAN_OP_NONE) Header = Ctx->OpHeader;
         /* 0.6.3: DISCONNECT / DOT11_RESET are done once (0.6.2 never cleared them). */
@@ -696,8 +725,11 @@ static VOID WlanThread(PVOID Context)
         if (Scan) {
             WlanRunScan(Ctx, &Header);
         } else if (Op == WLAN_OP_CONNECT) {
-            NTSTATUS St = BcmJoin(&Join);
+            NTSTATUS St;
+            Ctx->RxHold = TRUE;
+            St = BcmJoin(&Join);
             if (!NT_SUCCESS(St)) {
+                Ctx->RxHold = FALSE;
                 KeAcquireSpinLock(&Ctx->Lock, &Irql);
                 Ctx->PendingOp = WLAN_OP_NONE;
                 KeReleaseSpinLock(&Ctx->Lock, Irql);
@@ -712,6 +744,7 @@ static VOID WlanThread(PVOID Context)
         } else if (Op == WLAN_OP_DISCONNECT || Op == WLAN_OP_RESET) {
             BcmDataStop();
             BcmLeave();
+            WlanReleaseRx(Ctx);
             WlanTaskComplete(Ctx, (Op == WLAN_OP_RESET) ? WDI_INDICATION_DOT11_RESET_COMPLETE : WDI_INDICATION_DISCONNECT_COMPLETE,
                              &Header, NDIS_STATUS_SUCCESS);
         } else {
@@ -744,8 +777,10 @@ static VOID WlanThread(PVOID Context)
                 WlanTaskComplete(Ctx, WDI_INDICATION_CONNECT_COMPLETE, &Header,
                                  NT_SUCCESS(St) ? NDIS_STATUS_SUCCESS : NDIS_STATUS_FAILURE);
                 Ctx->ConnDoneMs = (ULONG)((KeQueryInterruptTime() - T0) / 10000ULL);
-            } else if (Op == WLAN_OP_DISCONNECT && Header.TransactionId != 0) {
-                WlanTaskComplete(Ctx, WDI_INDICATION_CONNECT_COMPLETE, &Header, NDIS_STATUS_FAILURE);
+                WlanReleaseRx(Ctx);
+            } else if (Op == WLAN_OP_DISCONNECT) {
+                if (Header.TransactionId != 0) WlanTaskComplete(Ctx, WDI_INDICATION_CONNECT_COMPLETE, &Header, NDIS_STATUS_FAILURE);
+                WlanReleaseRx(Ctx);
             }
         }
         if (KeyRequest != NULL) {
@@ -1141,6 +1176,11 @@ static VOID EvtRxAdvance(NETPACKETQUEUE Queue)
     KIRQL Irql;
 
     Ctx->RxAdvance++;
+    if (Ctx->RxHold) {                          /* 0.6.12: keep them until CONNECT_COMPLETE */
+        Fragments->NextIndex = Fragments->EndIndex;
+        Packets->NextIndex = Packets->BeginIndex;
+        return;
+    }
     /* Framework-owned fragments become available to this copy-based receiver. */
     Fragments->NextIndex = Fragments->EndIndex;
     {

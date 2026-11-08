@@ -10,7 +10,7 @@ Class       = Net
 ClassGuid   = {4d36e972-e325-11ce-bfc1-08002be10318}
 Provider    = %Mfg%
 CatalogFile = switchwlan.cat
-DriverVer   = 11/07/2026,0.6.11.0
+DriverVer   = 11/07/2026,0.6.12.0
 PnpLockdown = 1
 
 [DestinationDirs]
