@@ -122,6 +122,8 @@ function Show-Trace {
   if ($null -ne $p.Rotation) { Sum ('rotation (1=0, 2=90, 3=180, 4=270): {0}  source {1}x{2}' -f $p.Rotation, $p.SrcWidth, $p.SrcHeight) }
   if ($null -ne $p.Presents) { Sum ('presents: {0}  errors {1} (last 0x{2:X8})  commits {3}  power calls {4} (last 0x{5:X})' -f $p.Presents, $p.PresentErrors, [uint32]$p.LastPresentStatus, $p.Commits, $p.PowerCalls, [uint32]$p.LastPower) }
   if ($null -ne $p.PanelOffs) { Sum ('screen off: panel sleep {0} / wake {1}  DC stops {2}  DSI status 0x{3:X}  (PanelPower={4}, DcStop={5})' -f $p.PanelOffs, $p.PanelOns, $p.DcStops, [uint32]$p.DsiStatusAfterOn, $(if ($null -ne $p.PanelPower) { $p.PanelPower } else { 'default 1' }), $(if ($null -ne $p.DcStop) { $p.DcStop } else { 'default 1' })) }
+  if ($null -ne $p.HasInterrupt) { Sum ('vsync: DSDT interrupt {0} (vector 0x{1:X})  on {2} / off {3}  vblank interrupts {4}  other {5}  ISR calls {7} unclaimed {8}  DC int at AddDevice: status 0x{9:X} mask 0x{10:X} enable 0x{11:X}  (Vsync={6})' -f $(if ($p.HasInterrupt) { 'yes' } else { 'no (UEFI R408: Windows uses its timer)' }), [uint32]$p.ResIrqVector, $p.VsyncEnables, $p.VsyncDisables, $p.VsyncInts, $p.IsrOther, $(if ($null -ne $p.Vsync) { $p.Vsync } else { 'default 1' }), $p.IsrCalls, $p.IsrUnclaimed, [uint32]$p.EarlyIntStatus, [uint32]$p.EarlyIntMask, [uint32]$p.EarlyIntEnable) }
+  if ($null -ne $p.CiCalls) { Sum ('ControlInterrupt: calls {0}  types 0x{1:X}  last type {2} enable {3} -> 0x{4:X8}' -f $p.CiCalls, [uint32]$p.CiTypes, ([uint32]$p.CiLast -shr 8), ([uint32]$p.CiLast -band 1), [uint32]$p.CiLastSt) }
   $ddi = 'QueryChildRelations','QueryChildStatus','QueryDeviceDescriptor','QueryAdapterInfo','IsSupportedVidPn','RecommendFunctionalVidPn','EnumVidPnCofuncModality','SetVidPnSourceVisibility','CommitVidPn','UpdateActiveVidPnPresentPath','RecommendMonitorModes','QueryVidPnHWCapability','SetPowerState','SystemDisplayEnable','SetPointerPosition','Escape'
   $failed = @()
   foreach ($n in $ddi) {
@@ -181,9 +183,32 @@ function Remove-Old {
   }
 }
 
+# Windows' own view: why a display device was stopped (problem 43 and the like).
+function Show-Events {
+  Log ''
+  Log '--- events (last 24 h): display, dxgkrnl, PnP'
+  $since = (Get-Date).AddHours(-24)
+  $n = 0
+  foreach ($logName in 'System', 'Microsoft-Windows-DxgKrnl-Admin', 'Microsoft-Windows-DxgKrnl-Operational', 'Microsoft-Windows-Kernel-PnP/Configuration') {
+    try {
+      $ev = @(Get-WinEvent -FilterHashtable @{ LogName = $logName; StartTime = $since } -MaxEvents 400 -ErrorAction Stop |
+              Where-Object { $_.ProviderName -match 'Dxg|Display' -or $_.Message -match 'SWOA0E01|switchdisplay' } |
+              Select-Object -First 12)
+    } catch { $ev = @() }
+    foreach ($e in $ev) {
+      $n++
+      $msg = ("$($e.Message)" -replace '\s+', ' ')
+      if ($msg.Length -gt 300) { $msg = $msg.Substring(0, 300) + '...' }
+      Log ('  {0:MM-dd HH:mm:ss} [{1}] {2} id {3} level {4}: {5}' -f $e.TimeCreated, $logName, $e.ProviderName, $e.Id, $e.LevelDisplayName, $msg)
+      if ($msg -match 'SWOA0E01|switchdisplay' -and $e.Level -le 3) { Sum ('event: {0:MM-dd HH:mm} {1} id {2}: {3}' -f $e.TimeCreated, $e.ProviderName, $e.Id, $msg.Substring(0, [Math]::Min(160, $msg.Length))) }
+    }
+  }
+  if ($n -eq 0) { Log '  (none found)' }
+}
+
 switch ($Mode) {
   'Report' { Show-Report }
-  'Status' { Show-Adapters; Log ''; Show-Trace }
+  'Status' { Show-Adapters; Log ''; Show-Trace; Show-Events }
   'Install' {
     if (-not [Environment]::Is64BitProcess) { Sum 'This PowerShell is not 64-bit (ARM64); run Install.cmd from Explorer.'; break }
     $inf = Join-Path $Here 'switchdisplay.inf'

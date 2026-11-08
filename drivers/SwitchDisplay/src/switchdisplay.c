@@ -18,6 +18,9 @@
  *   - screen off (monitor or adapter out of D0): DCS display off + sleep in, then
  *     the DC stops scanning; screen on: DC restarts, sleep out, display on
  *     (registry PanelPower=0 / DcStop=0 turn these off)
+ *   - vsync: the DC-A vblank interrupt (DSDT DISP, UEFI R409) reported as the
+ *     display-only vsync when Windows asks (ControlInterrupt; registry Vsync=0
+ *     turns it off); without the interrupt Windows paces by its timer
  *   - boot-loop guard: two starts in a row that did not survive 60 s make the
  *     next start fail, so Windows keeps the Basic Display Driver
  *   - an EDID builder, off unless UseEdid=1 (with it Windows may raise the scale)
@@ -27,7 +30,7 @@
 #include <ntddk.h>
 #include <dispmprt.h>
 
-#define SWD_VERSION        0x00010100u   /* 1.1.0 */
+#define SWD_VERSION        0x00010202u   /* 1.2.2 */
 #define SWD_TAG            'DwsS'
 
 /* Boot framebuffer (coreboot display.c / UEFI MemoryMap.h "Display Reserved") */
@@ -62,6 +65,12 @@
 #define DISP_CTRL_MODE_C_DISPLAY   (1u << 5)
 #define GENERAL_ACT_REQ            (1u << 0)
 #define GENERAL_UPDATE             (1u << 8)
+/* stage 3: vblank interrupt (ENABLE sets the status bit, MASK delivers it, as
+ * the Linux tegra dc driver does). Status bits are cleared by writing 1. */
+#define DC_CMD_INT_STATUS_REG      (0x37u * 4u)
+#define DC_CMD_INT_MASK_REG        (0x38u * 4u)
+#define DC_CMD_INT_ENABLE_REG      (0x39u * 4u)
+#define DC_INT_V_BLANK             (1u << 2)
 
 /* DSI-A (stage 2): DCS short writes sent inside the running video stream, as
  * hekate's display_end() does for SET_DISPLAY_OFF (bdk/display/di.c). */
@@ -96,6 +105,10 @@ typedef struct _SWD_CONTEXT {
     PUCHAR               DcVa;          /* DC-A registers (stage 2b) */
     BOOLEAN              PanelAsleep;
     BOOLEAN              DcStopped;
+    BOOLEAN              HasInterrupt;  /* DSDT DISP has the DC-A interrupt (UEFI R409) */
+    PUCHAR               IrqDc;         /* DC-A mapped from AddDevice to RemoveDevice, for the ISR */
+    BOOLEAN              VsyncAllowed;  /* registry Vsync, default 1 */
+    BOOLEAN              VsyncWant;     /* argument of SyncVsync */
     D3DDDIFORMAT         FbFormat;
 
     /* current mode */
@@ -124,6 +137,10 @@ typedef struct _SWD_CONTEXT {
     volatile LONG        PanelOffs;
     volatile LONG        PanelOns;
     volatile LONG        DcStops;
+    volatile LONG        VsyncInts;
+    volatile LONG        IsrOther;
+    volatile LONG        VsyncEnables;
+    volatile LONG        VsyncDisables;
 } SWD_CONTEXT, *PSWD_CONTEXT;
 
 static WCHAR  gParamPathBuf[512];
@@ -135,6 +152,8 @@ static BOOLEAN gUseEdid;
 enum { D_QueryChildRelations, D_QueryChildStatus, D_QueryDeviceDescriptor, D_QueryAdapterInfo, D_IsSupportedVidPn, D_RecommendFunctionalVidPn, D_EnumVidPnCofuncModality, D_SetVidPnSourceVisibility, D_CommitVidPn, D_UpdateActiveVidPnPresentPath, D_RecommendMonitorModes, D_QueryVidPnHWCapability, D_SetPowerState, D_SystemDisplayEnable, D_SetPointerPosition, D_Escape, D_COUNT };
 static volatile LONG gCalls[D_COUNT], gFails[D_COUNT], gLastSt[D_COUNT];
 static volatile LONG gNotSupported, gRejCode, gRejA, gRejB, gCofuncStep, gSupportSt;
+static volatile LONG gCiCalls, gCiLast, gCiTypes, gCiLastSt;
+static volatile LONG gIsrCalls, gIsrUnclaimed, gEarlyIntStatus, gEarlyIntMask, gEarlyIntEnable;
 static const PCWSTR gNameN[D_COUNT] = { L"N_QueryChildRelations", L"N_QueryChildStatus", L"N_QueryDeviceDescriptor", L"N_QueryAdapterInfo", L"N_IsSupportedVidPn", L"N_RecommendFunctionalVidPn", L"N_EnumVidPnCofuncModality", L"N_SetVidPnSourceVisibility", L"N_CommitVidPn", L"N_UpdateActiveVidPnPresentPath", L"N_RecommendMonitorModes", L"N_QueryVidPnHWCapability", L"N_SetPowerState", L"N_SystemDisplayEnable", L"N_SetPointerPosition", L"N_Escape" };
 static const PCWSTR gNameS[D_COUNT] = { L"S_QueryChildRelations", L"S_QueryChildStatus", L"S_QueryDeviceDescriptor", L"S_QueryAdapterInfo", L"S_IsSupportedVidPn", L"S_RecommendFunctionalVidPn", L"S_EnumVidPnCofuncModality", L"S_SetVidPnSourceVisibility", L"S_CommitVidPn", L"S_UpdateActiveVidPnPresentPath", L"S_RecommendMonitorModes", L"S_QueryVidPnHWCapability", L"S_SetPowerState", L"S_SystemDisplayEnable", L"S_SetPointerPosition", L"S_Escape" };
 static const PCWSTR gNameF[D_COUNT] = { L"F_QueryChildRelations", L"F_QueryChildStatus", L"F_QueryDeviceDescriptor", L"F_QueryAdapterInfo", L"F_IsSupportedVidPn", L"F_RecommendFunctionalVidPn", L"F_EnumVidPnCofuncModality", L"F_SetVidPnSourceVisibility", L"F_CommitVidPn", L"F_UpdateActiveVidPnPresentPath", L"F_RecommendMonitorModes", L"F_QueryVidPnHWCapability", L"F_SetPowerState", L"F_SystemDisplayEnable", L"F_SetPointerPosition", L"F_Escape" };
@@ -190,6 +209,10 @@ static VOID FlushCounters(PSWD_CONTEXT Ctx)
     RegPutDword(L"PanelOffs", (ULONG)Ctx->PanelOffs);
     RegPutDword(L"PanelOns", (ULONG)Ctx->PanelOns);
     RegPutDword(L"DcStops", (ULONG)Ctx->DcStops);
+    RegPutDword(L"VsyncInts", (ULONG)Ctx->VsyncInts);
+    RegPutDword(L"IsrOther", (ULONG)Ctx->IsrOther);
+    RegPutDword(L"VsyncEnables", (ULONG)Ctx->VsyncEnables);
+    RegPutDword(L"VsyncDisables", (ULONG)Ctx->VsyncDisables);
     {
         int i;
         for (i = 0; i < D_COUNT; i++) {
@@ -202,7 +225,16 @@ static VOID FlushCounters(PSWD_CONTEXT Ctx)
         RegPutDword(L"RejA", (ULONG)gRejA);
         RegPutDword(L"RejB", (ULONG)gRejB);
         RegPutDword(L"CofuncStep", (ULONG)gCofuncStep);
-        RegPutDword(L"SupportSt", (ULONG)gSupportSt);    }
+        RegPutDword(L"SupportSt", (ULONG)gSupportSt);
+        RegPutDword(L"IsrCalls", (ULONG)gIsrCalls);
+        RegPutDword(L"CiCalls", (ULONG)gCiCalls);
+        RegPutDword(L"CiLast", (ULONG)gCiLast);
+        RegPutDword(L"CiTypes", (ULONG)gCiTypes);
+        RegPutDword(L"CiLastSt", (ULONG)gCiLastSt);
+        RegPutDword(L"IsrUnclaimed", (ULONG)gIsrUnclaimed);
+        RegPutDword(L"EarlyIntStatus", (ULONG)gEarlyIntStatus);
+        RegPutDword(L"EarlyIntMask", (ULONG)gEarlyIntMask);
+        RegPutDword(L"EarlyIntEnable", (ULONG)gEarlyIntEnable);    }
 }
 
 /* Clears the boot-loop guard after GUARD_SECONDS and flushes the counters
@@ -562,6 +594,23 @@ NTSTATUS SwdAddDevice(IN_CONST_PDEVICE_OBJECT PhysicalDeviceObject, OUT_PPVOID M
     ctx->Rotation = D3DKMDT_VPPR_IDENTITY;
     ctx->Visible = TRUE;
     KeInitializeEvent(&ctx->StopEvent, NotificationEvent, FALSE);
+    /* 1.2.1: dxgkrnl may connect the DC-A interrupt (level, UEFI R409) before
+     * StartDevice. 1.2.0 masked the DC interrupts only in StartDevice, and the
+     * device failed with problem 43 right after starting. Map DC-A here and
+     * silence it, so the line is quiet whenever the ISR can run. */
+    {
+        PHYSICAL_ADDRESS pa;
+        pa.QuadPart = (LONGLONG)DC_A_PHYS;
+        ctx->IrqDc = (PUCHAR)MmMapIoSpaceEx(pa, DC_MAP_SIZE, PAGE_READWRITE | PAGE_NOCACHE);
+        if (ctx->IrqDc) {
+            InterlockedExchange(&gEarlyIntStatus, (LONG)READ_REGISTER_ULONG((PULONG)(ctx->IrqDc + DC_CMD_INT_STATUS_REG)));
+            InterlockedExchange(&gEarlyIntMask, (LONG)READ_REGISTER_ULONG((PULONG)(ctx->IrqDc + DC_CMD_INT_MASK_REG)));
+            InterlockedExchange(&gEarlyIntEnable, (LONG)READ_REGISTER_ULONG((PULONG)(ctx->IrqDc + DC_CMD_INT_ENABLE_REG)));
+            WRITE_REGISTER_ULONG((PULONG)(ctx->IrqDc + DC_CMD_INT_MASK_REG), 0);
+            WRITE_REGISTER_ULONG((PULONG)(ctx->IrqDc + DC_CMD_INT_ENABLE_REG), 0);
+            WRITE_REGISTER_ULONG((PULONG)(ctx->IrqDc + DC_CMD_INT_STATUS_REG), 0xFFFFFFFFu);
+        }
+    }
     *MiniportDeviceContext = ctx;
     return STATUS_SUCCESS;
 }
@@ -635,11 +684,23 @@ NTSTATUS SwdStartDevice(IN_CONST_PVOID MiniportDeviceContext, IN_PDXGK_START_INF
                         RegPutDword(L"ResMemLength", d->u.Memory.Length);
                     }
                     if (d->Type == CmResourceTypeMemory) nMem++;
+                    if (d->Type == CmResourceTypeInterrupt) {
+                        ctx->HasInterrupt = TRUE;
+                        RegPutDword(L"ResIrqVector", d->u.Interrupt.Vector);
+                    }
                 }
                 full = (PCM_FULL_RESOURCE_DESCRIPTOR)&part->PartialDescriptors[part->Count];
             }
         }
         RegPutDword(L"ResCount", total);
+        RegPutDword(L"HasInterrupt", ctx->HasInterrupt ? 1 : 0);
+        ctx->VsyncAllowed = RegGetDword(L"Vsync", 1) != 0;
+        if (ctx->DcVa) {
+            /* Nothing delivered until Windows asks for vsync (ControlInterrupt). */
+            WRITE_REGISTER_ULONG((PULONG)(ctx->DcVa + DC_CMD_INT_MASK_REG), 0);
+            WRITE_REGISTER_ULONG((PULONG)(ctx->DcVa + DC_CMD_INT_ENABLE_REG), 0);
+            WRITE_REGISTER_ULONG((PULONG)(ctx->DcVa + DC_CMD_INT_STATUS_REG), 0xFFFFFFFFu);
+        }
         RegPutDword(L"ResMemCount", nMem);
     }
 
@@ -715,8 +776,11 @@ NTSTATUS SwdStartDevice(IN_CONST_PVOID MiniportDeviceContext, IN_PDXGK_START_INF
     return STATUS_SUCCESS;
 }
 
+static VOID VsyncSet(PSWD_CONTEXT Ctx, BOOLEAN On);
+
 static VOID StopCommon(PSWD_CONTEXT Ctx)
 {
+    VsyncSet(Ctx, FALSE);
     StopGuardThread(Ctx);
     FlushCounters(Ctx);
     UnmapFb(Ctx);
@@ -763,6 +827,11 @@ NTSTATUS SwdRemoveDevice(IN_CONST_PVOID MiniportDeviceContext)
     if (ctx) {
         StopGuardThread(ctx);
         UnmapFb(ctx);
+        if (ctx->IrqDc) {
+            WRITE_REGISTER_ULONG((PULONG)(ctx->IrqDc + DC_CMD_INT_MASK_REG), 0);
+            MmUnmapIoSpace(ctx->IrqDc, DC_MAP_SIZE);
+            ctx->IrqDc = NULL;
+        }
         ExFreePoolWithTag(ctx, SWD_TAG);
     }
     return STATUS_SUCCESS;
@@ -781,15 +850,91 @@ NTSTATUS SwdDispatchIoRequest(IN_CONST_PVOID MiniportDeviceContext, IN_ULONG Vid
 DXGKDDI_INTERRUPT_ROUTINE SwdInterruptRoutine;
 BOOLEAN SwdInterruptRoutine(IN_CONST_PVOID MiniportDeviceContext, IN_ULONG MessageNumber)
 {
-    UNREFERENCED_PARAMETER(MiniportDeviceContext);
+    PSWD_CONTEXT ctx = (PSWD_CONTEXT)MiniportDeviceContext;
+    ULONG st;
     UNREFERENCED_PARAMETER(MessageNumber);
-    return FALSE;
+    InterlockedIncrement(&gIsrCalls);
+    if (!ctx || !ctx->IrqDc) { InterlockedIncrement(&gIsrUnclaimed); return FALSE; }
+    st = READ_REGISTER_ULONG((PULONG)(ctx->IrqDc + DC_CMD_INT_STATUS_REG)) &
+         READ_REGISTER_ULONG((PULONG)(ctx->IrqDc + DC_CMD_INT_MASK_REG));
+    if (!st) { InterlockedIncrement(&gIsrUnclaimed); return FALSE; }
+    WRITE_REGISTER_ULONG((PULONG)(ctx->IrqDc + DC_CMD_INT_STATUS_REG), st);
+    if (st & DC_INT_V_BLANK) {
+        DXGKARGCB_NOTIFY_INTERRUPT_DATA d;
+        RtlZeroMemory(&d, sizeof(d));
+        d.InterruptType = DXGK_INTERRUPT_DISPLAYONLY_VSYNC;
+        d.DisplayOnlyVsync.VidPnTargetId = 0;
+        ctx->Dxgk.DxgkCbNotifyInterrupt(ctx->Dxgk.DeviceHandle, &d);
+        ctx->Dxgk.DxgkCbQueueDpc(ctx->Dxgk.DeviceHandle);
+        InterlockedIncrement(&ctx->VsyncInts);
+    } else {
+        InterlockedIncrement(&ctx->IsrOther);
+    }
+    return TRUE;
 }
 
 DXGKDDI_DPC_ROUTINE SwdDpcRoutine;
 VOID SwdDpcRoutine(IN_CONST_PVOID MiniportDeviceContext)
 {
-    UNREFERENCED_PARAMETER(MiniportDeviceContext);
+    PSWD_CONTEXT ctx = (PSWD_CONTEXT)MiniportDeviceContext;
+    if (ctx) ctx->Dxgk.DxgkCbNotifyDpc(ctx->Dxgk.DeviceHandle);
+}
+
+/* Runs at the interrupt's IRQL (DxgkCbSynchronizeExecution), so the ISR never
+ * sees a half-written ENABLE / MASK pair. */
+static BOOLEAN SyncVsync(PVOID Context)
+{
+    PSWD_CONTEXT ctx = (PSWD_CONTEXT)Context;
+    PUCHAR dc = ctx->IrqDc;
+    ULONG en = READ_REGISTER_ULONG((PULONG)(dc + DC_CMD_INT_ENABLE_REG));
+    ULONG mask = READ_REGISTER_ULONG((PULONG)(dc + DC_CMD_INT_MASK_REG));
+    if (ctx->VsyncWant) {
+        WRITE_REGISTER_ULONG((PULONG)(dc + DC_CMD_INT_STATUS_REG), DC_INT_V_BLANK);
+        WRITE_REGISTER_ULONG((PULONG)(dc + DC_CMD_INT_ENABLE_REG), en | DC_INT_V_BLANK);
+        WRITE_REGISTER_ULONG((PULONG)(dc + DC_CMD_INT_MASK_REG), mask | DC_INT_V_BLANK);
+    } else {
+        WRITE_REGISTER_ULONG((PULONG)(dc + DC_CMD_INT_MASK_REG), mask & ~DC_INT_V_BLANK);
+        WRITE_REGISTER_ULONG((PULONG)(dc + DC_CMD_INT_ENABLE_REG), en & ~DC_INT_V_BLANK);
+        WRITE_REGISTER_ULONG((PULONG)(dc + DC_CMD_INT_STATUS_REG), DC_INT_V_BLANK);
+    }
+    return TRUE;
+}
+
+static VOID VsyncSet(PSWD_CONTEXT Ctx, BOOLEAN On)
+{
+    BOOLEAN ret = FALSE;
+    if (!Ctx->IrqDc || !Ctx->HasInterrupt) return;
+    Ctx->VsyncWant = On;
+    (VOID)Ctx->Dxgk.DxgkCbSynchronizeExecution(Ctx->Dxgk.DeviceHandle, SyncVsync, Ctx, 0, &ret);
+}
+
+/* Stage 3: Windows turns the display-only vsync interrupt on and off. Without
+ * the DSDT interrupt (UEFI R408) or with Vsync=0, say "not implemented" and
+ * Windows keeps pacing by its timer as before. */
+DXGKDDI_CONTROLINTERRUPT SwdControlInterrupt;
+NTSTATUS SwdControlInterrupt(IN_CONST_HANDLE hAdapter, IN_CONST_DXGK_INTERRUPT_TYPE InterruptType, IN_BOOLEAN EnableInterrupt)
+{
+    PSWD_CONTEXT ctx = (PSWD_CONTEXT)hAdapter;
+    NTSTATUS st;
+    BOOLEAN vsyncType = (InterruptType == DXGK_INTERRUPT_DISPLAYONLY_VSYNC || InterruptType == DXGK_INTERRUPT_CRTC_VSYNC);
+    InterlockedIncrement(&gCiCalls);
+    InterlockedExchange(&gCiLast, (LONG)(((ULONG)InterruptType << 8) | (EnableInterrupt ? 1u : 0u)));
+    if ((ULONG)InterruptType < 32) InterlockedOr(&gCiTypes, (LONG)(1u << (ULONG)InterruptType));
+    if (!EnableInterrupt) {
+        /* 1.2.2: turning something off always succeeds. 1.2.0/1.2.1 answered
+         * NOT_IMPLEMENTED to anything but DISPLAYONLY_VSYNC, and with the DSDT
+         * interrupt (R409) the device then failed right after start (problem 43). */
+        if (vsyncType) { VsyncSet(ctx, FALSE); InterlockedIncrement(&ctx->VsyncDisables); }
+        st = STATUS_SUCCESS;
+    } else if (!vsyncType || !ctx->HasInterrupt || !ctx->VsyncAllowed || !ctx->IrqDc) {
+        st = STATUS_NOT_IMPLEMENTED;
+    } else {
+        VsyncSet(ctx, TRUE);
+        InterlockedIncrement(&ctx->VsyncEnables);
+        st = STATUS_SUCCESS;
+    }
+    InterlockedExchange(&gCiLastSt, (LONG)st);
+    return st;
 }
 
 static NTSTATUS ImplQueryChildRelations(IN_CONST_PVOID MiniportDeviceContext, PDXGK_CHILD_DESCRIPTOR ChildRelations,
@@ -1553,6 +1698,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
     init.DxgkDdiStopDeviceAndReleasePostDisplayOwnership = SwdStopAndRelease;
     init.DxgkDdiSystemDisplayEnable = SwdSystemDisplayEnable;
     init.DxgkDdiSystemDisplayWrite = SwdSystemDisplayWrite;
+    init.DxgkDdiControlInterrupt = SwdControlInterrupt;
 
     return DxgkInitializeDisplayOnlyDriver(DriverObject, RegistryPath, &init);
 }
