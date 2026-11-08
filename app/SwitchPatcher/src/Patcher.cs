@@ -21,6 +21,7 @@ namespace SwitchPatcher
         public string ImagePath;          // .iso, .wim or .esd
         public int ImageIndex;
         public bool Drivers, TestMode, ControlCenter;
+        public string FirmwareFolder;     // the user's own firmware (SwitchFirmware); null = none
     }
 
     static class Patcher
@@ -78,6 +79,13 @@ namespace SwitchPatcher
                     if (!File.Exists(Path.Combine(appSource, "SwitchCenter.exe"))) throw new InvalidDataException("SwitchCenter.exe");
                 }
                 log(T("ダウンロードしたものは、すべて確かめました。", "Everything downloaded has been checked."));
+                FirmwareSet firmware = null;
+                if (o.FirmwareFolder != null)
+                {
+                    firmware = SwitchFirmware.Find(o.FirmwareFolder);
+                    log(T("ファームウェアのフォルダー: ", "Firmware folder: ") + o.FirmwareFolder);
+                    foreach (string line in SwitchFirmware.Describe(firmware, true)) log("  " + line);
+                }
 
                 // ---- a new SD: erase it and make the partitions, then read its layout again
                 if (o.InitializeDisk)
@@ -166,9 +174,26 @@ namespace SwitchPatcher
                     await Offline.CopyDriverFile(win, Path.Combine(Path.GetDirectoryName(sd.Inf), rel.Sd.Service + ".sys"), log);
                 }
 
+                // ---- the user's firmware: XUSB on the ESP (read by the UEFI), Wi-Fi / Bluetooth inside Windows
+                if (firmware != null)
+                {
+                    SwitchFirmware.CopyToEsp(firmware, esp, log);
+                    SwitchFirmware.CopyToWindows(firmware, win, log);
+                }
+
                 // ---- offline registry: the SD drivers load at every boot (needed to boot from the Switch's SD)
                 await Offline.WithHive(win, "SYSTEM", system =>
                 {
+                    if (firmware?.Mac != null)
+                    {
+                        foreach (string cs in system.GetSubKeyNames())
+                        {
+                            if (!cs.StartsWith("ControlSet", StringComparison.OrdinalIgnoreCase)) continue;
+                            using Microsoft.Win32.RegistryKey k = system.CreateSubKey(cs + "\\" + SwitchFirmware.WlanParams);
+                            k.SetValue("MacAddress", firmware.Mac, Microsoft.Win32.RegistryValueKind.String);
+                        }
+                        log(T("  Wi-Fi の MAC アドレスを設定しました。", "  Set the Wi-Fi MAC address."));
+                    }
                     foreach (string line in Offline.LoadSdDriversAtBoot(system)) log("  " + line);
                     if (win11)
                         foreach (string line in Offline.AddBootDriver(system, rel.Sd.Service)) log("  " + line);

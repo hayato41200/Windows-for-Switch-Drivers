@@ -135,7 +135,8 @@ switch ($Mode) {
     Log "=== Wlan Install  $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
     Copy-Firmware
     Remove-Package 'switchwifi.inf'
-    if (Test-Path $Key) { $k = Get-Item $Key; foreach ($n in $k.GetValueNames()) { Remove-ItemProperty $Key -Name $n -ErrorAction SilentlyContinue } }
+    # MacAddress stays (SwitchPatcher / SwitchCenter may have written it); Set-Mac replaces it from wifi-mac.txt.
+    if (Test-Path $Key) { $k = Get-Item $Key; foreach ($n in $k.GetValueNames()) { if ($n -ne 'MacAddress') { Remove-ItemProperty $Key -Name $n -ErrorAction SilentlyContinue } } }
     Set-Mac
     $inf = Join-Path $Here 'switchwlan.inf'
     # 0.6.5: wlansvc keeps the adapter open; stop it so the old driver can be removed.

@@ -8,6 +8,22 @@ PC で動く道具です。Switch の SD を PC に挿して、SD の Windows �
 
 Windows のイメージ（ARM64）を、SD に入れ直すこともできます。設計は `docs/Design-SwitchPatcher-ja.md`。
 
+
+## v0.5.0（2026-11-08）: ファームウェアのフォルダー
+
+- 「3. 入れるもの」に「ファームウェア」のフォルダーを選ぶ欄を足した（任意）。ユーザーが自分の Switchroot Linux からコピーしたファイルを、SD の次の場所に入れる。どのファイルもリリースやこのツールには入っていない。
+
+  | ファイル（Switchroot の場所） | SD のどこに | 使うもの |
+  |---|---|---|
+  | `tegra21x_xusb_firmware`（`/lib/firmware`） | ESP の一番上 | UEFI（USB） |
+  | `brcmfmac4356A3-pcie.bin` / `.txt`（`/lib/firmware/brcm`） | `Windows\System32\drivers\switchwifi\brcmfmac4356-pcie.*` | switchwlan（Wi-Fi） |
+  | `BCM4356A3.hcd`（`/lib/firmware/brcm`） | `Windows\System32\drivers\SwitchWOA\` | switchbt（Bluetooth） |
+  | `wifi-mac.txt`（自分で作る 1 行、L4T の DT の `nvidia,wifi-mac`） | SYSTEM ハイブの `Services\switchwlan\Parameters\MacAddress` | switchwlan |
+
+- フォルダーの中の `firmware`、`brcm`、`lib\firmware(\brcm)`、`nvidia\tegra210` も探す。XUSB は linux-firmware の名前 `xusb.bin` も受け付ける（実機では未確認）。
+- 選んだときに、見つかったものと使えないもの（大きさがおかしい、.hcd の形が違う、MAC の形が違う）を表示する。
+- 未確認：実際の SD での書き込み（PC でビルドが通ったところまで）。
+
 ## 使い方
 
 1. **SD のバックアップを取る。** 「Windows を入れる」では、SD の Windows の区画が消えます。

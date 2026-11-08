@@ -41,6 +41,8 @@ function Publish-Release([string]$dir) {
   $notes += '', "Control center: $($m.app.version) ($($m.app.file))"
   if ($m.patcher) { $notes += "SwitchPatcher (PC): $($m.patcher.version) ($($m.patcher.file))" }
   $notes += '', 'SHA-256 values are in manifest.json.'
+  $notes += '', 'Firmware is not included: USB (tegra21x_xusb_firmware), Wi-Fi (brcmfmac4356A3-pcie.bin/.txt) and Bluetooth (BCM4356A3.hcd) come from your own Switchroot Linux install (/lib/firmware, /lib/firmware/brcm). Add them with SwitchPatcher (Firmware folder) or, for Wi-Fi and Bluetooth, the control center (Drivers > Firmware).'
+  $notes += 'ファームウェアは入っていません。USB（tegra21x_xusb_firmware）、Wi-Fi（brcmfmac4356A3-pcie.bin/.txt）、Bluetooth（BCM4356A3.hcd）は、自分の Switchroot Linux のインストールファイル（/lib/firmware、/lib/firmware/brcm）から取り出して、SwitchPatcher の「ファームウェア」か、コントロールセンターの「ドライバー」タブ（Wi-Fi・BT）で入れてください。' 
   $notesFile = Join-Path $dir 'release-notes.md'
   $notes -join "`n" | Set-Content $notesFile -Encoding utf8
   $files = Get-ChildItem $dir -File | Where-Object { $_.Name -ne 'release-notes.md' } | ForEach-Object FullName

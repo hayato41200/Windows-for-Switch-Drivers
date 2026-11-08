@@ -1,23 +1,19 @@
-// Wi-Fi (switchwlan) firmware, NVRAM and the console's MAC address.
+// Wi-Fi (switchwlan) and Bluetooth (switchbt) firmware on the running Switch.
 //
-// None of these are in a release: the Broadcom firmware and the board NVRAM
-// are not ours to redistribute, and the MAC belongs to one console. The user
-// points SwitchCenter at a folder with their own copies (for example taken from
-// their Switchroot / L4T install: /lib/firmware/brcm/brcmfmac4356A3-pcie.bin
-// and .txt), and the elevated "--wifi-firmware <folder>" mode copies them to
-// System32\drivers\switchwifi, where switchwlan reads them at start. That
-// folder is outside the driver store, so driver updates keep it.
-// wifi-mac.txt ("xx:xx:xx:xx:xx:xx") in the same folder, if present, goes to
-// Services\switchwlan\Parameters\MacAddress (the driver writes it into the
-// NVRAM "macaddr" before the firmware boots).
+// The files are the user's own (from their Switchroot Linux install); see
+// app\Shared\SwitchFirmware.cs for what goes where. The elevated
+// "--wifi-firmware <folder>" mode copies the Wi-Fi and Bluetooth files into this
+// Windows, writes wifi-mac.txt to Services\switchwlan\Parameters\MacAddress,
+// and restarts the Wi-Fi device. The XUSB (USB) firmware lives on the ESP and is
+// SwitchPatcher's job, not this one's. The folders are outside the driver store,
+// so driver updates keep the files.
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
+using System.Linq;
 using System.Runtime.InteropServices;
-using System.Security.Cryptography;
 using System.Security.Principal;
-using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Windows.Forms;
@@ -30,15 +26,11 @@ namespace SwitchCenter
     {
         public const string Service = "switchwlan";
         const string Hwid = "SWOA0D01";
-        const string ParamsKey = @"SYSTEM\CurrentControlSet\Services\switchwlan\Parameters";
-        const string BinName = "brcmfmac4356-pcie.bin", TxtName = "brcmfmac4356-pcie.txt";
-        // The firmware the driver was tested with (7.35.252.108, from Switchroot L4T). Only its hash is here.
-        const string TestedBinSha256 = "32a16e7b4391ccd248d3677c17cde940f398aaaaa6163571fcbff2bbee026ade";
 
-        public static string Folder => Path.Combine(Environment.SystemDirectory, "drivers", "switchwifi");
+        static string WindowsRoot => Path.GetPathRoot(Environment.SystemDirectory);
 
-        public static bool Present() =>
-            File.Exists(Path.Combine(Folder, BinName)) && File.Exists(Path.Combine(Folder, TxtName));
+        public static bool Present() => SwitchFirmware.WifiPresent(WindowsRoot);
+        public static bool BluetoothPresent() => SwitchFirmware.BtPresent(WindowsRoot);
 
         /// <summary>Starts this program elevated to copy the files from folder. null = the user said no to UAC.</summary>
         public static async Task<int?> RunElevatedAsync(string folder)
@@ -58,7 +50,7 @@ namespace SwitchCenter
             }
         }
 
-        /// <summary>The elevated part. Returns 0 when the files are in place.</summary>
+        /// <summary>The elevated part. Returns 0 when something was put in place.</summary>
         public static int Apply(string source)
         {
             var log = new List<string>();
@@ -67,66 +59,33 @@ namespace SwitchCenter
             {
                 if (!new WindowsPrincipal(WindowsIdentity.GetCurrent()).IsInRole(WindowsBuiltInRole.Administrator))
                     throw new UnauthorizedAccessException(T("管理者として実行されていません。", "Not running as administrator."));
-                string bin = Find(source, BinName, "brcmfmac4356A3-pcie.bin");
-                string txt = Find(source, TxtName, "brcmfmac4356A3-pcie.txt");
-                if (bin == null || txt == null)
-                    throw new FileNotFoundException(T(
-                        "フォルダーに brcmfmac4356-pcie.bin と .txt（または brcmfmac4356A3-pcie.bin と .txt）がありません。",
-                        "The folder has no brcmfmac4356-pcie.bin and .txt (or brcmfmac4356A3-pcie.bin and .txt)."));
-                long binLen = new FileInfo(bin).Length, txtLen = new FileInfo(txt).Length;
-                if (binLen < 100_000 || binLen > 2_000_000 || txtLen < 100 || txtLen > 64 * 1024)
-                    throw new InvalidDataException(T($"ファイルの大きさがおかしいです（.bin {binLen} バイト、.txt {txtLen} バイト）。",
-                                                     $"Unexpected file sizes (.bin {binLen} bytes, .txt {txtLen} bytes)."));
-                string hash;
-                using (FileStream f = File.OpenRead(bin)) hash = Convert.ToHexString(SHA256.HashData(f)).ToLowerInvariant();
-                log.Add(hash == TestedBinSha256
-                    ? T("ファームウェア: 動作を確かめた版（7.35.252.108）です。", "Firmware: the tested version (7.35.252.108).")
-                    : T("ファームウェア: 動作を確かめた版とは違います。動かないときは Switchroot の brcmfmac4356A3-pcie.bin を使ってください。",
-                        "Firmware: not the tested version. If Wi-Fi does not work, use Switchroot's brcmfmac4356A3-pcie.bin."));
-
-                Directory.CreateDirectory(Folder);
-                File.Copy(bin, Path.Combine(Folder, BinName), true);
-                File.Copy(txt, Path.Combine(Folder, TxtName), true);
-                log.Add(T($"{Folder} にコピーしました。", $"Copied to {Folder}."));
-
-                string macFile = Path.Combine(source, "wifi-mac.txt");
-                if (File.Exists(macFile))
+                FirmwareSet f = SwitchFirmware.Find(source);
+                log.AddRange(SwitchFirmware.Describe(f, false));
+                if (!f.Wifi && f.BtHcd == null && f.Mac == null)
+                    throw new FileNotFoundException(T("入れられるファイルがありません。Switchroot Linux の /lib/firmware/brcm から brcmfmac4356A3-pcie.bin、.txt、BCM4356A3.hcd をこのフォルダーにコピーしてください。",
+                                                      "Nothing to add. Copy brcmfmac4356A3-pcie.bin, .txt and BCM4356A3.hcd from Switchroot Linux's /lib/firmware/brcm into this folder."));
+                log.Add("");
+                SwitchFirmware.CopyToWindows(f, WindowsRoot, log.Add);
+                if (f.Mac != null)
                 {
-                    string mac = File.ReadAllLines(macFile).Length > 0 ? Regex.Replace(File.ReadAllLines(macFile)[0], @"\s", "").ToUpperInvariant().Replace('-', ':') : "";
-                    if (!Regex.IsMatch(mac, "^([0-9A-F]{2}:){5}[0-9A-F]{2}$"))
-                        throw new InvalidDataException(T("wifi-mac.txt が xx:xx:xx:xx:xx:xx の形ではありません。", "wifi-mac.txt is not xx:xx:xx:xx:xx:xx."));
-                    using (RegistryKey k = Registry.LocalMachine.CreateSubKey(ParamsKey)) k.SetValue("MacAddress", mac, RegistryValueKind.String);
-                    log.Add(T($"MAC アドレス（{mac.Substring(0, 8)}:xx:xx:xx）を設定しました。", $"Set the MAC address ({mac.Substring(0, 8)}:xx:xx:xx)."));
+                    using (RegistryKey k = Registry.LocalMachine.CreateSubKey(@"SYSTEM\CurrentControlSet\" + SwitchFirmware.WlanParams))
+                        k.SetValue("MacAddress", f.Mac, RegistryValueKind.String);
+                    log.Add(T("Wi-Fi の MAC アドレスを設定しました。", "Set the Wi-Fi MAC address."));
                 }
-                else
-                {
-                    log.Add(T("wifi-mac.txt が無いので、MAC アドレスは変えていません。", "No wifi-mac.txt; the MAC address is unchanged."));
-                }
-
                 code = 0;
-                if (RestartDevice(log)) log.Add(T("Wi-Fi のデバイスを再起動しました。少し待つとネットワークが見えます。",
-                                                  "Restarted the Wi-Fi device; networks show up in a moment."));
-                else log.Add(T("Windows を再起動すると、Wi-Fi が使えるようになります。", "Restart Windows to start Wi-Fi."));
+                if (f.Wifi || f.Mac != null)
+                    log.Add(RestartDevice(log) ? T("Wi-Fi のデバイスを再起動しました。少し待つとネットワークが見えます。", "Restarted the Wi-Fi device; networks show up in a moment.")
+                                               : T("Windows を再起動すると、Wi-Fi が新しいファイルで動きます。", "Restart Windows to use the new Wi-Fi files."));
+                if (f.BtHcd != null)
+                    log.Add(T("Bluetooth のパッチは、Windows を再起動したときから使われます。", "The Bluetooth patch is used from the next Windows restart."));
             }
-            catch (Exception e) when (e is IOException || e is UnauthorizedAccessException || e is InvalidDataException || e is ArgumentException)
+            catch (Exception e) when (e is IOException || e is UnauthorizedAccessException || e is ArgumentException)
             {
                 log.Add(T("失敗しました: ", "Failed: ") + e.Message);
             }
-            MessageBox.Show(string.Join(Environment.NewLine, log), T("Wi-Fi のファームウェア", "Wi-Fi firmware"),
+            MessageBox.Show(string.Join(Environment.NewLine, log), T("ファームウェア", "Firmware"),
                             MessageBoxButtons.OK, code == 0 ? MessageBoxIcon.Information : MessageBoxIcon.Error);
             return code;
-        }
-
-        /// <summary>name or alt in folder or folder\firmware.</summary>
-        static string Find(string folder, string name, string alt)
-        {
-            foreach (string dir in new[] { folder, Path.Combine(folder, "firmware") })
-                foreach (string n in new[] { name, alt })
-                {
-                    string p = Path.Combine(dir, n);
-                    if (File.Exists(p)) return p;
-                }
-            return null;
         }
 
         [DllImport("cfgmgr32.dll", CharSet = CharSet.Unicode)] static extern int CM_Locate_DevNodeW(out uint devInst, string id, uint flags);

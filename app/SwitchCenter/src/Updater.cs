@@ -216,8 +216,8 @@ namespace SwitchCenter
                         else if (code != 0)
                             throw new InvalidOperationException(T($"pnputil が失敗しました（{code}）。", $"pnputil failed ({code})."));
                         if (wlan && !WifiFirmware.Present())
-                            log(T("  Wi-Fi のファームウェアがまだありません。「Wi-Fi のファームウェア…」で入れてください。",
-                                  "  The Wi-Fi firmware is not there yet; add it with \"Wi-Fi firmware...\"."));
+                            log(T("  Wi-Fi のファームウェアがまだありません。「ファームウェア（Wi-Fi・BT）…」で入れてください。",
+                                  "  The Wi-Fi firmware is not there yet; add it with \"Firmware (Wi-Fi, BT)...\"."));
                     }
                 }
                 return reboot ? ExitReboot : ExitOk;

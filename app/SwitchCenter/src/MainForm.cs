@@ -396,18 +396,18 @@ namespace SwitchCenter
 
         void ShowWifiFirmware()
         {
-            wifiStatus.Text = WifiFirmware.Present()
-                ? T("Wi-Fi のファームウェア: あり", "Wi-Fi firmware: present")
-                : T("Wi-Fi のファームウェア: なし（自分の Switchroot などからコピーしてください）", "Wi-Fi firmware: missing (copy it from your own Switchroot install)");
+            bool wifi = WifiFirmware.Present(), bt = WifiFirmware.BluetoothPresent();
+            wifiStatus.Text = T($"Wi-Fi: {(wifi ? "あり" : "なし")}、Bluetooth: {(bt ? "あり" : "なし")}", $"Wi-Fi: {(wifi ? "present" : "missing")}, Bluetooth: {(bt ? "present" : "missing")}")
+                + (wifi && bt ? "" : T("（自分の Switchroot Linux の /lib/firmware/brcm からコピーしてください）", " (copy them from your own Switchroot Linux /lib/firmware/brcm)"));
         }
 
-        /// <summary>The user's own brcmfmac4356 firmware + NVRAM (+ wifi-mac.txt) from a folder; never downloaded.</summary>
+        /// <summary>The user's own Wi-Fi firmware + NVRAM, Bluetooth patch (+ wifi-mac.txt) from a folder; never downloaded.</summary>
         async System.Threading.Tasks.Task AddWifiFirmware()
         {
             using var dlg = new FolderBrowserDialog
             {
-                Description = T("brcmfmac4356-pcie.bin と .txt（Switchroot では brcmfmac4356A3-pcie.bin と .txt）があるフォルダーを選んでください。wifi-mac.txt があれば、本体の MAC アドレスも設定します。",
-                                "Choose the folder with brcmfmac4356-pcie.bin and .txt (brcmfmac4356A3-pcie.bin and .txt in Switchroot). A wifi-mac.txt there also sets the console's MAC address."),
+                Description = T("Switchroot Linux の /lib/firmware/brcm からコピーした brcmfmac4356A3-pcie.bin、.txt、BCM4356A3.hcd があるフォルダーを選んでください。wifi-mac.txt があれば、本体の MAC アドレスも設定します。",
+                                "Choose the folder with brcmfmac4356A3-pcie.bin, .txt and BCM4356A3.hcd copied from Switchroot Linux's /lib/firmware/brcm. A wifi-mac.txt there also sets the console's MAC address."),
                 UseDescriptionForTitle = true,
             };
             if (dlg.ShowDialog(this) != DialogResult.OK) return;
@@ -449,7 +449,7 @@ namespace SwitchCenter
             bottom.Controls.Add(signRow);
             ShowSignIn();
             var wifiRow = new FlowLayoutPanel { AutoSize = true };
-            wifiButton.Text = T("Wi-Fi のファームウェア…", "Wi-Fi firmware...");
+            wifiButton.Text = T("ファームウェア（Wi-Fi・BT）…", "Firmware (Wi-Fi, BT)...");
             wifiButton.Click += async (_, _) => await AddWifiFirmware();
             wifiRow.Controls.Add(wifiButton);
             wifiRow.Controls.Add(wifiStatus);

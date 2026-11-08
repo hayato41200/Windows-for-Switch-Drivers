@@ -5,10 +5,13 @@
 - Wi-Fi ドライバー（switchwlan、`ACPI\SWOA0D01`、UEFI R405 以降）を OTA で入れられるようにした。最初はベータ版のチャンネルだけ。
   - 入れ替えの前に WLAN AutoConfig（wlansvc）を止め、終わったら起動する。止めないと古いドライバーが外れず、pnputil が 480（query-remove の時間切れ）で止まる。
   - それでも 480 になったときは、失敗にせず「再起動で入れ替わる」として扱う。
-- ドライバーのタブに「Wi-Fi のファームウェア…」を足した。ファームウェア（brcmfmac4356-pcie.bin）、NVRAM（.txt）、本体の MAC はリリースに入れない。ユーザーが自分のファイル（Switchroot の `/lib/firmware/brcm/brcmfmac4356A3-pcie.bin` と `.txt` など）があるフォルダーを選ぶと、管理者として `System32\drivers\switchwifi` にコピーし、Wi-Fi のデバイスを再起動する。
+- ドライバーのタブに「ファームウェア（Wi-Fi・BT）…」を足した。ファームウェア、NVRAM、Bluetooth のパッチ、本体の MAC はリリースに入れない。ユーザーが自分の Switchroot Linux の `/lib/firmware/brcm` からコピーしたファイル（`brcmfmac4356A3-pcie.bin`、`.txt`、`BCM4356A3.hcd`）があるフォルダーを選ぶと、管理者として次の場所にコピーする（どちらもドライバーストアの外なので、ドライバーを更新しても消えない）。
+  - Wi-Fi：`System32\drivers\switchwifi`（そのあと Wi-Fi のデバイスを再起動する）
+  - Bluetooth：`System32\drivers\SwitchWOA\BCM4356A3.hcd`（次の Windows の再起動から使われる）
   - 同じフォルダーに `wifi-mac.txt`（`xx:xx:xx:xx:xx:xx` の 1 行）があれば、`Services\switchwlan\Parameters\MacAddress` に書く（ドライバーが NVRAM の macaddr に入れる）。
-  - 動作を確かめた版（7.35.252.108）かどうかを SHA-256 で比べて知らせる（ファイルそのものは入っていない）。
-  - コピー先はドライバーストアの外なので、ドライバーを更新しても消えない。
+  - Wi-Fi のファームウェアが動作を確かめた版（7.35.252.108）かどうかを SHA-256 で比べて知らせる（ファイルそのものは入っていない）。
+  - USB（XUSB）のファームウェアは ESP に置くもので、SwitchPatcher で入れる。
+  - ファイルを探す処理と確かめる処理は `app/Shared/SwitchFirmware.cs` にあり、SwitchPatcher と共通。
 - 未確認：Switch での OTA の入れ替えと、ファームウェアのボタン（PC でビルドが通ったところまで）。
 
 ## v0.6.3（2026-10-31）: 横長のウィンドウでの配置、CPU の試験的プロファイル

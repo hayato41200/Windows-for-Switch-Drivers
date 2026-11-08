@@ -24,6 +24,9 @@ namespace SwitchPatcher
         readonly CheckBox drivers = new CheckBox { AutoSize = true, Checked = true };
         readonly CheckBox testMode = new CheckBox { AutoSize = true, Checked = true };
         readonly CheckBox controlCenter = new CheckBox { AutoSize = true, Checked = true };
+        readonly TextBox firmwarePath = new TextBox { Width = 430, ReadOnly = true };
+        readonly Button firmwareBrowse = new Button { Width = 84, Height = 28 };
+        readonly Label firmwareNote = new Label { AutoSize = true, MaximumSize = new Size(640, 0) };
         readonly Button start = new Button { Width = 160, Height = 36 };
         readonly Label progressLabel = new Label { AutoSize = true };
         readonly TextBox logBox = new TextBox { Multiline = true, ReadOnly = true, ScrollBars = ScrollBars.Vertical, Dock = DockStyle.Fill, Font = new Font("Consolas", 9f) };
@@ -35,7 +38,7 @@ namespace SwitchPatcher
             Font = new Font("Yu Gothic UI", 9.5f);
             AutoScaleMode = AutoScaleMode.Dpi;
             StartPosition = FormStartPosition.CenterScreen;
-            ClientSize = new Size(700, 760);
+            ClientSize = new Size(700, 860);
             MinimumSize = new Size(600, 600);
 
             var refresh = new Button { Text = T("再読み込み", "Refresh"), Width = 100, Height = 28 };
@@ -51,6 +54,10 @@ namespace SwitchPatcher
             drivers.Text = T("Switch のドライバー（最新のリリース）", "Switch drivers (latest release)");
             testMode.Text = T("テストモードとテスト証明書（ドライバーに必要）", "Test signing and the test certificate (needed by the drivers)");
             controlCenter.Text = T("コントロールセンター（ログインしたときに起動）", "Control center (starts at login)");
+            firmwareBrowse.Text = T("選ぶ…", "Browse...");
+            firmwareBrowse.Click += (_, _) => ChooseFirmware();
+            firmwareNote.Text = T("任意: 自分の Switchroot Linux からコピーしたファームウェアのフォルダー（tegra21x_xusb_firmware、brcmfmac4356A3-pcie.bin/.txt、BCM4356A3.hcd、wifi-mac.txt）。USB・Wi-Fi・Bluetooth に使います。",
+                                  "Optional: a folder with firmware copied from your own Switchroot Linux (tegra21x_xusb_firmware, brcmfmac4356A3-pcie.bin/.txt, BCM4356A3.hcd, wifi-mac.txt), for USB, Wi-Fi and Bluetooth.");
             start.Text = T("開始", "Start");
             start.Click += async (_, _) => await Run();
 
@@ -77,6 +84,12 @@ namespace SwitchPatcher
             top.Controls.Add(drivers);
             top.Controls.Add(testMode);
             top.Controls.Add(controlCenter);
+            top.Controls.Add(new Label { Text = T("ファームウェア", "Firmware"), AutoSize = true, Margin = new Padding(3, 8, 3, 0) });
+            var firmwareRow = new FlowLayoutPanel { AutoSize = true };
+            firmwareRow.Controls.Add(firmwarePath);
+            firmwareRow.Controls.Add(firmwareBrowse);
+            top.Controls.Add(firmwareRow);
+            top.Controls.Add(firmwareNote);
             var runRow = new FlowLayoutPanel { AutoSize = true, Margin = new Padding(3, 14, 3, 3) };
             runRow.Controls.Add(start);
             progressLabel.Margin = new Padding(10, 10, 3, 3);
@@ -192,6 +205,25 @@ namespace SwitchPatcher
             }
         }
 
+        void ChooseFirmware()
+        {
+            using var dlg = new FolderBrowserDialog
+            {
+                Description = T("自分の Switchroot Linux からコピーしたファームウェアのフォルダーを選んでください。", "Choose the folder with firmware copied from your own Switchroot Linux."),
+                UseDescriptionForTitle = true,
+            };
+            if (dlg.ShowDialog(this) != DialogResult.OK) return;
+            SwitchCenter.FirmwareSet f = SwitchCenter.SwitchFirmware.Find(dlg.SelectedPath);
+            if (!f.Any)
+            {
+                MessageBox.Show(this, T("このフォルダーには、使えるファームウェアがありません。", "This folder has no usable firmware.") + "\n\n" +
+                                string.Join("\n", SwitchCenter.SwitchFirmware.Describe(f, true)), Text);
+                return;
+            }
+            firmwarePath.Text = dlg.SelectedPath;
+            firmwareNote.Text = string.Join(T("、", ", "), SwitchCenter.SwitchFirmware.Describe(f, true));
+        }
+
         async Task Run()
         {
             bool newSd = newSdRadio.Checked;
@@ -205,6 +237,7 @@ namespace SwitchPatcher
             {
                 Disk = disk, Windows = part, InitializeDisk = newSd, InstallImage = !patchRadio.Checked,
                 Drivers = drivers.Checked, TestMode = testMode.Checked, ControlCenter = controlCenter.Checked,
+                FirmwareFolder = firmwarePath.Text.Length > 0 ? firmwarePath.Text : null,
             };
             if (o.InstallImage)
             {
@@ -239,6 +272,7 @@ namespace SwitchPatcher
             if (o.Drivers) steps.Add(T("・Switch のドライバーを入れる", "- Add the Switch drivers"));
             if (o.TestMode) steps.Add(T("・テスト証明書を入れて、テストモードを有効にする（BCD は先に PC に保存する）", "- Add the test certificate and turn on test signing (the BCD is saved to the PC first)"));
             if (o.ControlCenter) steps.Add(T("・コントロールセンターを C:\\SwitchWOA\\SwitchCenter に置く", "- Put the control center in C:\\SwitchWOA\\SwitchCenter"));
+            if (o.FirmwareFolder != null) steps.Add(T("・フォルダーのファームウェアを入れる（USB は ESP、Wi-Fi・Bluetooth は Windows の中）", "- Add the firmware from the folder (USB on the ESP, Wi-Fi and Bluetooth inside Windows)"));
             if (steps.Count == 0) return;
             if (MessageBox.Show(this, $"{disk}\n\n" + string.Join("\n", steps) + T("\n\n始めますか？", "\n\nStart?"), Text,
                                 MessageBoxButtons.OKCancel, o.InstallImage ? MessageBoxIcon.Warning : MessageBoxIcon.Question) != DialogResult.OK) return;
