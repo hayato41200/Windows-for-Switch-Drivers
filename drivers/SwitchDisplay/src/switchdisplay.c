@@ -24,7 +24,7 @@
 #include <ntddk.h>
 #include <dispmprt.h>
 
-#define SWD_VERSION        0x0001000Bu   /* 1.0.11 */
+#define SWD_VERSION        0x0001000Cu   /* 1.0.12 */
 #define SWD_TAG            'DwsS'
 
 /* Boot framebuffer (coreboot display.c / UEFI MemoryMap.h "Display Reserved") */
@@ -50,6 +50,15 @@
 #define DC_WIN_SIZE        (0x705u * 4u)
 #define DC_WIN_LINE_STRIDE (0x70Au * 4u)
 #define DC_WINBUF_START    (0x800u * 4u)
+/* stage 2b: stop / restart scanning, as hekate's _di_dc_video_disable_config
+ * and its 'Start continuous display' sequence (bdk/display/di.inl). */
+#define DC_CMD_DISPLAY_COMMAND_REG (0x32u * 4u)
+#define DC_CMD_STATE_ACCESS_REG    (0x40u * 4u)
+#define DC_CMD_STATE_CONTROL_REG   (0x41u * 4u)
+#define DISP_CTRL_MODE_STOP        0u
+#define DISP_CTRL_MODE_C_DISPLAY   (1u << 5)
+#define GENERAL_ACT_REQ            (1u << 0)
+#define GENERAL_UPDATE             (1u << 8)
 
 /* DSI-A (stage 2): DCS short writes sent inside the running video stream, as
  * hekate's display_end() does for SET_DISPLAY_OFF (bdk/display/di.c). */
@@ -81,7 +90,9 @@ typedef struct _SWD_CONTEXT {
     SIZE_T               FbMapSize;
     PUCHAR               FbVa;
     PUCHAR               DsiVa;         /* DSI-A registers (stage 2) */
+    PUCHAR               DcVa;          /* DC-A registers (stage 2b) */
     BOOLEAN              PanelAsleep;
+    BOOLEAN              DcStopped;
     D3DDDIFORMAT         FbFormat;
 
     /* current mode */
@@ -109,6 +120,7 @@ typedef struct _SWD_CONTEXT {
     volatile LONG        LastPower;     /* (uid << 8) | Dx */
     volatile LONG        PanelOffs;
     volatile LONG        PanelOns;
+    volatile LONG        DcStops;
 } SWD_CONTEXT, *PSWD_CONTEXT;
 
 static WCHAR  gParamPathBuf[512];
@@ -176,6 +188,7 @@ static VOID FlushCounters(PSWD_CONTEXT Ctx)
     RegPutDword(L"LastPower", (ULONG)Ctx->LastPower);
     RegPutDword(L"PanelOffs", (ULONG)Ctx->PanelOffs);
     RegPutDword(L"PanelOns", (ULONG)Ctx->PanelOns);
+    RegPutDword(L"DcStops", (ULONG)Ctx->DcStops);
     {
         int i;
         for (i = 0; i < D_COUNT; i++) {
@@ -444,6 +457,10 @@ static VOID UnmapFb(PSWD_CONTEXT Ctx)
         MmUnmapIoSpace(Ctx->DsiVa, DSI_MAP_SIZE);
         Ctx->DsiVa = NULL;
     }
+    if (Ctx->DcVa) {
+        MmUnmapIoSpace(Ctx->DcVa, DC_MAP_SIZE);
+        Ctx->DcVa = NULL;
+    }
 }
 
 static VOID ReadDcTrace(VOID)
@@ -535,6 +552,17 @@ static VOID DsiDcs(PSWD_CONTEXT Ctx, ULONG Cmd, ULONG WaitMs)
     SleepMs(20 + WaitMs);
 }
 
+static VOID DcSetMode(PSWD_CONTEXT Ctx, ULONG Mode)
+{
+    PUCHAR dc = Ctx->DcVa;
+    WRITE_REGISTER_ULONG((PULONG)(dc + DC_CMD_STATE_ACCESS_REG), 0);      /* assembly copy */
+    WRITE_REGISTER_ULONG((PULONG)(dc + DC_CMD_DISPLAY_COMMAND_REG), Mode);
+    WRITE_REGISTER_ULONG((PULONG)(dc + DC_CMD_STATE_CONTROL_REG), GENERAL_UPDATE);
+    WRITE_REGISTER_ULONG((PULONG)(dc + DC_CMD_STATE_CONTROL_REG), GENERAL_ACT_REQ);
+    WRITE_REGISTER_ULONG((PULONG)(dc + DC_CMD_STATE_CONTROL_REG), GENERAL_UPDATE);
+    WRITE_REGISTER_ULONG((PULONG)(dc + DC_CMD_STATE_CONTROL_REG), GENERAL_ACT_REQ);
+}
+
 /* Display off + sleep in. The DC keeps scanning and the DSI link stays in HS
  * video mode, so waking needs no panel init (stage 2a). switchfan.sys turns
  * the backlight off on its own. */
@@ -547,6 +575,16 @@ static VOID PanelSleep(PSWD_CONTEXT Ctx)
     DsiDcs(Ctx, DCS_ENTER_SLEEP, 50);
     WRITE_REGISTER_ULONG((PULONG)(Ctx->DsiVa + DSI_VIDEO_MODE_CTL), 0);
     Ctx->PanelAsleep = TRUE;
+    /* Stage 2b (1.0.12): with the panel asleep, stop the DC so it no longer
+     * reads the framebuffer from memory 60 times a second. */
+    if (Ctx->DcVa && RegGetDword(L"DcStop", 1) != 0) {
+        SleepMs(20);
+        DcSetMode(Ctx, DISP_CTRL_MODE_STOP);
+        Ctx->DcStopped = TRUE;
+        InterlockedIncrement(&Ctx->DcStops);
+        SleepMs(20);
+        RegPutDword(L"DcCommandAfterStop", READ_REGISTER_ULONG((PULONG)(Ctx->DcVa + DC_CMD_DISPLAY_COMMAND_REG)));
+    }
     InterlockedIncrement(&Ctx->PanelOffs);
     RegPutDword(L"DsiStatusAfterOff", READ_REGISTER_ULONG((PULONG)(Ctx->DsiVa + DSI_STATUS_REG)));
 }
@@ -555,6 +593,14 @@ static VOID PanelSleep(PSWD_CONTEXT Ctx)
 static VOID PanelWake(PSWD_CONTEXT Ctx)
 {
     if (!Ctx->DsiVa || !Ctx->PanelAsleep) return;
+    if (Ctx->DcStopped) {
+        /* Restart scanning first: the DCS packets below ride the video stream. */
+        DcSetMode(Ctx, DISP_CTRL_MODE_C_DISPLAY);
+        Ctx->DcStopped = FALSE;
+        SleepMs(50);
+        RegPutDword(L"DcCommandAfterStart", READ_REGISTER_ULONG((PULONG)(Ctx->DcVa + DC_CMD_DISPLAY_COMMAND_REG)));
+        RegPutDword(L"DsiStatusAfterDcStart", READ_REGISTER_ULONG((PULONG)(Ctx->DsiVa + DSI_STATUS_REG)));
+    }
     WRITE_REGISTER_ULONG((PULONG)(Ctx->DsiVa + DSI_VIDEO_MODE_CTL), DSI_CMD_PKT_VID_ENABLE);
     DsiDcs(Ctx, DCS_EXIT_SLEEP, 180);
     DsiDcs(Ctx, DCS_DISPLAY_ON, 20);
@@ -615,6 +661,9 @@ NTSTATUS SwdStartDevice(IN_CONST_PVOID MiniportDeviceContext, IN_PDXGK_START_INF
         PHYSICAL_ADDRESS pa;
         pa.QuadPart = (LONGLONG)DSI_A_PHYS;
         ctx->DsiVa = (PUCHAR)MmMapIoSpaceEx(pa, DSI_MAP_SIZE, PAGE_READWRITE | PAGE_NOCACHE);
+        pa.QuadPart = (LONGLONG)DC_A_PHYS;
+        ctx->DcVa = (PUCHAR)MmMapIoSpaceEx(pa, DC_MAP_SIZE, PAGE_READWRITE | PAGE_NOCACHE);
+        ctx->DcStopped = FALSE;
         ctx->PanelAsleep = FALSE;
         RegPutDword(L"DsiMapped", ctx->DsiVa ? 1 : 0);
     }
