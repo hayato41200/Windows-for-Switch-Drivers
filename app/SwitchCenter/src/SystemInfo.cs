@@ -86,6 +86,10 @@ namespace SwitchCenter
             ("SWOA0701", "switchcpu",     "CPU のクロック",      "CPU clock"),
             ("SWOA0801", "switchrtc",     "時計（RTC）",         "Clock (RTC)"),
             ("SWOA0901", "switchsensor",  "明るさ・傾きセンサー", "Light, tilt sensors"),
+            // 0.8.1: listed before "Check for updates" too (they used to appear only from the release's manifest)
+            ("SWOA0B01", "switchbt",      "Bluetooth",           "Bluetooth"),
+            ("SWOA0C01", "switchaudio",   "音声（スピーカー）",  "Audio (speaker)"),
+            ("SWOA0D01", "switchwlan",    "Wi-Fi",               "Wi-Fi"),
         };
 
         /// <summary>The known devices, plus any other device the release has a driver for (named from the manifest).</summary>
@@ -147,7 +151,9 @@ namespace SwitchCenter
                         }
                     }
                     // The I2C driver keeps one trace for all controllers, with I2C_ names.
-                    row.Running = (DriverTrace.Get(k.Service, "DriverVersion") ?? DriverTrace.Get(k.Service, "I2C_0000_DriverVersion")) is int v ? "v" + v : "—";
+                    row.Running = (DriverTrace.Get(k.Service, "DriverVersion") ?? DriverTrace.Get(k.Service, "I2C_0000_DriverVersion")) is int v ? "v" + v
+                                : DriverTrace.Get(k.Service, "WlanVersion") is int w ? $"{(w >> 16) & 0xFF}.{(w >> 8) & 0xFF}"     // switchwlan: 0x00MMmm00
+                                : "—";
                     rows.Add(row);
                 }
             }
@@ -159,7 +165,8 @@ namespace SwitchCenter
     static class DiagnosticReport
     {
         static readonly string[] Services =
-            { "tegra210gpio", "tegra210i2c", "switchbattery", "switchfan", "switchtouch", "switchpwrbtn", "switchcpu", "switchrtc", "switchsensor" };
+            { "tegra210gpio", "tegra210i2c", "switchbattery", "switchfan", "switchtouch", "switchpwrbtn", "switchcpu", "switchrtc", "switchsensor",
+              "switchbt", "switchaudio", "switchwlan" };
 
         public static string BuildText(SystemUsage usage)
         {
