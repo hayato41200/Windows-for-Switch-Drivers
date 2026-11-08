@@ -76,6 +76,9 @@ $Drivers = @(
   @{ Dir = 'SwitchSensor';      Name = 'switchsensor';  Src = 'switchsensor.c';  Libs = @();                             Inc = $Spb; Kit = 'Switch-Sensor';      Hwid = 'ACPI\SWOA0901'; MinUefi = 'R379'; Ja = '明るさ・傾きセンサー'; En = 'Light, tilt sensors'; Boot = $false }
   @{ Dir = 'SwitchBluetooth';   Name = 'switchbt';      Src = 'switchbt.c';      Libs = @();                             Inc = @();  Kit = 'Switch-Bluetooth';   Hwid = 'ACPI\SWOA0B01'; MinUefi = 'R390'; Ja = 'Bluetooth'; En = 'Bluetooth'; Boot = $false }
   @{ Dir = 'SwitchAudio';       Name = 'switchaudio';   Src = 'switchaudio.cpp'; Libs = @('portcls.lib', 'libcntpr.lib'); Inc = $Spb; Kit = 'Switch-Audio';       Hwid = 'ACPI\SWOA0C01'; MinUefi = 'R402'; Ja = '音声（スピーカー）'; En = 'Audio (speaker)'; Boot = $false; Beta = $true; Wdm = $true }
+  # Wi-Fi: two sources against the 10.0.26100 WDK, built by its own script. Firmware, NVRAM and the
+  # console's MAC are never in the release: SwitchCenter copies them from the user's own files.
+  @{ Dir = 'SwitchWlan';        Name = 'switchwlan';    Build = 'drivers\SwitchWlan\build.ps1';                                      Kit = 'Switch-Wlan';        Hwid = 'ACPI\SWOA0D01'; MinUefi = 'R405'; Ja = 'Wi-Fi'; En = 'Wi-Fi'; Boot = $false; Beta = $true }
   @{ Dir = 'SwoaDiag';          Name = 'swoadiag';      Src = 'swoadiag.c';      Libs = @();                             Inc = @();  Kit = 'Switch-UsbDiag';     Hwid = '';              MinUefi = '' }
   @{ Dir = 'SwoaHello';         Name = 'SwoaHello';     Src = 'hello.c';         Libs = @();                             Inc = @();  Kit = 'Switch-Stage0';      Hwid = '';              MinUefi = '' }
 )
@@ -90,13 +93,14 @@ foreach ($d in $Drivers) {
   $dir = Join-Path $Root "drivers\$($d.Dir)"
   $build = Join-Path $Root "build\$($d.Dir)"
   $inf = Join-Path $dir "$($d.Name).inf"
-  $args = @{ Name = $d.Name; Sources = (Join-Path $dir "src\$($d.Src)"); OutDir = $build }
+  $args = @{ Name = $d.Name; Sources = $(if ($d.Src) { Join-Path $dir "src\$($d.Src)" } else { '' }); OutDir = $build }
   if (Test-Path $inf) { $args.Inf = $inf }
   if ($d.Libs.Count) { $args.Libs = $d.Libs }
   if ($d.Inc.Count) { $args.ExtraIncludes = $d.Inc }
   if ($d.Wdm) { $args.Wdm = $true }                 # PortCls (switchaudio): plain WDM, no KMDF
   Write-Host "=== $($d.Name)"
-  & (Join-Path $Root 'tools\Build-Driver.ps1') @args | Out-Host
+  if ($d.Build) { & (Join-Path $Root $d.Build) | Out-Host }        # own build script (switchwlan)
+  else { & (Join-Path $Root 'tools\Build-Driver.ps1') @args | Out-Host }
 
   $kit = Join-Path $DriverStage $d.Kit
   New-Item -ItemType Directory -Force $kit | Out-Null

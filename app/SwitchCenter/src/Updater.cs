@@ -198,11 +198,26 @@ namespace SwitchCenter
                     else
                     {
                         log(T($"{d.Service} を入れています…", $"Installing {d.Service}..."));
-                        int? code = await Pnputil($"/add-driver \"{inf}\" /install", log);
+                        // Wi-Fi: WLAN AutoConfig keeps the adapter open, and the old driver
+                        // then never finishes its query-remove (pnputil exit 480).
+                        bool wlan = d.Service == WifiFirmware.Service;
+                        if (wlan) WifiFirmware.StopWlanService(log);
+                        int? code;
+                        try { code = await Pnputil($"/add-driver \"{inf}\" /install", log); }
+                        finally { if (wlan) WifiFirmware.StartWlanService(log); }
                         if (code == null) { leaveFiles = true; return Stopped(chosen, n, log); }
                         if (code == ExitReboot) reboot = true;
+                        else if (code == 480)                   // ERROR_PNP_QUERY_REMOVE_DEVICE_TIMEOUT
+                        {
+                            log(T("  古いドライバーが外れませんでした。再起動すると新しいドライバーになります。",
+                                  "  The old driver could not be removed; it is replaced at the next restart."));
+                            reboot = true;
+                        }
                         else if (code != 0)
                             throw new InvalidOperationException(T($"pnputil が失敗しました（{code}）。", $"pnputil failed ({code})."));
+                        if (wlan && !WifiFirmware.Present())
+                            log(T("  Wi-Fi のファームウェアがまだありません。「Wi-Fi のファームウェア…」で入れてください。",
+                                  "  The Wi-Fi firmware is not there yet; add it with \"Wi-Fi firmware...\"."));
                     }
                 }
                 return reboot ? ExitReboot : ExitOk;

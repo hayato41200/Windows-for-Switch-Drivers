@@ -390,7 +390,31 @@ namespace SwitchCenter
         // GitHub sign-in: the releases can be read only by invited accounts (GitHubAuth).
         readonly Label signStatus = new Label { AutoSize = true, MaximumSize = new Size(330, 0), Margin = new Padding(3, 10, 3, 3) };
         readonly Button signButton = new Button { Width = 180, Height = 40 };
+        readonly Button wifiButton = new Button { Width = 200, Height = 40 };
+        readonly Label wifiStatus = new Label { AutoSize = true, MaximumSize = new Size(360, 0), Margin = new Padding(3, 12, 3, 3) };
         List<UpdateRow> updates;
+
+        void ShowWifiFirmware()
+        {
+            wifiStatus.Text = WifiFirmware.Present()
+                ? T("Wi-Fi のファームウェア: あり", "Wi-Fi firmware: present")
+                : T("Wi-Fi のファームウェア: なし（自分の Switchroot などからコピーしてください）", "Wi-Fi firmware: missing (copy it from your own Switchroot install)");
+        }
+
+        /// <summary>The user's own brcmfmac4356 firmware + NVRAM (+ wifi-mac.txt) from a folder; never downloaded.</summary>
+        async System.Threading.Tasks.Task AddWifiFirmware()
+        {
+            using var dlg = new FolderBrowserDialog
+            {
+                Description = T("brcmfmac4356-pcie.bin と .txt（Switchroot では brcmfmac4356A3-pcie.bin と .txt）があるフォルダーを選んでください。wifi-mac.txt があれば、本体の MAC アドレスも設定します。",
+                                "Choose the folder with brcmfmac4356-pcie.bin and .txt (brcmfmac4356A3-pcie.bin and .txt in Switchroot). A wifi-mac.txt there also sets the console's MAC address."),
+                UseDescriptionForTitle = true,
+            };
+            if (dlg.ShowDialog(this) != DialogResult.OK) return;
+            wifiButton.Enabled = false;
+            try { await WifiFirmware.RunElevatedAsync(dlg.SelectedPath); }
+            finally { wifiButton.Enabled = true; ShowWifiFirmware(); LoadDrivers(); }
+        }
 
         TabPage BuildDrivers()
         {
@@ -400,7 +424,7 @@ namespace SwitchCenter
             driverList.Columns.Add(T("入っている版", "Installed"), 90);
             driverList.Columns.Add(T("動作中", "Running"), 60);
             driverList.Columns.Add(T("最新", "Latest"), 100);
-            var bottom = new FlowLayoutPanel { Dock = DockStyle.Bottom, Height = 300, FlowDirection = FlowDirection.TopDown, WrapContents = false };
+            var bottom = new FlowLayoutPanel { Dock = DockStyle.Bottom, Height = 350, FlowDirection = FlowDirection.TopDown, WrapContents = false };
             var reload = new Button { Text = T("再読み込み", "Reload"), Width = 120, Height = 40 };
             reload.Click += (_, _) => LoadDrivers();
             checkButton.Text = T("更新を確認", "Check for updates");
@@ -424,6 +448,13 @@ namespace SwitchCenter
             signRow.Controls.Add(signStatus);
             bottom.Controls.Add(signRow);
             ShowSignIn();
+            var wifiRow = new FlowLayoutPanel { AutoSize = true };
+            wifiButton.Text = T("Wi-Fi のファームウェア…", "Wi-Fi firmware...");
+            wifiButton.Click += async (_, _) => await AddWifiFirmware();
+            wifiRow.Controls.Add(wifiButton);
+            wifiRow.Controls.Add(wifiStatus);
+            bottom.Controls.Add(wifiRow);
+            ShowWifiFirmware();
             var buttons = new FlowLayoutPanel { AutoSize = true };
             buttons.Controls.Add(reload);
             buttons.Controls.Add(checkButton);
