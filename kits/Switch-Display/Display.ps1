@@ -101,6 +101,7 @@ function Show-Trace {
     Sum ('QAI types 0x{0:X}  child status types 0x{1:X}  EDID reads {2}  VidPN not supported {3}  reject code {4} a=0x{5:X} b=0x{6:X}  cofunc step {7}' -f [uint32]$p.QaiTypes, [uint32]$p.ChildStatusTypes, $p.EdidReads, $p.VidPnNotSupported, $p.RejCode, [uint32]$p.RejA, [uint32]$p.RejB, $p.CofuncStep)
   }  if ($null -ne $p.TgtVariant) { Sum ('signal form: target {0} (add 0x{1:X8}, assign 0x{2:X8})  monitor {3}   (9/10 = frequency not specified, 1-8 = form 0-7; 0xFF = all refused)' -f $p.TgtVariant, [uint32]$p.TgtAddSt, [uint32]$p.TgtAssignSt, $p.MonVariant) }
   if ($null -ne $p.TgtSt0) { Sum ('target form status 0-9: ' + ((0..9 | ForEach-Object { '{0:X}' -f [uint32]$p."TgtSt$_" }) -join ' ') + ('   EDID given {0}' -f $p.EdidGiven)) }
+  if ($null -ne $p.PanelOffs) { Sum ('panel sleep (stage 2a): off {0}  on {1}  DSI map {2}  DSI status before off 0x{3:X} after off 0x{4:X} after on 0x{5:X}  (PanelPower={6})' -f $p.PanelOffs, $p.PanelOns, $p.DsiMapped, [uint32]$p.DsiStatusBeforeOff, [uint32]$p.DsiStatusAfterOff, [uint32]$p.DsiStatusAfterOn, $(if ($null -ne $p.PanelPower) { $p.PanelPower } else { 'default 1' })) }
   if ($p.GuardTripped) { Sum ('boot-loop guard tripped {0} time(s): the driver refused to start after crashes' -f $p.GuardTripped) }
 }
 

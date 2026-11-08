@@ -24,7 +24,7 @@
 #include <ntddk.h>
 #include <dispmprt.h>
 
-#define SWD_VERSION        0x0001000Au   /* 1.0.10 */
+#define SWD_VERSION        0x0001000Bu   /* 1.0.11 */
 #define SWD_TAG            'DwsS'
 
 /* Boot framebuffer (coreboot display.c / UEFI MemoryMap.h "Display Reserved") */
@@ -51,6 +51,20 @@
 #define DC_WIN_LINE_STRIDE (0x70Au * 4u)
 #define DC_WINBUF_START    (0x800u * 4u)
 
+/* DSI-A (stage 2): DCS short writes sent inside the running video stream, as
+ * hekate's display_end() does for SET_DISPLAY_OFF (bdk/display/di.c). */
+#define DSI_A_PHYS         0x54300000ull
+#define DSI_MAP_SIZE       0x1000u
+#define DSI_WR_DATA        (0x0Au * 4u)
+#define DSI_STATUS_REG     (0x15u * 4u)
+#define DSI_VIDEO_MODE_CTL (0x4Eu * 4u)
+#define DSI_CMD_PKT_VID_ENABLE 1u
+#define MIPI_DCS_SHORT_WRITE   0x05u
+#define DCS_ENTER_SLEEP    0x10u
+#define DCS_EXIT_SLEEP     0x11u
+#define DCS_DISPLAY_OFF    0x28u
+#define DCS_DISPLAY_ON     0x29u
+
 #define GUARD_SECONDS      60
 #define FLUSH_SECONDS      10
 
@@ -66,6 +80,8 @@ typedef struct _SWD_CONTEXT {
     ULONG                FbHeight;      /* native: 1280 */
     SIZE_T               FbMapSize;
     PUCHAR               FbVa;
+    PUCHAR               DsiVa;         /* DSI-A registers (stage 2) */
+    BOOLEAN              PanelAsleep;
     D3DDDIFORMAT         FbFormat;
 
     /* current mode */
@@ -91,6 +107,8 @@ typedef struct _SWD_CONTEXT {
     volatile LONG        Commits;
     volatile LONG        PowerCalls;
     volatile LONG        LastPower;     /* (uid << 8) | Dx */
+    volatile LONG        PanelOffs;
+    volatile LONG        PanelOns;
 } SWD_CONTEXT, *PSWD_CONTEXT;
 
 static WCHAR  gParamPathBuf[512];
@@ -156,6 +174,8 @@ static VOID FlushCounters(PSWD_CONTEXT Ctx)
     RegPutDword(L"Commits", (ULONG)Ctx->Commits);
     RegPutDword(L"PowerCalls", (ULONG)Ctx->PowerCalls);
     RegPutDword(L"LastPower", (ULONG)Ctx->LastPower);
+    RegPutDword(L"PanelOffs", (ULONG)Ctx->PanelOffs);
+    RegPutDword(L"PanelOns", (ULONG)Ctx->PanelOns);
     {
         int i;
         for (i = 0; i < D_COUNT; i++) {
@@ -420,6 +440,10 @@ static VOID UnmapFb(PSWD_CONTEXT Ctx)
         MmUnmapIoSpace(Ctx->FbVa, Ctx->FbMapSize);
         Ctx->FbVa = NULL;
     }
+    if (Ctx->DsiVa) {
+        MmUnmapIoSpace(Ctx->DsiVa, DSI_MAP_SIZE);
+        Ctx->DsiVa = NULL;
+    }
 }
 
 static VOID ReadDcTrace(VOID)
@@ -494,6 +518,52 @@ static VOID BltRect(PSWD_CONTEXT Ctx, PUCHAR SrcBase, LONG SrcTop, LONG Pitch, R
 #undef DSTROW
 }
 
+/* ------------------------------------------------------------ stage 2: panel sleep */
+
+static VOID SleepMs(ULONG Ms)
+{
+    LARGE_INTEGER t;
+    t.QuadPart = -(LONGLONG)Ms * 10 * 1000;
+    KeDelayExecutionThread(KernelMode, FALSE, &t);
+}
+
+static VOID DsiDcs(PSWD_CONTEXT Ctx, ULONG Cmd, ULONG WaitMs)
+{
+    /* The packet goes out in the next blanking of the video stream; wait one
+     * frame (16.7 ms) plus the panel's own delay. */
+    WRITE_REGISTER_ULONG((PULONG)(Ctx->DsiVa + DSI_WR_DATA), (Cmd << 8) | MIPI_DCS_SHORT_WRITE);
+    SleepMs(20 + WaitMs);
+}
+
+/* Display off + sleep in. The DC keeps scanning and the DSI link stays in HS
+ * video mode, so waking needs no panel init (stage 2a). switchfan.sys turns
+ * the backlight off on its own. */
+static VOID PanelSleep(PSWD_CONTEXT Ctx)
+{
+    if (!Ctx->DsiVa || Ctx->PanelAsleep || RegGetDword(L"PanelPower", 1) == 0) return;
+    RegPutDword(L"DsiStatusBeforeOff", READ_REGISTER_ULONG((PULONG)(Ctx->DsiVa + DSI_STATUS_REG)));
+    WRITE_REGISTER_ULONG((PULONG)(Ctx->DsiVa + DSI_VIDEO_MODE_CTL), DSI_CMD_PKT_VID_ENABLE);
+    DsiDcs(Ctx, DCS_DISPLAY_OFF, 20);
+    DsiDcs(Ctx, DCS_ENTER_SLEEP, 50);
+    WRITE_REGISTER_ULONG((PULONG)(Ctx->DsiVa + DSI_VIDEO_MODE_CTL), 0);
+    Ctx->PanelAsleep = TRUE;
+    InterlockedIncrement(&Ctx->PanelOffs);
+    RegPutDword(L"DsiStatusAfterOff", READ_REGISTER_ULONG((PULONG)(Ctx->DsiVa + DSI_STATUS_REG)));
+}
+
+/* Sleep out (the JDI panel needs 180 ms, as in coreboot/hekate) + display on. */
+static VOID PanelWake(PSWD_CONTEXT Ctx)
+{
+    if (!Ctx->DsiVa || !Ctx->PanelAsleep) return;
+    WRITE_REGISTER_ULONG((PULONG)(Ctx->DsiVa + DSI_VIDEO_MODE_CTL), DSI_CMD_PKT_VID_ENABLE);
+    DsiDcs(Ctx, DCS_EXIT_SLEEP, 180);
+    DsiDcs(Ctx, DCS_DISPLAY_ON, 20);
+    WRITE_REGISTER_ULONG((PULONG)(Ctx->DsiVa + DSI_VIDEO_MODE_CTL), 0);
+    Ctx->PanelAsleep = FALSE;
+    InterlockedIncrement(&Ctx->PanelOns);
+    RegPutDword(L"DsiStatusAfterOn", READ_REGISTER_ULONG((PULONG)(Ctx->DsiVa + DSI_STATUS_REG)));
+}
+
 /* ------------------------------------------------------------ DDIs */
 
 DXGKDDI_ADD_DEVICE SwdAddDevice;
@@ -541,6 +611,13 @@ NTSTATUS SwdStartDevice(IN_CONST_PVOID MiniportDeviceContext, IN_PDXGK_START_INF
     RegPutDword(L"StartPending", pending + 1);
 
     ReadDcTrace();
+    {
+        PHYSICAL_ADDRESS pa;
+        pa.QuadPart = (LONGLONG)DSI_A_PHYS;
+        ctx->DsiVa = (PUCHAR)MmMapIoSpaceEx(pa, DSI_MAP_SIZE, PAGE_READWRITE | PAGE_NOCACHE);
+        ctx->PanelAsleep = FALSE;
+        RegPutDword(L"DsiMapped", ctx->DsiVa ? 1 : 0);
+    }
 
     /* 1.0.1: which resources did the device get (the INF LogConfig)? */
     {
@@ -665,7 +742,8 @@ NTSTATUS SwdStopAndRelease(PVOID MiniportDeviceContext, D3DDDI_VIDEO_PRESENT_TAR
 {
     PSWD_CONTEXT ctx = (PSWD_CONTEXT)MiniportDeviceContext;
     if (TargetId != 0 || !DisplayInfo) return STATUS_INVALID_PARAMETER;
-    /* Hand back the framebuffer in its native layout. */
+    /* Hand back the framebuffer in its native layout, with the panel awake. */
+    PanelWake(ctx);
     ctx->Rotation = D3DKMDT_VPPR_IDENTITY;
     ClearFb(ctx);
     DisplayInfo->Width = ctx->FbWidth;
@@ -777,9 +855,12 @@ static NTSTATUS ImplSetPowerState(IN_CONST_PVOID MiniportDeviceContext, IN_ULONG
     UNREFERENCED_PARAMETER(ActionType);
     InterlockedIncrement(&ctx->PowerCalls);
     InterlockedExchange(&ctx->LastPower, (LONG)(((DeviceUid & 0xFFFFFF) << 8) | ((ULONG)DevicePowerState & 0xFF)));
-    /* Stage 1: the panel and DC stay on (switchfan.sys turns the backlight
-     * off). Only stop drawing while the monitor is off. */
-    if (DeviceUid == 0) ctx->MonitorOff = (DevicePowerState != PowerDeviceD0);
+    /* Stage 2a (1.0.11): the monitor (child 0) or the whole adapter going to
+     * D1-D3 puts the panel to sleep; D0 wakes it. */
+    if (DeviceUid == 0 || DeviceUid == DISPLAY_ADAPTER_HW_ID) {
+        if (DeviceUid == 0) ctx->MonitorOff = (DevicePowerState != PowerDeviceD0);
+        if (DevicePowerState == PowerDeviceD0) PanelWake(ctx); else PanelSleep(ctx);
+    }
     return STATUS_SUCCESS;
 }
 
