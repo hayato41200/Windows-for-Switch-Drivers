@@ -1843,9 +1843,27 @@ ULONG BcmGetLinkSpeed(VOID)
 {
     ULONG Rate = 0, St = 0;
     if (!gReady) return 0;
-    /* WLC_GET_RATE is in 500 kbit/s units; WDI link speed is 100 kbit/s. */
+    /* WLC_GET_RATE is in 500 kbit/s units; WDI and Windows show kbit/s
+     * (0.6.11: 0.6.5 multiplied by 5, so 866.5 Mbit/s showed as 8.7). */
     if (SwWifiIoctl(&gDev, WLC_GET_RATE, &Rate, 4, &Rate, 4, &St) < 4 || St != 0) return 0;
-    return Rate * 5;
+    SwWifiTrace(L"LinkRate500k", Rate);
+    return Rate * 500;
+}
+
+/* 0.6.11: the operating channel width after association ("chanspec", d11ac). */
+ULONG BcmGetBandwidth(VOID)
+{
+    ULONG Cs = 0, St = 0, Bw;
+    if (!gReady) return 20;
+    if (SwWifiGetVar(&gDev, "chanspec", &Cs, 4, &St) < 2 || St != 0) return 20;
+    SwWifiTrace(L"LinkChanspec", Cs & 0xFFFFu);
+    switch (Cs & 0x3800u) {
+    case 0x1800u: Bw = 40; break;
+    case 0x2000u: Bw = 80; break;
+    case 0x2800u: case 0x3000u: Bw = 160; break;
+    default:      Bw = 20; break;
+    }
+    return Bw;
 }
 
 /* WLC_DISASSOC (brcmf_link_down); the data path goes first. */

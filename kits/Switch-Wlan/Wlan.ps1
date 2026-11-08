@@ -86,6 +86,8 @@ function Show-Status {
   if ($p.WlanCmdLog) { Log ("cmdlog : ({0}) {1}" -f $p.WlanCmdLogN, $p.WlanCmdLog) }
   # 0.6.6: frames between the chip and Windows, connect timing
   if ($p.WlanOsPath) { Log ("os     : {0}" -f $p.WlanOsPath) }
+  # 0.6.11: what the association really is (PHY 4=OFDM 6=ERP 7=HT 8=VHT)
+  if ($null -ne $p.WlanPhy) { Log ("link   : phy={0} bandwidth={1} MHz rate={2} Mbit/s chanspec={3}" -f $p.WlanPhy, $p.WlanBandwidth, ([double]$p.LinkRate500k / 2), $(if ($null -ne $p.LinkChanspec) { '{0:X4}' -f $p.LinkChanspec } else { '-' })) }
   if ($p.WlanFormat) { Log ("format : {0}" -f $p.WlanFormat) }
   if ($p.WlanRxDst) { Log ("rx dst : {0}  (unicast to the adapter MAC / multicast / unicast to another MAC)" -f $p.WlanRxDst) }
   @($p.ScanList -split "`n" | Where-Object { $_.Trim() }) | Select-Object -First 6 | ForEach-Object { Log "  $_" }

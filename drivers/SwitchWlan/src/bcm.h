@@ -73,7 +73,8 @@ VOID BcmLinkResult(PULONG Event, PULONG Status, PULONG Reason);
 /* Returns WDI-ready association request/response bodies (fixed fields + IEs, no 802.11 MAC header). */
 VOID BcmGetAssocIes(PUCHAR Req, ULONG ReqMax, PULONG ReqLen, PUCHAR Resp, ULONG RespMax, PULONG RespLen);
 LONG BcmGetRssi(VOID);
-ULONG BcmGetLinkSpeed(VOID);                    /* WDI units: 100 kbit/s */
+ULONG BcmGetLinkSpeed(VOID);                    /* kbit/s */
+ULONG BcmGetBandwidth(VOID);                    /* MHz, from the operating chanspec */
 VOID BcmLeave(VOID);                            /* disassociate, data path down */
 NTSTATUS BcmSetMac(const UCHAR Mac[6]);
 NTSTATUS BcmSetKey(const BCM_KEY *Key);         /* waits for queued EAPOL frames to leave first */

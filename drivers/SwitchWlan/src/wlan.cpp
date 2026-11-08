@@ -25,7 +25,7 @@
 #include "bcm.h"
 #include <ntstrsafe.h>
 
-#define WLAN_VERSION        0x00060A00u     /* 0.6.10 */
+#define WLAN_VERSION        0x00060B00u     /* 0.6.11 */
 #define WLAN_TAG            'nlWS'
 #define WLAN_FRAME_MAX      2048u
 #define WLAN_FRAME_QUEUE    256u    /* 0.6.9: 32 frames per poll capped Rx at ~12 Mbit/s */
@@ -247,9 +247,20 @@ static VOID WlanIndicateAssociationResult(PWLAN_DEVICE Ctx, const WDI_MESSAGE_HE
     if (ReqLen) Off = PutTlv(Tlv, Off, WDI_TLV_ASSOCIATION_REQUEST_FRAME, ReqIes, ReqLen);
     if (RespLen) Off = PutTlv(Tlv, Off, WDI_TLV_ASSOCIATION_RESPONSE_FRAME, RespIes, RespLen);
 
-    /* WDI v1.1.4+ requires the active PHY list. HT is the conservative PHY
-     * common to the BCM4356 and this driver; the association is 2.4/5 GHz. */
-    Value = WDI_PHY_TYPE_HT;
+    /* WDI v1.1.4+ requires the active PHY list. 0.6.11: from the AP's
+     * association response IEs (VHT capabilities 191, HT capabilities 45). */
+    {
+        BOOLEAN Ht = FALSE, Vht = FALSE;
+        ULONG I = 6;                            /* capability, status, AID */
+        while (RespLen >= 6 && I + 2 <= RespLen && I + 2 + RespIes[I + 1] <= RespLen) {
+            if (RespIes[I] == 45) Ht = TRUE;
+            if (RespIes[I] == 191) Vht = TRUE;
+            I += 2 + RespIes[I + 1];
+        }
+        if (Join->Channel > 14) Value = Vht ? WDI_PHY_TYPE_VHT : Ht ? WDI_PHY_TYPE_HT : WDI_PHY_TYPE_OFDM;
+        else Value = Ht ? WDI_PHY_TYPE_HT : WDI_PHY_TYPE_ERP;
+        BcmTrace(L"WlanPhy", Value);
+    }
     Off = PutTlv(Tlv, Off, WDI_TLV_PHY_TYPE_LIST, &Value, sizeof(Value));
     (VOID)PutTlv(Tlv, 0, WDI_TLV_ASSOCIATION_RESULT, NULL, Off - 4);
 
@@ -281,7 +292,8 @@ static VOID WlanIndicateAssociationResult(PWLAN_DEVICE Ctx, const WDI_MESSAGE_HE
     RtlCopyMemory(LinkInfo + 20, &Channel, sizeof(Channel));
     RtlCopyMemory(LinkInfo + 24, &Band, sizeof(Band));
     RtlCopyMemory(LinkInfo + 28, &Rssi, sizeof(Rssi));
-    Value = 20; /* conservative 20 MHz channel width; firmware rate is reported above */
+    Value = BcmGetBandwidth();              /* 0.6.11: was a fixed 20 MHz */
+    BcmTrace(L"WlanBandwidth", Value);
     RtlCopyMemory(LinkInfo + 32, &Value, sizeof(Value));
     Off = PutTlv(LinkTlv, Off, WDI_TLV_LINK_INFO, LinkInfo, sizeof(LinkInfo));
     BcmTrace(L"WlanLinkSpeed", LinkSpeed);
