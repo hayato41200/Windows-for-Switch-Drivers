@@ -25,10 +25,10 @@
 #include "bcm.h"
 #include <ntstrsafe.h>
 
-#define WLAN_VERSION        0x00060800u     /* 0.6.8 */
+#define WLAN_VERSION        0x00060900u     /* 0.6.9 */
 #define WLAN_TAG            'nlWS'
 #define WLAN_FRAME_MAX      2048u
-#define WLAN_FRAME_QUEUE    32u
+#define WLAN_FRAME_QUEUE    256u    /* 0.6.9: 32 frames per poll capped Rx at ~12 Mbit/s */
 
 enum { WLAN_OP_NONE = 0, WLAN_OP_CONNECT = 1, WLAN_OP_DISCONNECT = 2, WLAN_OP_RESET = 3, WLAN_OP_CONNECTING = 4 };
 #define WLAN_KEY_MAX 4u
@@ -630,6 +630,12 @@ static VOID WlanDrainTx(PWLAN_DEVICE Ctx)
 static VOID WlanThread(PVOID Context)
 {
     PWLAN_DEVICE Ctx = (PWLAN_DEVICE)Context;
+    /* 0.6.9: no interrupt yet, so the rings are polled. Poll every 1 ms while
+     * frames are moving (1 ms system timer while the worker runs), 20 ms idle. */
+    ULONG Idle = 1000, LastFrames = 0;
+    ULONGLONG LastTick = KeQueryInterruptTime();
+    ULONG DeltaMs = 0;
+    (VOID)ExSetTimerResolution(10000, TRUE);
 
     while (!Ctx->Stop) {
         LARGE_INTEGER Timeout;
@@ -642,8 +648,15 @@ static VOID WlanThread(PVOID Context)
         ULONG KeyCount = 0, K;
         WIFIREQUEST KeyRequest = NULL;
 
-        Timeout.QuadPart = -20 * 10000LL;
+        Timeout.QuadPart = (Idle < 200) ? -1 * 10000LL : -20 * 10000LL;
         (VOID)KeWaitForSingleObject(&Ctx->Wake, Executive, KernelMode, FALSE, &Timeout);
+        {
+            ULONG Frames = Ctx->RxQueued + Ctx->TxFromOs;
+            ULONGLONG Now = KeQueryInterruptTime();
+            if (Frames != LastFrames) { LastFrames = Frames; Idle = 0; } else if (Idle < 1000) Idle++;
+            DeltaMs = (ULONG)((Now - LastTick) / 10000ULL);
+            LastTick = Now;
+        }
         if (Ctx->Stop) break;
         KeAcquireSpinLock(&Ctx->Lock, &Irql);
         Scan = Ctx->ScanPending;
@@ -691,7 +704,7 @@ static VOID WlanThread(PVOID Context)
             KeAcquireSpinLock(&Ctx->Lock, &Irql);
             if (Ctx->PendingOp == WLAN_OP_CONNECTING) {
                 ULONG Link = BcmLinkState();
-                Ctx->OpElapsedMs += 20;
+                Ctx->OpElapsedMs += DeltaMs;
                 if (Link == BCM_LINK_UP || Link == BCM_LINK_FAILED || Link == BCM_LINK_LOST || Ctx->OpElapsedMs >= 20000) {
                     Header = Ctx->OpHeader;
                     Ctx->PendingOp = WLAN_OP_NONE;
@@ -736,6 +749,7 @@ static VOID WlanThread(PVOID Context)
             if (Now - Ctx->TraceAt >= 10000000ULL) { Ctx->TraceAt = Now; WlanSaveTrace(Ctx); }
         }
     }
+    (VOID)ExSetTimerResolution(0, FALSE);
     PsTerminateSystemThread(STATUS_SUCCESS);
 }
 

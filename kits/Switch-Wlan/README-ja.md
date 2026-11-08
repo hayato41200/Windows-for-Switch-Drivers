@@ -98,3 +98,9 @@
   - Install：入れ替えの前に wlansvc を止める（止めないと pnputil が query-remove の時間切れ、exit 480 になる）。
 - 診断用：`Trace-Start.cmd` / `Trace-Stop.cmd` で `C:\SwitchWOA-wlan.etl` を記録できる（`netsh trace`）。PC で `netsh trace convert input=... dump=txt` すると読める。
 - 残り：本体の MAC の設定（cur_etheraddr を読み返すと変わっていない）、接続中のスキャンで見えるネットワークが 1 つだけになる、初回の接続が時間切れになることがある。
+
+## 0.6.9 の実機結果（2026-11-08、ユーザー報告）
+
+- fast.com で 11 Mbps（0.6.8）→ 36 Mbps（0.6.9）。
+- 0.6.8 までは 20 ms（実際は約 31 ms）ごとのポーリングで、1 回に 32 フレームまでしか Windows に渡せず、約 12 Mbps が上限だった。0.6.9 ではキューを 256 フレームにし、通信中は 1 ms ごとにポーリングする（約 0.2 秒通信がなければ 20 ms に戻す）。
+- さらに速くするなら、割り込み（MSI）での受信、コピーの削減が次の候補。
