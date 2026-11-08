@@ -27,6 +27,7 @@ the UEFI starts it (not `bootmgfw.efi` directly). Other `0xD…` codes: see "ブ
 | `switchbt` | ACPI\SWOA0B01 | R390 | Bluetooth（UART-D の BCM4356A3 を、Windows 標準の BthMini につなぐ）。3 Mbps。ファームウェアのパッチ `BCM4356A3.hcd` は各自で用意（配布しない）。今は電波がとても近くまでしか届かない（Wi-Fi 側が動いていないため） |
 | `switchaudio`（ベータ） | ACPI\SWOA0C01 | R403（R402 ならスピーカーだけ） | 音声。スピーカーとヘッドホンへの再生（PortCls WaveRT、48 kHz・16 ビット・ステレオ）。ヘッドホンを抜き差しすると自動で切り替わる。Windows に見える出力は「スピーカー」の1つで、音量も共通。マイクは無い |
 | `switchsensor` | ACPI\SWOA0901 | R379 | 傾きセンサー（画面の自動回転）。明るさセンサーは、この本体では見つからず使えていない |
+| `switchdisplay`（ベータ） | ACPI\SWOA0E01 | R408 | 内蔵パネルの表示（WDDM の表示専用ドライバー。Basic Display の代わり）。回転（設定と SwitchCenter の自動回転）。画面オフのときにパネルをスリープさせ、表示コントローラーも止める。描画は今までどおり CPU（GPU による高速化は無い）。入れ替えは次の起動のとき（`kits/Switch-Display`） |
 | `swoadiag` | —（読み込んだときだけ） | — | USB（XUSB）のレジスタを読むだけの診断用 |
 | `nvtsdhc` | ACPI\NVDA0101 | —（SD のローダーがデバイスを足す） | Windows 11 を SD から起動するための SD ホスト（sdport）。SwitchPatcher が SD に入れる（`kits/Switch-Sd`）。起動できないときは、ブルースクリーンに診断用のコードを出す（下の「ブルースクリーンのストップコード」） |
 

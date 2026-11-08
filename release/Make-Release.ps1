@@ -81,6 +81,9 @@ $Drivers = @(
   # Wi-Fi: two sources against the 10.0.26100 WDK, built by its own script. Firmware, NVRAM and the
   # console's MAC are never in the release: SwitchCenter copies them from the user's own files.
   @{ Dir = 'SwitchWlan';        Name = 'switchwlan';    Build = 'drivers\SwitchWlan\build.ps1';                                      Kit = 'Switch-Wlan';        Hwid = 'ACPI\SWOA0D01'; MinUefi = 'R405'; Ja = 'Wi-Fi'; En = 'Wi-Fi'; Boot = $false; Beta = $true }
+  # Display: WDDM display-only driver against the 10.0.26100 WDK, own build script. Replaced at the next
+  # boot like GPIO/I2C: swapping the display driver live can leave the screen black until a restart.
+  @{ Dir = 'SwitchDisplay';     Name = 'switchdisplay'; Build = 'drivers\SwitchDisplay\build.ps1';                                Kit = 'Switch-Display';     Hwid = 'ACPI\SWOA0E01'; MinUefi = 'R408'; Ja = '画面（表示専用ドライバー）'; En = 'Display (display-only)'; Boot = $true; Beta = $true }
   @{ Dir = 'SwoaDiag';          Name = 'swoadiag';      Src = 'swoadiag.c';      Libs = @();                             Inc = @();  Kit = 'Switch-UsbDiag';     Hwid = '';              MinUefi = '' }
   @{ Dir = 'SwoaHello';         Name = 'SwoaHello';     Src = 'hello.c';         Libs = @();                             Inc = @();  Kit = 'Switch-Stage0';      Hwid = '';              MinUefi = '' }
 )
