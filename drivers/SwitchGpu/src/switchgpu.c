@@ -39,7 +39,7 @@
 #include <wdf.h>
 #include <spb.h>
 
-#define SWGPU_VERSION      0x00000101u   /* 0.1.1 */
+#define SWGPU_VERSION      0x00000307u   /* 0.3.7 */
 
 #define CAR_PHYS           0x60006000ull
 #define CAR_LEN            0x1000u
@@ -89,6 +89,54 @@
 /* The WPR the GPU sees (from the MC carveouts sent with SEND_CFG_TO_GPU):
  * write index 2 -> start >> 8 in [31:8], index 3 -> limit (nouveau gm200_acr_wpr_check). */
 #define NV_PFB_MMU_WPR_INFO 0x100CD4
+/* Stage B1 probe (PowerTest = 2): no firmware, nothing executed on the GPU. */
+#define NV_PTOP_DEVICE_INFO 0x022700    /* 64 entries (nouveau gk104_top_parse) */
+#define NV_PTOP_SCAL       0x022430    /* num GPCs, TPC/GPC, FBPs, ... (nvgpu hw_top) */
+#define PMU_FALCON         0x10A000
+#define FALCON_MAILBOX0    0x040
+#define FALCON_MAILBOX1    0x044
+#define FALCON_CPUCTL      0x100
+#define FALCON_HWCFG       0x108       /* IMEM = ([8:0]) << 8, DMEM = ([17:9]) << 8 */
+#define FALCON_DMACTL      0x10C
+#define FALCON_ITFEN       0x048       /* bit 0: external interface on (nouveau sets it before DMA) */
+#define FALCON_HWCFG1      0x12C
+#define FALCON_SCTL        0x240
+#define FALCON_DMEMC0      0x1C0       /* BIT24 auto-increment write, BIT25 read */
+#define FALCON_DMEMD0      0x1C4
+#define PMU_DEBUG          0xC08       /* bit 20 = debug-fused (nouveau gm200_pmu_flcn.debug) */
+/* Stage B2a probe (PowerTest = 3): falcon DMA in physical mode, no firmware.
+ * Falcon v4 DMA (open-gpu-kernel-modules dev_falcon_v4.h): */
+#define FALCON_DMATRFBASE  0x110       /* address >> 8 */
+#define FALCON_DMATRFMOFFS 0x114       /* DMEM/IMEM offset */
+#define FALCON_DMATRFCMD   0x118       /* IDLE bit 1, IMEM bit 4, WRITE bit 5 (falcon -> memory), SIZE [10:8], CTXDMA [14:12] */
+#define FALCON_DMATRFFBOFFS 0x11C      /* offset from DMATRFBASE */
+#define DMATRFCMD_IDLE     (1u << 1)
+#define DMATRFCMD_WRITE    (1u << 5)
+#define DMATRFCMD_256B     (6u << 8)
+#define DMA_IDX            4u          /* ctx dma index 4 = PHYS_SYS_NCOH in nouveau's PMU setup */
+/* PMU FBIF at + 0xE00 (nouveau gm200_pmu_flcn_bind_inst); TRANSCFG(i) = + 4 i:
+ * TARGET [1:0] (2 = noncoherent sysmem), MEM_TYPE bit 2 (1 = physical);
+ * FBIF_CTL + 0x24 bit 7 = ALLOW_PHYS_NO_CTX (dev_fbif_v4.h). */
+#define PMU_FBIF_TRANSCFG(i) (0xE00 + (i) * 4)
+#define PMU_FBIF_CTL       0xE24
+#define FBIF_PHYS_NCOH     6u
+/* PMC_ENABLE units of the memory path (nvgpu hw_mc_gm20b: xbar bit 2, l2 bit 3,
+ * pfb bit 20, hub bit 29; nvgpu gk20a_fb_reset resets these four together). */
+#define PMC_ENABLE_MEMPATH ((1u << 2) | (1u << 3) | (1u << 20) | (1u << 29))
+/* Tegra210 MC SMMU (Linux tegra210.c / tegra-smmu.c) */
+#define MC_SMMU_CONFIG     0x010       /* bit 0 = SMMU on */
+#define MC_INTSTATUS       0x000       /* MC error interrupts (Linux tegra mc.c) */
+#define MC_ERR_STATUS      0x008
+#define MC_ERR_ADR         0x00C
+#define MC_SMMU_PTB_ASID   0x01C       /* select ASID for PTB_DATA (tegra-smmu) */
+#define MC_SMMU_PTB_DATA   0x020       /* [31:29] attr, [21:0] page-directory pfn */
+#define MC_SMMU_TLB_FLUSH  0x030       /* 0 = flush all (ATF MC_SMMU_TLB_FLUSH_ALL) */
+#define MC_SMMU_PTC_FLUSH  0x034       /* 0 = flush all (ATF MC_SMMU_PTC_FLUSH_ALL) */
+#define SMMU_ATTR_RWNS     0xE0000000u /* readable, writable, non-secure (tegra-smmu) */
+#define SMMU_PDE_NEXT      (1u << 28)  /* PDE points to a page table */
+#define MC_SMMU_GPU_ASID   0xAAC       /* bit 31 = GPU swgroup translated */
+#define MC_SMMU_CLIENT_230 0x230       /* bit 24 GPUSRD, bit 25 GPUSWR */
+#define MC_SMMU_CLIENT_B98 0xB98       /* bit 8 GPUSRD2, bit 9 GPUSWR2 */
 
 typedef struct _SWGPU_DEVICE {
     WDFDEVICE      Device;
@@ -156,6 +204,13 @@ static VOID TraceDurable(PCWSTR Name, ULONG Value)
 }
 
 static VOID Step(ULONG N) { TraceDurable(L"Step", N); }
+
+static VOID TraceBin(PCWSTR Name, PVOID Data, ULONG Length)
+{
+    if (SwGpuParamsPath[0] != L'\0' && KeGetCurrentIrql() == PASSIVE_LEVEL) {
+        (VOID)RtlWriteRegistryValue(RTL_REGISTRY_ABSOLUTE, SwGpuParamsPath, Name, REG_BINARY, Data, Length);
+    }
+}
 
 /* ------------------------------------------------------------------- MMIO */
 
@@ -265,9 +320,348 @@ static VOID Snapshot(PSWGPU_DEVICE Dev, BOOLEAN After)
 #undef N
 }
 
+/* ------------------------------------------------------- stage B1 probe */
+
+/* Error values from a PRI read that nobody answered (0xBADFxxxx) or a dead bus. */
+static BOOLEAN PriBad(ULONG v) { return (v & 0xFFFF0000u) == 0xBADF0000u || v == 0xFFFFFFFFu; }
+
+/* With the GPU powered and answering as GM20B: read the topology table and the
+ * PMU falcon, try a DMEM write/read through the PIO port (nothing is started),
+ * then run nouveau's gk20a_privring init and read the ring status. */
+static VOID ProbeB1(PSWGPU_DEVICE Dev)
+{
+    static const ULONG pat[4] = { 0x5A5A0001u, 0xA5A50002u, 0x12345678u, 0xFEDCBA98u };
+    ULONG ptop[64], scal[12], rb[4], i, ok = 0, hw;
+    volatile UCHAR *B = Dev->Bar0;
+
+    Step(20);   /* topology, scal */
+    for (i = 0; i < 64; ++i) ptop[i] = Rd(B, NV_PTOP_DEVICE_INFO + i * 4);
+    TraceBin(L"Ptop", ptop, sizeof(ptop));
+    for (i = 0; i < 12; ++i) scal[i] = Rd(B, NV_PTOP_SCAL + i * 4);
+    TraceBin(L"Scal", scal, sizeof(scal));
+    TraceDurable(L"PtopRead", 1);
+
+    Step(21);   /* PMU falcon registers */
+    hw = Rd(B, PMU_FALCON + FALCON_HWCFG);
+    Trace(L"PmuHwcfg", hw);
+    Trace(L"PmuHwcfg1", Rd(B, PMU_FALCON + FALCON_HWCFG1));
+    Trace(L"PmuCpuctl", Rd(B, PMU_FALCON + FALCON_CPUCTL));
+    Trace(L"PmuDmactl", Rd(B, PMU_FALCON + FALCON_DMACTL));
+    Trace(L"PmuSctl", Rd(B, PMU_FALCON + FALCON_SCTL));
+    Trace(L"PmuDebug", Rd(B, PMU_FALCON + PMU_DEBUG));
+    Trace(L"PmuMbox0", Rd(B, PMU_FALCON + FALCON_MAILBOX0));
+    Trace(L"PmuMbox1", Rd(B, PMU_FALCON + FALCON_MAILBOX1));
+    TraceDurable(L"PmuRead", 1);
+
+    if (!PriBad(hw) && hw != 0) {
+        Step(22);   /* DMEM PIO write / read back at offset 0, then clear */
+        Wr(B, PMU_FALCON + FALCON_DMEMC0, (1u << 24));
+        for (i = 0; i < 4; ++i) Wr(B, PMU_FALCON + FALCON_DMEMD0, pat[i]);
+        Wr(B, PMU_FALCON + FALCON_DMEMC0, (1u << 25));
+        for (i = 0; i < 4; ++i) { rb[i] = Rd(B, PMU_FALCON + FALCON_DMEMD0); if (rb[i] == pat[i]) ++ok; }
+        Wr(B, PMU_FALCON + FALCON_DMEMC0, (1u << 24));
+        for (i = 0; i < 4; ++i) Wr(B, PMU_FALCON + FALCON_DMEMD0, 0);
+        TraceBin(L"DmemReadBack", rb, sizeof(rb));
+        TraceDurable(L"DmemOk", ok);
+    }
+
+    Step(23);   /* nouveau gk20a_privring_init_privring_ring */
+    Trace(L"RingStatus0Before", Rd(B, 0x120058));
+    Wr(B, 0x137250, Rd(B, 0x137250) & ~0x3Fu);
+    Wr(B, NV_PMC_ENABLE, Rd(B, NV_PMC_ENABLE) & ~0x20u);
+    Us(20);
+    Wr(B, NV_PMC_ENABLE, Rd(B, NV_PMC_ENABLE) | 0x20u);
+    Wr(B, 0x12004C, 0x4);
+    Wr(B, 0x122204, 0x2);
+    (VOID)Rd(B, 0x122204);
+    Wr(B, 0x122354, 0x800);
+    Wr(B, 0x128328, 0x800);
+    Wr(B, 0x124320, 0x800);
+    Us(10);
+    Trace(L"RingStatus0", Rd(B, 0x120058));
+    Trace(L"RingCmd", Rd(B, 0x12004C));
+    Trace(L"RingMaster", Rd(B, 0x122204));
+    Trace(L"PmcEnableAfterRing", Rd(B, NV_PMC_ENABLE));
+    TraceDurable(L"RingDone", 1);
+}
+
+/* ------------------------------------------------------ stage B2a probe */
+
+static ULONG DmaWait(volatile UCHAR *B)
+{
+    ULONG i;
+    for (i = 0; i < 2000; ++i) {
+        if (Rd(B, PMU_FALCON + FALCON_DMATRFCMD) & DMATRFCMD_IDLE) return i;
+        Us(5);
+    }
+    return 0xFFFFFFFFu;
+}
+
+/* With the GPU powered and answering as GM20B: check that the GPU is not
+ * behind the SMMU, then let the PMU falcon's DMA engine copy 256 bytes from a
+ * Windows buffer into DMEM and 256 bytes from DMEM back into the buffer, in
+ * physical mode (no GPU page tables), driven from the CPU. Nothing runs on the
+ * falcon. The buffer is 4 KB, physically contiguous, below 4 GB, uncached;
+ * only bytes 0x100..0x1FF of it are a DMA target. */
+static VOID ProbeB2a(PSWGPU_DEVICE Dev)
+{
+    volatile UCHAR *B = Dev->Bar0;
+    PHYSICAL_ADDRESS lo, hi, none, pa;
+    volatile ULONG *buf;
+    ULONG cfg, asid, c230, cb98, tc, ctl, dmactl, i, ok, polls, spill, now;
+    ULONG oldPtbAsid, oldPtb0, base;
+    BOOLEAN idle = TRUE, asidChanged = FALSE, stillTranslated = FALSE, ptbChanged = FALSE;
+    volatile ULONG *pd = NULL, *pt = NULL;
+    PHYSICAL_ADDRESS pdPa, ptPa;
+
+    Step(30);   /* SMMU */
+    cfg = Rd(Dev->Mc, MC_SMMU_CONFIG);
+    asid = Rd(Dev->Mc, MC_SMMU_GPU_ASID);
+    c230 = Rd(Dev->Mc, MC_SMMU_CLIENT_230);
+    cb98 = Rd(Dev->Mc, MC_SMMU_CLIENT_B98);
+    Trace(L"SmmuConfig", cfg);
+    Trace(L"SmmuGpuAsid", asid);
+    Trace(L"SmmuClient230", c230);
+    Trace(L"SmmuClientB98", cb98);
+    /* 0.3.0 on hardware: config and the client registers read 0xFFFFFFFF and
+     * the GPU swgroup reads 0x80000000 (translated, ASID 0). Linux runs the
+     * GPU in identity mode by clearing that enable bit (tegra_smmu_disable),
+     * so do the same for the test only, and put it back afterwards. */
+    if (asid & 0x80000000u) {
+        Wr(Dev->Mc, MC_SMMU_GPU_ASID, asid & ~0x80000000u);
+        now = Rd(Dev->Mc, MC_SMMU_GPU_ASID);
+        TraceDurable(L"SmmuGpuAsidBypass", now);
+        if (now & 0x80000000u) {
+            /* 0.3.1 on hardware: the write is ignored (the SMMU registers look
+             * locked to the secure world). Go on anyway: the read DMA cannot
+             * harm anything, and the write DMA only runs if the read proves
+             * the address reaches our buffer unchanged. */
+            TraceDurable(L"SmmuStillTranslated", 1);
+            stillTranslated = TRUE;
+        } else {
+            asidChanged = TRUE;
+        }
+    }
+    /* 0.3.3: the page directory of ASID 0 (ATF leaves ASID_SECURITY = 0, so
+     * the PTB registers should be usable from the normal world). */
+    oldPtbAsid = Rd(Dev->Mc, MC_SMMU_PTB_ASID);
+    Trace(L"SmmuPtbAsidWas", oldPtbAsid);
+    Wr(Dev->Mc, MC_SMMU_PTB_ASID, 0);
+    Trace(L"SmmuPtbAsid0", Rd(Dev->Mc, MC_SMMU_PTB_ASID));
+    oldPtb0 = Rd(Dev->Mc, MC_SMMU_PTB_DATA);
+    TraceDurable(L"SmmuPtbData0", oldPtb0);
+    Trace(L"McIntStatusBefore", Rd(Dev->Mc, MC_INTSTATUS));
+    Trace(L"McErrStatusBefore", Rd(Dev->Mc, MC_ERR_STATUS));
+    Trace(L"McErrAdrBefore", Rd(Dev->Mc, MC_ERR_ADR));
+    /* 0.3.2 showed an old latched error (int 0x200); the error registers only
+     * latch a new error after the status is cleared (write 1 to clear). */
+    Wr(Dev->Mc, MC_INTSTATUS, Rd(Dev->Mc, MC_INTSTATUS));
+    Trace(L"McIntStatusCleared", Rd(Dev->Mc, MC_INTSTATUS));
+
+    lo.QuadPart = 0; hi.QuadPart = 0xFFFFFFFFll; none.QuadPart = 0;
+    buf = (volatile ULONG *)MmAllocateContiguousMemorySpecifyCache(PAGE_SIZE, lo, hi, none, MmNonCached);
+    if (buf == NULL) {
+        if (asidChanged) Wr(Dev->Mc, MC_SMMU_GPU_ASID, asid);
+        TraceDurable(L"B2aResult", 0xE0000031u);
+        return;
+    }
+    pa = MmGetPhysicalAddress((PVOID)buf);
+    Trace(L"B2aBufPhys", pa.LowPart);
+
+    /* 0.3.3 on hardware: the GPU stays in ASID 0, whose page directory points
+     * outside RAM (PTB_DATA 0x4020608C), but the PTB registers are writable.
+     * So give ASID 0 a small identity map: one page directory and one page
+     * table mapping the 4 MB around the buffer to itself (tegra-smmu format),
+     * flush the SMMU caches, and put the old value back afterwards. */
+    if (stillTranslated) {
+        pd = (volatile ULONG *)MmAllocateContiguousMemorySpecifyCache(PAGE_SIZE, lo, hi, none, MmNonCached);
+        pt = (volatile ULONG *)MmAllocateContiguousMemorySpecifyCache(PAGE_SIZE, lo, hi, none, MmNonCached);
+        if (pd != NULL && pt != NULL) {
+            pdPa = MmGetPhysicalAddress((PVOID)pd);
+            ptPa = MmGetPhysicalAddress((PVOID)pt);
+            base = pa.LowPart & ~0x3FFFFFu;
+            for (i = 0; i < 1024; ++i) pd[i] = 0;
+            for (i = 0; i < 1024; ++i) pt[i] = ((base >> 12) + i) | SMMU_ATTR_RWNS;
+            pd[base >> 22] = (ULONG)(ptPa.QuadPart >> 12) | SMMU_ATTR_RWNS | SMMU_PDE_NEXT;
+            KeMemoryBarrier();
+            Trace(L"SmmuPdPhys", pdPa.LowPart);
+            Trace(L"SmmuPtPhys", ptPa.LowPart);
+            Wr(Dev->Mc, MC_SMMU_PTB_ASID, 0);
+            Wr(Dev->Mc, MC_SMMU_PTB_DATA, (ULONG)(pdPa.QuadPart >> 12) | SMMU_ATTR_RWNS);
+            Trace(L"SmmuPtbDataNew", Rd(Dev->Mc, MC_SMMU_PTB_DATA));
+            Wr(Dev->Mc, MC_SMMU_PTC_FLUSH, 0);
+            (VOID)Rd(Dev->Mc, MC_SMMU_PTB_ASID);
+            Wr(Dev->Mc, MC_SMMU_TLB_FLUSH, 0);
+            (VOID)Rd(Dev->Mc, MC_SMMU_PTB_ASID);
+            ptbChanged = TRUE;
+            TraceDurable(L"SmmuIdentityMap", 1);
+        }
+    }
+    for (i = 0; i < 64; ++i) buf[i] = 0xC0DE0000u + i * 0x01010101u;     /* source for memory -> DMEM */
+    for (i = 64; i < 1024; ++i) buf[i] = 0xEEEEEEEEu;                      /* 0x100..0x1FF: DMEM -> memory target */
+    KeMemoryBarrier();
+
+    Step(35);   /* 0.3.4 on hardware: still no DMA with an identity map, and
+                 * PMC_ENABLE (0xC0012020) has none of XBAR, L2, PFB, HUB on:
+                 * reset them as nvgpu does (off, wait, on). */
+    /* 0.3.5 on hardware: writing those bits changed nothing (0xC0012020 stays):
+     * GM20B has no enable bits for them (nouveau's gk104 reset table has only
+     * FIFO and PMU). So only record PMC_ENABLE and the PMU FBIF window. */
+    now = Rd(B, NV_PMC_ENABLE);
+    Trace(L"PmcEnableBeforeMem", now);
+    Trace(L"PmcEnableAfterMem", now);
+    {
+        ULONG fb[12];
+        for (i = 0; i < 12; ++i) fb[i] = Rd(B, PMU_FALCON + 0xE00 + i * 4);
+        TraceBin(L"PmuFbifWindow", fb, sizeof(fb));
+    }
+
+    Step(31);   /* physical DMA setup */
+    tc = Rd(B, PMU_FALCON + PMU_FBIF_TRANSCFG(DMA_IDX));
+    ctl = Rd(B, PMU_FALCON + PMU_FBIF_CTL);
+    dmactl = Rd(B, PMU_FALCON + FALCON_DMACTL);
+    Trace(L"B2aTranscfgWas", tc);
+    Trace(L"B2aFbifCtlWas", ctl);
+    Trace(L"B2aDmactlWas", dmactl);
+    Wr(B, PMU_FALCON + PMU_FBIF_TRANSCFG(DMA_IDX), FBIF_PHYS_NCOH);
+    Wr(B, PMU_FALCON + PMU_FBIF_CTL, ctl | 0x80u);
+    Wr(B, PMU_FALCON + FALCON_DMACTL, 0);
+    Trace(L"B2aTranscfg", Rd(B, PMU_FALCON + PMU_FBIF_TRANSCFG(DMA_IDX)));
+    Trace(L"B2aFbifCtl", Rd(B, PMU_FALCON + PMU_FBIF_CTL));
+    TraceDurable(L"B2aSetup", 1);
+
+    {
+        /* 0.3.6: try the FBIF target noncoherent sysmem (6), then local FB (4),
+         * then coherent sysmem (5), resetting the PMU falcon (PMC_ENABLE bit 13
+         * off/on, wait for the scrub) before each retry. After each attempt,
+         * record the falcon interrupt status (bit 5 = EXTERR, a bus error) and
+         * the PFIFO MMU fault registers. */
+        static const ULONG targets[3] = { 6, 4, 5 };
+        static const PCWSTR names[3][4] = {
+            { L"B2aV1Polls", L"B2aV1Cmd", L"B2aV1Irq", L"B2aV1Ok" },
+            { L"B2aV2Polls", L"B2aV2Cmd", L"B2aV2Irq", L"B2aV2Ok" },
+            { L"B2aV3Polls", L"B2aV3Cmd", L"B2aV3Irq", L"B2aV3Ok" } };
+        ULONG v, k, w;
+        ok = 0;
+        for (k = 0; k < 3 && ok != 64; ++k) {
+            Step(36 + k);
+            if (k > 0) {
+                ULONG en = Rd(B, NV_PMC_ENABLE);
+                Wr(B, NV_PMC_ENABLE, en & ~(1u << 13));
+                (VOID)Rd(B, NV_PMC_ENABLE);
+                Us(20);
+                Wr(B, NV_PMC_ENABLE, en | (1u << 13));
+                (VOID)Rd(B, NV_PMC_ENABLE);
+                for (w = 0; w < 2000 && (Rd(B, PMU_FALCON + FALCON_DMACTL) & 6u); ++w) Us(5);
+                Wr(B, PMU_FALCON + PMU_FBIF_CTL, Rd(B, PMU_FALCON + PMU_FBIF_CTL) | 0x80u);
+                Wr(B, PMU_FALCON + FALCON_DMACTL, 0);
+            }
+            Wr(B, PMU_FALCON + PMU_FBIF_TRANSCFG(DMA_IDX), targets[k]);
+            /* 0.3.6 on hardware: no transfer started with any target and no
+             * bus error: the falcon's external interface (ITFEN bit 0) may be
+             * off after reset; nouveau's gm200_flcn_fw_load sets it first. */
+            if (k == 0) Trace(L"B2aItfenWas", Rd(B, PMU_FALCON + FALCON_ITFEN));
+            Wr(B, PMU_FALCON + FALCON_ITFEN, Rd(B, PMU_FALCON + FALCON_ITFEN) | 1u);
+            if (k == 0) {
+                Trace(L"B2aItfen", Rd(B, PMU_FALCON + FALCON_ITFEN));
+                Trace(L"B2aDmactlNow", Rd(B, PMU_FALCON + FALCON_DMACTL));
+                Trace(L"B2aTranscfgNow", Rd(B, PMU_FALCON + PMU_FBIF_TRANSCFG(DMA_IDX)));
+            }
+            Wr(B, PMU_FALCON + FALCON_DMEMC0, 0x100u | (1u << 24));
+            for (i = 0; i < 64; ++i) Wr(B, PMU_FALCON + FALCON_DMEMD0, 0);
+            Wr(B, PMU_FALCON + 0x004, 0xFFFFFFFFu);        /* clear falcon interrupts */
+            Wr(B, PMU_FALCON + FALCON_DMATRFBASE, (ULONG)(pa.QuadPart >> 8));
+            Wr(B, PMU_FALCON + FALCON_DMATRFMOFFS, 0x100);
+            Wr(B, PMU_FALCON + FALCON_DMATRFFBOFFS, 0);
+            Wr(B, PMU_FALCON + FALCON_DMATRFCMD, DMATRFCMD_256B | (DMA_IDX << 12));
+            polls = DmaWait(B);
+            Trace(names[k][0], polls);
+            Trace(names[k][1], Rd(B, PMU_FALCON + FALCON_DMATRFCMD));
+            Trace(names[k][2], Rd(B, PMU_FALCON + 0x008));
+            Wr(B, PMU_FALCON + FALCON_DMEMC0, 0x100u | (1u << 25));
+            ok = 0;
+            for (i = 0; i < 64; ++i) {
+                v = Rd(B, PMU_FALCON + FALCON_DMEMD0);
+                if (i == 0) Trace(L"B2aInWord0", v);
+                if (i == 63) Trace(L"B2aInWord63", v);
+                if (v == 0xC0DE0000u + i * 0x01010101u) ++ok;
+            }
+            TraceDurable(names[k][3], ok);
+            Trace(L"B2aInPolls", polls);
+            Trace(L"B2aInCmd", Rd(B, PMU_FALCON + FALCON_DMATRFCMD));
+            idle = (polls != 0xFFFFFFFFu);
+        }
+        Trace(L"B2aGoodTarget", ok == 64 ? targets[k - 1] : 0);
+        Trace(L"PfifoIntr0", Rd(B, 0x2100));
+        Trace(L"PfifoMmuFaultId", Rd(B, 0x259C));
+        Trace(L"PfifoFault0Inst", Rd(B, 0x2800));
+        Trace(L"PfifoFault0Lo", Rd(B, 0x2804));
+        Trace(L"PfifoFault0Hi", Rd(B, 0x2808));
+        Trace(L"PfifoFault0Info", Rd(B, 0x280C));
+        TraceDurable(L"B2aInOk", ok);
+    }
+    Trace(L"McIntStatusAfterIn", Rd(Dev->Mc, MC_INTSTATUS));
+    Trace(L"McErrStatusAfterIn", Rd(Dev->Mc, MC_ERR_STATUS));
+    Trace(L"McErrAdrAfterIn", Rd(Dev->Mc, MC_ERR_ADR));
+
+    /* Write into memory only when the read proved the address reaches our buffer. */
+    if (idle && ok == 64) {
+        Step(33);   /* DMEM 0x200 -> memory + 0x100 */
+        Wr(B, PMU_FALCON + FALCON_DMEMC0, 0x200u | (1u << 24));
+        for (i = 0; i < 64; ++i) Wr(B, PMU_FALCON + FALCON_DMEMD0, 0x600D0000u + i);
+        Wr(B, PMU_FALCON + FALCON_DMATRFMOFFS, 0x200);
+        Wr(B, PMU_FALCON + FALCON_DMATRFFBOFFS, 0x100);
+        Wr(B, PMU_FALCON + FALCON_DMATRFCMD, DMATRFCMD_WRITE | DMATRFCMD_256B | (DMA_IDX << 12));
+        polls = DmaWait(B);
+        Trace(L"B2aOutPolls", polls);
+        Trace(L"B2aOutCmd", Rd(B, PMU_FALCON + FALCON_DMATRFCMD));
+        if (polls == 0xFFFFFFFFu) idle = FALSE;
+        Us(100);
+        KeMemoryBarrier();
+        ok = 0; spill = 0;
+        for (i = 0; i < 64; ++i) if (buf[64 + i] == 0x600D0000u + i) ++ok;
+        for (i = 128; i < 1024; ++i) if (buf[i] != 0xEEEEEEEEu) ++spill;
+        for (i = 0; i < 64; ++i) if (buf[i] != 0xC0DE0000u + i * 0x01010101u) ++spill;
+        Trace(L"B2aOutWord0", buf[64]);
+        Trace(L"B2aOutSpill", spill);
+        TraceDurable(L"B2aOutOk", ok);
+    }
+
+    Step(34);   /* put the DMA setup back, clear DMEM */
+    Wr(B, PMU_FALCON + PMU_FBIF_TRANSCFG(DMA_IDX), tc);
+    Wr(B, PMU_FALCON + PMU_FBIF_CTL, ctl);
+    Wr(B, PMU_FALCON + FALCON_DMACTL, dmactl);
+    Wr(B, PMU_FALCON + FALCON_ITFEN, Rd(B, PMU_FALCON + FALCON_ITFEN) & ~1u);
+    Wr(B, PMU_FALCON + FALCON_DMEMC0, 0x100u | (1u << 24));
+    for (i = 0; i < 128; ++i) Wr(B, PMU_FALCON + FALCON_DMEMD0, 0);
+    /* A DMA that never went idle might still write: keep (leak) the buffer then. */
+    if (ptbChanged) {
+        Wr(Dev->Mc, MC_SMMU_PTB_ASID, 0);
+        Wr(Dev->Mc, MC_SMMU_PTB_DATA, oldPtb0);
+        Wr(Dev->Mc, MC_SMMU_PTB_ASID, oldPtbAsid);
+        Wr(Dev->Mc, MC_SMMU_PTC_FLUSH, 0);
+        (VOID)Rd(Dev->Mc, MC_SMMU_PTB_ASID);
+        Wr(Dev->Mc, MC_SMMU_TLB_FLUSH, 0);
+        (VOID)Rd(Dev->Mc, MC_SMMU_PTB_ASID);
+        Wr(Dev->Mc, MC_SMMU_PTB_ASID, 0);
+        Trace(L"SmmuPtbDataRestored", Rd(Dev->Mc, MC_SMMU_PTB_DATA));
+        Wr(Dev->Mc, MC_SMMU_PTB_ASID, oldPtbAsid);
+    }
+    if (idle) {
+        if (pd != NULL) MmFreeContiguousMemorySpecifyCache((PVOID)pd, PAGE_SIZE, MmNonCached);
+        if (pt != NULL) MmFreeContiguousMemorySpecifyCache((PVOID)pt, PAGE_SIZE, MmNonCached);
+    }
+    if (asidChanged) {
+        Wr(Dev->Mc, MC_SMMU_GPU_ASID, asid);
+        Trace(L"SmmuGpuAsidRestored", Rd(Dev->Mc, MC_SMMU_GPU_ASID));
+    }
+    if (idle) MmFreeContiguousMemorySpecifyCache((PVOID)buf, PAGE_SIZE, MmNonCached);
+    TraceDurable(L"B2aResult", !idle ? 0xE0000032u : (ok == 64 ? 0 : 0xE0000033u));
+}
+
 /* ------------------------------------------------------------ power test */
 
-static NTSTATUS PowerTest(PSWGPU_DEVICE Dev, BOOLEAN KeepOn)
+static NTSTATUS PowerTest(PSWGPU_DEVICE Dev, BOOLEAN KeepOn, ULONG Mode)
 {
     UCHAR vout0 = 0, dvs0 = 0, gpio0 = 0, v = 0;
     ULONG clkx0, clkh0, outc0, rg, clkx, rstx, boot0 = 0xDEADDEADu, t0 = 0, t1 = 0, th = 0, en = 0, i;
@@ -367,6 +761,8 @@ static NTSTATUS PowerTest(PSWGPU_DEVICE Dev, BOOLEAN KeepOn)
     Trace(L"ChipRev", boot0 & 0xFF);
     st = (((boot0 >> 20) & 0x1FF) == 0x12B) ? STATUS_SUCCESS : STATUS_DEVICE_HARDWARE_ERROR;
     Trace(L"Result", (ULONG)st);
+    if (NT_SUCCESS(st) && Mode == 2) ProbeB1(Dev);
+    if (NT_SUCCESS(st) && Mode == 3) ProbeB2a(Dev);
     if (KeepOn) { Step(100); return st; }
 
 down:
@@ -450,6 +846,7 @@ NTSTATUS SwGpuEvtSelfManagedIoInit(WDFDEVICE Device)
 {
     PSWGPU_DEVICE Dev = SwGpuGetDevice(Device);
     NTSTATUS st;
+    ULONG mode;
 
     Trace(L"Version", SWGPU_VERSION);
     Trace(L"StartCount", ReadParam(L"StartCount", 0) + 1);
@@ -460,14 +857,15 @@ NTSTATUS SwGpuEvtSelfManagedIoInit(WDFDEVICE Device)
 
     Snapshot(Dev, FALSE);
 
-    if (ReadParam(L"PowerTest", 0) == 1) {
+    mode = ReadParam(L"PowerTest", 0);
+    if (mode >= 1 && mode <= 3) {     /* 2 = also the stage B1 probe, 3 = the B2a DMA probe */
         BOOLEAN keep = ReadParam(L"KeepOn", 0) == 1;
         LARGE_INTEGER t0, t1, f;
         TraceDurable(L"PowerTest", 0);      /* once: a hang does not repeat at the next boot */
         Trace(L"Result", 0xFFFFFFFFu);
         Trace(L"Boot0", 0);
         t0 = KeQueryPerformanceCounter(&f);
-        (VOID)PowerTest(Dev, keep);
+        (VOID)PowerTest(Dev, keep, mode);
         t1 = KeQueryPerformanceCounter(NULL);
         Trace(L"TestUs", (ULONG)((t1.QuadPart - t0.QuadPart) * 1000000 / (f.QuadPart ? f.QuadPart : 1)));
         Snapshot(Dev, TRUE);
