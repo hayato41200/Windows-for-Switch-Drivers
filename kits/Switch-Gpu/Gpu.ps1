@@ -21,12 +21,18 @@
                     SMMU, the PMU falcon's DMA copies 256 bytes from a Windows
                     buffer into DMEM and 256 bytes back, in physical mode.
                     No firmware, nothing runs on the falcon.
+  -Mode FwTest    : stage B3a (PowerTest = 4). Copies the user's own
+                    linux-firmware nvidia\gm20b\acr\bl.bin and ucode_load.bin
+                    (from .\firmware\nvidia\gm20b) into the registry; the
+                    driver checks them, patches the signature in memory and
+                    loads the ACR bootloader into PMU IMEM/DMEM by PIO. The
+                    falcon is not started.
   -Mode Remove    : removes the driver package.
 
   Log: C:\SwitchWOA-Gpu.txt
   This file must stay ASCII: Windows PowerShell 5.1 reads it as the ANSI code page.
 #>
-param([Parameter(Mandatory = $true)][ValidateSet('Install', 'Status', 'PowerTest', 'ProbeTest', 'DmaTest', 'Remove')][string]$Mode)
+param([Parameter(Mandatory = $true)][ValidateSet('Install', 'Status', 'PowerTest', 'ProbeTest', 'DmaTest', 'FwTest', 'Remove')][string]$Mode)
 
 $ErrorActionPreference = 'Continue'
 $Sys = Join-Path $env:windir 'Sysnative'
@@ -79,7 +85,7 @@ function Show-Trace {
   Sum ('at start: VOUT {0}  VOUT_DVS {1}  GPIO6 {2}' -f (MvText $p.VoutAtStart), (MvText $p.VoutDvsAtStart), (Gpio $p.Gpio6AtStart))
   Sum ('at start: clamp (RG_CNTRL bit0) {0}  gpu clock {1}  pllg_ref {2}  gpu reset {3}  PLLP_OUTC {4}  fuse clock {5}  MC hot reset ctrl {6} stat {7}' -f (Bit $p.RgCntrlAtStart 0), (Bit $p.ClkXAtStart 24), (Bit $p.ClkXAtStart 29), (Bit $p.RstXAtStart 24), (Hex $p.PllpOutcAtStart), (Bit $p.ClkHAtStart 7), (Hex $p.McHotCtrlAtStart), (Hex $p.McHotStatAtStart))
   if ($p.TestRuns) {
-    $steps = @{ 1 = 'read the regulator'; 2 = 'VDD_GPU on'; 3 = 'clocks on'; 4 = 'reset assert'; 5 = 'clamp off'; 6 = 'reset deassert'; 7 = 'MC flush'; 8 = 'first BAR0 read (BOOT_0)'; 9 = 'PTIMER and WPR reads'; 20 = 'B1: topology read'; 21 = 'B1: PMU falcon read'; 22 = 'B1: DMEM test'; 23 = 'B1: priv ring init'; 29 = 'B2a: priv ring init'; 30 = 'B2a: SMMU check'; 31 = 'B2a: DMA setup'; 32 = 'B2a: DMA memory -> DMEM'; 33 = 'B2a: DMA DMEM -> memory'; 34 = 'B2a: DMA setup restore'; 35 = 'B2a: memory path read'; 36 = 'B2a: DMA try 1'; 37 = 'B2a: DMA try 2 (after PMU reset)'; 38 = 'B2a: DMA try 3 (after PMU reset)'; 39 = 'B2a: PMU instance bind'; 10 = 'power down'; 11 = 'done'; 100 = 'done, GPU left on (KeepOn)' }
+    $steps = @{ 1 = 'read the regulator'; 2 = 'VDD_GPU on'; 3 = 'clocks on'; 4 = 'reset assert'; 5 = 'clamp off'; 6 = 'reset deassert'; 7 = 'MC flush'; 8 = 'first BAR0 read (BOOT_0)'; 9 = 'PTIMER and WPR reads'; 20 = 'B1: topology read'; 21 = 'B1: PMU falcon read'; 22 = 'B1: DMEM test'; 23 = 'B1: priv ring init'; 29 = 'B2a: priv ring init'; 40 = 'B3a: firmware from registry'; 41 = 'B3a: bl.bin header'; 42 = 'B3a: ucode_load.bin headers'; 43 = 'B3a: signed image'; 44 = 'B3a: PMU reset + IMEM PIO'; 45 = 'B3a: DMEM descriptor'; 30 = 'B2a: SMMU check'; 31 = 'B2a: DMA setup'; 32 = 'B2a: DMA memory -> DMEM'; 33 = 'B2a: DMA DMEM -> memory'; 34 = 'B2a: DMA setup restore'; 35 = 'B2a: memory path read'; 36 = 'B2a: DMA try 1'; 37 = 'B2a: DMA try 2 (after PMU reset)'; 38 = 'B2a: DMA try 3 (after PMU reset)'; 39 = 'B2a: PMU instance bind'; 10 = 'power down'; 11 = 'done'; 100 = 'done, GPU left on (KeepOn)' }
     Sum ('power test runs {0}: last step {1} ({2})  result {3}  took {4} us' -f $p.TestRuns, $p.Step, $steps[[int]$p.Step], (Hex $p.Result), $p.TestUs)
     if ($null -ne $p.McHotStatAfterReset) {
       $pts = @(@('GPU off', $p.McHotStatAtStart), @('after reset', $p.McHotStatAfterReset), @('after flush', $p.McHotStatAfterFlush), @('after BAR0 reads', $p.McHotStatAfterBar0), @('B2a start', $p.McHotStatB2aStart), @('before DMA', $p.McHotStatBeforeDma), @('after DMA', $p.McHotStatAfterDma))
@@ -253,6 +259,28 @@ function Show-Trace {
         Sum ('B2a MMU fault record unit 0x{0:X2} ({1}): inst {2} (block 0x{3:X}) va 0x{4:X}{5:X8} info {6} -> type {7} ({8}) {9} {10} client 0x{11:X2} gpc {12}' -f $u, $un, (Hex $fi), ([uint64]$fi * 4096), $fhi, $flo, (Hex $fty), ($fty -band 0xF), $reasons[$fty -band 0xF], $acc, $hub, (($fty -shr 8) -band 0x1F), (($fty -shr 24) -band 0x1F))
       }
     }
+    if ($null -ne $p.B3aResult) {
+      $b3err = @{ 0 = 'OK'; 0xE0000041 = 'firmware missing in the registry (run FwTest from the kit)'; 0xE0000042 = 'bl.bin too short'; 0xE0000043 = 'bl.bin header bad'; 0xE0000044 = 'bl.bin descriptor bad'; 0xE0000045 = 'ucode_load.bin too short'; 0xE0000046 = 'ucode_load.bin header bad'; 0xE0000047 = 'patch location outside the file'; 0xE0000048 = 'load header outside the file'; 0xE0000049 = 'app table bad'; 0xE000004A = 'signature/section offsets bad'; 0xE000004B = 'no memory'; 0xE000004C = 'bootloader does not fit IMEM'; 0xE000004D = 'no memory' }
+      $why3 = $b3err[[int]$p.B3aResult]; if (-not $why3) { $why3 = '?' }
+      Sum ('B3a firmware: bl.bin {0} bytes magic {1} (hdr {2} data {3}+{4})  start tag {5} dmem off {6} code {7}+{8}' -f $p.B3aBlLen, (Hex $p.B3aBlMagic), (Hex $p.B3aBlHdrOff), (Hex $p.B3aBlDataOff), (Hex $p.B3aBlDataSize), (Hex $p.B3aBlStartTag), (Hex $p.B3aBlDmemLoadOff), (Hex $p.B3aBlCodeOff), (Hex $p.B3aBlCodeSize))
+      if ($null -ne $p.B3aUcMagic) {
+        Sum ('B3a firmware: ucode_load.bin {0} bytes magic {1} (hdr {2} data {3}+{4})  sig prod {5}+{6} dbg {7}+{8}  patch {9}/{10} -> loc {11} sig {12}' -f $p.B3aUcLen, (Hex $p.B3aUcMagic), (Hex $p.B3aUcHdrOff), (Hex $p.B3aUcDataOff), (Hex $p.B3aUcDataSize), (Hex $p.B3aSigPrdOff), (Hex $p.B3aSigPrdSize), (Hex $p.B3aSigDbgOff), (Hex $p.B3aSigDbgSize), (Hex $p.B3aPatchLoc), (Hex $p.B3aPatchSig), (Hex $p.B3aLoc), (Hex $p.B3aSig))
+      }
+      if ($null -ne $p.B3aNsOff) {
+        Sum ('B3a load header: non-secure code {0}+{1}  data {2}+{3}  apps {4}  app0 {5}+{6}' -f (Hex $p.B3aNsOff), (Hex $p.B3aNsSize), (Hex $p.B3aDataBase), (Hex $p.B3aDataSize), $p.B3aNumApps, (Hex $p.B3aApp0Off), (Hex $p.B3aApp0Size))
+      }
+      if ($null -ne $p.B3aDebugFused) {
+        $sk = 'production'; if ([uint32]$p.B3aDebugFused -ne 0) { $sk = 'debug' }
+        Sum ('B3a signed image: {0} fuse -> {0} signature patched at {1} (first word {2}, DMEM offset {3})  image word sum {4}' -f $sk, (Hex $p.B3aLoc), (Hex $p.B3aSigWord0), (Hex $p.B3aDmemSign), (Hex $p.B3aImgSum))
+      }
+      if ($null -ne $p.B3aImemOk) {
+        Sum ('B3a PMU PIO: IMEM {0} DMEM {1}  scrub polls {2}  bootloader at IMEM {3} (tag {4}): {5} of {6} words read back OK (first {7})' -f (Hex $p.B3aImemSize), (Hex $p.B3aDmemSize), $p.B3aScrubPolls, (Hex $p.B3aImemBase), (Hex $p.B3aBlStartTag), $p.B3aImemOk, $p.B3aImemWords, (Hex $p.B3aImemWord0))
+      }
+      if ($null -ne $p.B3aDescOk) {
+        Sum ('B3a BL descriptor at DMEM 0: {0} of 19 words read back OK  CPUCTL {1} (not started)  boot address {2}' -f $p.B3aDescOk, (Hex $p.B3aCpuctl), (Hex $p.B3aBootAddr))
+      }
+      Sum ('B3a result {0} ({1})' -f (Hex $p.B3aResult), $why3)
+    }
     if ($null -ne $p.PfifoIntr0) {
       Sum ('B2a PFIFO: intr0 {0}  mmu fault id {1}  fault0 inst {2} lo {3} hi {4} info {5}' -f (Hex $p.PfifoIntr0), (Hex $p.PfifoMmuFaultId), (Hex $p.PfifoFault0Inst), (Hex $p.PfifoFault0Lo), (Hex $p.PfifoFault0Hi), (Hex $p.PfifoFault0Info))
     }
@@ -286,14 +314,33 @@ switch ($Mode) {
     Show-Device; Log ''; Show-Trace
   }
   'Status' { Show-Device; Log ''; Show-Trace }
-  { $_ -eq 'PowerTest' -or $_ -eq 'ProbeTest' -or $_ -eq 'DmaTest' } {
-    $tv = 1; if ($Mode -eq 'ProbeTest') { $tv = 2 }; if ($Mode -eq 'DmaTest') { $tv = 3 }
+  { $_ -eq 'PowerTest' -or $_ -eq 'ProbeTest' -or $_ -eq 'DmaTest' -or $_ -eq 'FwTest' } {
+    $tv = 1; if ($Mode -eq 'ProbeTest') { $tv = 2 }; if ($Mode -eq 'DmaTest') { $tv = 3 }; if ($Mode -eq 'FwTest') { $tv = 4 }
     New-Item -Path $Key -Force | Out-Null
     $old = Get-ItemProperty $Key -ErrorAction SilentlyContinue
     if ($old) {
-      foreach ($n in @($old.PSObject.Properties | Where-Object { $_.Name -match '^(B2a|Smmu|Mc[IE]|McHotStat(Before|After)Dma|McHotStatAfter(Reset|Flush|Bar0)|McHotStatB2aStart|Pmu|Pfifo|Ptop|Scal|Dmem|Ring|Wpr|PmcEnable)' } | ForEach-Object { $_.Name })) {
+      foreach ($n in @($old.PSObject.Properties | Where-Object { $_.Name -match '^(B2a|B3a|Smmu|Mc[IE]|McHotStat(Before|After)Dma|McHotStatAfter(Reset|Flush|Bar0)|McHotStatB2aStart|Pmu|Pfifo|Ptop|Scal|Dmem|Ring|Wpr|PmcEnable)' } | ForEach-Object { $_.Name })) {
         Remove-ItemProperty -Path $Key -Name $n -ErrorAction SilentlyContinue
       }
+    }
+    if ($Mode -eq 'FwTest') {
+      # The firmware is the user's own linux-firmware copy; the kit never ships it.
+      $fwDir = $null
+      foreach ($c in @((Join-Path $Here 'firmware\nvidia\gm20b'), (Join-Path $Here 'firmware\gm20b'), (Join-Path $Here 'firmware'))) {
+        if (Test-Path (Join-Path $c 'acr\bl.bin')) { $fwDir = $c; break }
+      }
+      if (-not $fwDir) { Sum ('firmware not found: copy your own linux-firmware nvidia\gm20b folder to ' + (Join-Path $Here 'firmware\nvidia\gm20b')); break }
+      $fwOk = $true
+      foreach ($f in @(@('acr\bl.bin', 'FwAcrBl', 832), @('acr\ucode_load.bin', 'FwAcrUcodeLoad', 18592))) {
+        $fp = Join-Path $fwDir $f[0]
+        if (-not (Test-Path $fp)) { Sum "missing: $fp"; $fwOk = $false; break }
+        $bytes = [IO.File]::ReadAllBytes($fp)
+        $sha = (Get-FileHash $fp -Algorithm SHA256).Hash
+        $note = ''; if ($bytes.Length -ne $f[2]) { $note = (' (linux-firmware has {0} bytes)' -f $f[2]) }
+        Sum ('firmware {0}: {1} bytes{2}  SHA256 {3}' -f $f[0], $bytes.Length, $note, $sha)
+        Set-ItemProperty -Path $Key -Name $f[1] -Value $bytes -Type Binary
+      }
+      if (-not $fwOk) { break }
     }
     Set-ItemProperty -Path $Key -Name PowerTest -Value $tv -Type DWord
     Log "PowerTest = $tv; restarting ACPI\SWOA0F01\0 ..."
@@ -314,6 +361,7 @@ switch ($Mode) {
       Log "pnputil /delete-driver $name /uninstall /force"
       (& $Pnputil /delete-driver $name /uninstall /force 2>&1) | ForEach-Object { Log "  $_" }
     }
+    Remove-ItemProperty -Path $Key -Name FwAcrBl, FwAcrUcodeLoad -ErrorAction SilentlyContinue
     Show-Device
   }
 }

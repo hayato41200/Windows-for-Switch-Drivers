@@ -39,7 +39,7 @@
 #include <wdf.h>
 #include <spb.h>
 
-#define SWGPU_VERSION      0x00000311u   /* 0.3.17 */
+#define SWGPU_VERSION      0x00000400u   /* 0.4.0 */
 
 #define CAR_PHYS           0x60006000ull
 #define CAR_LEN            0x1000u
@@ -1044,6 +1044,267 @@ static VOID ProbeB2a(PSWGPU_DEVICE Dev)
 
 /* ------------------------------------------------------------ power test */
 
+/* ------------------------------------------------------ stage B3a probe */
+
+/* 0.4.0: stage B3a. Read the ACR HS firmware that the kit copied from the
+ * user's own linux-firmware (nvidia/gm20b/acr/bl.bin, acr/ucode_load.bin)
+ * into the registry, check every header field against the blob sizes, build
+ * the signed image in memory (nouveau nvkm_falcon_fw_ctor_hs and
+ * nvkm_falcon_fw_patch), load the HS bootloader into the top of PMU IMEM by
+ * PIO (gm200_flcn_fw_load / gm200_flcn_pio_imem_wr) and the bootloader DMEM
+ * descriptor (flcn_bl_dmem_desc v0, gm20b_acr_hsfw_load_bld) at DMEM 0, and
+ * read both back. The falcon CPU is NOT started: the bootloader would DMA the
+ * image through a GPU virtual address (ctx_dma VIRT), which needs the PMU
+ * address space first. The DMA bases in the descriptor stay 0 here. */
+#define FALCON_BOOTVEC     0x104
+#define FALCON_IMEMC0      0x180       /* BIT24 auto-increment write, BIT25 read, BIT28 secure */
+#define FALCON_IMEMD0      0x184
+#define FALCON_IMEMT0      0x188       /* tag of the next 256-byte block */
+#define ACR_BL_MAX         0x2000u
+#define ACR_UC_MAX         0x20000u
+#define ACR_DMAIDX_VIRT    1u          /* nvgpu GK20A_PMU_DMAIDX_VIRT */
+#define SWGPU_TAG          'uGwS'
+
+static PUCHAR ReadBinParam(PCWSTR Name, ULONG Max, PULONG Len)
+{
+    UNICODE_STRING path, name;
+    OBJECT_ATTRIBUTES oa;
+    HANDLE key;
+    ULONG need = 0;
+    PKEY_VALUE_PARTIAL_INFORMATION kv;
+    PUCHAR out = NULL;
+    NTSTATUS st;
+
+    *Len = 0;
+    if (SwGpuParamsPath[0] == L'\0') return NULL;
+    RtlInitUnicodeString(&path, SwGpuParamsPath);
+    InitializeObjectAttributes(&oa, &path, OBJ_KERNEL_HANDLE | OBJ_CASE_INSENSITIVE, NULL, NULL);
+    if (!NT_SUCCESS(ZwOpenKey(&key, KEY_READ, &oa))) return NULL;
+    RtlInitUnicodeString(&name, Name);
+    st = ZwQueryValueKey(key, &name, KeyValuePartialInformation, NULL, 0, &need);
+    if ((st == STATUS_BUFFER_TOO_SMALL || st == STATUS_BUFFER_OVERFLOW) &&
+        need > 0 && need <= Max + sizeof(KEY_VALUE_PARTIAL_INFORMATION)) {
+        kv = (PKEY_VALUE_PARTIAL_INFORMATION)ExAllocatePool2(POOL_FLAG_PAGED, need, SWGPU_TAG);
+        if (kv != NULL) {
+            if (NT_SUCCESS(ZwQueryValueKey(key, &name, KeyValuePartialInformation, kv, need, &need)) &&
+                kv->Type == REG_BINARY && kv->DataLength > 0 && kv->DataLength <= Max) {
+                out = (PUCHAR)ExAllocatePool2(POOL_FLAG_NON_PAGED, kv->DataLength, SWGPU_TAG);
+                if (out != NULL) {
+                    RtlCopyMemory(out, kv->Data, kv->DataLength);
+                    *Len = kv->DataLength;
+                }
+            }
+            ExFreePoolWithTag(kv, SWGPU_TAG);
+        }
+    }
+    ZwClose(key);
+    return out;
+}
+
+static ULONG Le32(const UCHAR *p)
+{
+    return (ULONG)p[0] | ((ULONG)p[1] << 8) | ((ULONG)p[2] << 16) | ((ULONG)p[3] << 24);
+}
+
+/* TRUE when [Off, Off + Size) lies inside a blob of Len bytes (no overflow). */
+static BOOLEAN InBlob(ULONG Len, ULONG Off, ULONG Size)
+{
+    return Off <= Len && Size <= Len - Off;
+}
+
+static VOID PmuReset(volatile UCHAR *B, PCWSTR PollName)
+{
+    ULONG en = Rd(B, NV_PMC_ENABLE), w;
+    Wr(B, NV_PMC_ENABLE, en & ~(1u << 13));
+    (VOID)Rd(B, NV_PMC_ENABLE);
+    Us(20);
+    Wr(B, NV_PMC_ENABLE, en | (1u << 13));
+    (VOID)Rd(B, NV_PMC_ENABLE);
+    for (w = 0; w < 2000 && (Rd(B, PMU_FALCON + FALCON_DMACTL) & 6u); ++w) Us(5);
+    Trace(PollName, w);
+}
+
+static VOID ProbeB3a(PSWGPU_DEVICE Dev)
+{
+    volatile UCHAR *B = Dev->Bar0;
+    PUCHAR bl = NULL, uc = NULL, img = NULL, boot = NULL;
+    ULONG blLen = 0, ucLen = 0, i, ok, err = 0, sum;
+    ULONG blMagic, blHdrOff, blDataOff, blDataSize, startTag, dmemLoadOff, codeOff, codeSize, bootSize;
+    ULONG ucMagic, ucHdrOff, ucDataOff, ucDataSize;
+    ULONG sigDbgOff, sigDbgSize, sigPrdOff, sigPrdSize, patchLoc, patchSig, ldOff, loc, sig;
+    ULONG nsOff, nsSize, dataBase, dataSize, numApps, app0Off, app0Size, sigSrc;
+    ULONG hwcfg, imemSize, dmemSize, imemBase, dbgFused;
+    ULONG desc[19];
+
+    Step(40);   /* firmware blobs from the registry */
+    bl = ReadBinParam(L"FwAcrBl", ACR_BL_MAX, &blLen);
+    uc = ReadBinParam(L"FwAcrUcodeLoad", ACR_UC_MAX, &ucLen);
+    Trace(L"B3aBlLen", blLen);
+    Trace(L"B3aUcLen", ucLen);
+    if (bl == NULL || uc == NULL) { err = 0xE0000041u; goto out; }
+
+    Step(41);   /* acr/bl.bin: nvfw_bin_hdr (24 bytes) + nvfw_bl_desc (24 bytes) */
+    if (blLen < 24) { err = 0xE0000042u; goto out; }
+    blMagic = Le32(bl);
+    blHdrOff = Le32(bl + 12);
+    blDataOff = Le32(bl + 16);
+    blDataSize = Le32(bl + 20);
+    Trace(L"B3aBlMagic", blMagic);
+    Trace(L"B3aBlHdrOff", blHdrOff);
+    Trace(L"B3aBlDataOff", blDataOff);
+    Trace(L"B3aBlDataSize", blDataSize);
+    if ((blMagic != 0x000010DEu && blMagic != 0x3B1D14F0u) ||
+        !InBlob(blLen, blHdrOff, 24) || !InBlob(blLen, blDataOff, blDataSize)) { err = 0xE0000043u; goto out; }
+    startTag = Le32(bl + blHdrOff);
+    dmemLoadOff = Le32(bl + blHdrOff + 4);
+    codeOff = Le32(bl + blHdrOff + 8);
+    codeSize = Le32(bl + blHdrOff + 12);
+    Trace(L"B3aBlStartTag", startTag);
+    Trace(L"B3aBlDmemLoadOff", dmemLoadOff);
+    Trace(L"B3aBlCodeOff", codeOff);
+    Trace(L"B3aBlCodeSize", codeSize);
+    if (codeSize == 0 || codeSize > 0x1000 || startTag > 0xFFFF || !InBlob(blDataSize, codeOff, codeSize)) {
+        err = 0xE0000044u; goto out;
+    }
+    bootSize = (codeSize + 0xFFu) & ~0xFFu;
+
+    Step(42);   /* acr/ucode_load.bin: bin hdr + nvfw_hs_header + nvfw_hs_load_header */
+    if (ucLen < 24) { err = 0xE0000045u; goto out; }
+    ucMagic = Le32(uc);
+    ucHdrOff = Le32(uc + 12);
+    ucDataOff = Le32(uc + 16);
+    ucDataSize = Le32(uc + 20);
+    Trace(L"B3aUcMagic", ucMagic);
+    Trace(L"B3aUcHdrOff", ucHdrOff);
+    Trace(L"B3aUcDataOff", ucDataOff);
+    Trace(L"B3aUcDataSize", ucDataSize);
+    if ((ucMagic != 0x000010DEu && ucMagic != 0x3B1D14F0u) ||
+        !InBlob(ucLen, ucHdrOff, 32) || !InBlob(ucLen, ucDataOff, ucDataSize) || ucDataSize == 0) {
+        err = 0xE0000046u; goto out;
+    }
+    sigDbgOff = Le32(uc + ucHdrOff);
+    sigDbgSize = Le32(uc + ucHdrOff + 4);
+    sigPrdOff = Le32(uc + ucHdrOff + 8);
+    sigPrdSize = Le32(uc + ucHdrOff + 12);
+    patchLoc = Le32(uc + ucHdrOff + 16);
+    patchSig = Le32(uc + ucHdrOff + 20);
+    ldOff = Le32(uc + ucHdrOff + 24);
+    Trace(L"B3aSigDbgOff", sigDbgOff);
+    Trace(L"B3aSigDbgSize", sigDbgSize);
+    Trace(L"B3aSigPrdOff", sigPrdOff);
+    Trace(L"B3aSigPrdSize", sigPrdSize);
+    Trace(L"B3aPatchLoc", patchLoc);
+    Trace(L"B3aPatchSig", patchSig);
+    Trace(L"B3aLoadHdrOff", ldOff);
+    /* NVIDIA's standard format (0x10de) stores the patch location and the
+     * signature index indirectly; the early nouveau format stores them. */
+    if (ucMagic == 0x000010DEu) {
+        if (!InBlob(ucLen, patchLoc, 4) || !InBlob(ucLen, patchSig, 4)) { err = 0xE0000047u; goto out; }
+        loc = Le32(uc + patchLoc);
+        sig = Le32(uc + patchSig);
+    } else {
+        loc = patchLoc;
+        sig = patchSig;
+    }
+    Trace(L"B3aLoc", loc);
+    Trace(L"B3aSig", sig);
+    if (!InBlob(ucLen, ldOff, 20)) { err = 0xE0000048u; goto out; }
+    nsOff = Le32(uc + ldOff);
+    nsSize = Le32(uc + ldOff + 4);
+    dataBase = Le32(uc + ldOff + 8);
+    dataSize = Le32(uc + ldOff + 12);
+    numApps = Le32(uc + ldOff + 16);
+    Trace(L"B3aNsOff", nsOff);
+    Trace(L"B3aNsSize", nsSize);
+    Trace(L"B3aDataBase", dataBase);
+    Trace(L"B3aDataSize", dataSize);
+    Trace(L"B3aNumApps", numApps);
+    if (numApps == 0 || numApps > 8 || !InBlob(ucLen, ldOff + 20, numApps * 8)) { err = 0xE0000049u; goto out; }
+    app0Off = Le32(uc + ldOff + 20);
+    app0Size = Le32(uc + ldOff + 20 + numApps * 4);
+    Trace(L"B3aApp0Off", app0Off);
+    Trace(L"B3aApp0Size", app0Size);
+    if (sigPrdSize == 0 || sigPrdSize > 0x100 || (sigPrdSize & 3u) || sigDbgSize != sigPrdSize ||
+        sig > ucLen || !InBlob(ucLen, sigPrdOff, sig) ||
+        !InBlob(ucLen, sigPrdOff + sig, sigPrdSize) ||
+        !InBlob(ucLen, sigDbgOff, sig) || !InBlob(ucLen, sigDbgOff + sig, sigDbgSize) ||
+        !InBlob(ucDataSize, loc, sigPrdSize) || !InBlob(ucDataSize, nsOff, nsSize) ||
+        !InBlob(ucDataSize, app0Off, app0Size) || !InBlob(ucDataSize, dataBase, dataSize) ||
+        loc < dataBase) {
+        err = 0xE000004Au; goto out;
+    }
+
+    Step(43);   /* signed image in memory: data section + the signature for this fuse */
+    dbgFused = (Rd(B, PMU_FALCON + PMU_DEBUG) & 0x00100000u) ? 1 : 0;
+    Trace(L"B3aDebugFused", dbgFused);
+    sigSrc = (dbgFused ? sigDbgOff : sigPrdOff) + sig;
+    img = (PUCHAR)ExAllocatePool2(POOL_FLAG_NON_PAGED, ucDataSize, SWGPU_TAG);
+    if (img == NULL) { err = 0xE000004Bu; goto out; }
+    RtlCopyMemory(img, uc + ucDataOff, ucDataSize);
+    RtlCopyMemory(img + loc, uc + sigSrc, sigPrdSize);
+    Trace(L"B3aSigWord0", Le32(img + loc));
+    Trace(L"B3aDmemSign", loc - dataBase);
+    for (sum = 0, i = 0; i + 4 <= ucDataSize; i += 4) sum += Le32(img + i);
+    Trace(L"B3aImgSum", sum);
+
+    Step(44);   /* PMU reset, scrub, bootloader -> top of IMEM by PIO */
+    PmuReset(B, L"B3aScrubPolls");
+    hwcfg = Rd(B, PMU_FALCON + FALCON_HWCFG);
+    imemSize = (hwcfg & 0x1FFu) << 8;
+    dmemSize = ((hwcfg >> 9) & 0x1FFu) << 8;
+    Trace(L"B3aImemSize", imemSize);
+    Trace(L"B3aDmemSize", dmemSize);
+    if (bootSize > imemSize || sizeof(desc) > dmemSize) { err = 0xE000004Cu; goto out; }
+    imemBase = imemSize - bootSize;
+    Trace(L"B3aImemBase", imemBase);
+    boot = (PUCHAR)ExAllocatePool2(POOL_FLAG_NON_PAGED, bootSize, SWGPU_TAG);  /* zeroed */
+    if (boot == NULL) { err = 0xE000004Du; goto out; }
+    RtlCopyMemory(boot, bl + blDataOff + codeOff, codeSize);
+    Wr(B, PMU_FALCON + FALCON_IMEMC0, (1u << 24) | imemBase);
+    for (i = 0; i < bootSize; i += 4) {
+        if ((i & 0xFFu) == 0) Wr(B, PMU_FALCON + FALCON_IMEMT0, startTag + (i >> 8));
+        Wr(B, PMU_FALCON + FALCON_IMEMD0, Le32(boot + i));
+    }
+    Wr(B, PMU_FALCON + FALCON_IMEMC0, (1u << 25) | imemBase);
+    for (ok = 0, i = 0; i < bootSize; i += 4) {
+        ULONG v = Rd(B, PMU_FALCON + FALCON_IMEMD0);
+        if (i == 0) Trace(L"B3aImemWord0", v);
+        if (v == Le32(boot + i)) ++ok;
+    }
+    Trace(L"B3aImemWords", bootSize / 4);
+    TraceDurable(L"B3aImemOk", ok);
+
+    Step(45);   /* flcn_bl_dmem_desc v0 at DMEM 0 (DMA bases left 0: no PMU VM yet) */
+    RtlZeroMemory(desc, sizeof(desc));
+    desc[8] = ACR_DMAIDX_VIRT;                  /* ctx_dma */
+    desc[9] = 0;                                /* code_dma_base: GPU VA >> 8, not mapped yet */
+    desc[10] = nsOff;                           /* non_sec_code_off */
+    desc[11] = nsSize;                          /* non_sec_code_size */
+    desc[12] = (app0Off + 0xFFu) & ~0xFFu;      /* sec_code_off = ALIGN(apps[0], 0x100) */
+    desc[13] = app0Size;                        /* sec_code_size */
+    desc[14] = 0;                               /* code_entry_point */
+    desc[15] = 0;                               /* data_dma_base: (VA + data_dma_base) >> 8 */
+    desc[16] = dataSize;                        /* data_size */
+    TraceBin(L"B3aBlDesc", desc, sizeof(desc));
+    Wr(B, PMU_FALCON + FALCON_DMEMC0, (1u << 24) | 0);
+    for (i = 0; i < 19; ++i) Wr(B, PMU_FALCON + FALCON_DMEMD0, desc[i]);
+    Wr(B, PMU_FALCON + FALCON_DMEMC0, (1u << 25) | 0);
+    for (ok = 0, i = 0; i < 19; ++i) if (Rd(B, PMU_FALCON + FALCON_DMEMD0) == desc[i]) ++ok;
+    TraceDurable(L"B3aDescOk", ok);
+    Trace(L"B3aCpuctl", Rd(B, PMU_FALCON + FALCON_CPUCTL));
+    Trace(L"B3aBootAddr", startTag << 8);
+
+    /* Leave the PMU clean: reset it again (the CPU was never started). */
+    PmuReset(B, L"B3aScrubPolls2");
+
+out:
+    TraceDurable(L"B3aResult", err);
+    if (boot != NULL) ExFreePoolWithTag(boot, SWGPU_TAG);
+    if (img != NULL) ExFreePoolWithTag(img, SWGPU_TAG);
+    if (bl != NULL) ExFreePoolWithTag(bl, SWGPU_TAG);
+    if (uc != NULL) ExFreePoolWithTag(uc, SWGPU_TAG);
+}
+
 static NTSTATUS PowerTest(PSWGPU_DEVICE Dev, BOOLEAN KeepOn, ULONG Mode)
 {
     UCHAR vout0 = 0, dvs0 = 0, gpio0 = 0, v = 0;
@@ -1160,6 +1421,7 @@ static NTSTATUS PowerTest(PSWGPU_DEVICE Dev, BOOLEAN KeepOn, ULONG Mode)
     Trace(L"Result", (ULONG)st);
     if (NT_SUCCESS(st) && Mode == 2) ProbeB1(Dev);
     if (NT_SUCCESS(st) && Mode == 3) ProbeB2a(Dev);
+    if (NT_SUCCESS(st) && Mode == 4) ProbeB3a(Dev);
     if (KeepOn) { Step(100); return st; }
 
 down:
@@ -1256,7 +1518,7 @@ NTSTATUS SwGpuEvtSelfManagedIoInit(WDFDEVICE Device)
     Snapshot(Dev, FALSE);
 
     mode = ReadParam(L"PowerTest", 0);
-    if (mode >= 1 && mode <= 3) {     /* 2 = also the stage B1 probe, 3 = the B2a DMA probe */
+    if (mode >= 1 && mode <= 4) {     /* 2 = B1 probe, 3 = B2a DMA probe, 4 = B3a ACR firmware load */
         BOOLEAN keep = ReadParam(L"KeepOn", 0) == 1;
         LARGE_INTEGER t0, t1, f;
         TraceDurable(L"PowerTest", 0);      /* once: a hang does not repeat at the next boot */

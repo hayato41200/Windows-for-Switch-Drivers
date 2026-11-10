@@ -15,6 +15,7 @@ GM20B の GPU に Windows から電源とクロックを入れ、GPU が応答�
 | `PowerTest.cmd` | GPU を 1 回起こして ID を読み、止める。終わったら Status と同じ表示 |
 | `ProbeTest.cmd` | 段階 B1。PowerTest と同じく GPU を 1 回起こし、そのあいだに、ファームウェアを使わない調べもの(GPU の中の部品の一覧、PMU ファルコンのレジスター、DMEM の書き込みと読み返し、priv ring の初期化)をしてから止める。GPU の上では何も動かさない |
 | `DmaTest.cmd` | 段階 B2a。GPU を 1 回起こし、GPU の中の小さな CPU(PMU ファルコン)の DMA で、Windows のメモリーから 256 バイト読み、256 バイト書き戻せるかを確かめてから止める。ファームウェアは使わず、ファルコンの上では何も動かさない |
+| `FwTest.cmd` | 段階 B3a。自分の linux-firmware の ACR のファームウェアを読み、署名を当てた像をメモリーに作り、ACR のブートローダーを PMU の IMEM と DMEM に直接(PIO)書いて読み返す。ファルコンは起動しない |
 | `Remove.cmd` | switchgpu を外す |
 
 どれも右クリックして「管理者として実行」。最後の `SUMMARY` を写真に撮る。記録は `C:\SwitchWOA-Gpu.txt` に追記される。
@@ -62,6 +63,22 @@ GM20B の GPU に Windows から電源とクロックを入れ、GPU が応答�
 - `B2a DMA DMEM -> memory: 64 of 64 words OK ... stray changes 0`: GPU から Windows のメモリーに、決めた場所だけ書けた。
 
 固まったら、長押し → R411 で起動 → `Status.cmd`。`last step` が 30〜38 なら B2a のどこか(36〜38 = DMA の 1〜3 回目)。
+
+## 段階 B3a(FwTest、0.4.0)
+
+B2a の結論: 署名のない PMU から物理アドレスで DMA すると、GPU の MMU が権限違反(PRIV_VIOLATION)で止める。nvgpu と nouveau の本番の手順は、署名つきの ACR のブートローダーを PIO で入れて起動し、そのローダーが GPU の仮想アドレスで DMA する。B3a はその前半(ファームウェアの読み込みと PIO での書き込み)だけをする。
+
+準備: 自分の linux-firmware の `nvidia/gm20b` フォルダーを、キットの中に `firmware\nvidia\gm20b` として写す(`acr\bl.bin` 832 バイトと `acr\ucode_load.bin` 18592 バイトを使う)。キットにはファームウェアを入れていない。
+
+`Install.cmd`(0.4.0 に入れ替え)→ `FwTest.cmd` → `SUMMARY` を写真に撮る。見たいもの:
+- `firmware acr\bl.bin: ... SHA256 ...`: キットがレジストリに写したファイル。
+- `B3a firmware` / `B3a load header`: ヘッダーの値。ドライバーはどの値もファイルの大きさの内側にあるかを確かめてから使う。
+- `B3a signed image`: ヒューズ(production / debug)に合う署名を、像の決まった場所に当てた。
+- `B3a PMU PIO: ... N of N words read back OK`: ブートローダーが IMEM の上の端に書けた。
+- `B3a BL descriptor at DMEM 0: 19 of 19 words read back OK ... (not started)`
+- `B3a result 0x00000000 (OK)`
+
+ローダーが使う DMA のアドレス(`code_dma_base` と `data_dma_base`)は、PMU 用の仮想アドレス空間ができるまで 0 のまま。起動もしない。固まったら `Status.cmd`。`last step` が 40〜45 なら B3a のどこか。
 
 ## GPU を起こす手順(L4T の nvgpu と同じ順)
 
