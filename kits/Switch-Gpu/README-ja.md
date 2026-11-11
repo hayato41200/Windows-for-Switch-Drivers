@@ -64,13 +64,16 @@ GM20B の GPU に Windows から電源とクロックを入れ、GPU が応答�
 
 固まったら、長押し → R411 で起動 → `Status.cmd`。`last step` が 30〜38 なら B2a のどこか(36〜38 = DMA の 1〜3 回目)。
 
-## 段階 B3a(FwTest、0.4.0)
+## 段階 B3a / B3b(FwTest、0.4.2)
 
 B2a の結論: 署名のない PMU から物理アドレスで DMA すると、GPU の MMU が権限違反(PRIV_VIOLATION)で止める。nvgpu と nouveau の本番の手順は、署名つきの ACR のブートローダーを PIO で入れて起動し、そのローダーが GPU の仮想アドレスで DMA する。B3a はその前半(ファームウェアの読み込みと PIO での書き込み)だけをする。
 
-準備: 自分の linux-firmware の `nvidia/gm20b` フォルダーを、キットの中に `firmware\nvidia\gm20b` として写す(`acr\bl.bin` 832 バイトと `acr\ucode_load.bin` 18592 バイトを使う)。キットにはファームウェアを入れていない。
+準備: 自分の linux-firmware の `nvidia/gm20b` フォルダーを、キットの中に `firmware\nvidia\gm20b` として写す(`acr\bl.bin` 832 バイトと `acr\ucode_load.bin` 18592 バイトを使う)。0.4.1 からは、次の段階のために `pmu\desc.bin`、`pmu\image.bin`、`pmu\sig.bin`、`gr\fecs_bl.bin`、`gr\fecs_inst.bin`、`gr\fecs_data.bin`、`gr\fecs_sig.bin` もレジストリに写す(ドライバーは届いたかと大きさを確かめるだけで、まだ使わない。`B3a other firmware in the registry`)。キットにはファームウェアを入れていない。キットの中に無いときは、`C:\SwitchWOA\firmware\nvidia\gm20b`、`C:\firmware\nvidia\gm20b`、`C:\lib\firmware\nvidia\gm20b` の順に探す。どこにも無いときは、前の FwTest がレジストリに残したものを使う(`firmware ... (registry)` と出る)。キットの中に無いときは、`C:\SwitchWOAirmware
+vidia\gm20b`、`C:irmware
+vidia\gm20b`、`C:\libirmware
+vidia\gm20b` の順に探す。どこにも無いときは、前の FwTest がレジストリに残したものを使う(`firmware ... (registry)` と出る)。
 
-`Install.cmd`(0.4.0 に入れ替え)→ `FwTest.cmd` → `SUMMARY` を写真に撮る。見たいもの:
+`Install.cmd`(0.4.2 に入れ替え)→ `FwTest.cmd` → `SUMMARY` を写真に撮る。見たいもの:
 - `firmware acr\bl.bin: ... SHA256 ...`: キットがレジストリに写したファイル。
 - `B3a firmware` / `B3a load header`: ヘッダーの値。ドライバーはどの値もファイルの大きさの内側にあるかを確かめてから使う。
 - `B3a signed image`: ヒューズ(production / debug)に合う署名を、像の決まった場所に当てた。

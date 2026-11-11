@@ -85,7 +85,7 @@ function Show-Trace {
   Sum ('at start: VOUT {0}  VOUT_DVS {1}  GPIO6 {2}' -f (MvText $p.VoutAtStart), (MvText $p.VoutDvsAtStart), (Gpio $p.Gpio6AtStart))
   Sum ('at start: clamp (RG_CNTRL bit0) {0}  gpu clock {1}  pllg_ref {2}  gpu reset {3}  PLLP_OUTC {4}  fuse clock {5}  MC hot reset ctrl {6} stat {7}' -f (Bit $p.RgCntrlAtStart 0), (Bit $p.ClkXAtStart 24), (Bit $p.ClkXAtStart 29), (Bit $p.RstXAtStart 24), (Hex $p.PllpOutcAtStart), (Bit $p.ClkHAtStart 7), (Hex $p.McHotCtrlAtStart), (Hex $p.McHotStatAtStart))
   if ($p.TestRuns) {
-    $steps = @{ 1 = 'read the regulator'; 2 = 'VDD_GPU on'; 3 = 'clocks on'; 4 = 'reset assert'; 5 = 'clamp off'; 6 = 'reset deassert'; 7 = 'MC flush'; 8 = 'first BAR0 read (BOOT_0)'; 9 = 'PTIMER and WPR reads'; 20 = 'B1: topology read'; 21 = 'B1: PMU falcon read'; 22 = 'B1: DMEM test'; 23 = 'B1: priv ring init'; 29 = 'B2a: priv ring init'; 40 = 'B3a: firmware from registry'; 41 = 'B3a: bl.bin header'; 42 = 'B3a: ucode_load.bin headers'; 43 = 'B3a: signed image'; 44 = 'B3a: PMU reset + IMEM PIO'; 45 = 'B3a: DMEM descriptor'; 30 = 'B2a: SMMU check'; 31 = 'B2a: DMA setup'; 32 = 'B2a: DMA memory -> DMEM'; 33 = 'B2a: DMA DMEM -> memory'; 34 = 'B2a: DMA setup restore'; 35 = 'B2a: memory path read'; 36 = 'B2a: DMA try 1'; 37 = 'B2a: DMA try 2 (after PMU reset)'; 38 = 'B2a: DMA try 3 (after PMU reset)'; 39 = 'B2a: PMU instance bind'; 10 = 'power down'; 11 = 'done'; 100 = 'done, GPU left on (KeepOn)' }
+    $steps = @{ 1 = 'read the regulator'; 2 = 'VDD_GPU on'; 3 = 'clocks on'; 4 = 'reset assert'; 5 = 'clamp off'; 6 = 'reset deassert'; 7 = 'MC flush'; 8 = 'first BAR0 read (BOOT_0)'; 9 = 'PTIMER and WPR reads'; 20 = 'B1: topology read'; 21 = 'B1: PMU falcon read'; 22 = 'B1: DMEM test'; 23 = 'B1: priv ring init'; 29 = 'B2a: priv ring init'; 40 = 'B3a: firmware from registry'; 41 = 'B3a: bl.bin header'; 42 = 'B3a: ucode_load.bin headers'; 43 = 'B3a: signed image'; 44 = 'B3a: PMU reset + IMEM PIO'; 45 = 'B3a: DMEM descriptor'; 46 = 'B3b: CPU-side image (user code)'; 30 = 'B2a: SMMU check'; 31 = 'B2a: DMA setup'; 32 = 'B2a: DMA memory -> DMEM'; 33 = 'B2a: DMA DMEM -> memory'; 34 = 'B2a: DMA setup restore'; 35 = 'B2a: memory path read'; 36 = 'B2a: DMA try 1'; 37 = 'B2a: DMA try 2 (after PMU reset)'; 38 = 'B2a: DMA try 3 (after PMU reset)'; 39 = 'B2a: PMU instance bind'; 10 = 'power down'; 11 = 'done'; 100 = 'done, GPU left on (KeepOn)' }
     Sum ('power test runs {0}: last step {1} ({2})  result {3}  took {4} us' -f $p.TestRuns, $p.Step, $steps[[int]$p.Step], (Hex $p.Result), $p.TestUs)
     if ($null -ne $p.McHotStatAfterReset) {
       $pts = @(@('GPU off', $p.McHotStatAtStart), @('after reset', $p.McHotStatAfterReset), @('after flush', $p.McHotStatAfterFlush), @('after BAR0 reads', $p.McHotStatAfterBar0), @('B2a start', $p.McHotStatB2aStart), @('before DMA', $p.McHotStatBeforeDma), @('after DMA', $p.McHotStatAfterDma))
@@ -279,7 +279,23 @@ function Show-Trace {
       if ($null -ne $p.B3aDescOk) {
         Sum ('B3a BL descriptor at DMEM 0: {0} of 19 words read back OK  CPUCTL {1} (not started)  boot address {2}' -f $p.B3aDescOk, (Hex $p.B3aCpuctl), (Hex $p.B3aBootAddr))
       }
+      if ($null -ne $p.B3aFwPmuImageLen) {
+        Sum ('B3a other firmware in the registry (bytes): pmu desc {0} image {1} sig {2}  fecs bl {3} inst {4} data {5} sig {6}' -f $p.B3aFwPmuDescLen, $p.B3aFwPmuImageLen, $p.B3aFwPmuSigLen, $p.B3aFwFecsBlLen, $p.B3aFwFecsInstLen, $p.B3aFwFecsDataLen, $p.B3aFwFecsSigLen)
+      }
       Sum ('B3a result {0} ({1})' -f (Hex $p.B3aResult), $why3)
+    }
+    if ($null -ne $p.B3bResult) {
+      # 0.4.2: the user's B3b code; show its values as they are (no decoding).
+      $bv = @(); $bb = @()
+      foreach ($pr in $p.PSObject.Properties) {
+        if ($pr.Name -notmatch '^B3b' -or $pr.Name -eq 'B3bResult') { continue }
+        if ($pr.Value -is [byte[]]) { $bb += ('{0} ({1} bytes)' -f $pr.Name.Substring(3), $pr.Value.Length) }
+        else { $bv += ('{0}={1:X}' -f $pr.Name.Substring(3), [uint32]$pr.Value) }
+      }
+      Sum ('B3b values: ' + ($bv -join '  '))
+      if ($bb.Count) { Sum ('B3b binary traces: ' + ($bb -join '  ')) }
+      $b3bok = 'OK'; if ([uint32]$p.B3bResult -ne 0) { $b3bok = 'error code from the B3b code' }
+      Sum ('B3b result {0} ({1})' -f (Hex $p.B3bResult), $b3bok)
     }
     if ($null -ne $p.PfifoIntr0) {
       Sum ('B2a PFIFO: intr0 {0}  mmu fault id {1}  fault0 inst {2} lo {3} hi {4} info {5}' -f (Hex $p.PfifoIntr0), (Hex $p.PfifoMmuFaultId), (Hex $p.PfifoFault0Inst), (Hex $p.PfifoFault0Lo), (Hex $p.PfifoFault0Hi), (Hex $p.PfifoFault0Info))
@@ -319,19 +335,41 @@ switch ($Mode) {
     New-Item -Path $Key -Force | Out-Null
     $old = Get-ItemProperty $Key -ErrorAction SilentlyContinue
     if ($old) {
-      foreach ($n in @($old.PSObject.Properties | Where-Object { $_.Name -match '^(B2a|B3a|Smmu|Mc[IE]|McHotStat(Before|After)Dma|McHotStatAfter(Reset|Flush|Bar0)|McHotStatB2aStart|Pmu|Pfifo|Ptop|Scal|Dmem|Ring|Wpr|PmcEnable)' } | ForEach-Object { $_.Name })) {
+      foreach ($n in @($old.PSObject.Properties | Where-Object { $_.Name -match '^(B2a|B3a|B3b|Smmu|Mc[IE]|McHotStat(Before|After)Dma|McHotStatAfter(Reset|Flush|Bar0)|McHotStatB2aStart|Pmu|Pfifo|Ptop|Scal|Dmem|Ring|Wpr|PmcEnable)' } | ForEach-Object { $_.Name })) {
         Remove-ItemProperty -Path $Key -Name $n -ErrorAction SilentlyContinue
       }
     }
     if ($Mode -eq 'FwTest') {
       # The firmware is the user's own linux-firmware copy; the kit never ships it.
+      # Where to look, in order: inside the kit, then fixed places on C:.
+      # If none has it, reuse what an earlier FwTest left in the registry.
+      $fwPlaces = @((Join-Path $Here 'firmware\nvidia\gm20b'), (Join-Path $Here 'firmware\gm20b'), (Join-Path $Here 'firmware'),
+                    'C:\SwitchWOA\firmware\nvidia\gm20b', 'C:\firmware\nvidia\gm20b', 'C:\lib\firmware\nvidia\gm20b')
       $fwDir = $null
-      foreach ($c in @((Join-Path $Here 'firmware\nvidia\gm20b'), (Join-Path $Here 'firmware\gm20b'), (Join-Path $Here 'firmware'))) {
+      foreach ($c in $fwPlaces) {
         if (Test-Path (Join-Path $c 'acr\bl.bin')) { $fwDir = $c; break }
       }
-      if (-not $fwDir) { Sum ('firmware not found: copy your own linux-firmware nvidia\gm20b folder to ' + (Join-Path $Here 'firmware\nvidia\gm20b')); break }
+      $fwList = @(@('acr\bl.bin', 'FwAcrBl', 832), @('acr\ucode_load.bin', 'FwAcrUcodeLoad', 18592),
+                       @('pmu\desc.bin', 'FwPmuDesc', 652), @('pmu\image.bin', 'FwPmuImage', 47872), @('pmu\sig.bin', 'FwPmuSig', 76),
+                       @('gr\fecs_bl.bin', 'FwFecsBl', 576), @('gr\fecs_inst.bin', 'FwFecsInst', 17021), @('gr\fecs_data.bin', 'FwFecsData', 1964), @('gr\fecs_sig.bin', 'FwFecsSig', 76))
       $fwOk = $true
-      foreach ($f in @(@('acr\bl.bin', 'FwAcrBl', 832), @('acr\ucode_load.bin', 'FwAcrUcodeLoad', 18592))) {
+      if (-not $fwDir) {
+        $have = Get-ItemProperty $Key -ErrorAction SilentlyContinue
+        $missing = @($fwList | Where-Object { -not ($have -and ($have.PSObject.Properties.Name -contains $_[1])) })
+        if ($missing.Count) {
+          Sum ('firmware not found. Put your own linux-firmware nvidia\gm20b folder in one of: ' + ($fwPlaces -join ' ; '))
+          break
+        }
+        Sum 'firmware folder not found: using the copy an earlier FwTest left in the registry'
+        foreach ($f in $fwList) {
+          $bytes = [byte[]]$have.($f[1])
+          $sha = [BitConverter]::ToString([Security.Cryptography.SHA256]::Create().ComputeHash($bytes)).Replace('-', '')
+          Sum ('firmware {0} (registry): {1} bytes  SHA256 {2}' -f $f[0], $bytes.Length, $sha)
+        }
+      }
+      else { Sum "firmware folder: $fwDir" }
+      foreach ($f in $fwList) {
+        if (-not $fwDir) { break }
         $fp = Join-Path $fwDir $f[0]
         if (-not (Test-Path $fp)) { Sum "missing: $fp"; $fwOk = $false; break }
         $bytes = [IO.File]::ReadAllBytes($fp)
@@ -361,7 +399,7 @@ switch ($Mode) {
       Log "pnputil /delete-driver $name /uninstall /force"
       (& $Pnputil /delete-driver $name /uninstall /force 2>&1) | ForEach-Object { Log "  $_" }
     }
-    Remove-ItemProperty -Path $Key -Name FwAcrBl, FwAcrUcodeLoad -ErrorAction SilentlyContinue
+    Remove-ItemProperty -Path $Key -Name FwAcrBl, FwAcrUcodeLoad, FwPmuDesc, FwPmuImage, FwPmuSig, FwFecsBl, FwFecsInst, FwFecsData, FwFecsSig -ErrorAction SilentlyContinue
     Show-Device
   }
 }

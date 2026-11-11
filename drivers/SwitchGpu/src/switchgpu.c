@@ -39,7 +39,7 @@
 #include <wdf.h>
 #include <spb.h>
 
-#define SWGPU_VERSION      0x00000400u   /* 0.4.0 */
+#define SWGPU_VERSION      0x00000402u   /* 0.4.2 */
 
 #define CAR_PHYS           0x60006000ull
 #define CAR_LEN            0x1000u
@@ -1124,6 +1124,273 @@ static VOID PmuReset(volatile UCHAR *B, PCWSTR PollName)
     Trace(PollName, w);
 }
 
+static VOID WprPutLe32(PUCHAR P, ULONG V)
+{
+    P[0] = (UCHAR)V;
+    P[1] = (UCHAR)(V >> 8);
+    P[2] = (UCHAR)(V >> 16);
+    P[3] = (UCHAR)(V >> 24);
+}
+
+/* Build a CPU-only GM20B WPR image from the staged Linux firmware blobs.
+ * This deliberately does not map the buffer for GPU DMA, alter SMMU state,
+ * enable the PMU, or ask ACR to consume it. The WPR addresses in both BLDs
+ * are still relative to the beginning of the image and need the WPR-base
+ * relocation performed by ACR before they can be used. */
+static ULONG BuildWprB3b(ULONG PmuDmemSize)
+{
+    PUCHAR pmuDesc = NULL, pmuImage = NULL, pmuSig = NULL;
+    PUCHAR fecsBl = NULL, fecsInst = NULL, fecsData = NULL, fecsSig = NULL;
+    PUCHAR fecsImage = NULL, wpr = NULL;
+    ULONG pmuDescLen = 0, pmuImageLen = 0, pmuSigLen = 0;
+    ULONG fecsBlLen = 0, fecsInstLen = 0, fecsDataLen = 0, fecsSigLen = 0;
+    ULONG blHdrOff, blDataOff, blDataSize, blDescOff;
+    ULONG fecsStartTag, fecsCodeSize, fecsCodeOff;
+    ULONG pmuBootStart, pmuBootSize, pmuBootImem, pmuAppStart, pmuAppSize;
+    ULONG pmuAppCodeOff, pmuAppCodeSize, pmuAppDataOff, pmuAppDataSize;
+    ULONG pmuCodeOffset, pmuDataOffset, pmuUcodeSize, pmuDataSize;
+    ULONG pmuLsbOff, pmuImgOff, pmuBldOff, fecsLsbOff, fecsImgOff, fecsBldOff;
+    ULONG fecsBootPad, fecsInstPad, fecsDataPad, fecsImageLen, fecsUcodeSize;
+    ULONG fecsDataAreaSize, totalUsed, allocLen, i, ok, result = 0xE0000051u;
+    ULONG pmuBld[13], fecsBld[19];
+    ULONG descSize, imageSize;
+
+    Step(46); /* parse firmware descriptors and construct the CPU-side WPR image */
+    pmuDesc = ReadBinParam(L"FwPmuDesc", 0x20000u, &pmuDescLen);
+    pmuImage = ReadBinParam(L"FwPmuImage", 0x20000u, &pmuImageLen);
+    pmuSig = ReadBinParam(L"FwPmuSig", 0x20000u, &pmuSigLen);
+    fecsBl = ReadBinParam(L"FwFecsBl", 0x20000u, &fecsBlLen);
+    fecsInst = ReadBinParam(L"FwFecsInst", 0x20000u, &fecsInstLen);
+    fecsData = ReadBinParam(L"FwFecsData", 0x20000u, &fecsDataLen);
+    fecsSig = ReadBinParam(L"FwFecsSig", 0x20000u, &fecsSigLen);
+    Trace(L"B3bPmuDescLen", pmuDescLen);
+    Trace(L"B3bPmuImageLen", pmuImageLen);
+    Trace(L"B3bPmuSigLen", pmuSigLen);
+    Trace(L"B3bFecsBlLen", fecsBlLen);
+    Trace(L"B3bFecsInstLen", fecsInstLen);
+    Trace(L"B3bFecsDataLen", fecsDataLen);
+    Trace(L"B3bFecsSigLen", fecsSigLen);
+    /* Keep the 0.4.1 kit's existing SUMMARY field names usable. */
+    Trace(L"B3aFwPmuDescLen", pmuDescLen);
+    Trace(L"B3aFwPmuImageLen", pmuImageLen);
+    Trace(L"B3aFwPmuSigLen", pmuSigLen);
+    Trace(L"B3aFwFecsBlLen", fecsBlLen);
+    Trace(L"B3aFwFecsInstLen", fecsInstLen);
+    Trace(L"B3aFwFecsDataLen", fecsDataLen);
+    Trace(L"B3aFwFecsSigLen", fecsSigLen);
+    if (pmuDesc == NULL || pmuImage == NULL || pmuSig == NULL || fecsBl == NULL ||
+        fecsInst == NULL || fecsData == NULL || fecsSig == NULL) {
+        result = 0xE0000052u; goto done;
+    }
+
+    /* nvfw_ls_desc_head: 132-byte fixed header, followed by overlay data. */
+    if (pmuDescLen < 132 || pmuImageLen == 0 || pmuSigLen != 76 || fecsSigLen != 76 ||
+        fecsBlLen < 24 || fecsInstLen == 0 || fecsDataLen == 0 ||
+        Le32(pmuSig + 72) != 0 || Le32(fecsSig + 72) != 2) {
+        result = 0xE0000053u; goto done;
+    }
+    descSize = Le32(pmuDesc + 0);
+    imageSize = Le32(pmuDesc + 4);
+    pmuBootStart = Le32(pmuDesc + 80);
+    pmuBootSize = Le32(pmuDesc + 84);
+    pmuBootImem = Le32(pmuDesc + 88);
+    pmuAppStart = Le32(pmuDesc + 96);
+    pmuAppSize = Le32(pmuDesc + 100);
+    pmuAppCodeOff = Le32(pmuDesc + 116);
+    pmuAppCodeSize = Le32(pmuDesc + 120);
+    pmuAppDataOff = Le32(pmuDesc + 124);
+    pmuAppDataSize = Le32(pmuDesc + 128);
+    Trace(L"B3bPmuDescSize", descSize);
+    Trace(L"B3bPmuImageSize", imageSize);
+    Trace(L"B3bPmuBootSize", pmuBootSize);
+    Trace(L"B3bPmuAppSize", pmuAppSize);
+    if (descSize < 132 || descSize > pmuDescLen || imageSize == 0 || imageSize > pmuImageLen ||
+        pmuBootSize == 0 || pmuAppSize == 0 ||
+        !InBlob(imageSize, pmuBootStart, pmuBootSize) ||
+        !InBlob(imageSize, pmuAppStart, pmuAppSize) ||
+        !InBlob(pmuAppSize, pmuAppCodeOff, pmuAppCodeSize) ||
+        !InBlob(pmuAppSize, pmuAppDataOff, pmuAppDataSize) ||
+        pmuAppCodeSize == 0 || pmuAppDataSize == 0 ||
+        pmuBootSize > 0x1FFFFu || pmuAppSize > 0x1FFFFu ||
+        PmuDmemSize < 44) {
+        result = 0xE0000054u; goto done;
+    }
+    pmuCodeOffset = pmuAppStart + pmuAppCodeOff;
+    pmuDataOffset = pmuAppStart + pmuAppDataOff;
+    if (!InBlob(imageSize, pmuCodeOffset, pmuAppCodeSize) ||
+        !InBlob(imageSize, pmuDataOffset, pmuAppDataSize)) {
+        result = 0xE0000055u; goto done;
+    }
+    pmuBootSize = (pmuBootSize + 0xFFu) & ~0xFFu;
+    pmuAppSize = (pmuAppSize + 0xFFu) & ~0xFFu;
+    pmuUcodeSize = ((pmuAppDataOff + 0xFFu) & ~0xFFu) + pmuBootSize;
+    if (pmuUcodeSize > pmuAppSize + pmuBootSize) {
+        result = 0xE0000056u; goto done;
+    }
+    pmuDataSize = pmuAppSize + pmuBootSize - pmuUcodeSize;
+
+    /* nvfw_bin_hdr + nvfw_bl_desc; Nouveau takes the bootloader bytes from
+     * hdr.data_offset, then appends INST and DATA with 256-byte zero padding. */
+    if (!InBlob(fecsBlLen, 0, 24)) { result = 0xE0000057u; goto done; }
+    blHdrOff = Le32(fecsBl + 12);
+    blDataOff = Le32(fecsBl + 16);
+    blDataSize = Le32(fecsBl + 20);
+    if (!InBlob(fecsBlLen, blHdrOff, 24) || !InBlob(fecsBlLen, blDataOff, blDataSize)) {
+        result = 0xE0000058u; goto done;
+    }
+    blDescOff = blHdrOff;
+    fecsStartTag = Le32(fecsBl + blDescOff);
+    fecsCodeOff = Le32(fecsBl + blDescOff + 8);
+    fecsCodeSize = Le32(fecsBl + blDescOff + 12);
+    Trace(L"B3bFecsStartTag", fecsStartTag);
+    Trace(L"B3bFecsCodeOff", fecsCodeOff);
+    Trace(L"B3bFecsCodeSize", fecsCodeSize);
+    if (fecsCodeSize == 0 || fecsCodeSize > 0x1FFFFu ||
+        !InBlob(blDataSize, 0, fecsCodeSize) || fecsStartTag > 0xFFFFu ||
+        fecsInstLen > 0x1FFFFu || fecsDataLen > 0x1FFFFu) {
+        result = 0xE0000059u; goto done;
+    }
+    fecsBootPad = (fecsCodeSize + 0xFFu) & ~0xFFu;
+    fecsInstPad = (fecsInstLen + 0xFFu) & ~0xFFu;
+    fecsDataPad = (fecsDataLen + 0xFFu) & ~0xFFu;
+    if (fecsBootPad > 0x20000u - fecsInstPad ||
+        fecsBootPad + fecsInstPad > 0x20000u - fecsDataPad) {
+        result = 0xE000005Au; goto done;
+    }
+    fecsImageLen = fecsBootPad + fecsInstPad + fecsDataPad;
+    fecsUcodeSize = fecsBootPad + fecsInstPad;
+    fecsDataAreaSize = fecsBootPad + fecsInstPad + fecsDataPad - fecsUcodeSize;
+
+    /* Match gm200_acr_wpr_layout: 11 headers reserved, then LSB/image/BLD
+     * entries aligned to 256/4096/256 bytes. WPR allocation is 0x40000-aligned. */
+    pmuLsbOff = 11u * 20u;
+    pmuLsbOff = (pmuLsbOff + 0xFFu) & ~0xFFu;
+    pmuImgOff = (pmuLsbOff + 124u + 0xFFFu) & ~0xFFFu;
+    if (imageSize > 0x40000u - pmuImgOff) { result = 0xE000005Bu; goto done; }
+    pmuBldOff = (pmuImgOff + imageSize + 0xFFu) & ~0xFFu;
+    fecsLsbOff = pmuBldOff + 256u;
+    fecsImgOff = (fecsLsbOff + 124u + 0xFFFu) & ~0xFFFu;
+    if (fecsImageLen > 0x40000u - fecsImgOff) { result = 0xE000005Cu; goto done; }
+    fecsBldOff = (fecsImgOff + fecsImageLen + 0xFFu) & ~0xFFu;
+    if (fecsBldOff > 0x40000u - 256u) { result = 0xE000005Du; goto done; }
+    totalUsed = fecsBldOff + 256u;
+    allocLen = (totalUsed + 0x3FFFFu) & ~0x3FFFFu;
+    if (allocLen != 0x40000u) { result = 0xE000005Eu; goto done; }
+    Trace(L"B3bPmuLsbOff", pmuLsbOff);
+    Trace(L"B3bPmuImgOff", pmuImgOff);
+    Trace(L"B3bPmuBldOff", pmuBldOff);
+    Trace(L"B3bFecsLsbOff", fecsLsbOff);
+    Trace(L"B3bFecsImgOff", fecsImgOff);
+    Trace(L"B3bFecsBldOff", fecsBldOff);
+    Trace(L"B3bWprUsed", totalUsed);
+    Trace(L"B3bWprAlloc", allocLen);
+
+    wpr = (PUCHAR)ExAllocatePool2(POOL_FLAG_NON_PAGED, allocLen, SWGPU_TAG);
+    fecsImage = (PUCHAR)ExAllocatePool2(POOL_FLAG_NON_PAGED, fecsImageLen, SWGPU_TAG);
+    if (wpr == NULL || fecsImage == NULL) { result = 0xE000005Fu; goto done; }
+    RtlZeroMemory(wpr, allocLen);
+    RtlZeroMemory(fecsImage, fecsImageLen);
+    RtlCopyMemory(wpr + pmuImgOff, pmuImage, imageSize);
+    RtlCopyMemory(fecsImage, fecsBl + blDataOff, fecsCodeSize);
+    RtlCopyMemory(fecsImage + fecsBootPad, fecsInst, fecsInstLen);
+    RtlCopyMemory(fecsImage + fecsBootPad + fecsInstPad, fecsData, fecsDataLen);
+    RtlCopyMemory(wpr + fecsImgOff, fecsImage, fecsImageLen);
+
+    /* Two WPR v0 records (PMU id 0, FECS id 2), followed by the invalid id. */
+    WprPutLe32(wpr + 0, 0); WprPutLe32(wpr + 4, pmuLsbOff);
+    WprPutLe32(wpr + 8, 0); WprPutLe32(wpr + 12, 0); WprPutLe32(wpr + 16, 1);
+    WprPutLe32(wpr + 20, 2); WprPutLe32(wpr + 24, fecsLsbOff);
+    WprPutLe32(wpr + 28, 0); WprPutLe32(wpr + 32, 1); WprPutLe32(wpr + 36, 1);
+    WprPutLe32(wpr + 40, 0xFFFFFFFFu);
+
+    RtlCopyMemory(wpr + pmuLsbOff, pmuSig, 76);
+    WprPutLe32(wpr + pmuLsbOff + 76, pmuImgOff);
+    WprPutLe32(wpr + pmuLsbOff + 80, pmuUcodeSize);
+    WprPutLe32(wpr + pmuLsbOff + 84, pmuDataSize);
+    WprPutLe32(wpr + pmuLsbOff + 88, pmuBootSize);
+    WprPutLe32(wpr + pmuLsbOff + 92, pmuBootImem);
+    WprPutLe32(wpr + pmuLsbOff + 96, pmuBldOff);
+    WprPutLe32(wpr + pmuLsbOff + 100, 256);
+    WprPutLe32(wpr + pmuLsbOff + 104, pmuAppStart + pmuAppCodeOff);
+    WprPutLe32(wpr + pmuLsbOff + 108, pmuAppCodeSize);
+    WprPutLe32(wpr + pmuLsbOff + 112, pmuAppStart + pmuAppDataOff);
+    WprPutLe32(wpr + pmuLsbOff + 116, pmuAppDataSize);
+    WprPutLe32(wpr + pmuLsbOff + 120, 4); /* DMACTL_REQ_CTX */
+
+    RtlCopyMemory(wpr + fecsLsbOff, fecsSig, 76);
+    WprPutLe32(wpr + fecsLsbOff + 76, fecsImgOff);
+    WprPutLe32(wpr + fecsLsbOff + 80, fecsUcodeSize);
+    WprPutLe32(wpr + fecsLsbOff + 84, fecsDataAreaSize);
+    WprPutLe32(wpr + fecsLsbOff + 88, fecsBootPad);
+    WprPutLe32(wpr + fecsLsbOff + 92, fecsStartTag << 8);
+    WprPutLe32(wpr + fecsLsbOff + 96, fecsBldOff);
+    WprPutLe32(wpr + fecsLsbOff + 100, 256);
+    WprPutLe32(wpr + fecsLsbOff + 104, fecsBootPad);
+    WprPutLe32(wpr + fecsLsbOff + 108, fecsInstPad);
+    WprPutLe32(wpr + fecsLsbOff + 112, fecsBootPad + fecsInstPad);
+    WprPutLe32(wpr + fecsLsbOff + 116, fecsDataPad);
+    WprPutLe32(wpr + fecsLsbOff + 120, 0);
+
+    RtlZeroMemory(pmuBld, sizeof(pmuBld));
+    pmuBld[0] = DMA_IDX;
+    pmuBld[1] = (pmuImgOff + pmuCodeOffset) >> 8;
+    pmuBld[2] = pmuAppSize;
+    pmuBld[3] = pmuAppCodeSize;
+    pmuBld[4] = Le32(pmuDesc + 108); /* app_imem_entry */
+    pmuBld[5] = (pmuImgOff + pmuDataOffset) >> 8;
+    pmuBld[6] = pmuAppDataSize;
+    pmuBld[7] = pmuBld[1];
+    pmuBld[8] = 1;
+    pmuBld[9] = PmuDmemSize - 44u; /* sizeof(struct nv_pmu_args) */
+    for (i = 0; i < RTL_NUMBER_OF(pmuBld); ++i)
+        WprPutLe32(wpr + pmuBldOff + i * 4u, pmuBld[i]);
+
+    RtlZeroMemory(fecsBld, sizeof(fecsBld));
+    fecsBld[8] = DMA_IDX;
+    fecsBld[9] = (fecsImgOff + fecsBootPad) >> 8;
+    fecsBld[10] = 0;
+    fecsBld[11] = fecsInstPad;
+    fecsBld[14] = 0;
+    fecsBld[15] = (fecsImgOff + fecsBootPad + fecsInstPad) >> 8;
+    fecsBld[16] = fecsDataPad;
+    for (i = 0; i < RTL_NUMBER_OF(fecsBld); ++i)
+        WprPutLe32(wpr + fecsBldOff + i * 4u, fecsBld[i]);
+
+    /* CPU-only integrity/readback checks; this is not a GPU DMA proof. */
+    TraceBin(L"B3bWprHeaders", wpr, 60);
+    TraceBin(L"B3bPmuLsb", wpr + pmuLsbOff, 124);
+    TraceBin(L"B3bPmuBld", wpr + pmuBldOff, sizeof(pmuBld));
+    TraceBin(L"B3bFecsLsb", wpr + fecsLsbOff, 124);
+    TraceBin(L"B3bFecsBld", wpr + fecsBldOff, sizeof(fecsBld));
+    ok = (Le32(wpr) == 0 && Le32(wpr + 20) == 2 && Le32(wpr + 40) == 0xFFFFFFFFu &&
+          Le32(wpr + pmuLsbOff + 72) == 0 && Le32(wpr + fecsLsbOff + 72) == 2 &&
+          Le32(wpr + pmuLsbOff + 76) == pmuImgOff &&
+          Le32(wpr + fecsLsbOff + 76) == fecsImgOff &&
+          Le32(wpr + pmuBldOff) == DMA_IDX && Le32(wpr + fecsBldOff + 32) == DMA_IDX &&
+          RtlCompareMemory(wpr + pmuImgOff, pmuImage, imageSize) == imageSize &&
+          RtlCompareMemory(wpr + fecsImgOff, fecsImage, fecsImageLen) == fecsImageLen) ? 1u : 0u;
+    Trace(L"B3bPmuCodeDmaRel", pmuBld[1]);
+    Trace(L"B3bPmuDataDmaRel", pmuBld[5]);
+    Trace(L"B3bPmuArgv", pmuBld[9]);
+    Trace(L"B3bFecsCodeDmaRel", fecsBld[9]);
+    Trace(L"B3bFecsDataDmaRel", fecsBld[15]);
+    TraceDurable(L"B3bWprCpuReadback", ok);
+    result = ok ? 0 : 0xE0000060u;
+
+done:
+    TraceDurable(L"B3bResult", result);
+    if (wpr != NULL) ExFreePoolWithTag(wpr, SWGPU_TAG);
+    if (fecsImage != NULL) ExFreePoolWithTag(fecsImage, SWGPU_TAG);
+    if (fecsSig != NULL) ExFreePoolWithTag(fecsSig, SWGPU_TAG);
+    if (fecsData != NULL) ExFreePoolWithTag(fecsData, SWGPU_TAG);
+    if (fecsInst != NULL) ExFreePoolWithTag(fecsInst, SWGPU_TAG);
+    if (fecsBl != NULL) ExFreePoolWithTag(fecsBl, SWGPU_TAG);
+    if (pmuSig != NULL) ExFreePoolWithTag(pmuSig, SWGPU_TAG);
+    if (pmuImage != NULL) ExFreePoolWithTag(pmuImage, SWGPU_TAG);
+    if (pmuDesc != NULL) ExFreePoolWithTag(pmuDesc, SWGPU_TAG);
+    return result;
+}
+
 static VOID ProbeB3a(PSWGPU_DEVICE Dev)
 {
     volatile UCHAR *B = Dev->Bar0;
@@ -1293,6 +1560,9 @@ static VOID ProbeB3a(PSWGPU_DEVICE Dev)
     TraceDurable(L"B3aDescOk", ok);
     Trace(L"B3aCpuctl", Rd(B, PMU_FALCON + FALCON_CPUCTL));
     Trace(L"B3aBootAddr", startTag << 8);
+
+    /* CPU-only WPR layout and readback; no GPU DMA or ACR/PMU start. */
+    (VOID)BuildWprB3b(dmemSize);
 
     /* Leave the PMU clean: reset it again (the CPU was never started). */
     PmuReset(B, L"B3aScrubPolls2");
