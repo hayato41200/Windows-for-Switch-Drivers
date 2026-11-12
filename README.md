@@ -25,6 +25,7 @@ the UEFI starts it (not `bootmgfw.efi` directly). Other `0xD…` codes: see "ブ
 | `switchcpu` | ACPI\SWOA0701 | R375 | CPU のクロックのプロファイル（614〜1766 MHz）、温度による制限 |
 | `switchrtc` | ACPI\SWOA0801 | R377 | 時計（MAX77620 の RTC を読み、ずれを覚えて時刻を合わせる） |
 | `switchbt` | ACPI\SWOA0B01 | R390 | Bluetooth（UART-D の BCM4356A3 を、Windows 標準の BthMini につなぐ）。3 Mbps。ファームウェアのパッチ `BCM4356A3.hcd` は各自で用意（配布しない）。今は電波がとても近くまでしか届かない（Wi-Fi 側が動いていないため） |
+| `switchwlan` | `ACPI\SWOA0D01` | R405 | Wi-Fi（ベータ）。WPA2-Personalで接続、DHCP、インターネット接続。Wi-Fi 5（802.11ac）、866/866 Mbit/s。2026-11-08に実機確認：fast.com 下り55 Mbit/s・上り39 Mbit/s。ファームウェア `brcmfmac4356(A3)-pcie.bin/.txt` は各自で用意（動作確認済み 7.35.252.108）。`switchwlan.sys` 0.6.13 |
 | `switchaudio`（ベータ） | ACPI\SWOA0C01 | R403（R402 ならスピーカーだけ） | 音声。スピーカーとヘッドホンへの再生（PortCls WaveRT、48 kHz・16 ビット・ステレオ）。ヘッドホンを抜き差しすると自動で切り替わる。Windows に見える出力は「スピーカー」の1つで、音量も共通。マイクは無い |
 | `switchsensor` | ACPI\SWOA0901 | R379 | 傾きセンサー（画面の自動回転）。明るさセンサーは、この本体では見つからず使えていない |
 | `swoadiag` | —（読み込んだときだけ） | — | USB（XUSB）のレジスタを読むだけの診断用 |
