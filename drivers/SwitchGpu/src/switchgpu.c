@@ -39,7 +39,7 @@
 #include <wdf.h>
 #include <spb.h>
 
-#define SWGPU_VERSION      0x00000402u   /* 0.4.2 */
+#define SWGPU_VERSION      0x00000410u   /* 0.4.16 */
 
 #define CAR_PHYS           0x60006000ull
 #define CAR_LEN            0x1000u
@@ -446,7 +446,7 @@ static ULONG DmaWait(volatile UCHAR *B)
 /* GM200 PMU bind handshake from nouveau gm200_pmu_flcn_bind_inst/bind_stat.
  * Return the final state (0 means complete); expose the intermediate state
  * and poll counts so the probe can identify exactly where it stopped. */
-static BOOLEAN PmuBindInst(volatile UCHAR *B, ULONG instAddress,
+static BOOLEAN PmuBindInst(volatile UCHAR *B, ULONGLONG instAddress,
                            PULONG AckState, PULONG DoneState,
                            PULONG AckPolls, PULONG DonePolls)
 {
@@ -461,7 +461,7 @@ static BOOLEAN PmuBindInst(volatile UCHAR *B, ULONG instAddress,
     Wr(B, PMU_FALCON + FALCON_CTX_ENABLE,
        Rd(B, PMU_FALCON + FALCON_CTX_ENABLE) | 0x00010000u);
     Wr(B, PMU_FALCON + FALCON_BIND_INST,
-       0x40000000u | (3u << 28) | (instAddress >> 12)); /* SYS_NCOH */
+       0x40000000u | (3u << 28) | (ULONG)(instAddress >> 12)); /* SYS_NCOH */
 
     Wr(B, PMU_FALCON + FALCON_BIND_TRIGGER, 0x0000030Eu);
     state = (Rd(B, PMU_FALCON + FALCON_BIND_STATUS) & 0x00007000u) >> 12;
@@ -1063,6 +1063,362 @@ static VOID ProbeB2a(PSWGPU_DEVICE Dev)
 #define ACR_BL_MAX         0x2000u
 #define ACR_UC_MAX         0x20000u
 #define ACR_DMAIDX_VIRT    1u          /* nvgpu GK20A_PMU_DMAIDX_VIRT */
+#define ACR_VM_ARENA_SIZE  0x80000u
+#define ACR_VM_PGD_OFF     0x02000u    /* 8K-aligned; 8K entries x 8 bytes */
+#define ACR_VM_PGT_OFF     0x12000u    /* 4K small-page table, 32768 x 8 bytes */
+#define ACR_VM_INST_OFF    0x52000u
+#define ACR_VM_IMAGE_OFF   0x53000u
+#define ACR_GPU_VA_BASE    0x10000000u
+#define ACR_SMMU_WINDOW    0x00400000u
+#define ACR_WPR_BYTES      0x00040000u
+#define ACR_GM20B_IOMMU_TAG (1ull << 34) /* nouveau_platform.c: gm20b iommu_bit */
+
+typedef struct _ACR_VM_STATE {
+    PVOID Arena;
+    PVOID WprBuffer;
+    ULONG OldPtbAsid;
+    ULONG OldPtbData;
+    PHYSICAL_ADDRESS WprPa;
+    ULONG WprBytes;
+    BOOLEAN PtbChanged;
+    BOOLEAN Active;
+} ACR_VM_STATE;
+
+static ACR_VM_STATE g_AcrVm;
+
+/* Read back one identity-mapped Tegra-SMMU page. This is diagnostic only:
+ * a mismatch is recorded but does not change the ACR experiment flow. */
+static BOOLEAN AcrTraceSmmuPte(volatile ULONG *Pt, ULONG Win, ULONG Pa,
+                               PCWSTR IndexName, PCWSTR ExpectedName,
+                               PCWSTR ReadName)
+{
+    ULONG index, expected, actual;
+
+    if (Pa < Win || ((Pa - Win) >> 12) >= 1024u) return FALSE;
+    index = (Pa - Win) >> 12;
+    expected = (Pa >> 12) | SMMU_ATTR_RWNS;
+    actual = Pt[index];
+    Trace(IndexName, index);
+    Trace(ExpectedName, expected);
+    Trace(ReadName, actual);
+    return actual == expected;
+}
+
+/* GM20B stores its WPR image in ordinary INST-target memory and passes the
+ * physical base/size in flcn_acr_desc.  The 0x100CD4 WPR range is only a
+ * capacity check; it is not CPU-writable backing memory.  Set up a separate
+ * CPU-writable blob plus the bounded PMU GPU VA space. */
+static BOOLEAN AcrVmPrepare(PSWGPU_DEVICE Dev, ULONG WprBytes, ULONGLONG *ArenaIovaOut,
+                            ULONGLONG *InstIovaOut)
+{
+    PHYSICAL_ADDRESS lo, hi, boundary, arenaPa;
+    volatile ULONG *smmuPd, *smmuPt;
+    ULONGLONG *gpuPgd, *gpuPgt, *inst;
+    ULONG win, arenaFirst, arenaPages;
+    ULONGLONG arenaIova;
+    ULONG i, oldAsid, oldPtbAsid, oldPtbData;
+    ULONG pdeIndex, pteIndex;
+    ULONG smmuPdeExpected, smmuPdeRead, smmuMapOk = 0, smmuPdeIndex;
+    ULONGLONG attrs;
+    ULONGLONG smmuPtPa;
+    BOOLEAN smmuReadbackOk;
+
+    RtlZeroMemory(&g_AcrVm, sizeof(g_AcrVm));
+    lo.QuadPart = 0;
+    hi.QuadPart = 0xFFFFFFFFll;
+    boundary.QuadPart = 0;
+    g_AcrVm.WprBytes = WprBytes;
+    g_AcrVm.WprBuffer = MmAllocateContiguousMemorySpecifyCache(
+        WprBytes, lo, hi, boundary, MmNonCached);
+    if (g_AcrVm.WprBuffer == NULL) return FALSE;
+    RtlZeroMemory(g_AcrVm.WprBuffer, WprBytes);
+    g_AcrVm.WprPa = MmGetPhysicalAddress(g_AcrVm.WprBuffer);
+    if (g_AcrVm.WprPa.HighPart != 0 || (g_AcrVm.WprPa.LowPart & 0xFFFu) != 0) return FALSE;
+    Trace(L"AcrWprBufferPaLo", g_AcrVm.WprPa.LowPart);
+    Trace(L"AcrWprBufferPaHi", (ULONG)g_AcrVm.WprPa.HighPart);
+    Trace(L"AcrWprBufferBytes", WprBytes);
+
+    boundary.QuadPart = ACR_SMMU_WINDOW;
+    g_AcrVm.Arena = MmAllocateContiguousMemorySpecifyCache(
+        ACR_VM_ARENA_SIZE, lo, hi, boundary, MmNonCached);
+    if (g_AcrVm.Arena == NULL) return FALSE;
+    RtlZeroMemory(g_AcrVm.Arena, ACR_VM_ARENA_SIZE);
+    arenaPa = MmGetPhysicalAddress(g_AcrVm.Arena);
+    Trace(L"AcrArenaPa", arenaPa.LowPart);
+    if (arenaPa.HighPart != 0 || (arenaPa.LowPart & 0xFFFu) != 0 ||
+        arenaPa.LowPart > 0xFFFFFFFFu - ACR_VM_ARENA_SIZE) return FALSE;
+
+    oldAsid = Rd(Dev->Mc, MC_SMMU_GPU_ASID);
+    win = arenaPa.LowPart & ~(ACR_SMMU_WINDOW - 1u);
+    arenaPages = ACR_VM_ARENA_SIZE >> 12;
+    arenaFirst = (arenaPa.LowPart - win) >> 12;
+    if (arenaFirst + arenaPages > (ACR_SMMU_WINDOW >> 12)) return FALSE;
+
+    if (oldAsid & 0x80000000u) {
+        /* The existing GPU SMMU path translates ASID 0. Preserve its prior
+         * page-table selection and restore it only after the GPU reset. */
+        oldPtbAsid = Rd(Dev->Mc, MC_SMMU_PTB_ASID);
+        Wr(Dev->Mc, MC_SMMU_PTB_ASID, 0);
+        oldPtbData = Rd(Dev->Mc, MC_SMMU_PTB_DATA);
+        g_AcrVm.OldPtbAsid = oldPtbAsid;
+        g_AcrVm.OldPtbData = oldPtbData;
+
+        smmuPd = (volatile ULONG *)((PUCHAR)g_AcrVm.Arena + 0);
+        smmuPt = (volatile ULONG *)((PUCHAR)g_AcrVm.Arena + PAGE_SIZE);
+        for (i = 0; i < 1024; ++i) { smmuPd[i] = 0; smmuPt[i] = 0; }
+        for (i = 0; i < arenaPages; ++i)
+            smmuPt[arenaFirst + i] = ((arenaPa.LowPart >> 12) + i) | SMMU_ATTR_RWNS;
+        arenaPa = MmGetPhysicalAddress(g_AcrVm.Arena);
+        smmuPd[win >> 22] = (ULONG)((arenaPa.QuadPart + PAGE_SIZE) >> 12) |
+                            SMMU_ATTR_RWNS | SMMU_PDE_NEXT;
+        KeMemoryBarrier();
+
+        Wr(Dev->Mc, MC_SMMU_PTB_ASID, 0);
+        Wr(Dev->Mc, MC_SMMU_PTB_DATA, (ULONG)(arenaPa.QuadPart >> 12) | SMMU_ATTR_RWNS);
+        Wr(Dev->Mc, MC_SMMU_PTC_FLUSH, 0);
+        (VOID)Rd(Dev->Mc, MC_SMMU_PTB_ASID);
+        Wr(Dev->Mc, MC_SMMU_TLB_FLUSH, 0);
+        (VOID)Rd(Dev->Mc, MC_SMMU_PTB_ASID);
+        g_AcrVm.PtbChanged = TRUE;
+        /* gk20a_instobj_ctor_iommu tags device addresses with iommu_bit;
+         * GM20B uses bit 34. The SMMU directory/PTEs still use untagged
+         * IOVA/physical addresses. See NOTICE-GM20B-MMU.txt. */
+        arenaIova = (ULONGLONG)arenaPa.LowPart | ACR_GM20B_IOMMU_TAG;
+        if (Rd(Dev->Mc, MC_SMMU_PTB_DATA) !=
+            ((ULONG)(arenaPa.QuadPart >> 12) | SMMU_ATTR_RWNS)) return FALSE;
+    } else {
+        /* With the GPU SMMU disabled, PMU VM entries use system physical
+         * addresses directly. */
+        arenaIova = arenaPa.LowPart;
+    }
+
+    *ArenaIovaOut = arenaIova;
+    *InstIovaOut = *ArenaIovaOut + ACR_VM_INST_OFF;
+    Trace(L"AcrSmmuWin", win);
+    Trace(L"AcrArenaIova", (ULONG)*ArenaIovaOut);
+    Trace(L"AcrArenaIovaHi", (ULONG)(*ArenaIovaOut >> 32));
+    Trace(L"AcrInstIova", (ULONG)*InstIovaOut);
+    Trace(L"AcrInstIovaHi", (ULONG)(*InstIovaOut >> 32));
+    Trace(L"AcrIommuTagHi", (oldAsid & 0x80000000u) ? 4u : 0u);
+    Trace(L"AcrSmmuArenaFirst", arenaFirst);
+
+    gpuPgd = (ULONGLONG *)((PUCHAR)g_AcrVm.Arena + ACR_VM_PGD_OFF);
+    gpuPgt = (ULONGLONG *)((PUCHAR)g_AcrVm.Arena + ACR_VM_PGT_OFF);
+    inst = (ULONGLONG *)((PUCHAR)g_AcrVm.Arena + ACR_VM_INST_OFF);
+    RtlZeroMemory(gpuPgd, 0x10000u);
+    RtlZeroMemory(gpuPgt, 0x40000u);
+    RtlZeroMemory(inst, PAGE_SIZE);
+    /* GM20B uses gk20a_vmm_aper(): NCOH maps to aperture 0 in PTEs.
+     * Do not copy the GM200/GF100 aperture value (3) here. */
+    attrs = 1ull; /* valid; aperture=0, vol=0, ro=0, priv=0, kind=0 */
+    for (i = 0; i < arenaPages; ++i) {
+        ULONGLONG iova = (ULONGLONG)*ArenaIovaOut + ((ULONGLONG)i << 12);
+        gpuPgt[((ACR_GPU_VA_BASE >> 12) & 0x7FFFu) + i] = (iova >> 8) | attrs;
+    }
+    pdeIndex = ACR_GPU_VA_BASE >> 27;
+    /* Report the entry for the first ACR image byte, the address faulted at
+     * in the 0.4.6 run (VA 0x10053000), not merely the start of the mapping. */
+    pteIndex = ((ACR_GPU_VA_BASE + ACR_VM_IMAGE_OFF) >> 12) & 0x7FFFu;
+    /* gf100_vmm_pgd_pde(): pt[1] is the 4K SPT, encoded in the high
+     * dword; the low dword selects the large-page table and stays absent.
+     * 0.4.14 probes the SoC DRAM policy: VIDMEM + VOL for table walks.
+     * Keep the 128K big-page layout (RAMIN bit 11 clear, PDE shift 27).
+     * Adapted from Linux nouveau v6.12, Copyright 2017 Red Hat Inc. (MIT).
+     * See NOTICE-GM20B-MMU.txt in the test kit for the upstream notice. */
+    gpuPgd[pdeIndex] =
+        (((ULONGLONG)*ArenaIovaOut + ACR_VM_PGT_OFF) << 24) | (5ull << 32);
+    Trace(L"AcrSmallPdeHighHalf", 1u);
+    Trace(L"AcrSocTablePolicy", 1u); /* experimental VIDMEM/VOL table route */
+    inst[0x200 / sizeof(ULONGLONG)] =
+        (((ULONGLONG)*ArenaIovaOut + ACR_VM_PGD_OFF) & ~0xFFFULL) | 4u;
+    inst[0x208 / sizeof(ULONGLONG)] = 0xFFFFFFFFFFULL;
+    KeMemoryBarrier();
+
+    /* The PMU GPU-MMU tables above are themselves reached through the SoC
+     * SMMU. Record the outer identity map at every page relevant to the PDE
+     * fault, including the backing pages that contain the GPU tables. */
+    Trace(L"AcrSmmuMode", (oldAsid & 0x80000000u) ? 1u : 0u);
+    Trace(L"AcrSmmuGpuAsid", oldAsid);
+    if (oldAsid & 0x80000000u) {
+        smmuReadbackOk = TRUE;
+        smmuPdeIndex = win >> 22;
+        smmuPtPa = (ULONGLONG)arenaPa.LowPart + PAGE_SIZE;
+
+        smmuPdeExpected = (ULONG)(smmuPtPa >> 12) |
+                          SMMU_ATTR_RWNS | SMMU_PDE_NEXT;
+        smmuPdeRead = smmuPd[smmuPdeIndex];
+        Trace(L"AcrSmmuPdeIndex", smmuPdeIndex);
+        Trace(L"AcrSmmuPdeExpected", smmuPdeExpected);
+        Trace(L"AcrSmmuPdeRead", smmuPdeRead);
+        smmuReadbackOk = (smmuPdeRead == smmuPdeExpected);
+        smmuReadbackOk = AcrTraceSmmuPte(smmuPt, win, arenaPa.LowPart,
+                                L"AcrSmmuArenaPteIndex", L"AcrSmmuArenaPteExpected",
+                                L"AcrSmmuArenaPteRead") && smmuReadbackOk;
+        smmuReadbackOk = AcrTraceSmmuPte(smmuPt, win, arenaPa.LowPart + ACR_VM_PGD_OFF,
+                                L"AcrSmmuPgdPteIndex", L"AcrSmmuPgdPteExpected",
+                                L"AcrSmmuPgdPteRead") && smmuReadbackOk;
+        smmuReadbackOk = AcrTraceSmmuPte(smmuPt, win, arenaPa.LowPart + ACR_VM_PGT_OFF,
+                                L"AcrSmmuPgtPteIndex", L"AcrSmmuPgtPteExpected",
+                                L"AcrSmmuPgtPteRead") && smmuReadbackOk;
+        smmuReadbackOk = AcrTraceSmmuPte(smmuPt, win, arenaPa.LowPart + ACR_VM_INST_OFF,
+                                L"AcrSmmuInstPteIndex", L"AcrSmmuInstPteExpected",
+                                L"AcrSmmuInstPteRead") && smmuReadbackOk;
+        smmuReadbackOk = AcrTraceSmmuPte(smmuPt, win, arenaPa.LowPart + ACR_VM_IMAGE_OFF,
+                                L"AcrSmmuImagePteIndex", L"AcrSmmuImagePteExpected",
+                                L"AcrSmmuImagePteRead") && smmuReadbackOk;
+        Trace(L"AcrSmmuPtbDataRead", Rd(Dev->Mc, MC_SMMU_PTB_DATA));
+        smmuMapOk = smmuReadbackOk ? 1u : 0u;
+    } else {
+        /* With SMMU bypassed, the Falcon sees physical pages directly. */
+        smmuMapOk = 2u;
+    }
+    TraceDurable(L"AcrSmmuMapReadback", smmuMapOk);
+
+    Trace(L"AcrPgdIova", (ULONG)(*ArenaIovaOut + ACR_VM_PGD_OFF));
+    Trace(L"AcrPgdIovaHi", (ULONG)((*ArenaIovaOut + ACR_VM_PGD_OFF) >> 32));
+    Trace(L"AcrPgtIova", (ULONG)(*ArenaIovaOut + ACR_VM_PGT_OFF));
+    Trace(L"AcrPgtIovaHi", (ULONG)((*ArenaIovaOut + ACR_VM_PGT_OFF) >> 32));
+    Trace(L"AcrPdeIndex", pdeIndex);
+    Trace(L"AcrPdeLo", (ULONG)gpuPgd[pdeIndex]);
+    Trace(L"AcrPdeHi", (ULONG)(gpuPgd[pdeIndex] >> 32));
+    Trace(L"AcrPteVa", ACR_GPU_VA_BASE + ACR_VM_IMAGE_OFF);
+    Trace(L"AcrPteIndex", pteIndex);
+    Trace(L"AcrPteLo", (ULONG)gpuPgt[pteIndex]);
+    Trace(L"AcrPteHi", (ULONG)(gpuPgt[pteIndex] >> 32));
+    Trace(L"AcrInstPdbLo", (ULONG)inst[0x200 / sizeof(ULONGLONG)]);
+    Trace(L"AcrInstPdbHi", (ULONG)(inst[0x200 / sizeof(ULONGLONG)] >> 32));
+    Trace(L"AcrInstLimitLo", (ULONG)inst[0x208 / sizeof(ULONGLONG)]);
+    Trace(L"AcrInstLimitHi", (ULONG)(inst[0x208 / sizeof(ULONGLONG)] >> 32));
+    g_AcrVm.Active = TRUE;
+    return TRUE;
+}
+
+static BOOLEAN AcrVmBind(volatile UCHAR *B, ULONGLONG InstIova)
+{
+    ULONG a = 0, d = 0, ap = 0, dp = 0;
+    BOOLEAN ok = PmuBindInst(B, InstIova, &a, &d, &ap, &dp);
+    Trace(L"AcrBindInstWritten", 0x70000000u | (ULONG)(InstIova >> 12));
+    Trace(L"AcrBindInstRead", Rd(B, PMU_FALCON + FALCON_BIND_INST));
+    Trace(L"AcrBindAckState", a);
+    Trace(L"AcrBindDoneState", d);
+    Trace(L"AcrBindAckPolls", ap);
+    Trace(L"AcrBindDonePolls", dp);
+    TraceDurable(L"AcrBindOk", ok ? 1u : 0u);
+    return ok;
+}
+
+/* Match nouveau's gf100_vmm_invalidate(): 0x100C80[23:16] is the available
+ * invalidate-slot count. Wait boundedly for a nonzero count, select this PDB
+ * in 0x100CB8, request PAGE_ALL via 0x100CBC, and wait for it to queue. */
+static BOOLEAN AcrMmuInvalidatePdb(volatile UCHAR *B, ULONGLONG PgdIova)
+{
+    /* Match the experimental SoC DRAM PDB target (VIDMEM=0). The PMU's
+     * separate NEW_INSTBLK target remains SYS_NCOH as in gm20b bootstrap. */
+    ULONGLONG pdb = (((ULONGLONG)PgdIova >> 12) << 4);
+    ULONG status = 0, pdbRead = 0, polls;
+    BOOLEAN queued = FALSE;
+
+    for (polls = 0; polls < 2000; ++polls) {
+        status = Rd(B, 0x100C80);
+        if ((status & 0x00FF0000u) != 0) break;
+        Us(5);
+    }
+    Trace(L"AcrMmuInvSlotPolls", polls);
+    Trace(L"AcrMmuInvSlotStatus", status);
+    Trace(L"AcrMmuInvFreeSlots", (status & 0x00FF0000u) >> 16);
+    Trace(L"AcrMmuInvPendingBefore", (status & 0x00008000u) ? 1u : 0u);
+    if (polls == 2000) goto done;
+
+    Wr(B, 0x100CB8, (ULONG)pdb);
+    pdbRead = Rd(B, 0x100CB8);
+    Trace(L"AcrMmuInvPdb", (ULONG)pdb);
+    Trace(L"AcrMmuInvPdbRead", pdbRead);
+    /* Nouveau programs 0x100CB8 without reading it back. Keep the readback
+     * diagnostic only: this register may not return the written PDB value. */
+
+    Wr(B, 0x100CBC, 0x80000001u); /* invalidate request + PAGE_ALL */
+    for (polls = 0; polls < 2000; ++polls) {
+        status = Rd(B, 0x100C80);
+        if (status & 0x00008000u) { queued = TRUE; break; }
+        Us(5);
+    }
+    Trace(L"AcrMmuInvDonePolls", polls);
+    Trace(L"AcrMmuInvDoneStatus", status);
+done:
+    TraceDurable(L"AcrMmuInvOk", queued ? 1u : 0u);
+    return queued;
+}
+
+/* Diagnostic discriminator for a stale/incorrect per-PDB translation: after
+ * the normal selected-PDB PAGE_ALL request, issue PAGE_ALL + ALL_PDB.  The
+ * status bit is reported as an observation only; it may already be set before
+ * the request and is not treated as proof that this particular request ran. */
+static BOOLEAN AcrMmuInvalidateAllPdbs(volatile UCHAR *B)
+{
+    ULONG status = 0, polls;
+    BOOLEAN fifoEmptyObserved = FALSE;
+
+    status = Rd(B, 0x100C80);
+    Trace(L"AcrMmuAllPdbBeforeStatus", status);
+    for (polls = 0; polls < 2000; ++polls) {
+        status = Rd(B, 0x100C80);
+        if ((status & 0x00FF0000u) != 0) break;
+        Us(5);
+    }
+    Trace(L"AcrMmuAllPdbSlotPolls", polls);
+    Trace(L"AcrMmuAllPdbSlotStatus", status);
+    Trace(L"AcrMmuAllPdbFreeSlots", (status & 0x00FF0000u) >> 16);
+    if (polls == 2000) {
+        TraceDurable(L"AcrMmuAllPdbInvOk", 0);
+        return FALSE;
+    }
+
+    Wr(B, 0x100CBC, 0x80000003u); /* trigger + PAGE_ALL + ALL_PDB */
+    KeMemoryBarrier();
+    status = Rd(B, 0x100C80);
+    Trace(L"AcrMmuAllPdbRequest", 0x80000003u);
+    Trace(L"AcrMmuAllPdbPostWriteStatus", status);
+    for (polls = 0; polls < 2000; ++polls) {
+        status = Rd(B, 0x100C80);
+        if (status & 0x00008000u) {
+            fifoEmptyObserved = TRUE;
+            break;
+        }
+        Us(5);
+    }
+    Trace(L"AcrMmuAllPdbStatusPolls", polls);
+    Trace(L"AcrMmuAllPdbStatus", status);
+    TraceDurable(L"AcrMmuAllPdbInvOk", fifoEmptyObserved ? 1u : 0u);
+    return fifoEmptyObserved;
+}
+
+/* Called only after the GPU block reset, so no Falcon DMA can still reference
+ * these backing pages. */
+static VOID AcrVmCleanupAfterGpuReset(PSWGPU_DEVICE Dev)
+{
+    ULONG restoreData, restoreAsid;
+    if (g_AcrVm.PtbChanged) {
+        Wr(Dev->Mc, MC_SMMU_PTB_ASID, 0);
+        Wr(Dev->Mc, MC_SMMU_PTB_DATA, g_AcrVm.OldPtbData);
+        Wr(Dev->Mc, MC_SMMU_PTC_FLUSH, 0);
+        (VOID)Rd(Dev->Mc, MC_SMMU_PTB_ASID);
+        Wr(Dev->Mc, MC_SMMU_TLB_FLUSH, 0);
+        (VOID)Rd(Dev->Mc, MC_SMMU_PTB_ASID);
+        restoreData = Rd(Dev->Mc, MC_SMMU_PTB_DATA);
+        Wr(Dev->Mc, MC_SMMU_PTB_ASID, g_AcrVm.OldPtbAsid);
+        restoreAsid = Rd(Dev->Mc, MC_SMMU_PTB_ASID);
+        Trace(L"AcrSmmuRestoreData", restoreData);
+        TraceDurable(L"AcrSmmuRestored",
+                     restoreData == g_AcrVm.OldPtbData && restoreAsid == g_AcrVm.OldPtbAsid ? 1u : 0u);
+    } else {
+        TraceDurable(L"AcrSmmuRestored", 1u); /* no SMMU page-table change */
+    }
+    if (g_AcrVm.WprBuffer != NULL)
+        MmFreeContiguousMemorySpecifyCache(g_AcrVm.WprBuffer, g_AcrVm.WprBytes, MmNonCached);
+    if (g_AcrVm.Arena != NULL)
+        MmFreeContiguousMemorySpecifyCache(g_AcrVm.Arena, ACR_VM_ARENA_SIZE, MmNonCached);
+    RtlZeroMemory(&g_AcrVm, sizeof(g_AcrVm));
+}
 #define SWGPU_TAG          'uGwS'
 
 static PUCHAR ReadBinParam(PCWSTR Name, ULONG Max, PULONG Len)
@@ -1132,12 +1488,18 @@ static VOID WprPutLe32(PUCHAR P, ULONG V)
     P[3] = (UCHAR)(V >> 24);
 }
 
+static VOID WprPutLe64(PUCHAR P, ULONGLONG V)
+{
+    WprPutLe32(P, (ULONG)V);
+    WprPutLe32(P + 4, (ULONG)(V >> 32));
+}
+
 /* Build a CPU-only GM20B WPR image from the staged Linux firmware blobs.
  * This deliberately does not map the buffer for GPU DMA, alter SMMU state,
  * enable the PMU, or ask ACR to consume it. The WPR addresses in both BLDs
  * are still relative to the beginning of the image and need the WPR-base
  * relocation performed by ACR before they can be used. */
-static ULONG BuildWprB3b(ULONG PmuDmemSize)
+static ULONG BuildWprB3b(ULONG PmuDmemSize, PUCHAR *OutWpr, PULONG OutAllocLen, PULONG OutUsed)
 {
     PUCHAR pmuDesc = NULL, pmuImage = NULL, pmuSig = NULL;
     PUCHAR fecsBl = NULL, fecsInst = NULL, fecsData = NULL, fecsSig = NULL;
@@ -1154,6 +1516,10 @@ static ULONG BuildWprB3b(ULONG PmuDmemSize)
     ULONG fecsDataAreaSize, totalUsed, allocLen, i, ok, result = 0xE0000051u;
     ULONG pmuBld[13], fecsBld[19];
     ULONG descSize, imageSize;
+
+    if (OutWpr != NULL) *OutWpr = NULL;
+    if (OutAllocLen != NULL) *OutAllocLen = 0;
+    if (OutUsed != NULL) *OutUsed = 0;
 
     Step(46); /* parse firmware descriptors and construct the CPU-side WPR image */
     pmuDesc = ReadBinParam(L"FwPmuDesc", 0x20000u, &pmuDescLen);
@@ -1284,6 +1650,7 @@ static ULONG BuildWprB3b(ULONG PmuDmemSize)
     Trace(L"B3bFecsBldOff", fecsBldOff);
     Trace(L"B3bWprUsed", totalUsed);
     Trace(L"B3bWprAlloc", allocLen);
+    if (OutUsed != NULL) *OutUsed = totalUsed;
 
     wpr = (PUCHAR)ExAllocatePool2(POOL_FLAG_NON_PAGED, allocLen, SWGPU_TAG);
     fecsImage = (PUCHAR)ExAllocatePool2(POOL_FLAG_NON_PAGED, fecsImageLen, SWGPU_TAG);
@@ -1379,6 +1746,11 @@ static ULONG BuildWprB3b(ULONG PmuDmemSize)
 
 done:
     TraceDurable(L"B3bResult", result);
+    if (result == 0 && OutWpr != NULL && OutAllocLen != NULL) {
+        *OutWpr = wpr;
+        *OutAllocLen = allocLen;
+        wpr = NULL;
+    }
     if (wpr != NULL) ExFreePoolWithTag(wpr, SWGPU_TAG);
     if (fecsImage != NULL) ExFreePoolWithTag(fecsImage, SWGPU_TAG);
     if (fecsSig != NULL) ExFreePoolWithTag(fecsSig, SWGPU_TAG);
@@ -1391,16 +1763,20 @@ done:
     return result;
 }
 
-static VOID ProbeB3a(PSWGPU_DEVICE Dev)
+static VOID ProbeB3a(PSWGPU_DEVICE Dev, BOOLEAN RunAcr)
 {
     volatile UCHAR *B = Dev->Bar0;
-    PUCHAR bl = NULL, uc = NULL, img = NULL, boot = NULL;
+    PUCHAR bl = NULL, uc = NULL, img = NULL, boot = NULL, wprImage = NULL;
     ULONG blLen = 0, ucLen = 0, i, ok, err = 0, sum;
     ULONG blMagic, blHdrOff, blDataOff, blDataSize, startTag, dmemLoadOff, codeOff, codeSize, bootSize;
     ULONG ucMagic, ucHdrOff, ucDataOff, ucDataSize;
     ULONG sigDbgOff, sigDbgSize, sigPrdOff, sigPrdSize, patchLoc, patchSig, ldOff, loc, sig;
     ULONG nsOff, nsSize, dataBase, dataSize, numApps, app0Off, app0Size, sigSrc;
     ULONG hwcfg, imemSize, dmemSize, imemBase, dbgFused;
+    ULONG wprRawStart, wprRawLimit, wprAllocLen = 0, wprUsed = 0;
+    ULONG bootPolls;
+    ULONGLONG arenaIova = 0, instIova = 0;
+    ULONGLONG wprStart, wprEnd;
     ULONG desc[19];
 
     Step(40);   /* firmware blobs from the registry */
@@ -1561,15 +1937,202 @@ static VOID ProbeB3a(PSWGPU_DEVICE Dev)
     Trace(L"B3aCpuctl", Rd(B, PMU_FALCON + FALCON_CPUCTL));
     Trace(L"B3aBootAddr", startTag << 8);
 
-    /* CPU-only WPR layout and readback; no GPU DMA or ACR/PMU start. */
-    (VOID)BuildWprB3b(dmemSize);
+    if (RunAcr) {
+        ULONGLONG *acrDesc;
+        /* 0.4.6: the memory-path setup that B2a proved necessary (priv ring,
+         * PFIFO reset/enable in nvgpu order, FB flush). Without the priv ring
+         * the L2 answered with PRI errors and falcon DMA never completed. The
+         * whole GPU is reset after this test, so nothing is put back here. */
+        PrivRingInit(B, 53);
+        Trace(L"B3cLtcNr", Rd(B, 0x12006C));
+        Trace(L"B3cTagBase", Rd(B, 0x17E278));
+        {
+            ULONG en = Rd(B, NV_PMC_ENABLE), w;
+            Trace(L"B3cFifoPmcWas", en);
+            Wr(B, NV_PMC_ENABLE, en & ~0x100u);
+            (VOID)Rd(B, NV_PMC_ENABLE);
+            Us(20);
+            Wr(B, NV_PMC_ENABLE, en | 0x100u);
+            (VOID)Rd(B, NV_PMC_ENABLE);
+            Us(20);
+            Trace(L"B3cFifoPmcNow", Rd(B, NV_PMC_ENABLE));
+            Wr(B, 0x2100, 0xFFFFFFFFu);
+            Trace(L"B3cFifoIntr0Clr", Rd(B, 0x2100));
+            Wr(B, 0x070000, 1u);
+            for (w = 0; w < 100 && (Rd(B, 0x070000) & 3u); ++w) Us(5);
+            Trace(L"B3cFbFlushPolls", w);
+            TraceDurable(L"B3cFbFlushReg", Rd(B, 0x070000));
+        }
+        Step(47);   /* hardware WPR range (GM200 ACR setup uses selectors 2/3) */
+        Wr(B, NV_PFB_MMU_WPR_INFO, 2);
+        wprRawStart = Rd(B, NV_PFB_MMU_WPR_INFO);
+        Wr(B, NV_PFB_MMU_WPR_INFO, 3);
+        wprRawLimit = Rd(B, NV_PFB_MMU_WPR_INFO);
+        wprStart = ((ULONGLONG)(wprRawStart & 0xFFFFFF00u)) << 8;
+        wprEnd = (((ULONGLONG)(wprRawLimit & 0xFFFFFF00u)) << 8) + 0x20000ull;
+        Trace(L"AcrWprRawStart", wprRawStart);
+        Trace(L"AcrWprRawLimit", wprRawLimit);
+        Trace(L"AcrWprStartLo", (ULONG)wprStart);
+        Trace(L"AcrWprStartHi", (ULONG)(wprStart >> 32));
+        Trace(L"AcrWprEndLo", (ULONG)wprEnd);
+        Trace(L"AcrWprEndHi", (ULONG)(wprEnd >> 32));
+        if (wprStart == 0 || wprEnd <= wprStart || wprEnd - wprStart != ACR_WPR_BYTES) {
+            err = 0xE0000061u; goto out;
+        }
 
-    /* Leave the PMU clean: reset it again (the CPU was never started). */
-    PmuReset(B, L"B3aScrubPolls2");
+        Step(48);   /* build WPR in CPU memory and verify it fits the protected region */
+        err = BuildWprB3b(dmemSize, &wprImage, &wprAllocLen, &wprUsed);
+        Trace(L"AcrWprBuildAlloc", wprAllocLen);
+        Trace(L"AcrWprBuildUsed", wprUsed);
+        if (err != 0) goto out;
+        if (wprUsed > ACR_WPR_BYTES || wprAllocLen < wprUsed) {
+            err = 0xE0000062u; goto out;
+        }
+        if (dataSize < 0x250u || !InBlob(ucDataSize, dataBase, dataSize) ||
+            !InBlob(ucDataSize, dataBase, 0x250u)) {
+            err = 0xE0000063u; goto out;
+        }
+
+        Step(49);   /* allocate CPU-writable WPR backing and prepare PMU VM */
+        if (!AcrVmPrepare(Dev, wprUsed, &arenaIova, &instIova)) {
+            err = 0xE0000064u; goto out;
+        }
+        RtlCopyMemory(g_AcrVm.WprBuffer, wprImage, wprUsed);
+        KeMemoryBarrier();
+        ok = (ULONG)(RtlCompareMemory(g_AcrVm.WprBuffer, wprImage, wprUsed) == wprUsed);
+        TraceDurable(L"AcrWprCpuReadback", ok);
+        if (!ok) { err = 0xE0000069u; goto out; }
+        Trace(L"AcrWprCpuCopyBytes", wprUsed);
+
+        /* GM20B's setup differs from GM200: point the descriptor at the
+         * allocated INST-target WPR blob instead of programming region_props. */
+        acrDesc = (ULONGLONG *)(img + dataBase);
+        WprPutLe32((PUCHAR)acrDesc + 0x240, wprUsed); /* ucode_blob_size */
+        WprPutLe64((PUCHAR)acrDesc + 0x248, (ULONGLONG)g_AcrVm.WprPa.QuadPart);
+        Trace(L"AcrDescWprBytes", wprUsed);
+        Trace(L"AcrDescWprBaseLo", g_AcrVm.WprPa.LowPart);
+        Trace(L"AcrDescWprBaseHi", (ULONG)g_AcrVm.WprPa.HighPart);
+        RtlCopyMemory((PUCHAR)g_AcrVm.Arena + ACR_VM_IMAGE_OFF, img, ucDataSize);
+        KeMemoryBarrier();
+        Trace(L"AcrImageIova", (ULONG)(arenaIova + ACR_VM_IMAGE_OFF));
+        Trace(L"AcrImageIovaHi", (ULONG)((arenaIova + ACR_VM_IMAGE_OFF) >> 32));
+        Trace(L"AcrImageBytes", ucDataSize);
+
+        /* GM20B fb_gm20b.c: gm20b_fb_set_mmu_page_size() selects the
+         * per-instance PDB big-page bit. Until this bit is set, our RAMIN
+         * bit 11=0 is not sufficient to select the 128K table geometry.
+         * See COMPARE-B3c-ja.md and NOTICE-GM20B-MMU.txt in the kit. */
+        Step(57);
+        {
+            ULONG mmuBefore = Rd(B, 0x100C80), mmuAfter;
+            Trace(L"AcrMmuPageCtrlBefore", mmuBefore);
+            Wr(B, 0x100C80, mmuBefore | 0x00000800u);
+            mmuAfter = Rd(B, 0x100C80);
+            Trace(L"AcrMmuPageCtrlAfter", mmuAfter);
+            Trace(L"AcrPreBootDmactl", Rd(B, PMU_FALCON + FALCON_DMACTL));
+            Trace(L"AcrPreBootItfen", Rd(B, PMU_FALCON + FALCON_ITFEN));
+            Trace(L"AcrPreBootTranscfg1", Rd(B, PMU_FALCON + 0xE04));
+            TraceDurable(L"AcrPdbPageModeOk", (mmuAfter & 0x800u) ? 1u : 0u);
+            if (!(mmuAfter & 0x800u)) { err = 0xE000006Cu; goto out; }
+        }
+
+        Step(50);   /* bind the PMU instance block to the GM20B virtual address space */
+        if (!AcrVmBind(B, instIova)) { err = 0xE0000065u; goto out; }
+
+        Step(51);   /* write the virtual DMA addresses into flcn_bl_dmem_desc */
+        desc[9] = (ACR_GPU_VA_BASE + ACR_VM_IMAGE_OFF) >> 8;
+        desc[15] = (ACR_GPU_VA_BASE + ACR_VM_IMAGE_OFF + dataBase) >> 8;
+        Trace(L"AcrDescCodeDmaBase", desc[9]);
+        Trace(L"AcrDescDataDmaBase", desc[15]);
+        Wr(B, PMU_FALCON + FALCON_DMEMC0, (1u << 24) | 0);
+        for (i = 0; i < 19; ++i) Wr(B, PMU_FALCON + FALCON_DMEMD0, desc[i]);
+        Wr(B, PMU_FALCON + FALCON_DMEMC0, (1u << 25) | 0);
+        for (ok = 0, i = 0; i < 19; ++i) if (Rd(B, PMU_FALCON + FALCON_DMEMD0) == desc[i]) ++ok;
+        TraceDurable(L"AcrDescOk", ok);
+        if (ok != 19) { err = 0xE0000066u; goto out; }
+
+        Step(54);   /* invalidate the selected PDB after table construction/bind */
+        if (!AcrMmuInvalidatePdb(B, arenaIova + ACR_VM_PGD_OFF)) {
+            err = 0xE000006Au; goto out;
+        }
+
+        Step(55);   /* discriminator: flush all PDBs after the selected-PDB flush */
+        if (!AcrMmuInvalidateAllPdbs(B)) { err = 0xE000006Bu; goto out; }
+
+        Step(56);   /* one-shot secure ACR boot; bounded wait, no automatic retry */
+        Wr(Dev->Mc, MC_INTSTATUS, Rd(Dev->Mc, MC_INTSTATUS));   /* 0.4.6: fresh MC errors for the boot */
+        Wr(B, PMU_FALCON + FALCON_MAILBOX0, 0xCAFEBEEFu);
+        Wr(B, PMU_FALCON + FALCON_BOOTVEC, startTag << 8);
+        Wr(B, PMU_FALCON + FALCON_CPUCTL, 2u);
+        for (bootPolls = 0; bootPolls < 2000; ++bootPolls) {
+            if (Rd(B, PMU_FALCON + FALCON_CPUCTL) & 0x10u) break;
+            Ms(1);
+        }
+        Trace(L"AcrBootPolls", bootPolls);
+        Trace(L"AcrBootCpuctl", Rd(B, PMU_FALCON + FALCON_CPUCTL));
+        Trace(L"AcrBootMailbox0", Rd(B, PMU_FALCON + FALCON_MAILBOX0));
+        Trace(L"AcrBootMailbox1", Rd(B, PMU_FALCON + FALCON_MAILBOX1));
+        Trace(L"AcrBootIrq", Rd(B, PMU_FALCON + 0x004));
+        Trace(L"AcrBootSctl", Rd(B, PMU_FALCON + FALCON_SCTL));
+        Trace(L"AcrBootPc", Rd(B, PMU_FALCON + 0x148));
+        /* 0.4.6 (read only, apart from selecting the trace slot like nouveau's
+         * gm200_flcn_tracepc): where the falcon is, its DMA state, and any
+         * MC/SMMU or GPU MMU fault raised during the boot. */
+        {
+            ULONG tidx = Rd(B, PMU_FALCON + 0x148), nr, sp, pcs[8], rec[6][5], n = 0, id, u;
+            nr = (tidx >> 16) & 0xFFu;
+            Trace(L"B3cTraceIdx", tidx);
+            Trace(L"B3cTraceNr", nr);
+            if (nr > 8) nr = 8;
+            for (sp = 0; sp < nr; ++sp) {
+                Wr(B, PMU_FALCON + 0x148, sp);
+                pcs[sp] = Rd(B, PMU_FALCON + 0x14C);
+            }
+            if (nr) TraceBin(L"B3cTracePc", pcs, nr * sizeof(ULONG));
+            Trace(L"B3cDmaCmd", Rd(B, PMU_FALCON + FALCON_DMATRFCMD));
+            Trace(L"B3cDmaBase", Rd(B, PMU_FALCON + FALCON_DMATRFBASE));
+            Trace(L"B3cDmaMoffs", Rd(B, PMU_FALCON + FALCON_DMATRFMOFFS));
+            Trace(L"B3cDmaFboffs", Rd(B, PMU_FALCON + FALCON_DMATRFFBOFFS));
+            Trace(L"B3cDmactl", Rd(B, PMU_FALCON + FALCON_DMACTL));
+            Trace(L"B3cMcInt", Rd(Dev->Mc, MC_INTSTATUS));
+            Trace(L"B3cMcErr", Rd(Dev->Mc, MC_ERR_STATUS));
+            Trace(L"B3cMcErrAdr", Rd(Dev->Mc, MC_ERR_ADR));
+            Trace(L"B3cFifoIntr0", Rd(B, 0x2100));
+            id = Rd(B, 0x259C);
+            Trace(L"B3cFifoFaultId", id);
+            for (u = 0; u < 32 && n < 6; ++u) {
+                if (!(id & (1u << u))) continue;
+                rec[n][0] = u;
+                rec[n][1] = Rd(B, 0x2800 + u * 0x10);
+                rec[n][2] = Rd(B, 0x2804 + u * 0x10);
+                rec[n][3] = Rd(B, 0x2808 + u * 0x10);
+                rec[n][4] = Rd(B, 0x280C + u * 0x10);
+                ++n;
+            }
+            if (n) TraceBin(L"B3cFaultRecs", rec, n * 5 * sizeof(ULONG));
+            TraceDurable(L"B3cDiagDone", 1);
+        }
+        if (bootPolls == 2000) err = 0xE0000067u;
+        else if (Rd(B, PMU_FALCON + FALCON_MAILBOX0) != 0) err = 0xE0000068u;
+        else {
+            Wr(B, PMU_FALCON + 0x004, 0x10u);
+            err = 0;
+        }
+        TraceDurable(L"AcrBootResult", err);
+    } else {
+        /* CPU-only WPR layout and readback; no GPU DMA or ACR/PMU start. */
+        (VOID)BuildWprB3b(dmemSize, NULL, NULL, NULL);
+    }
+
+    /* In launch mode the surrounding PowerTest path asserts GPU reset before
+     * releasing the WPR/VM backing pages; otherwise reset the idle PMU here. */
+    if (!RunAcr) PmuReset(B, L"B3aScrubPolls2");
 
 out:
+    if (RunAcr) TraceDurable(L"AcrBootResult", err);
     TraceDurable(L"B3aResult", err);
     if (boot != NULL) ExFreePoolWithTag(boot, SWGPU_TAG);
+    if (wprImage != NULL) ExFreePoolWithTag(wprImage, SWGPU_TAG);
     if (img != NULL) ExFreePoolWithTag(img, SWGPU_TAG);
     if (bl != NULL) ExFreePoolWithTag(bl, SWGPU_TAG);
     if (uc != NULL) ExFreePoolWithTag(uc, SWGPU_TAG);
@@ -1581,6 +2144,10 @@ static NTSTATUS PowerTest(PSWGPU_DEVICE Dev, BOOLEAN KeepOn, ULONG Mode)
     ULONG clkx0, clkh0, outc0, rg, clkx, rstx, boot0 = 0xDEADDEADu, t0 = 0, t1 = 0, th = 0, en = 0, i;
     BOOLEAN railOn = FALSE, clocksOn = FALSE, outcChanged = FALSE, fuseChanged = FALSE;
     NTSTATUS st;
+
+    /* ACR may leave signed Falcon firmware running. Always reset the GPU and
+     * release the temporary DMA mappings before returning from the opt-in run. */
+    if (Mode == 5) KeepOn = FALSE;
 
     Step(1);    /* read what is there now */
     st = I2cRead(Dev->Vdd, MAX77621_VOUT, &vout0);
@@ -1691,7 +2258,8 @@ static NTSTATUS PowerTest(PSWGPU_DEVICE Dev, BOOLEAN KeepOn, ULONG Mode)
     Trace(L"Result", (ULONG)st);
     if (NT_SUCCESS(st) && Mode == 2) ProbeB1(Dev);
     if (NT_SUCCESS(st) && Mode == 3) ProbeB2a(Dev);
-    if (NT_SUCCESS(st) && Mode == 4) ProbeB3a(Dev);
+    if (NT_SUCCESS(st) && Mode == 4) ProbeB3a(Dev, FALSE);
+    if (NT_SUCCESS(st) && Mode == 5) ProbeB3a(Dev, TRUE);
     if (KeepOn) { Step(100); return st; }
 
 down:
@@ -1706,6 +2274,7 @@ down:
         Wr(Dev->Car, CAR_RST_DEV_X_SET, CLK_X_GPU);
         Us(10);
         FreeB2aPagesAfterGpuReset();
+        AcrVmCleanupAfterGpuReset(Dev);
         Wr(Dev->Car, CAR_CLK_ENB_X_CLR, (CLK_X_GPU | CLK_X_PLLG_REF) & ~clkx0);
         Wr(Dev->Mc, MC_HOTRESET_CTRL_1, Rd(Dev->Mc, MC_HOTRESET_CTRL_1) & ~MC_HOTRESET_GPU);
         if (fuseChanged) Wr(Dev->Car, CAR_CLK_ENB_H_CLR, CLK_H_FUSE);
@@ -1788,7 +2357,7 @@ NTSTATUS SwGpuEvtSelfManagedIoInit(WDFDEVICE Device)
     Snapshot(Dev, FALSE);
 
     mode = ReadParam(L"PowerTest", 0);
-    if (mode >= 1 && mode <= 4) {     /* 2 = B1 probe, 3 = B2a DMA probe, 4 = B3a ACR firmware load */
+    if (mode >= 1 && mode <= 5) {     /* 5 = isolated B3c signed ACR boot */
         BOOLEAN keep = ReadParam(L"KeepOn", 0) == 1;
         LARGE_INTEGER t0, t1, f;
         TraceDurable(L"PowerTest", 0);      /* once: a hang does not repeat at the next boot */

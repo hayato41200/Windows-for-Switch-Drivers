@@ -16,6 +16,7 @@ GM20B の GPU に Windows から電源とクロックを入れ、GPU が応答�
 | `ProbeTest.cmd` | 段階 B1。PowerTest と同じく GPU を 1 回起こし、そのあいだに、ファームウェアを使わない調べもの(GPU の中の部品の一覧、PMU ファルコンのレジスター、DMEM の書き込みと読み返し、priv ring の初期化)をしてから止める。GPU の上では何も動かさない |
 | `DmaTest.cmd` | 段階 B2a。GPU を 1 回起こし、GPU の中の小さな CPU(PMU ファルコン)の DMA で、Windows のメモリーから 256 バイト読み、256 バイト書き戻せるかを確かめてから止める。ファームウェアは使わず、ファルコンの上では何も動かさない |
 | `FwTest.cmd` | 段階 B3a。自分の linux-firmware の ACR のファームウェアを読み、署名を当てた像をメモリーに作り、ACR のブートローダーを PMU の IMEM と DMEM に直接(PIO)書いて読み返す。ファルコンは起動しない |
+| `AcrTest.cmd` | 段階 B3c。GPU の WPR 保護領域と SMMU の範囲を確認し、PMU の仮想アドレス空間を作って署名付き ACR を一度だけ起動する。2 秒で待ちを打ち切り、必ず GPU をリセットしてから一時メモリーと変換表を戻す |
 | `Remove.cmd` | switchgpu を外す |
 
 どれも右クリックして「管理者として実行」。最後の `SUMMARY` を写真に撮る。記録は `C:\SwitchWOA-Gpu.txt` に追記される。
@@ -64,24 +65,33 @@ GM20B の GPU に Windows から電源とクロックを入れ、GPU が応答�
 
 固まったら、長押し → R411 で起動 → `Status.cmd`。`last step` が 30〜38 なら B2a のどこか(36〜38 = DMA の 1〜3 回目)。
 
-## 段階 B3a / B3b(FwTest、0.4.2)
+## 段階 B3a / B3b(FwTest、0.4.16)
 
 B2a の結論: 署名のない PMU から物理アドレスで DMA すると、GPU の MMU が権限違反(PRIV_VIOLATION)で止める。nvgpu と nouveau の本番の手順は、署名つきの ACR のブートローダーを PIO で入れて起動し、そのローダーが GPU の仮想アドレスで DMA する。B3a はその前半(ファームウェアの読み込みと PIO での書き込み)だけをする。
 
-準備: 自分の linux-firmware の `nvidia/gm20b` フォルダーを、キットの中に `firmware\nvidia\gm20b` として写す(`acr\bl.bin` 832 バイトと `acr\ucode_load.bin` 18592 バイトを使う)。0.4.1 からは、次の段階のために `pmu\desc.bin`、`pmu\image.bin`、`pmu\sig.bin`、`gr\fecs_bl.bin`、`gr\fecs_inst.bin`、`gr\fecs_data.bin`、`gr\fecs_sig.bin` もレジストリに写す(ドライバーは届いたかと大きさを確かめるだけで、まだ使わない。`B3a other firmware in the registry`)。キットにはファームウェアを入れていない。キットの中に無いときは、`C:\SwitchWOA\firmware\nvidia\gm20b`、`C:\firmware\nvidia\gm20b`、`C:\lib\firmware\nvidia\gm20b` の順に探す。どこにも無いときは、前の FwTest がレジストリに残したものを使う(`firmware ... (registry)` と出る)。キットの中に無いときは、`C:\SwitchWOAirmware
-vidia\gm20b`、`C:irmware
-vidia\gm20b`、`C:\libirmware
-vidia\gm20b` の順に探す。どこにも無いときは、前の FwTest がレジストリに残したものを使う(`firmware ... (registry)` と出る)。
+準備: 自分の linux-firmware の `nvidia/gm20b` フォルダーを、キットの中に `firmware\nvidia\gm20b` として写す(`acr\bl.bin` 832 バイトと `acr\ucode_load.bin` 18592 バイトを使う)。0.4.1 からは、次の段階のために `pmu\desc.bin`、`pmu\image.bin`、`pmu\sig.bin`、`gr\fecs_bl.bin`、`gr\fecs_inst.bin`、`gr\fecs_data.bin`、`gr\fecs_sig.bin` もレジストリに写す(ドライバーは届いたかと大きさを確かめるだけで、まだ使わない。`B3a other firmware in the registry`)。キットにはファームウェアを入れていない。キットの中に無いときは、`C:\SwitchWOA\firmware\nvidia\gm20b`、`C:\firmware\nvidia\gm20b`、`C:\lib\firmware\nvidia\gm20b` の順に探す。どこにも無いときは、前の FwTest がレジストリに残したものを使う(`firmware ... (registry)` と出る)。
 
-`Install.cmd`(0.4.2 に入れ替え)→ `FwTest.cmd` → `SUMMARY` を写真に撮る。見たいもの:
+`Install.cmd`(0.4.16 に入れ替え)→ `FwTest.cmd` → `SUMMARY` を写真に撮る。見たいもの:
 - `firmware acr\bl.bin: ... SHA256 ...`: キットがレジストリに写したファイル。
 - `B3a firmware` / `B3a load header`: ヘッダーの値。ドライバーはどの値もファイルの大きさの内側にあるかを確かめてから使う。
 - `B3a signed image`: ヒューズ(production / debug)に合う署名を、像の決まった場所に当てた。
 - `B3a PMU PIO: ... N of N words read back OK`: ブートローダーが IMEM の上の端に書けた。
-- `B3a BL descriptor at DMEM 0: 19 of 19 words read back OK ... (not started)`
+- `B3a BL descriptor at DMEM 0: 19 of 19 words read back OK`
 - `B3a result 0x00000000 (OK)`
 
-ローダーが使う DMA のアドレス(`code_dma_base` と `data_dma_base`)は、PMU 用の仮想アドレス空間ができるまで 0 のまま。起動もしない。固まったら `Status.cmd`。`last step` が 40〜45 なら B3a のどこか。
+FwTest はCPU側のファームウェア確認だけで、ローダーが使うDMAアドレスは0のまま、起動もしない。実機での起動は次の独立モード。
+
+### ACR起動(AcrTest、PowerTest=5)
+
+**FwTestの結果を確認してから**使う。実機で確認されたGPUのWPR容量範囲は`0xFEB00000..0xFEB40000`(256 KiB)です。GM20B用Nouveauでは、この範囲を容量確認に使い、WPR像自体は別のINSTメモリーとして確保してACR descriptorの`ucode_blob_base`/`ucode_blob_size`に渡します。AcrTestもこの方式に変更し、通常の連続メモリーにWPR像を置き、512 KiB DMAアリーナにはPMU用の仮想アドレス表を作ります。ACR descriptorのWPR blob情報と`code_dma_base`/`data_dma_base`を設定し、PMUのinstance blockをbindしてから、ACRを一度だけ起動します。待ちは最大2秒。終了時はGPUをリセットしてからSMMU設定を復元し、メモリーを解放します。起動後にPMUが継続実行する場合もあるため、**フリーズ時は電源長押しが必要になる可能性がある**。
+
+`Install.cmd`(0.4.16に入れ替え)→ `AcrTest.cmd` → `SUMMARY`を写真に撮る。Step 47〜56と`AcrBootResult`を確認する。`AcrWprCpuReadback`と`AcrSmmuRestored`はSUMMARYにも表示される。`ACR VM walk`にはGPU側PGD/PTEのindexと64-bit entryが出る。0.4.12では、GPU側のページ表を格納するページに対する外側Tegra SMMUのPDEと、Arena/PGD/PGT/instance/image各ページのPTEを読み返して期待値と並べる。`AcrSmmuMapReadback=1`はメモリ上の表と期待値のreadback一致、`0`は不一致、`2`はGPU SMMU bypassで直接物理アドレスを使ったことを示す。これはCPUから読んだ表の内容の確認で、GPU DMAが成功した証明ではない。また、読戻し不一致でも診断用にログするだけで、従来のACR起動フローは変えない。
+
+PDB個別の無効化(Step 54)の後、0.4.11から診断用に全PDBのPAGE_ALL無効化(Step 55、`0x80000003`)も要求してからACRを起動する。これは「個別PDBの無効化範囲またはキャッシュ残留が原因か」を切り分ける追加試験で、全PDB無効化が修正になるとは未確認。`0x100CB8`の読み返しは診断値で、成功判定には使わない。無効化前後の状態、空きスロット数、要求値、ポーリング値を記録する。bit 15 は要求前から1の場合があるため、SUMMARYも要求完了の証明とは扱わない。空きスロットを得られない場合や要求後にbit 15を観測できない場合はACRを起動せず、個別要求は`0xE000006A`、全PDB要求は`0xE000006B`で終了する。待ちは各最大10 ms。`AcrBootResult=0`はブート完了とmailbox0=0を示すが、後続のFECS起動や画面出力までの成功を意味しない。`AcrBindOk`、`AcrDescOk`、両方のPDB invalidateの状態、`AcrBootPolls`、mailbox、IRQ、PCも記録される。
+
+0.4.5 の実機では、ACR は起動したが 2 秒で終わらなかった(CPUCTL 0、mailbox0 は 0xCAFEBEEF のまま)。0.4.6でpriv ring、PFIFO、FB flushを足すと、ブートローダーのDMAがGPU MMUに達したが、VA 0x10053000のPDE faultで停止した。0.4.7でNouveauのGM20B設定に合わせPTE apertureを修正してもfaultは変わらず、PGD/PTE entry自体は想定値と一致していた。0.4.8はMMU invalidate前の空きスロット待ちで停止し、`0x100C80=0x00208001`を記録した。この値のビット23:16は`0x20`で、空きスロットが32個ある状態だった。0.4.9で条件を修正し、空きスロット待ちを通過したが、0x100CB8の読み返し不一致で停止した。Nouveauは0x100CB8を読み返さずに書き込み、無効化を要求するため、0.4.10では読み返しを診断値にし、無効化要求へ進める。要求前からbit 15が1である場合があるので、要求前の値と要求後のポーリング結果を併記する。PDE faultの解消は実機で未確認。待ちの後には、ファルコンのPCトレース、DMAの状態、MCとSMMUのエラー、PFIFOのMMUエラーを記録する(`B3c after the boot wait`、`B3c faults during the boot`、`B3c MMU fault record`)。
+
+実機では未確認。特にWPR範囲へのCPU書き込み可能性、SMMUの新しい表によるDMA、ACRのmailbox値はテスト前に保証できない。`Status.cmd`で結果を読み、フリーズ後は電源長押しで起動し直す。通常FwTestはファルコンを起動しないまま。
 
 ## GPU を起こす手順(L4T の nvgpu と同じ順)
 
@@ -102,3 +112,43 @@ vidia\gm20b` の順に探す。どこにも無いときは、前の FwTest が�
 `HKLM\SYSTEM\CurrentControlSet\Services\switchgpu\Parameters`。設定(DWORD):
 - `PowerTest` = 1: 次にドライバーが起動したとき、1 回だけ GPU を起こす(始める前に 0 に戻る)。`PowerTest.cmd` が使う。2 なら B1 の調べものもする(`ProbeTest.cmd`)。3 なら B2a の DMA の確認をする(`DmaTest.cmd`)。
 - `KeepOn` = 1: テストのあと GPU を止めない(段階 B の準備用。ふだんは使わない)。
+
+## 0.4.13: GPU PDEの4 KiB SPT配置を修正
+
+mesa-switch-woaを手掛かりにLinux本家v6.12のgf100_vmm_pgd_pde()を再確認したところ、従来の式は4 KiB用SPTの住所を大ページ用LPTの下位側に書いていた。0.4.13ではPDEを `(pgtIova << 24) | (3ULL << 32)` に修正し、下位32 bitを0、上位32 bitをSPTの住所とNCOH属性にする。既存の128 KiB大ページ構成(dir shift=27、SPT index mask=0x7fff)とPDB、PTE属性は継続する。これは64 KiB構成を使う別実装を一式取り込む変更ではない。
+
+直近0.4.11ログのPgtIova=0xFB9DA000なら、PDEは以前の00000000:00FB9DA3から00FB9DA3:00000000になる。GPU MMUのPDE faultが変わるかを確認する。ACR boot成功は実機未確認。0.4.12の外側SMMU読戻し診断も含むので、Install.cmd後にAcrTest.cmdを1回実行し、C:\SwitchWOA-Gpu.txt全体を保存する。
+
+比較資料:
+- https://github.com/ruje0504-2/mesa-switch-woa/blob/main/tegra-x1-wddm/core/gm20b_mmu.c
+- https://github.com/torvalds/linux/blob/v6.12/drivers/gpu/drm/nouveau/nvkm/subdev/mmu/vmmgf100.c
+- https://github.com/torvalds/linux/blob/v6.12/drivers/gpu/drm/nouveau/nvkm/subdev/mmu/vmmgm20b.c
+
+別実装ではSoC向けのPDE/PDB target、VOL、64 KiB構成にも違いがある。これは残る比較候補で、今回の単独修正で原因が確定したという意味ではない。参照先のビルド済みドライバーやスクリプトは実行していない。上流コードの許諾はNOTICE-GM20B-MMU.txtを参照。
+## 0.4.14: SoC DRAM向けのページ表target/VOLを検証
+
+引継ぎメモの0.4.13結果は、外側SMMU表のCPU読戻しがすべて一致し、instanceページの住所もfaultと一致した一方、VA 0x10053000のPDE faultは変わらなかった。0.4.14ではmesa-switch-woaのSoC DRAM向け設定を仮説として検証する。実機での改善は未確認。
+
+変更は同じページ表経路に関する3か所: RAMIN+0x200のPDBをtarget=VIDMEM(0)、VOL=1(bit2)とし、PDE上位dwordをVIDMEM(1)+VOL(4)の5にし、選択PDB無効化のtargetもVIDMEM(0)にそろえる。PMU NEW_INSTBLKのSYS_NCOH(3)は別のレジスター形式なので継続する。128 KiB big-page構成(bit11=0、PGD index=VA>>27、SPT mask=0x7fff)、GPU PTE、4 MB SMMUウィンドウと有限待ち/リセット手順は従来どおり。
+
+SUMMARYのACR table-route probe行に64-bit PDB、VA limitとtarget/VOLを表示する。0.4.13ログのarena=0xFE5E5000を例にすると、PDBは0xFE5E7004、PDEは0x00FE5F75:0x00000000、選択PDB無効化値は0x00FE5E70になる。住所は毎回変わるので実測のAcrArenaIovaと比較する。
+
+Install.cmd → AcrTest.cmdを1回実行し、C:\SwitchWOA-Gpu.txt全体を保存する。同じPDE faultが続くか、別のfault/PCに進むかを確認する。AcrBootResult=0だけでPMU/FECS全体の起動や描画成功とは判定しない。参照コードはMITのMMU部分のみ。参照プロジェクトのビルド済みバイナリやスクリプトは実行していない。
+## 0.4.15: GPU向けアドレスのIOMMU bit 34を検証
+
+0.4.14でもVA 0x10053000のPDE faultが継続したとの実機報告を受け、Linux nouveau v6.12のnouveau_platform.cとinstmem/gk20a.cを再確認した。GM20Bのiommu_bitは34であり、IOMMU経由で確保したGPU向けアドレスにはbit34を付けている。従来のAcrVmPrepareはCPU物理住所をULONGのままGPUへ渡していたため、この区別を表現できていなかった。
+
+0.4.15ではSMMU経路が有効なとき、arenaのGPU向け住所をIOVA | (1ULL<<34)とし、インスタンス、PDB、PDE、PTE、選択PDB無効化まで64-bitで伝える。SoC SMMU表に書く物理PFN/IOVA、CPUポインター、MCのPTB_DATAにはこの印を入れない。SMMU bypassなら従来どおりタグを付けない。GPU VA(0x10053000)は変えない。
+
+SUMMARYにはACR IOMMU tag probeとNEW_INSTBLK encoded/readを追加。0.4.14ログのarena=0xFE5DC000を例にすると、GPU instance=0x00000004:FE62E000、PDB=0x00000004:FE5DE004、PDE=0x04FE5EE5:00000000、PTE=0x00000000:04FE62F1、無効化要求のPDB値=0x04FE5DE0、NEW_INSTBLK書込値=0x704FE62Eになる。実際の配置は毎回異なる。faultのinstにタグが含まれるかも比較する。
+
+これはIOMMUアドレス選択の仮説検証であり、原因やACR成功は実機未確認。今回PRAMINによる別経路のメモリー読み取りは追加していない。128 KiB構成、0.4.14のtable target/VOL設定、既存の有限待ちとGPU reset後SMMU復元を使う。WPR blob descriptorは従来のCPU物理アドレスのままであり、その後のWPRアクセス経路まで検証済みとはしない。
+
+Install.cmd → AcrTest.cmdを1回実行し、C:\SwitchWOA-Gpu.txt全体を保存する。IOMMU tag行、PDB/PGD/PTE、NEW_INSTBLK書込と読戻し、MCエラー、MMU fault、PC、最終SMMU restoredを比較する。途中の取得値だけで成功扱いにせず、AcrBootResultと最終状態も確認する。
+## 0.4.16: MMUのper-instance大ページサイズ指定を有効化
+
+起動経路全体の比較は同梱のCOMPARE-B3c-ja.mdに記録した。今回はPDEの式を変える代わりに、MMU_CTRL(0x100C80) bit11(USE_PDB_BIG_PAGE_SIZE)をセットする。これにより既存RAMIN PDB bit11=0の128 KiB構成を選ばせる。CPUから見た表と、MMUが採用する表の階層設定の不一致を検証する試験であり、原因や実機改善は未確認。
+
+新しいStep57はbindとTLB無効化より前に実行する。読戻しでbit11が立たなければE000006CでACR起動をスキップする。成功なら従来のStep50/51/54/55/56へ進む。SUMMARYのACR page geometry probeでMMU_CTRL変更前後とbit11を確認する。DMACTL、ITFEN、TRANSCFG1はbind前の読み取りのみで、DMACTL.REQUIRE_CTX解除は今回行わない。次候補として比較表に記録した。
+
+Install.cmd→AcrTest.cmdを1回実行し、C:\SwitchWOA-Gpu.txt全体を保存する。タイムアウト時はfaultのVA/type/inst、PC、mailboxが以前と同じかを比較する。GPU reset後のSMMU復元と最終電源状態も確認する。

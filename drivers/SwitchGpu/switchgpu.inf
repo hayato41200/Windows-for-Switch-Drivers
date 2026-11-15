@@ -9,7 +9,7 @@ Class       = System
 ClassGuid   = {4d36e97d-e325-11ce-bfc1-08002be10318}
 Provider    = %Mfg%
 CatalogFile = switchgpu.cat
-DriverVer   = 11/10/2026,0.4.2.0
+DriverVer   = 11/12/2026,0.4.16.0
 PnpLockdown = 1
 
 [DestinationDirs]

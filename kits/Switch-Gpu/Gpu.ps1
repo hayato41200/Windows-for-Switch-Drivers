@@ -27,12 +27,17 @@
                     driver checks them, patches the signature in memory and
                     loads the ACR bootloader into PMU IMEM/DMEM by PIO. The
                     falcon is not started.
+  -Mode AcrTest   : isolated one-shot ACR load (PowerTest = 5). This writes the
+                    GM20B WPR and DMA page tables, binds PMU virtual memory and
+                    starts signed ACR firmware. It always resets the GPU after
+                    the bounded wait. Use only when prepared for a forced power
+                    cycle if the GPU or system stops responding.
   -Mode Remove    : removes the driver package.
 
   Log: C:\SwitchWOA-Gpu.txt
   This file must stay ASCII: Windows PowerShell 5.1 reads it as the ANSI code page.
 #>
-param([Parameter(Mandatory = $true)][ValidateSet('Install', 'Status', 'PowerTest', 'ProbeTest', 'DmaTest', 'FwTest', 'Remove')][string]$Mode)
+param([Parameter(Mandatory = $true)][ValidateSet('Install', 'Status', 'PowerTest', 'ProbeTest', 'DmaTest', 'FwTest', 'AcrTest', 'Remove')][string]$Mode)
 
 $ErrorActionPreference = 'Continue'
 $Sys = Join-Path $env:windir 'Sysnative'
@@ -51,6 +56,7 @@ Log ''
 Log "=== Gpu $Mode  $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
 
 function Hex($v) { if ($null -eq $v) { 'n/a' } else { '0x{0:X8}' -f [uint32]$v } }
+function Key32($v) { if ($null -eq $v) { return '' }; $n = [long]$v; if ($n -lt 0) { $n += 4294967296 }; '{0:X8}' -f $n }
 function MvText($code) {
   if ($null -eq $code -or ([uint32]$code -band 0xFF000000)) { return 'read failed' }
   $c = [uint32]$code
@@ -85,7 +91,7 @@ function Show-Trace {
   Sum ('at start: VOUT {0}  VOUT_DVS {1}  GPIO6 {2}' -f (MvText $p.VoutAtStart), (MvText $p.VoutDvsAtStart), (Gpio $p.Gpio6AtStart))
   Sum ('at start: clamp (RG_CNTRL bit0) {0}  gpu clock {1}  pllg_ref {2}  gpu reset {3}  PLLP_OUTC {4}  fuse clock {5}  MC hot reset ctrl {6} stat {7}' -f (Bit $p.RgCntrlAtStart 0), (Bit $p.ClkXAtStart 24), (Bit $p.ClkXAtStart 29), (Bit $p.RstXAtStart 24), (Hex $p.PllpOutcAtStart), (Bit $p.ClkHAtStart 7), (Hex $p.McHotCtrlAtStart), (Hex $p.McHotStatAtStart))
   if ($p.TestRuns) {
-    $steps = @{ 1 = 'read the regulator'; 2 = 'VDD_GPU on'; 3 = 'clocks on'; 4 = 'reset assert'; 5 = 'clamp off'; 6 = 'reset deassert'; 7 = 'MC flush'; 8 = 'first BAR0 read (BOOT_0)'; 9 = 'PTIMER and WPR reads'; 20 = 'B1: topology read'; 21 = 'B1: PMU falcon read'; 22 = 'B1: DMEM test'; 23 = 'B1: priv ring init'; 29 = 'B2a: priv ring init'; 40 = 'B3a: firmware from registry'; 41 = 'B3a: bl.bin header'; 42 = 'B3a: ucode_load.bin headers'; 43 = 'B3a: signed image'; 44 = 'B3a: PMU reset + IMEM PIO'; 45 = 'B3a: DMEM descriptor'; 46 = 'B3b: CPU-side image (user code)'; 30 = 'B2a: SMMU check'; 31 = 'B2a: DMA setup'; 32 = 'B2a: DMA memory -> DMEM'; 33 = 'B2a: DMA DMEM -> memory'; 34 = 'B2a: DMA setup restore'; 35 = 'B2a: memory path read'; 36 = 'B2a: DMA try 1'; 37 = 'B2a: DMA try 2 (after PMU reset)'; 38 = 'B2a: DMA try 3 (after PMU reset)'; 39 = 'B2a: PMU instance bind'; 10 = 'power down'; 11 = 'done'; 100 = 'done, GPU left on (KeepOn)' }
+    $steps = @{ 1 = 'read the regulator'; 2 = 'VDD_GPU on'; 3 = 'clocks on'; 4 = 'reset assert'; 5 = 'clamp off'; 6 = 'reset deassert'; 7 = 'MC flush'; 8 = 'first BAR0 read (BOOT_0)'; 9 = 'PTIMER and WPR reads'; 20 = 'B1: topology read'; 21 = 'B1: PMU falcon read'; 22 = 'B1: DMEM test'; 23 = 'B1: priv ring init'; 29 = 'B2a: priv ring init'; 40 = 'B3a: firmware from registry'; 41 = 'B3a: bl.bin header'; 42 = 'B3a: ucode_load.bin headers'; 43 = 'B3a: signed image'; 44 = 'B3a: PMU reset + IMEM PIO'; 45 = 'B3a: DMEM descriptor'; 46 = 'B3b: CPU-side image (user code)'; 47 = 'B3c: read hardware WPR range'; 48 = 'B3c: build bounded WPR image'; 49 = 'B3c: prepare SMMU and PMU VM'; 50 = 'B3c: bind PMU instance block'; 51 = 'B3c: write ACR DMA descriptors'; 52 = 'B3c: legacy ACR step'; 53 = 'B3c: priv ring init'; 54 = 'B3c: invalidate selected PMU PDB'; 55 = 'B3c: invalidate all PMU PDBs'; 56 = 'B3c: one-shot ACR boot'; 57 = 'B3c: select per-instance PDB page size'; 30 = 'B2a: SMMU check'; 31 = 'B2a: DMA setup'; 32 = 'B2a: DMA memory -> DMEM'; 33 = 'B2a: DMA DMEM -> memory'; 34 = 'B2a: DMA setup restore'; 35 = 'B2a: memory path read'; 36 = 'B2a: DMA try 1'; 37 = 'B2a: DMA try 2 (after PMU reset)'; 38 = 'B2a: DMA try 3 (after PMU reset)'; 39 = 'B2a: PMU instance bind'; 10 = 'power down'; 11 = 'done'; 100 = 'done, GPU left on (KeepOn)' }
     Sum ('power test runs {0}: last step {1} ({2})  result {3}  took {4} us' -f $p.TestRuns, $p.Step, $steps[[int]$p.Step], (Hex $p.Result), $p.TestUs)
     if ($null -ne $p.McHotStatAfterReset) {
       $pts = @(@('GPU off', $p.McHotStatAtStart), @('after reset', $p.McHotStatAfterReset), @('after flush', $p.McHotStatAfterFlush), @('after BAR0 reads', $p.McHotStatAfterBar0), @('B2a start', $p.McHotStatB2aStart), @('before DMA', $p.McHotStatBeforeDma), @('after DMA', $p.McHotStatAfterDma))
@@ -138,7 +144,7 @@ function Show-Trace {
       Sum ('B1 DMEM write/read: {0} of 4 words OK  (read {1}; wrote 5A5A0001 A5A50002 12345678 FEDCBA98)' -f $p.DmemOk, ($rv -join ' '))
     }
     if ($null -ne $p.RingDone) {
-      $rw = 'B1'; if ([uint32]$p.RingDone -eq 29) { $rw = 'B2a' }
+      $rw = 'B1'; if ([uint32]$p.RingDone -eq 29) { $rw = 'B2a' }; if ([uint32]$p.RingDone -eq 53) { $rw = 'B3c' }
       Sum ($rw + ' priv ring: status0 before {0} after {1}  cmd {2}  master {3}  PMC_ENABLE {4}' -f (Hex $p.RingStatus0Before), (Hex $p.RingStatus0), (Hex $p.RingCmd), (Hex $p.RingMaster), (Hex $p.PmcEnableAfterRing))
     }
     if ($null -ne $p.SmmuConfig) {
@@ -260,8 +266,8 @@ function Show-Trace {
       }
     }
     if ($null -ne $p.B3aResult) {
-      $b3err = @{ 0 = 'OK'; 0xE0000041 = 'firmware missing in the registry (run FwTest from the kit)'; 0xE0000042 = 'bl.bin too short'; 0xE0000043 = 'bl.bin header bad'; 0xE0000044 = 'bl.bin descriptor bad'; 0xE0000045 = 'ucode_load.bin too short'; 0xE0000046 = 'ucode_load.bin header bad'; 0xE0000047 = 'patch location outside the file'; 0xE0000048 = 'load header outside the file'; 0xE0000049 = 'app table bad'; 0xE000004A = 'signature/section offsets bad'; 0xE000004B = 'no memory'; 0xE000004C = 'bootloader does not fit IMEM'; 0xE000004D = 'no memory' }
-      $why3 = $b3err[[int]$p.B3aResult]; if (-not $why3) { $why3 = '?' }
+      $b3err = @{ '00000000' = 'OK'; 'E0000041' = 'firmware missing in the registry (run FwTest from the kit)'; 'E0000042' = 'bl.bin too short'; 'E0000043' = 'bl.bin header bad'; 'E0000044' = 'bl.bin descriptor bad'; 'E0000045' = 'ucode_load.bin too short'; 'E0000046' = 'ucode_load.bin header bad'; 'E0000047' = 'patch location outside the file'; 'E0000048' = 'load header outside the file'; 'E0000049' = 'app table bad'; 'E000004A' = 'signature/section offsets bad'; 'E000004B' = 'no memory'; 'E000004C' = 'bootloader does not fit IMEM'; 'E000004D' = 'no memory'; 'E0000061' = 'invalid WPR range'; 'E0000062' = 'built WPR is larger than the hardware protected region'; 'E0000063' = 'ACR descriptor is too short'; 'E0000064' = 'could not map WPR/VM memory'; 'E0000065' = 'PMU virtual-memory bind failed'; 'E0000066' = 'ACR DMA descriptor readback mismatch'; 'E0000067' = 'ACR boot timed out'; 'E0000068' = 'ACR boot mailbox indicated failure'; 'E0000069' = 'WPR CPU write/readback mismatch'; 'E000006A' = 'PMU PDB MMU invalidate failed'; 'E000006B' = 'all-PDB MMU invalidate could not observe FIFO empty'; 'E000006C' = 'MMU per-instance PDB page-size selection readback failed' }
+      $why3 = $b3err[(Key32 $p.B3aResult)]; if (-not $why3) { $why3 = '?' }
       Sum ('B3a firmware: bl.bin {0} bytes magic {1} (hdr {2} data {3}+{4})  start tag {5} dmem off {6} code {7}+{8}' -f $p.B3aBlLen, (Hex $p.B3aBlMagic), (Hex $p.B3aBlHdrOff), (Hex $p.B3aBlDataOff), (Hex $p.B3aBlDataSize), (Hex $p.B3aBlStartTag), (Hex $p.B3aBlDmemLoadOff), (Hex $p.B3aBlCodeOff), (Hex $p.B3aBlCodeSize))
       if ($null -ne $p.B3aUcMagic) {
         Sum ('B3a firmware: ucode_load.bin {0} bytes magic {1} (hdr {2} data {3}+{4})  sig prod {5}+{6} dbg {7}+{8}  patch {9}/{10} -> loc {11} sig {12}' -f $p.B3aUcLen, (Hex $p.B3aUcMagic), (Hex $p.B3aUcHdrOff), (Hex $p.B3aUcDataOff), (Hex $p.B3aUcDataSize), (Hex $p.B3aSigPrdOff), (Hex $p.B3aSigPrdSize), (Hex $p.B3aSigDbgOff), (Hex $p.B3aSigDbgSize), (Hex $p.B3aPatchLoc), (Hex $p.B3aPatchSig), (Hex $p.B3aLoc), (Hex $p.B3aSig))
@@ -277,7 +283,7 @@ function Show-Trace {
         Sum ('B3a PMU PIO: IMEM {0} DMEM {1}  scrub polls {2}  bootloader at IMEM {3} (tag {4}): {5} of {6} words read back OK (first {7})' -f (Hex $p.B3aImemSize), (Hex $p.B3aDmemSize), $p.B3aScrubPolls, (Hex $p.B3aImemBase), (Hex $p.B3aBlStartTag), $p.B3aImemOk, $p.B3aImemWords, (Hex $p.B3aImemWord0))
       }
       if ($null -ne $p.B3aDescOk) {
-        Sum ('B3a BL descriptor at DMEM 0: {0} of 19 words read back OK  CPUCTL {1} (not started)  boot address {2}' -f $p.B3aDescOk, (Hex $p.B3aCpuctl), (Hex $p.B3aBootAddr))
+        Sum ('B3a BL descriptor at DMEM 0: {0} of 19 words read back OK  CPUCTL {1}  boot address {2}' -f $p.B3aDescOk, (Hex $p.B3aCpuctl), (Hex $p.B3aBootAddr))
       }
       if ($null -ne $p.B3aFwPmuImageLen) {
         Sum ('B3a other firmware in the registry (bytes): pmu desc {0} image {1} sig {2}  fecs bl {3} inst {4} data {5} sig {6}' -f $p.B3aFwPmuDescLen, $p.B3aFwPmuImageLen, $p.B3aFwPmuSigLen, $p.B3aFwFecsBlLen, $p.B3aFwFecsInstLen, $p.B3aFwFecsDataLen, $p.B3aFwFecsSigLen)
@@ -296,6 +302,59 @@ function Show-Trace {
       if ($bb.Count) { Sum ('B3b binary traces: ' + ($bb -join '  ')) }
       $b3bok = 'OK'; if ([uint32]$p.B3bResult -ne 0) { $b3bok = 'error code from the B3b code' }
       Sum ('B3b result {0} ({1})' -f (Hex $p.B3bResult), $b3bok)
+    }
+    if ($null -ne $p.AcrBootResult) {
+      Sum ('ACR WPR range {0:X8}{1:X8}..{2:X8}{3:X8}; blob PA {4:X8}{5:X8} size {6}; CPU readback {7}; SMMU restored {8}' -f [uint32]$p.AcrWprStartHi, [uint32]$p.AcrWprStartLo, [uint32]$p.AcrWprEndHi, [uint32]$p.AcrWprEndLo, [uint32]$p.AcrWprBufferPaHi, [uint32]$p.AcrWprBufferPaLo, $p.AcrWprBufferBytes, $p.AcrWprCpuReadback, $p.AcrSmmuRestored)
+      Sum ('ACR PMU VM bind {0}; boot polls {1}; CPUCTL {2}; mailbox0/1 {3}/{4}; IRQ {5}; PC {6}; result {7}' -f $p.AcrBindOk, $p.AcrBootPolls, (Hex $p.AcrBootCpuctl), (Hex $p.AcrBootMailbox0), (Hex $p.AcrBootMailbox1), (Hex $p.AcrBootIrq), (Hex $p.AcrBootPc), (Hex $p.AcrBootResult))
+      if ($null -ne $p.AcrPdeIndex) {
+        if ($null -ne $p.AcrPdbPageModeOk) {
+          Sum ('ACR page geometry probe: MMU_CTRL {0} -> {1}; use PDB big-page size bit11 {2}; PDB big-page bit11=0 (128K); PGD index=VA>>27; DMACTL {3}, ITFEN {4}, TRANSCFG1 {5} (before bind; read only)' -f (Hex $p.AcrMmuPageCtrlBefore), (Hex $p.AcrMmuPageCtrlAfter), $p.AcrPdbPageModeOk, (Hex $p.AcrPreBootDmactl), (Hex $p.AcrPreBootItfen), (Hex $p.AcrPreBootTranscfg1))
+        }
+        if ($null -ne $p.AcrIommuTagHi) {
+          Sum ('ACR IOMMU tag probe: bit34 tag high {0}; arena {1}:{2}; instance {3}:{4}; PGD {5}:{6}; PGT {7}:{8}; image {9}:{10}' -f (Hex $p.AcrIommuTagHi), (Hex $p.AcrArenaIovaHi), (Hex $p.AcrArenaIova), (Hex $p.AcrInstIovaHi), (Hex $p.AcrInstIova), (Hex $p.AcrPgdIovaHi), (Hex $p.AcrPgdIova), (Hex $p.AcrPgtIovaHi), (Hex $p.AcrPgtIova), (Hex $p.AcrImageIovaHi), (Hex $p.AcrImageIova))
+          Sum ('ACR NEW_INSTBLK encoded/read {0}/{1} (readback diagnostic only)' -f (Hex $p.AcrBindInstWritten), (Hex $p.AcrBindInstRead))
+        }
+        Sum ('ACR VM walk: PGD[{0}]={1}:{2}; PTE[{3}]={4}:{5}; GM20B NCOH PTE aperture=0' -f (Hex $p.AcrPdeIndex), (Hex $p.AcrPdeHi), (Hex $p.AcrPdeLo), (Hex $p.AcrPteIndex), (Hex $p.AcrPteHi), (Hex $p.AcrPteLo))
+        if ($p.AcrSmallPdeHighHalf) { Sum 'ACR PDE layout: 4K SPT in high dword, low dword absent; 128K big-page layout (directory shift 27)' }
+        if ($p.AcrSocTablePolicy) {
+          Sum ('ACR table-route probe: PDB {0}:{1}, VA limit {2}:{3}; PDB target VIDMEM=0/VOL=1, PDE target VIDMEM=1/VOL=1, invalidate target=0; PMU bind SYS_NCOH' -f (Hex $p.AcrInstPdbHi), (Hex $p.AcrInstPdbLo), (Hex $p.AcrInstLimitHi), (Hex $p.AcrInstLimitLo))
+        }
+      }
+      if ($null -ne $p.AcrSmmuMapReadback) {
+        $smmuMode = 'active identity-map readback'
+        if ([uint32]$p.AcrSmmuMapReadback -eq 2) { $smmuMode = 'GPU SMMU bypass; direct physical addresses' }
+        elseif ([uint32]$p.AcrSmmuMapReadback -eq 0) { $smmuMode = 'active identity-map mismatch observed' }
+        Sum ('ACR outer SMMU: {0}; result {1}; GPU ASID {2}; PTB_DATA read {3}; PDE[{4}] expected/read {5}/{6}' -f $smmuMode, $p.AcrSmmuMapReadback, (Hex $p.AcrSmmuGpuAsid), (Hex $p.AcrSmmuPtbDataRead), (Hex $p.AcrSmmuPdeIndex), (Hex $p.AcrSmmuPdeExpected), (Hex $p.AcrSmmuPdeRead))
+        if ([uint32]$p.AcrSmmuMapReadback -ne 2) {
+          Sum ('ACR outer SMMU PTE expected/read: arena {0}/{1}; PGD {2}/{3}; PGT {4}/{5}' -f (Hex $p.AcrSmmuArenaPteExpected), (Hex $p.AcrSmmuArenaPteRead), (Hex $p.AcrSmmuPgdPteExpected), (Hex $p.AcrSmmuPgdPteRead), (Hex $p.AcrSmmuPgtPteExpected), (Hex $p.AcrSmmuPgtPteRead))
+          Sum ('ACR outer SMMU PTE expected/read: instance {0}/{1}; image {2}/{3}' -f (Hex $p.AcrSmmuInstPteExpected), (Hex $p.AcrSmmuInstPteRead), (Hex $p.AcrSmmuImagePteExpected), (Hex $p.AcrSmmuImagePteRead))
+        }
+        Sum 'ACR outer SMMU readback checks CPU-visible table contents only; they do not prove device DMA.'
+      }
+      Sum ('ACR selected-PDB invalidate: {0}; free slots {1}; queue polls {2} status {3}; status bit 15 before {4}; PDB written {5} readback {6} (diagnostic); status polls {7} final {8}' -f $p.AcrMmuInvOk, $p.AcrMmuInvFreeSlots, $p.AcrMmuInvSlotPolls, (Hex $p.AcrMmuInvSlotStatus), $p.AcrMmuInvPendingBefore, (Hex $p.AcrMmuInvPdb), (Hex $p.AcrMmuInvPdbRead), $p.AcrMmuInvDonePolls, (Hex $p.AcrMmuInvDoneStatus))
+      if ($null -ne $p.AcrMmuAllPdbInvOk) {
+        Sum ('ACR all-PDB invalidate discriminator: queue empty observed {0}; free slots {1}; pre {2}; request {3}; post-write {4}; polls {5}; final {6} (status bit is not proof of request completion)' -f $p.AcrMmuAllPdbInvOk, $p.AcrMmuAllPdbFreeSlots, (Hex $p.AcrMmuAllPdbBeforeStatus), (Hex $p.AcrMmuAllPdbRequest), (Hex $p.AcrMmuAllPdbPostWriteStatus), $p.AcrMmuAllPdbStatusPolls, (Hex $p.AcrMmuAllPdbStatus))
+      }
+      Sum 'ACR test is one-shot; GPU reset follows the bounded wait. Check the final GPU state separately.'
+    }
+    if ($null -ne $p.B3cFifoPmcNow) {
+      Sum ('B3c memory path before ACR: priv ring master {0}  LTC nr {1}  tag base {2}  PFIFO PMC_ENABLE {3} -> {4}  intr0 after clear {5}  FB flush polls {6} reg {7}' -f (Hex $p.RingMaster), (Hex $p.B3cLtcNr), (Hex $p.B3cTagBase), (Hex $p.B3cFifoPmcWas), (Hex $p.B3cFifoPmcNow), (Hex $p.B3cFifoIntr0Clr), $p.B3cFbFlushPolls, (Hex $p.B3cFbFlushReg))
+    }
+    if ($null -ne $p.B3cDiagDone) {
+      $tp = ''
+      if ($null -ne $p.B3cTracePc) { $tb = [byte[]]$p.B3cTracePc; $tl = @(); for ($i = 0; $i + 4 -le $tb.Length; $i += 4) { $tl += ('{0:X}' -f [BitConverter]::ToUInt32($tb, $i)) }; $tp = $tl -join ' ' }
+      Sum ('B3c after the boot wait: trace idx {0} ({1} entries) PCs {2}  DMATRFCMD {3} base {4} moffs {5} fboffs {6}  DMACTL {7}' -f (Hex $p.B3cTraceIdx), $p.B3cTraceNr, $tp, (Hex $p.B3cDmaCmd), (Hex $p.B3cDmaBase), (Hex $p.B3cDmaMoffs), (Hex $p.B3cDmaFboffs), (Hex $p.B3cDmactl))
+      Sum ('B3c faults during the boot: MC int {0} err {1} adr {2}  PFIFO intr0 {3} (bit 28 = MMU fault) fault id {4}' -f (Hex $p.B3cMcInt), (Hex $p.B3cMcErr), (Hex $p.B3cMcErrAdr), (Hex $p.B3cFifoIntr0), (Hex $p.B3cFifoFaultId))
+      if ($null -ne $p.B3cFaultRecs) {
+        $reasons3 = @('PDE', 'PDE_SIZE', 'PTE', 'VA_LIMIT_VIOLATION', 'UNBOUND_INST_BLOCK', 'PRIV_VIOLATION', 'RO_VIOLATION', 'WO_VIOLATION', 'PITCH_MASK_VIOLATION', 'WORK_CREATION', 'UNSUPPORTED_APERTURE', 'COMPRESSION_FAILURE', 'UNSUPPORTED_KIND', 'REGION_VIOLATION', 'BOTH_PTES_VALID', 'POISONED')
+        $fr3 = [byte[]]$p.B3cFaultRecs
+        for ($o = 0; $o + 20 -le $fr3.Length; $o += 20) {
+          $u = [BitConverter]::ToUInt32($fr3, $o); $fi = [BitConverter]::ToUInt32($fr3, $o + 4); $flo = [BitConverter]::ToUInt32($fr3, $o + 8); $fhi = [BitConverter]::ToUInt32($fr3, $o + 12); $fty = [BitConverter]::ToUInt32($fr3, $o + 16)
+          $acc = 'read'; if ($fty -band 0x80) { $acc = 'write' }
+          $hub = 'gpc'; if ($fty -band 0x40) { $hub = 'hub' }
+          Sum ('B3c MMU fault record unit 0x{0:X2}: inst {1} va 0x{2:X}{3:X8} info {4} -> type {5} ({6}) {7} {8} client 0x{9:X2}' -f $u, (Hex $fi), $fhi, $flo, (Hex $fty), ($fty -band 0xF), $reasons3[$fty -band 0xF], $acc, $hub, (($fty -shr 8) -band 0x1F))
+        }
+      }
     }
     if ($null -ne $p.PfifoIntr0) {
       Sum ('B2a PFIFO: intr0 {0}  mmu fault id {1}  fault0 inst {2} lo {3} hi {4} info {5}' -f (Hex $p.PfifoIntr0), (Hex $p.PfifoMmuFaultId), (Hex $p.PfifoFault0Inst), (Hex $p.PfifoFault0Lo), (Hex $p.PfifoFault0Hi), (Hex $p.PfifoFault0Info))
@@ -330,16 +389,16 @@ switch ($Mode) {
     Show-Device; Log ''; Show-Trace
   }
   'Status' { Show-Device; Log ''; Show-Trace }
-  { $_ -eq 'PowerTest' -or $_ -eq 'ProbeTest' -or $_ -eq 'DmaTest' -or $_ -eq 'FwTest' } {
-    $tv = 1; if ($Mode -eq 'ProbeTest') { $tv = 2 }; if ($Mode -eq 'DmaTest') { $tv = 3 }; if ($Mode -eq 'FwTest') { $tv = 4 }
+  { $_ -eq 'PowerTest' -or $_ -eq 'ProbeTest' -or $_ -eq 'DmaTest' -or $_ -eq 'FwTest' -or $_ -eq 'AcrTest' } {
+    $tv = 1; if ($Mode -eq 'ProbeTest') { $tv = 2 }; if ($Mode -eq 'DmaTest') { $tv = 3 }; if ($Mode -eq 'FwTest') { $tv = 4 }; if ($Mode -eq 'AcrTest') { $tv = 5 }
     New-Item -Path $Key -Force | Out-Null
     $old = Get-ItemProperty $Key -ErrorAction SilentlyContinue
     if ($old) {
-      foreach ($n in @($old.PSObject.Properties | Where-Object { $_.Name -match '^(B2a|B3a|B3b|Smmu|Mc[IE]|McHotStat(Before|After)Dma|McHotStatAfter(Reset|Flush|Bar0)|McHotStatB2aStart|Pmu|Pfifo|Ptop|Scal|Dmem|Ring|Wpr|PmcEnable)' } | ForEach-Object { $_.Name })) {
+      foreach ($n in @($old.PSObject.Properties | Where-Object { $_.Name -match '^(Acr|B2a|B3a|B3b|B3c|Smmu|Mc[IE]|McHotStat(Before|After)Dma|McHotStatAfter(Reset|Flush|Bar0)|McHotStatB2aStart|Pmu|Pfifo|Ptop|Scal|Dmem|Ring|Wpr|PmcEnable)' } | ForEach-Object { $_.Name })) {
         Remove-ItemProperty -Path $Key -Name $n -ErrorAction SilentlyContinue
       }
     }
-    if ($Mode -eq 'FwTest') {
+    if ($Mode -eq 'FwTest' -or $Mode -eq 'AcrTest') {
       # The firmware is the user's own linux-firmware copy; the kit never ships it.
       # Where to look, in order: inside the kit, then fixed places on C:.
       # If none has it, reuse what an earlier FwTest left in the registry.
