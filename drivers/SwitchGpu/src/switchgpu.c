@@ -39,7 +39,7 @@
 #include <wdf.h>
 #include <spb.h>
 
-#define SWGPU_VERSION      0x00000410u   /* 0.4.16 */
+#define SWGPU_VERSION      0x00000419u   /* 0.4.25 */
 
 #define CAR_PHYS           0x60006000ull
 #define CAR_LEN            0x1000u
@@ -115,10 +115,15 @@
 #define FALCON_BIND_INST    0x480      /* instance-block address/target */
 #define FALCON_CTX_ENABLE   0x090      /* bit 16 enables context binding */
 #define FALCON_CTX_ACTION   0x058      /* bit 1: commit pending context bind */
+#define FALCON_IMEMC0       0x180
+#define FALCON_IMEMD0       0x184
+#define FALCON_IMEMT0       0x188
+#define FALCON_IMEMC_AINCR  (1u << 25)
 #define DMATRFCMD_IDLE     (1u << 1)
 #define DMATRFCMD_WRITE    (1u << 5)
 #define DMATRFCMD_256B     (6u << 8)
 #define DMA_IDX            4u          /* ctx dma index 4 = PHYS_SYS_NCOH in nouveau's PMU setup */
+#define PMU_UCODE_DMA_IDX  0u          /* GK20A_PMU_DMAIDX_UCODE: physical local FB */
 /* PMU FBIF at + 0xE00 (nouveau gm200_pmu_flcn_bind_inst); TRANSCFG(i) = + 4 i:
  * TARGET [1:0] (2 = noncoherent sysmem), MEM_TYPE bit 2 (1 = physical);
  * FBIF_CTL + 0x24 bit 7 = ALLOW_PHYS_NO_CTX (dev_fbif_v4.h). */
@@ -1494,12 +1499,11 @@ static VOID WprPutLe64(PUCHAR P, ULONGLONG V)
     WprPutLe32(P + 4, (ULONG)(V >> 32));
 }
 
-/* Build a CPU-only GM20B WPR image from the staged Linux firmware blobs.
- * This deliberately does not map the buffer for GPU DMA, alter SMMU state,
- * enable the PMU, or ask ACR to consume it. The WPR addresses in both BLDs
- * are still relative to the beginning of the image and need the WPR-base
- * relocation performed by ACR before they can be used. */
-static ULONG BuildWprB3b(ULONG PmuDmemSize, PUCHAR *OutWpr, PULONG OutAllocLen, PULONG OutUsed)
+/* Build a GM20B WPR image from the staged Linux firmware blobs. Runtime PMU
+ * loader_config addresses are physical WPR addresses (WPR base + image
+ * offsets), as populated by nvgpu and relocated by nouveau before ACR.
+ * WprBase=0 is used only for the CPU-only layout preview. */
+static ULONG BuildWprB3b(ULONG PmuDmemSize, ULONGLONG WprBase, PUCHAR *OutWpr, PULONG OutAllocLen, PULONG OutUsed, PULONG OutPmuArgv)
 {
     PUCHAR pmuDesc = NULL, pmuImage = NULL, pmuSig = NULL;
     PUCHAR fecsBl = NULL, fecsInst = NULL, fecsData = NULL, fecsSig = NULL;
@@ -1516,10 +1520,16 @@ static ULONG BuildWprB3b(ULONG PmuDmemSize, PUCHAR *OutWpr, PULONG OutAllocLen, 
     ULONG fecsDataAreaSize, totalUsed, allocLen, i, ok, result = 0xE0000051u;
     ULONG pmuBld[13], fecsBld[19];
     ULONG descSize, imageSize;
+    ULONGLONG pmuCodeAddr, pmuDataAddr;
 
     if (OutWpr != NULL) *OutWpr = NULL;
     if (OutAllocLen != NULL) *OutAllocLen = 0;
     if (OutUsed != NULL) *OutUsed = 0;
+    if (OutPmuArgv != NULL) *OutPmuArgv = 0;
+    if (OutWpr != NULL && WprBase == 0) {
+        result = 0xE0000077u;
+        goto done;
+    }
 
     Step(46); /* parse firmware descriptors and construct the CPU-side WPR image */
     pmuDesc = ReadBinParam(L"FwPmuDesc", 0x20000u, &pmuDescLen);
@@ -1568,6 +1578,7 @@ static ULONG BuildWprB3b(ULONG PmuDmemSize, PUCHAR *OutWpr, PULONG OutAllocLen, 
     pmuAppDataSize = Le32(pmuDesc + 128);
     Trace(L"B3bPmuDescSize", descSize);
     Trace(L"B3bPmuImageSize", imageSize);
+    Trace(L"B3cPmuAppVersion", Le32(pmuDesc + 12));
     Trace(L"B3bPmuBootSize", pmuBootSize);
     Trace(L"B3bPmuAppSize", pmuAppSize);
     if (descSize < 132 || descSize > pmuDescLen || imageSize == 0 || imageSize > pmuImageLen ||
@@ -1699,12 +1710,21 @@ static ULONG BuildWprB3b(ULONG PmuDmemSize, PUCHAR *OutWpr, PULONG OutAllocLen, 
     WprPutLe32(wpr + fecsLsbOff + 120, 0);
 
     RtlZeroMemory(pmuBld, sizeof(pmuBld));
-    pmuBld[0] = DMA_IDX;
-    pmuBld[1] = (pmuImgOff + pmuCodeOffset) >> 8;
+    /* The PMU ACR loader uses DMAIDX_UCODE (0), whose FBIF TRANSCFG is
+     * physical local FB. DMA_IDX=4 is PHYS_SYS_NCOH for the separate B2a
+     * system-memory DMA probe and would send these WPR addresses to sysmem. */
+    pmuBld[0] = PMU_UCODE_DMA_IDX;
+    pmuCodeAddr = WprBase + (ULONGLONG)pmuImgOff + pmuCodeOffset;
+    pmuDataAddr = WprBase + (ULONGLONG)pmuImgOff + pmuDataOffset;
+    if ((pmuCodeAddr >> 8) > 0xFFFFFFFFull || (pmuDataAddr >> 8) > 0xFFFFFFFFull) {
+        result = 0xE0000077u;
+        goto done;
+    }
+    pmuBld[1] = (ULONG)(pmuCodeAddr >> 8);
     pmuBld[2] = pmuAppSize;
     pmuBld[3] = pmuAppCodeSize;
     pmuBld[4] = Le32(pmuDesc + 108); /* app_imem_entry */
-    pmuBld[5] = (pmuImgOff + pmuDataOffset) >> 8;
+    pmuBld[5] = (ULONG)(pmuDataAddr >> 8);
     pmuBld[6] = pmuAppDataSize;
     pmuBld[7] = pmuBld[1];
     pmuBld[8] = 1;
@@ -1733,11 +1753,15 @@ static ULONG BuildWprB3b(ULONG PmuDmemSize, PUCHAR *OutWpr, PULONG OutAllocLen, 
           Le32(wpr + pmuLsbOff + 72) == 0 && Le32(wpr + fecsLsbOff + 72) == 2 &&
           Le32(wpr + pmuLsbOff + 76) == pmuImgOff &&
           Le32(wpr + fecsLsbOff + 76) == fecsImgOff &&
-          Le32(wpr + pmuBldOff) == DMA_IDX && Le32(wpr + fecsBldOff + 32) == DMA_IDX &&
+          Le32(wpr + pmuBldOff) == PMU_UCODE_DMA_IDX && Le32(wpr + fecsBldOff + 32) == DMA_IDX &&
           RtlCompareMemory(wpr + pmuImgOff, pmuImage, imageSize) == imageSize &&
           RtlCompareMemory(wpr + fecsImgOff, fecsImage, fecsImageLen) == fecsImageLen) ? 1u : 0u;
-    Trace(L"B3bPmuCodeDmaRel", pmuBld[1]);
-    Trace(L"B3bPmuDataDmaRel", pmuBld[5]);
+    Trace(L"B3cPmuCodeDmaBase", pmuBld[1]);
+    Trace(L"B3bPmuDmaIdx", pmuBld[0]);
+    Trace(L"B3cPmuDataDmaBase", pmuBld[5]);
+    Trace(L"B3cPmuWprBaseLo", (ULONG)WprBase);
+    Trace(L"B3cPmuWprBaseHi", (ULONG)(WprBase >> 32));
+    Trace(L"B3cPmuDmaBaseAbsolute", WprBase != 0 ? 1u : 0u);
     Trace(L"B3bPmuArgv", pmuBld[9]);
     Trace(L"B3bFecsCodeDmaRel", fecsBld[9]);
     Trace(L"B3bFecsDataDmaRel", fecsBld[15]);
@@ -1749,6 +1773,7 @@ done:
     if (result == 0 && OutWpr != NULL && OutAllocLen != NULL) {
         *OutWpr = wpr;
         *OutAllocLen = allocLen;
+        if (OutPmuArgv != NULL) *OutPmuArgv = pmuBld[9];
         wpr = NULL;
     }
     if (wpr != NULL) ExFreePoolWithTag(wpr, SWGPU_TAG);
@@ -1763,6 +1788,266 @@ done:
     return result;
 }
 
+/* The ACR PMU loader_config advertises argv = DMEM - sizeof(nv_pmu_args)
+ * (44 bytes, as in nouveau gm20b_pmu_acr_bld_write). Write that ABI at the
+ * advertised address. mesa tg_gpu_pmu_start's 32-byte cmdline_args_v3 is a
+ * different host-start path and must not override this WPR loader argv. */
+static ULONG B3cStartPmuLs(PSWGPU_DEVICE Dev, ULONG PmuArgv)
+{
+    volatile UCHAR *B = Dev->Bar0;
+    static const ULONG aperture[5] = { 4, 0, 4, 5, 6 };
+    /* struct nv_pmu_args (44 bytes): reserved, freq, trace fields, secure_mode
+     * at byte 24, remaining privilege/GC6 fields zero. */
+    ULONG args[11] = { 0, 204000000u, 0, 0, 0, 0, 1, 0, 0, 0, 0 };
+    ULONG argsReadback[11];
+    ULONG cpuctl, irq, hwcfg, dmemSize = 0, argsOff = 0, i, polls = 0, head, tail, result = 0;
+    ULONG dmaCtlBeforeStart, dmaCtlAtStart;
+    ULONG traceIdx, traceNr, traceSlot, tracePc[8], argsOk, argsCursor;
+    ULONG initWords[11], initHdr, initType, initCursor;
+    ULONG diagWords[64], diagOff, diagCount, diagI;
+    ULONG imemHwcfg, imemSize, imemOff, imemWords[16], imemOk;
+    ULONG transcfg[8], faultRecs[32][5], faultNr, faultId, faultUnit;
+
+    Step(58);
+    cpuctl = Rd(B, PMU_FALCON + FALCON_CPUCTL);
+    Trace(L"B3cLsPmuPreCpuctl", cpuctl);
+    Trace(L"B3cLsPmuPreSctl", Rd(B, PMU_FALCON + FALCON_SCTL));
+    Trace(L"B3cLsPmuPreMailbox0", Rd(B, PMU_FALCON + FALCON_MAILBOX0));
+    Trace(L"B3cLsPmuPreMailbox1", Rd(B, PMU_FALCON + FALCON_MAILBOX1));
+    if ((cpuctl & 0x50u) != 0x50u ||
+        Rd(B, PMU_FALCON + FALCON_MAILBOX0) != 0 ||
+        Rd(B, PMU_FALCON + FALCON_MAILBOX1) != 0) {
+        result = 0xE000006Du;
+        goto done;
+    }
+    hwcfg = Rd(B, PMU_FALCON + FALCON_HWCFG);
+    dmemSize = ((hwcfg >> 9) & 0x1FFu) << 8;
+    Trace(L"B3cLsPmuDmemSize", dmemSize);
+    if (dmemSize < 256u || dmemSize > 0xFFFFu) {
+        result = 0xE000006Eu;
+        goto done;
+    }
+    Wr(B, PMU_FALCON + 0x004, 0x10u);
+    irq = Rd(B, PMU_FALCON + 0x008);
+    Trace(L"B3cLsPmuIrqAfterClear", irq);
+    if (irq & 0x10u) {
+        result = 0xE000006Fu;
+        goto done;
+    }
+    for (i = 0; i < RTL_NUMBER_OF(aperture); ++i)
+        Wr(B, PMU_FALCON + 0xE00 + i * 4u, aperture[i]);
+    Trace(L"B3cLsPmuAperture0", Rd(B, PMU_FALCON + 0xE00));
+    Trace(L"B3cLsPmuAperture4", Rd(B, PMU_FALCON + 0xE10));
+
+    argsOff = dmemSize - sizeof(args);
+    Trace(L"B3cLsPmuArgvAdvertised", PmuArgv);
+    Trace(L"B3cLsPmuArgvComputed", argsOff);
+    Trace(L"B3cLsPmuArgsSize", sizeof(args));
+    TraceDurable(L"B3cLsPmuArgvMatch", argsOff == PmuArgv ? 1u : 0u);
+    if (argsOff != PmuArgv) {
+        result = 0xE0000074u;
+        goto done;
+    }
+    Wr(B, PMU_FALCON + FALCON_DMEMC0, (1u << 24) | argsOff);
+    for (i = 0; i < RTL_NUMBER_OF(args); ++i)
+        Wr(B, PMU_FALCON + FALCON_DMEMD0, args[i]);
+    Wr(B, PMU_FALCON + FALCON_DMEMC0, (1u << 25) | argsOff);
+    argsOk = 1;
+    for (i = 0; i < RTL_NUMBER_OF(args); ++i) {
+        argsReadback[i] = Rd(B, PMU_FALCON + FALCON_DMEMD0);
+        if (argsReadback[i] != args[i]) argsOk = 0;
+    }
+    argsCursor = Rd(B, PMU_FALCON + FALCON_DMEMC0) & 0xFFFFu;
+    Trace(L"B3cLsPmuArgsOff", argsOff);
+    Trace(L"B3cLsPmuArgsCursor", argsCursor);
+    TraceDurable(L"B3cLsPmuArgsOk", argsOk);
+    TraceBin(L"B3cLsPmuArgvReadback", argsReadback, sizeof(argsReadback));
+    if (!argsOk || argsCursor != argsOff + sizeof(args)) {
+        result = 0xE0000073u;
+        goto done;
+    }
+
+    Trace(L"B3cLsPmuItfenBeforeStart", Rd(B, PMU_FALCON + FALCON_ITFEN));
+    Trace(L"B3cLsPmuCpuctlAliasBefore", Rd(B, PMU_FALCON + 0x130));
+    /* ACR leaves DMACTL=1 on this device. Snapshot only; host writes are
+     * ignored in this post-ACR secure state, as observed in 0.4.24. */
+    Step(63);
+    dmaCtlBeforeStart = Rd(B, PMU_FALCON + FALCON_DMACTL);
+    Trace(L"B3cLsPmuDmaCtlBeforeStart", dmaCtlBeforeStart);
+    dmaCtlAtStart = Rd(B, PMU_FALCON + FALCON_DMACTL);
+    Trace(L"B3cLsPmuDmaCtlAtStart", dmaCtlAtStart);
+    Wr(B, PMU_FALCON + 0x130, 2u); /* CPUCTL_ALIAS starts the LS RTOS. */
+    Trace(L"B3cLsPmuCpuctlAliasAfter", Rd(B, PMU_FALCON + 0x130));
+    Step(59);
+    for (polls = 0; polls < 2000u; ++polls) {
+        head = Rd(B, PMU_FALCON + 0x4C8);
+        tail = Rd(B, PMU_FALCON + 0x4CC);
+        if (head == 0xFFFFFFFFu || tail == 0xFFFFFFFFu) {
+            result = 0xE0000071u;
+            goto done;
+        }
+        if (head != tail) {
+            if ((head & 3u) || (tail & 3u) || head > argsOff || tail >= argsOff ||
+                head < tail || head - tail < 44u) {
+                result = 0xE0000071u;
+                goto done;
+            }
+            break; /* INIT is published; parsing/acknowledgment is a later stage. */
+        }
+        Ms(1);
+    }
+    if (polls == 2000u) result = 0xE0000070u;
+    else {
+        tail = Rd(B, PMU_FALCON + 0x4CC);
+        if (tail > argsOff || argsOff - tail < 44u) result = 0xE0000071u;
+        else {
+            Wr(B, PMU_FALCON + FALCON_DMEMC0, (1u << 25) | tail);
+            for (i = 0; i < RTL_NUMBER_OF(initWords); ++i)
+                initWords[i] = Rd(B, PMU_FALCON + FALCON_DMEMD0);
+            initCursor = Rd(B, PMU_FALCON + FALCON_DMEMC0) & 0xFFFFu;
+            initHdr = initWords[0];
+            initType = initWords[1] & 0xFFu;
+            Trace(L"B3cLsPmuInitHdr", initHdr);
+            Trace(L"B3cLsPmuInitType", initType);
+            Trace(L"B3cLsPmuInitPioCursor", initCursor);
+            TraceBin(L"B3cLsPmuInitWords", initWords, sizeof(initWords));
+            if ((initHdr & 0xFFu) != 7u || ((initHdr >> 8) & 0xFFu) != 42u ||
+                initType != 0u || initCursor != tail + 44u)
+                result = 0xE0000072u;
+        }
+    }
+done:
+    Step(60);
+    Trace(L"B3cLsPmuIrqStat", Rd(B, PMU_FALCON + 0x008));
+    Trace(L"B3cLsPmuInitPolls", polls);
+    head = Rd(B, PMU_FALCON + 0x4C8);
+    tail = Rd(B, PMU_FALCON + 0x4CC);
+    Trace(L"B3cLsPmuMsgHead", head);
+    Trace(L"B3cLsPmuMsgTail", tail);
+    Trace(L"B3cLsPmuCpuctl", Rd(B, PMU_FALCON + FALCON_CPUCTL));
+    Trace(L"B3cLsPmuSctl", Rd(B, PMU_FALCON + FALCON_SCTL));
+    Trace(L"B3cLsPmuMailbox0", Rd(B, PMU_FALCON + FALCON_MAILBOX0));
+    Trace(L"B3cLsPmuMailbox1", Rd(B, PMU_FALCON + FALCON_MAILBOX1));
+    /* Falcon register offsets follow the MIT nvgpu GK20A Falcon register map. */
+    Trace(L"B3cLsPmuIrqMode", Rd(B, PMU_FALCON + 0x00C));
+    Trace(L"B3cLsPmuIrqMask", Rd(B, PMU_FALCON + 0x018));
+    Trace(L"B3cLsPmuIrqDest", Rd(B, PMU_FALCON + 0x01C));
+    Trace(L"B3cLsPmuGptmrInt", Rd(B, PMU_FALCON + 0x028));
+    Trace(L"B3cLsPmuGptmrVal", Rd(B, PMU_FALCON + 0x02C));
+    Trace(L"B3cLsPmuPtimerLow", Rd(B, NV_PTIMER_TIME_0));
+    Trace(L"B3cLsPmuPtimerHigh", Rd(B, NV_PTIMER_TIME_1));
+    diagOff = argsOff >= 16u ? argsOff - 16u : 0u;
+    diagCount = (diagOff < dmemSize) ? (dmemSize - diagOff) / 4u : 0u;
+    if (diagCount > RTL_NUMBER_OF(diagWords)) diagCount = RTL_NUMBER_OF(diagWords);
+    if (diagCount) {
+        Wr(B, PMU_FALCON + FALCON_DMEMC0, (1u << 25) | diagOff);
+        for (diagI = 0; diagI < diagCount; ++diagI)
+            diagWords[diagI] = Rd(B, PMU_FALCON + FALCON_DMEMD0);
+        Trace(L"B3cLsPmuArgsWindowOff", diagOff);
+        Trace(L"B3cLsPmuArgsWindowWords", diagCount);
+        TraceBin(L"B3cLsPmuArgsWindow", diagWords, diagCount * sizeof(ULONG));
+    }
+    diagOff = (tail != 0xFFFFFFFFu && tail >= 16u) ? (tail & ~3u) - 16u : 0u;
+    diagCount = (diagOff < dmemSize) ? (dmemSize - diagOff) / 4u : 0u;
+    if (diagCount > RTL_NUMBER_OF(diagWords)) diagCount = RTL_NUMBER_OF(diagWords);
+    if (diagCount) {
+        Wr(B, PMU_FALCON + FALCON_DMEMC0, (1u << 25) | diagOff);
+        for (diagI = 0; diagI < diagCount; ++diagI)
+            diagWords[diagI] = Rd(B, PMU_FALCON + FALCON_DMEMD0);
+        Trace(L"B3cLsPmuQueueDataOff", diagOff);
+        Trace(L"B3cLsPmuQueueDataWords", diagCount);
+        TraceBin(L"B3cLsPmuQueueDataWindow", diagWords, diagCount * sizeof(ULONG));
+    }
+    TraceDurable(L"B3cLsPmuStepResult", result);
+    traceIdx = Rd(B, PMU_FALCON + 0x148);
+    traceNr = (traceIdx >> 16) & 0xFFu;
+    Trace(L"B3cLsPmuTraceIdx", traceIdx);
+    Trace(L"B3cLsPmuTraceNr", traceNr);
+    if (traceNr > RTL_NUMBER_OF(tracePc)) traceNr = RTL_NUMBER_OF(tracePc);
+    for (traceSlot = 0; traceSlot < traceNr; ++traceSlot) {
+        Wr(B, PMU_FALCON + 0x148, traceSlot);
+        tracePc[traceSlot] = Rd(B, PMU_FALCON + 0x14C);
+    }
+    if (traceNr) TraceBin(L"B3cLsPmuTracePc", tracePc, traceNr * sizeof(ULONG));
+    /* Step 61 is read-only with respect to Falcon execution. The IMEM PIO
+     * cursor is selected using the nvgpu GK20A read path (IMEMC block/offset,
+     * auto-increment; then IMEMD reads). It helps classify PC 0x3256 as the
+     * ACR-loaded loader or a later image without assuming either. */
+    Step(61);
+    imemHwcfg = Rd(B, PMU_FALCON + FALCON_HWCFG);
+    imemSize = (imemHwcfg & 0x1FFu) << 8;
+    imemOk = (traceNr != 0 && tracePc[traceNr - 1] < imemSize) ? 1u : 0u;
+    imemOff = imemOk ? (tracePc[traceNr - 1] & ~0x3Fu) : 0u;
+    Trace(L"B3cLsPmuImemHwcfg", imemHwcfg);
+    Trace(L"B3cLsPmuImemSize", imemSize);
+    Trace(L"B3cLsPmuImemTagBefore", Rd(B, PMU_FALCON + FALCON_IMEMT0));
+    Trace(L"B3cLsPmuImemReadOff", imemOff);
+    TraceDurable(L"B3cLsPmuImemReadOk", imemOk);
+    if (imemOk && imemOff + sizeof(imemWords) <= imemSize) {
+        Wr(B, PMU_FALCON + FALCON_IMEMC0,
+           ((imemOff >> 8) << 8) | (((imemOff >> 2) & 0x3Fu) << 2) | FALCON_IMEMC_AINCR);
+        Trace(L"B3cLsPmuImemTagSelected", Rd(B, PMU_FALCON + FALCON_IMEMT0));
+        for (diagI = 0; diagI < RTL_NUMBER_OF(imemWords); ++diagI)
+            imemWords[diagI] = Rd(B, PMU_FALCON + FALCON_IMEMD0);
+        TraceBin(L"B3cLsPmuImemPcWindow", imemWords, sizeof(imemWords));
+    }
+    Trace(L"B3cLsPmuImemTagAfter", Rd(B, PMU_FALCON + FALCON_IMEMT0));
+    Trace(L"B3cLsPmuDmaCmd", Rd(B, PMU_FALCON + FALCON_DMATRFCMD));
+    Trace(L"B3cLsPmuDmaBase", Rd(B, PMU_FALCON + FALCON_DMATRFBASE));
+    Trace(L"B3cLsPmuDmaMoffs", Rd(B, PMU_FALCON + FALCON_DMATRFMOFFS));
+    Trace(L"B3cLsPmuDmaFboffs", Rd(B, PMU_FALCON + FALCON_DMATRFFBOFFS));
+    Trace(L"B3cLsPmuDmaCtl", Rd(B, PMU_FALCON + FALCON_DMACTL));
+    Trace(L"B3cLsPmuBindStatus", Rd(B, PMU_FALCON + FALCON_BIND_STATUS));
+    Trace(L"B3cLsPmuBindInst", Rd(B, PMU_FALCON + FALCON_BIND_INST));
+    Trace(L"B3cLsPmuCtxEnable", Rd(B, PMU_FALCON + FALCON_CTX_ENABLE));
+    Trace(L"B3cLsPmuCtxAction", Rd(B, PMU_FALCON + FALCON_CTX_ACTION));
+    for (diagI = 0; diagI < RTL_NUMBER_OF(transcfg); ++diagI)
+        transcfg[diagI] = Rd(B, PMU_FALCON + PMU_FBIF_TRANSCFG(diagI));
+    TraceBin(L"B3cLsPmuTranscfg", transcfg, sizeof(transcfg));
+    Trace(L"B3cLsPmuFbifCtl", Rd(B, PMU_FALCON + PMU_FBIF_CTL));
+    Trace(L"B3cLsPmuPfifoIntr0", Rd(B, 0x2100));
+    faultId = Rd(B, 0x259C);
+    Trace(L"B3cLsPmuFaultId", faultId);
+    faultNr = 0;
+    for (faultUnit = 0; faultUnit < 32; ++faultUnit) {
+        if (!(faultId & (1u << faultUnit)) && faultUnit != 0x17u) continue;
+        faultRecs[faultNr][0] = faultUnit;
+        faultRecs[faultNr][1] = Rd(B, 0x2800 + faultUnit * 0x10);
+        faultRecs[faultNr][2] = Rd(B, 0x2804 + faultUnit * 0x10);
+        faultRecs[faultNr][3] = Rd(B, 0x2808 + faultUnit * 0x10);
+        faultRecs[faultNr][4] = Rd(B, 0x280C + faultUnit * 0x10);
+        ++faultNr;
+    }
+    Trace(L"B3cLsPmuFaultRecCount", faultNr);
+    if (faultNr) TraceBin(L"B3cLsPmuFaultRecs", faultRecs, faultNr * sizeof(faultRecs[0]));
+    Trace(L"B3cLsPmuMcInt", Rd(Dev->Mc, MC_INTSTATUS));
+    Trace(L"B3cLsPmuMcErr", Rd(Dev->Mc, MC_ERR_STATUS));
+    Trace(L"B3cLsPmuMcErrAdr", Rd(Dev->Mc, MC_ERR_ADR));
+    /* Expand both bounded DMEM snapshots to 256 bytes for loader/runtime data. */
+    diagOff = argsOff >= 0x80u ? argsOff - 0x80u : 0u;
+    diagCount = (diagOff < dmemSize) ? (dmemSize - diagOff) / sizeof(ULONG) : 0u; /* Claude: no underflow on a bogus tail */
+    if (diagCount > RTL_NUMBER_OF(diagWords)) diagCount = RTL_NUMBER_OF(diagWords);
+    if (diagCount) {
+        Wr(B, PMU_FALCON + FALCON_DMEMC0, (1u << 25) | diagOff);
+        for (diagI = 0; diagI < diagCount; ++diagI) diagWords[diagI] = Rd(B, PMU_FALCON + FALCON_DMEMD0);
+        Trace(L"B3cLsPmuArgsWindowOff", diagOff);
+        Trace(L"B3cLsPmuArgsWindowWords", diagCount);
+        TraceBin(L"B3cLsPmuArgsWindow", diagWords, diagCount * sizeof(ULONG));
+    }
+    diagOff = (tail != 0xFFFFFFFFu && tail >= 0x80u) ? ((tail & ~3u) - 0x80u) : 0u;
+    diagCount = (diagOff < dmemSize) ? (dmemSize - diagOff) / sizeof(ULONG) : 0u; /* Claude: no underflow on a bogus tail */
+    if (diagCount > RTL_NUMBER_OF(diagWords)) diagCount = RTL_NUMBER_OF(diagWords);
+    if (diagCount) {
+        Wr(B, PMU_FALCON + FALCON_DMEMC0, (1u << 25) | diagOff);
+        for (diagI = 0; diagI < diagCount; ++diagI) diagWords[diagI] = Rd(B, PMU_FALCON + FALCON_DMEMD0);
+        Trace(L"B3cLsPmuQueueDataOff", diagOff);
+        Trace(L"B3cLsPmuQueueDataWords", diagCount);
+        TraceBin(L"B3cLsPmuQueueDataWindow", diagWords, diagCount * sizeof(ULONG));
+    }
+    TraceDurable(L"B3cLsPmuStartResult", result);
+    return result;
+}
+
 static VOID ProbeB3a(PSWGPU_DEVICE Dev, BOOLEAN RunAcr)
 {
     volatile UCHAR *B = Dev->Bar0;
@@ -1774,7 +2059,8 @@ static VOID ProbeB3a(PSWGPU_DEVICE Dev, BOOLEAN RunAcr)
     ULONG nsOff, nsSize, dataBase, dataSize, numApps, app0Off, app0Size, sigSrc;
     ULONG hwcfg, imemSize, dmemSize, imemBase, dbgFused;
     ULONG wprRawStart, wprRawLimit, wprAllocLen = 0, wprUsed = 0;
-    ULONG bootPolls;
+    ULONG bootPolls, pmuArgv = 0;
+    BOOLEAN acrAttempted = FALSE;
     ULONGLONG arenaIova = 0, instIova = 0;
     ULONGLONG wprStart, wprEnd;
     ULONG desc[19];
@@ -1981,7 +2267,8 @@ static VOID ProbeB3a(PSWGPU_DEVICE Dev, BOOLEAN RunAcr)
         }
 
         Step(48);   /* build WPR in CPU memory and verify it fits the protected region */
-        err = BuildWprB3b(dmemSize, &wprImage, &wprAllocLen, &wprUsed);
+        Step(64);   /* PMU LS loader DMA bases include the physical WPR base */
+        err = BuildWprB3b(dmemSize, wprStart, &wprImage, &wprAllocLen, &wprUsed, &pmuArgv);
         Trace(L"AcrWprBuildAlloc", wprAllocLen);
         Trace(L"AcrWprBuildUsed", wprUsed);
         if (err != 0) goto out;
@@ -2059,7 +2346,62 @@ static VOID ProbeB3a(PSWGPU_DEVICE Dev, BOOLEAN RunAcr)
         Step(55);   /* discriminator: flush all PDBs after the selected-PDB flush */
         if (!AcrMmuInvalidateAllPdbs(B)) { err = 0xE000006Bu; goto out; }
 
+        /* Nouveau gk104_fifo_intr() snapshots asserted fault units, writes
+         * each unit bit to FAULT_ID (0x259C), then ACKs PFIFO INTR0. The data
+         * registers can retain their payload after ACK; only a set ID bit is
+         * a current record. Clear stale MMU-fault latches immediately before
+         * the single ACR launch and verify that the validity bits went away. */
+        Step(62);   /* Claude: 53 is already the B3c priv ring init step */
+        {
+            ULONG intrBefore = Rd(B, 0x2100), idBefore = Rd(B, 0x259C);
+            ULONG intrAfter = intrBefore, idAfter = idBefore, faultCount = 0;
+            ULONG faultUnits[32], recBefore[32][5], recAfter[32][5];
+            ULONG u, j, clearPolls;
+            BOOLEAN cleared = FALSE;
+            Trace(L"B3cPreAcrFifoIntr0", intrBefore);
+            Trace(L"B3cPreAcrFaultId", idBefore);
+            for (u = 0; u < 32; ++u) {
+                if (!(idBefore & (1u << u))) continue;
+                faultUnits[faultCount] = u;
+                recBefore[faultCount][0] = u;
+                for (j = 1; j < 5; ++j)
+                    recBefore[faultCount][j] = Rd(B, 0x2800 + u * 0x10 + (j - 1) * 4);
+                ++faultCount;
+            }
+            Trace(L"B3cPreAcrFaultRecCount", faultCount);
+            if (faultCount)
+                TraceBin(L"B3cPreAcrFaultRecs", recBefore, faultCount * sizeof(recBefore[0]));
+            for (u = 0; u < 32; ++u)
+                if (idBefore & (1u << u)) Wr(B, 0x259C, 1u << u);
+            if (intrBefore & 0x18000000u) Wr(B, 0x2100, intrBefore & 0x18000000u);
+            for (clearPolls = 0; clearPolls < 100u; ++clearPolls) {
+                idAfter = Rd(B, 0x259C);
+                intrAfter = Rd(B, 0x2100);
+                if (idAfter == 0 && !(intrAfter & 0x18000000u)) {
+                    cleared = TRUE;
+                    break;
+                }
+                Us(10);
+            }
+            Trace(L"B3cPreAcrFaultIdAfterClear", idAfter);
+            Trace(L"B3cPreAcrFifoIntr0AfterClear", intrAfter);
+            Trace(L"B3cPreAcrFaultClearPolls", clearPolls);
+            if (faultCount) {
+                for (u = 0; u < faultCount; ++u) {
+                    recAfter[u][0] = faultUnits[u];
+                    for (j = 1; j < 5; ++j)
+                        recAfter[u][j] = Rd(B, 0x2800 + faultUnits[u] * 0x10 + (j - 1) * 4);
+                }
+                TraceBin(L"B3cPreAcrFaultRecsAfterAck", recAfter, faultCount * sizeof(recAfter[0]));
+                Trace(L"B3cPreAcrFaultDataPersist", RtlCompareMemory(recBefore, recAfter,
+                    faultCount * sizeof(recBefore[0])) == faultCount * sizeof(recBefore[0]) ? 1u : 0u);
+            }
+            TraceDurable(L"B3cPreAcrFaultClearResult", cleared ? 0u : 0xE0000075u);
+            if (!cleared) { err = 0xE0000075u; goto out; }
+        }
+
         Step(56);   /* one-shot secure ACR boot; bounded wait, no automatic retry */
+        acrAttempted = TRUE;
         Wr(Dev->Mc, MC_INTSTATUS, Rd(Dev->Mc, MC_INTSTATUS));   /* 0.4.6: fresh MC errors for the boot */
         Wr(B, PMU_FALCON + FALCON_MAILBOX0, 0xCAFEBEEFu);
         Wr(B, PMU_FALCON + FALCON_BOOTVEC, startTag << 8);
@@ -2110,6 +2452,29 @@ static VOID ProbeB3a(PSWGPU_DEVICE Dev, BOOLEAN RunAcr)
                 ++n;
             }
             if (n) TraceBin(L"B3cFaultRecs", rec, n * 5 * sizeof(ULONG));
+            /* 0.4.17 (read only): what state ACR left the LS falcons in.
+             * SCTL bits [13:12] report the falcon security mode. The GR
+             * falcons (FECS 0x409000, GPCCS 0x41A000) are read only when
+             * PMC_ENABLE already has GR (bit 12) on; nothing is enabled here. */
+            {
+                ULONG pmcEn = Rd(B, NV_PMC_ENABLE);
+                Trace(L"B3cLsPmcEnable", pmcEn);
+                Trace(L"B3cPostAcrPmuCpuctl", Rd(B, PMU_FALCON + FALCON_CPUCTL));
+                Trace(L"B3cPostAcrPmuSctl", Rd(B, PMU_FALCON + FALCON_SCTL));
+                Trace(L"B3cLsPmuMb0", Rd(B, PMU_FALCON + FALCON_MAILBOX0));
+                Trace(L"B3cLsPmuMb1", Rd(B, PMU_FALCON + FALCON_MAILBOX1));
+                if (pmcEn & 0x1000u) {
+                    Trace(L"B3cLsFecsCpuctl", Rd(B, 0x409000 + FALCON_CPUCTL));
+                    Trace(L"B3cLsFecsSctl", Rd(B, 0x409000 + FALCON_SCTL));
+                    Trace(L"B3cLsFecsMb0", Rd(B, 0x409000 + FALCON_MAILBOX0));
+                    Trace(L"B3cLsGpccsCpuctl", Rd(B, 0x41A000 + FALCON_CPUCTL));
+                    Trace(L"B3cLsGpccsSctl", Rd(B, 0x41A000 + FALCON_SCTL));
+                    Trace(L"B3cLsGpccsMb0", Rd(B, 0x41A000 + FALCON_MAILBOX0));
+                    Trace(L"B3cLsGrRead", 1);
+                } else {
+                    Trace(L"B3cLsGrRead", 0);
+                }
+            }
             TraceDurable(L"B3cDiagDone", 1);
         }
         if (bootPolls == 2000) err = 0xE0000067u;
@@ -2119,9 +2484,13 @@ static VOID ProbeB3a(PSWGPU_DEVICE Dev, BOOLEAN RunAcr)
             err = 0;
         }
         TraceDurable(L"AcrBootResult", err);
+        if (err == 0) {
+            err = B3cStartPmuLs(Dev, pmuArgv);
+            TraceDurable(L"B3cLsResult", err);
+        }
     } else {
         /* CPU-only WPR layout and readback; no GPU DMA or ACR/PMU start. */
-        (VOID)BuildWprB3b(dmemSize, NULL, NULL, NULL);
+        (VOID)BuildWprB3b(dmemSize, 0, NULL, NULL, NULL, NULL);
     }
 
     /* In launch mode the surrounding PowerTest path asserts GPU reset before
@@ -2129,7 +2498,7 @@ static VOID ProbeB3a(PSWGPU_DEVICE Dev, BOOLEAN RunAcr)
     if (!RunAcr) PmuReset(B, L"B3aScrubPolls2");
 
 out:
-    if (RunAcr) TraceDurable(L"AcrBootResult", err);
+    if (RunAcr && !acrAttempted) TraceDurable(L"AcrBootResult", err);
     TraceDurable(L"B3aResult", err);
     if (boot != NULL) ExFreePoolWithTag(boot, SWGPU_TAG);
     if (wprImage != NULL) ExFreePoolWithTag(wprImage, SWGPU_TAG);

@@ -91,7 +91,7 @@ function Show-Trace {
   Sum ('at start: VOUT {0}  VOUT_DVS {1}  GPIO6 {2}' -f (MvText $p.VoutAtStart), (MvText $p.VoutDvsAtStart), (Gpio $p.Gpio6AtStart))
   Sum ('at start: clamp (RG_CNTRL bit0) {0}  gpu clock {1}  pllg_ref {2}  gpu reset {3}  PLLP_OUTC {4}  fuse clock {5}  MC hot reset ctrl {6} stat {7}' -f (Bit $p.RgCntrlAtStart 0), (Bit $p.ClkXAtStart 24), (Bit $p.ClkXAtStart 29), (Bit $p.RstXAtStart 24), (Hex $p.PllpOutcAtStart), (Bit $p.ClkHAtStart 7), (Hex $p.McHotCtrlAtStart), (Hex $p.McHotStatAtStart))
   if ($p.TestRuns) {
-    $steps = @{ 1 = 'read the regulator'; 2 = 'VDD_GPU on'; 3 = 'clocks on'; 4 = 'reset assert'; 5 = 'clamp off'; 6 = 'reset deassert'; 7 = 'MC flush'; 8 = 'first BAR0 read (BOOT_0)'; 9 = 'PTIMER and WPR reads'; 20 = 'B1: topology read'; 21 = 'B1: PMU falcon read'; 22 = 'B1: DMEM test'; 23 = 'B1: priv ring init'; 29 = 'B2a: priv ring init'; 40 = 'B3a: firmware from registry'; 41 = 'B3a: bl.bin header'; 42 = 'B3a: ucode_load.bin headers'; 43 = 'B3a: signed image'; 44 = 'B3a: PMU reset + IMEM PIO'; 45 = 'B3a: DMEM descriptor'; 46 = 'B3b: CPU-side image (user code)'; 47 = 'B3c: read hardware WPR range'; 48 = 'B3c: build bounded WPR image'; 49 = 'B3c: prepare SMMU and PMU VM'; 50 = 'B3c: bind PMU instance block'; 51 = 'B3c: write ACR DMA descriptors'; 52 = 'B3c: legacy ACR step'; 53 = 'B3c: priv ring init'; 54 = 'B3c: invalidate selected PMU PDB'; 55 = 'B3c: invalidate all PMU PDBs'; 56 = 'B3c: one-shot ACR boot'; 57 = 'B3c: select per-instance PDB page size'; 30 = 'B2a: SMMU check'; 31 = 'B2a: DMA setup'; 32 = 'B2a: DMA memory -> DMEM'; 33 = 'B2a: DMA DMEM -> memory'; 34 = 'B2a: DMA setup restore'; 35 = 'B2a: memory path read'; 36 = 'B2a: DMA try 1'; 37 = 'B2a: DMA try 2 (after PMU reset)'; 38 = 'B2a: DMA try 3 (after PMU reset)'; 39 = 'B2a: PMU instance bind'; 10 = 'power down'; 11 = 'done'; 100 = 'done, GPU left on (KeepOn)' }
+    $steps = @{ 1 = 'read the regulator'; 2 = 'VDD_GPU on'; 3 = 'clocks on'; 4 = 'reset assert'; 5 = 'clamp off'; 6 = 'reset deassert'; 7 = 'MC flush'; 8 = 'first BAR0 read (BOOT_0)'; 9 = 'PTIMER and WPR reads'; 20 = 'B1: topology read'; 21 = 'B1: PMU falcon read'; 22 = 'B1: DMEM test'; 23 = 'B1: priv ring init'; 29 = 'B2a: priv ring init'; 40 = 'B3a: firmware from registry'; 41 = 'B3a: bl.bin header'; 42 = 'B3a: ucode_load.bin headers'; 43 = 'B3a: signed image'; 44 = 'B3a: PMU reset + IMEM PIO'; 45 = 'B3a: DMEM descriptor'; 46 = 'B3b: CPU-side image (user code)'; 47 = 'B3c: read hardware WPR range'; 48 = 'B3c: build bounded WPR image'; 49 = 'B3c: prepare SMMU and PMU VM'; 50 = 'B3c: bind PMU instance block'; 51 = 'B3c: write ACR DMA descriptors'; 52 = 'B3c: legacy ACR step'; 53 = 'B3c: priv ring init'; 62 = 'B3c: snapshot and clear old PFIFO MMU faults'; 54 = 'B3c: invalidate selected PMU PDB'; 55 = 'B3c: invalidate all PMU PDBs'; 56 = 'B3c: one-shot ACR boot'; 57 = 'B3c: select per-instance PDB page size'; 58 = 'B3c: write advertised PMU argv and start LS PMU'; 59 = 'B3c: wait for and inspect PMU INIT'; 60 = 'B3c: read PMU post-wait diagnostics'; 61 = 'B3c: snapshot LS loader IMEM, DMA, FBIF, bind and faults'; 63 = 'B3c: snapshot DMACTL before LS start'; 64 = 'B3c: build PMU loader DMA bases from WPR address'; 30 = 'B2a: SMMU check'; 31 = 'B2a: DMA setup'; 32 = 'B2a: DMA memory -> DMEM'; 33 = 'B2a: DMA DMEM -> memory'; 34 = 'B2a: DMA setup restore'; 35 = 'B2a: memory path read'; 36 = 'B2a: DMA try 1'; 37 = 'B2a: DMA try 2 (after PMU reset)'; 38 = 'B2a: DMA try 3 (after PMU reset)'; 39 = 'B2a: PMU instance bind'; 10 = 'power down'; 11 = 'done'; 100 = 'done, GPU left on (KeepOn)' }
     Sum ('power test runs {0}: last step {1} ({2})  result {3}  took {4} us' -f $p.TestRuns, $p.Step, $steps[[int]$p.Step], (Hex $p.Result), $p.TestUs)
     if ($null -ne $p.McHotStatAfterReset) {
       $pts = @(@('GPU off', $p.McHotStatAtStart), @('after reset', $p.McHotStatAfterReset), @('after flush', $p.McHotStatAfterFlush), @('after BAR0 reads', $p.McHotStatAfterBar0), @('B2a start', $p.McHotStatB2aStart), @('before DMA', $p.McHotStatBeforeDma), @('after DMA', $p.McHotStatAfterDma))
@@ -266,8 +266,9 @@ function Show-Trace {
       }
     }
     if ($null -ne $p.B3aResult) {
-      $b3err = @{ '00000000' = 'OK'; 'E0000041' = 'firmware missing in the registry (run FwTest from the kit)'; 'E0000042' = 'bl.bin too short'; 'E0000043' = 'bl.bin header bad'; 'E0000044' = 'bl.bin descriptor bad'; 'E0000045' = 'ucode_load.bin too short'; 'E0000046' = 'ucode_load.bin header bad'; 'E0000047' = 'patch location outside the file'; 'E0000048' = 'load header outside the file'; 'E0000049' = 'app table bad'; 'E000004A' = 'signature/section offsets bad'; 'E000004B' = 'no memory'; 'E000004C' = 'bootloader does not fit IMEM'; 'E000004D' = 'no memory'; 'E0000061' = 'invalid WPR range'; 'E0000062' = 'built WPR is larger than the hardware protected region'; 'E0000063' = 'ACR descriptor is too short'; 'E0000064' = 'could not map WPR/VM memory'; 'E0000065' = 'PMU virtual-memory bind failed'; 'E0000066' = 'ACR DMA descriptor readback mismatch'; 'E0000067' = 'ACR boot timed out'; 'E0000068' = 'ACR boot mailbox indicated failure'; 'E0000069' = 'WPR CPU write/readback mismatch'; 'E000006A' = 'PMU PDB MMU invalidate failed'; 'E000006B' = 'all-PDB MMU invalidate could not observe FIFO empty'; 'E000006C' = 'MMU per-instance PDB page-size selection readback failed' }
+      $b3err = @{ '00000000' = 'OK'; 'E0000041' = 'firmware missing in the registry (run FwTest from the kit)'; 'E0000042' = 'bl.bin too short'; 'E0000043' = 'bl.bin header bad'; 'E0000044' = 'bl.bin descriptor bad'; 'E0000045' = 'ucode_load.bin too short'; 'E0000046' = 'ucode_load.bin header bad'; 'E0000047' = 'patch location outside the file'; 'E0000048' = 'load header outside the file'; 'E0000049' = 'app table bad'; 'E000004A' = 'signature/section offsets bad'; 'E000004B' = 'no memory'; 'E000004C' = 'bootloader does not fit IMEM'; 'E000004D' = 'no memory'; 'E0000061' = 'invalid WPR range'; 'E0000062' = 'built WPR is larger than the hardware protected region'; 'E0000063' = 'ACR descriptor is too short'; 'E0000064' = 'could not map WPR/VM memory'; 'E0000065' = 'PMU virtual-memory bind failed'; 'E0000066' = 'ACR DMA descriptor readback mismatch'; 'E0000067' = 'ACR boot timed out'; 'E0000068' = 'ACR boot mailbox indicated failure'; 'E0000069' = 'WPR CPU write/readback mismatch'; 'E000006A' = 'PMU PDB MMU invalidate failed'; 'E000006B' = 'all-PDB MMU invalidate could not observe FIFO empty'; 'E000006C' = 'MMU per-instance PDB page-size selection readback failed'; 'E000006D' = 'ACR did not leave PMU halted with empty mailboxes'; 'E000006E' = 'PMU DMEM size is outside the supported range'; 'E000006F' = 'PMU HS halt interrupt did not clear'; 'E0000070' = 'PMU LS INIT did not appear within 2000 polls (2 s)'; 'E0000071' = 'PMU INIT queue pointers are invalid'; 'E0000072' = 'PMU INIT message header/type or PIO cursor mismatch'; 'E0000073' = 'PMU cmdline args DMEM readback/cursor mismatch'; 'E0000074' = 'WPR-advertised PMU argv does not match the runtime DMEM args location'; 'E0000075' = 'pre-ACR PFIFO MMU fault latches did not clear; ACR was skipped'; 'E0000076' = 'PMU DMACTL REQUIRE_CTX did not clear before LS start'; 'E0000077' = 'PMU loader WPR DMA address cannot be represented in the descriptor' }
       $why3 = $b3err[(Key32 $p.B3aResult)]; if (-not $why3) { $why3 = '?' }
+      Sum ('B3c PMU app version {0}; argv in WPR {1}' -f (Hex $p.B3cPmuAppVersion), (Hex $p.B3bPmuArgv))
       Sum ('B3a firmware: bl.bin {0} bytes magic {1} (hdr {2} data {3}+{4})  start tag {5} dmem off {6} code {7}+{8}' -f $p.B3aBlLen, (Hex $p.B3aBlMagic), (Hex $p.B3aBlHdrOff), (Hex $p.B3aBlDataOff), (Hex $p.B3aBlDataSize), (Hex $p.B3aBlStartTag), (Hex $p.B3aBlDmemLoadOff), (Hex $p.B3aBlCodeOff), (Hex $p.B3aBlCodeSize))
       if ($null -ne $p.B3aUcMagic) {
         Sum ('B3a firmware: ucode_load.bin {0} bytes magic {1} (hdr {2} data {3}+{4})  sig prod {5}+{6} dbg {7}+{8}  patch {9}/{10} -> loc {11} sig {12}' -f $p.B3aUcLen, (Hex $p.B3aUcMagic), (Hex $p.B3aUcHdrOff), (Hex $p.B3aUcDataOff), (Hex $p.B3aUcDataSize), (Hex $p.B3aSigPrdOff), (Hex $p.B3aSigPrdSize), (Hex $p.B3aSigDbgOff), (Hex $p.B3aSigDbgSize), (Hex $p.B3aPatchLoc), (Hex $p.B3aPatchSig), (Hex $p.B3aLoc), (Hex $p.B3aSig))
@@ -299,9 +300,23 @@ function Show-Trace {
         else { $bv += ('{0}={1:X}' -f $pr.Name.Substring(3), [uint32]$pr.Value) }
       }
       Sum ('B3b values: ' + ($bv -join '  '))
+      if ($null -ne $p.B3bPmuDmaIdx) { Sum ('B3b PMU LS loader: DMA index {0}; argv {1}' -f (Hex $p.B3bPmuDmaIdx), (Hex $p.B3bPmuArgv)) }
+      if ($null -ne $p.B3cPmuCodeDmaBase) { Sum ('B3c PMU loader DMA: code/data base {0}/{1}; WPR base {2}{3}; absolute addresses {4}' -f (Hex $p.B3cPmuCodeDmaBase), (Hex $p.B3cPmuDataDmaBase), (Hex $p.B3cPmuWprBaseHi), (Hex $p.B3cPmuWprBaseLo), $p.B3cPmuDmaBaseAbsolute) }
+      if ($null -ne $p.B3bPmuBld) { $pb = [byte[]]$p.B3bPmuBld; $pl = @(); for ($i = 0; $i + 4 -le $pb.Length; $i += 4) { $pl += ('{0:X8}' -f [BitConverter]::ToUInt32($pb, $i)) }; Sum ('B3b PMU WPR loader-config words (DMA index is word 0, offset {0}): {1}' -f (Hex $p.B3bPmuBldOff), ($pl -join ' ')) }
       if ($bb.Count) { Sum ('B3b binary traces: ' + ($bb -join '  ')) }
       $b3bok = 'OK'; if ([uint32]$p.B3bResult -ne 0) { $b3bok = 'error code from the B3b code' }
       Sum ('B3b result {0} ({1})' -f (Hex $p.B3bResult), $b3bok)
+    }
+    if ($null -ne $p.B3cPreAcrFaultClearResult) {
+      $fcWhy = $b3err[(Key32 $p.B3cPreAcrFaultClearResult)]; if (-not $fcWhy) { $fcWhy = '?' }
+      Sum ('B3c pre-ACR PFIFO MMU fault clear: result {0} ({1}); intr0/id {2}/{3} -> {4}/{5}; polls {6}; old payload remained after ACK {7}' -f (Hex $p.B3cPreAcrFaultClearResult), $fcWhy, (Hex $p.B3cPreAcrFifoIntr0), (Hex $p.B3cPreAcrFaultId), (Hex $p.B3cPreAcrFifoIntr0AfterClear), (Hex $p.B3cPreAcrFaultIdAfterClear), $p.B3cPreAcrFaultClearPolls, (Hex $p.B3cPreAcrFaultDataPersist))
+      foreach ($w in @(@('pre-ACK active fault records', 'B3cPreAcrFaultRecs'), @('fault data after ACK', 'B3cPreAcrFaultRecsAfterAck'))) {
+        if ($null -ne $p.($w[1])) {
+          $fb = [byte[]]$p.($w[1]); $fv = @()
+          for ($i = 0; $i + 4 -le $fb.Length; $i += 4) { $fv += ('{0:X8}' -f [BitConverter]::ToUInt32($fb, $i)) }
+          Sum ('B3c {0} (unit, inst, lo, hi, info): ' -f $w[0] + ($fv -join ' '))
+        }
+      }
     }
     if ($null -ne $p.AcrBootResult) {
       Sum ('ACR WPR range {0:X8}{1:X8}..{2:X8}{3:X8}; blob PA {4:X8}{5:X8} size {6}; CPU readback {7}; SMMU restored {8}' -f [uint32]$p.AcrWprStartHi, [uint32]$p.AcrWprStartLo, [uint32]$p.AcrWprEndHi, [uint32]$p.AcrWprEndLo, [uint32]$p.AcrWprBufferPaHi, [uint32]$p.AcrWprBufferPaLo, $p.AcrWprBufferBytes, $p.AcrWprCpuReadback, $p.AcrSmmuRestored)
@@ -345,6 +360,48 @@ function Show-Trace {
       if ($null -ne $p.B3cTracePc) { $tb = [byte[]]$p.B3cTracePc; $tl = @(); for ($i = 0; $i + 4 -le $tb.Length; $i += 4) { $tl += ('{0:X}' -f [BitConverter]::ToUInt32($tb, $i)) }; $tp = $tl -join ' ' }
       Sum ('B3c after the boot wait: trace idx {0} ({1} entries) PCs {2}  DMATRFCMD {3} base {4} moffs {5} fboffs {6}  DMACTL {7}' -f (Hex $p.B3cTraceIdx), $p.B3cTraceNr, $tp, (Hex $p.B3cDmaCmd), (Hex $p.B3cDmaBase), (Hex $p.B3cDmaMoffs), (Hex $p.B3cDmaFboffs), (Hex $p.B3cDmactl))
       Sum ('B3c faults during the boot: MC int {0} err {1} adr {2}  PFIFO intr0 {3} (bit 28 = MMU fault) fault id {4}' -f (Hex $p.B3cMcInt), (Hex $p.B3cMcErr), (Hex $p.B3cMcErrAdr), (Hex $p.B3cFifoIntr0), (Hex $p.B3cFifoFaultId))
+      if ($null -ne $p.B3cPostAcrPmuSctl) {
+        Sum ('B3c falcons after ACR: PMC_ENABLE {0} (GR bit 12 = {1})  PMU CPUCTL {2} SCTL {3} (mode bits 13:12 = {4}) mb0 {5} mb1 {6}' -f (Hex $p.B3cLsPmcEnable), (([uint32]$p.B3cLsPmcEnable -shr 12) -band 1), (Hex $p.B3cPostAcrPmuCpuctl), (Hex $p.B3cPostAcrPmuSctl), (([uint32]$p.B3cPostAcrPmuSctl -shr 12) -band 3), (Hex $p.B3cLsPmuMb0), (Hex $p.B3cLsPmuMb1))
+        if ([uint32]$p.B3cLsGrRead -eq 1) {
+          Sum ('B3c GR falcons after ACR: FECS CPUCTL {0} SCTL {1} (mode {2}) mb0 {3}  GPCCS CPUCTL {4} SCTL {5} (mode {6}) mb0 {7}' -f (Hex $p.B3cLsFecsCpuctl), (Hex $p.B3cLsFecsSctl), (([uint32]$p.B3cLsFecsSctl -shr 12) -band 3), (Hex $p.B3cLsFecsMb0), (Hex $p.B3cLsGpccsCpuctl), (Hex $p.B3cLsGpccsSctl), (([uint32]$p.B3cLsGpccsSctl -shr 12) -band 3), (Hex $p.B3cLsGpccsMb0))
+        } else {
+          Sum 'B3c GR falcons after ACR: not read (GR is not enabled in PMC_ENABLE; nothing was enabled)'
+        }
+      }
+      if ($null -ne $p.B3cLsResult) {
+        $lsWhy = $b3err[(Key32 $p.B3cLsResult)]; if (-not $lsWhy) { $lsWhy = '?' }
+        if ($null -ne $p.B3cLsPmuDmaCtlBeforeStart) { Sum ('B3c LS start DMACTL snapshot: before start {0}; at CPUCTL_ALIAS write {1}' -f (Hex $p.B3cLsPmuDmaCtlBeforeStart), (Hex $p.B3cLsPmuDmaCtlAtStart)) }
+        Sum ('B3c LS PMU start result {0} ({1}); INIT queue polls {2} head/tail {3}/{4}; CPUCTL {5} SCTL {6} mailbox0/1 {7}/{8}' -f (Hex $p.B3cLsResult), $lsWhy, $p.B3cLsPmuInitPolls, (Hex $p.B3cLsPmuMsgHead), (Hex $p.B3cLsPmuMsgTail), (Hex $p.B3cLsPmuCpuctl), (Hex $p.B3cLsPmuSctl), (Hex $p.B3cLsPmuMailbox0), (Hex $p.B3cLsPmuMailbox1))
+        Sum ('B3c LS PMU setup: DMEM {0} bytes; IRQSTAT after clear {1}; aperture0/4 {2}/{3}; args readback {4} offset/cursor {5}/{6}; ITFEN {7}; CPUCTL_ALIAS before/after {8}/{9}' -f $p.B3cLsPmuDmemSize, (Hex $p.B3cLsPmuIrqAfterClear), (Hex $p.B3cLsPmuAperture0), (Hex $p.B3cLsPmuAperture4), $p.B3cLsPmuArgsOk, (Hex $p.B3cLsPmuArgsOff), (Hex $p.B3cLsPmuArgsCursor), (Hex $p.B3cLsPmuItfenBeforeStart), (Hex $p.B3cLsPmuCpuctlAliasBefore), (Hex $p.B3cLsPmuCpuctlAliasAfter))
+        if ($null -ne $p.B3cLsPmuInitHdr) { Sum ('B3c LS PMU INIT header {0}; msg type {1}; PIO cursor {2}; Step result {3}' -f (Hex $p.B3cLsPmuInitHdr), (Hex $p.B3cLsPmuInitType), (Hex $p.B3cLsPmuInitPioCursor), (Hex $p.B3cLsPmuStepResult)) }
+        $lp = ''; if ($null -ne $p.B3cLsPmuTracePc) { $lb = [byte[]]$p.B3cLsPmuTracePc; $ll = @(); for ($i = 0; $i + 4 -le $lb.Length; $i += 4) { $ll += ('{0:X}' -f [BitConverter]::ToUInt32($lb, $i)) }; $lp = $ll -join ' ' }
+        Sum ('B3c LS PMU after wait: IRQSTAT {0}; PC trace idx {1} ({2} entries) PCs {3}' -f (Hex $p.B3cLsPmuIrqStat), (Hex $p.B3cLsPmuTraceIdx), $p.B3cLsPmuTraceNr, $lp)
+        Sum ('B3c LS PMU diagnostic registers: IRQMODE/MASK/DEST {0}/{1}/{2}; GPTMR INT/VAL {3}/{4}; PTIMER low/high {5}/{6}' -f (Hex $p.B3cLsPmuIrqMode), (Hex $p.B3cLsPmuIrqMask), (Hex $p.B3cLsPmuIrqDest), (Hex $p.B3cLsPmuGptmrInt), (Hex $p.B3cLsPmuGptmrVal), (Hex $p.B3cLsPmuPtimerLow), (Hex $p.B3cLsPmuPtimerHigh))
+        if ($null -ne $p.B3cLsPmuDmaCmd) {
+          Sum ('B3c LS PMU loader DMA: cmd/base/moffs/fboffs {0}/{1}/{2}/{3}; DMACTL {4}; bind status/inst {5}/{6}; context enable/action {7}/{8}' -f (Hex $p.B3cLsPmuDmaCmd), (Hex $p.B3cLsPmuDmaBase), (Hex $p.B3cLsPmuDmaMoffs), (Hex $p.B3cLsPmuDmaFboffs), (Hex $p.B3cLsPmuDmaCtl), (Hex $p.B3cLsPmuBindStatus), (Hex $p.B3cLsPmuBindInst), (Hex $p.B3cLsPmuCtxEnable), (Hex $p.B3cLsPmuCtxAction))
+          Sum ('B3c LS PMU FBIF: FBIF_CTL {0}; TRANSCFG words are listed below' -f (Hex $p.B3cLsPmuFbifCtl))
+          Sum ('B3c LS PMU post-wait faults (asserted ID units only): PFIFO intr0 {0}; fault id {1}; current fault records {2}; MC int/err/adr {3}/{4}/{5}' -f (Hex $p.B3cLsPmuPfifoIntr0), (Hex $p.B3cLsPmuFaultId), $p.B3cLsPmuFaultRecCount, (Hex $p.B3cLsPmuMcInt), (Hex $p.B3cLsPmuMcErr), (Hex $p.B3cLsPmuMcErrAdr))
+          Sum ('B3c LS PMU IMEM: HWCFG {0}; bytes {1}; PC-window offset {2}; read valid {3}; tag before/selected/after {4}/{5}/{6}' -f (Hex $p.B3cLsPmuImemHwcfg), (Hex $p.B3cLsPmuImemSize), (Hex $p.B3cLsPmuImemReadOff), $p.B3cLsPmuImemReadOk, (Hex $p.B3cLsPmuImemTagBefore), (Hex $p.B3cLsPmuImemTagSelected), (Hex $p.B3cLsPmuImemTagAfter))
+        }
+        Sum ('B3c LS PMU argv: advertised {0}; computed {1}; size {2}; location match {3}; write readback {4}' -f (Hex $p.B3cLsPmuArgvAdvertised), (Hex $p.B3cLsPmuArgvComputed), $p.B3cLsPmuArgsSize, $p.B3cLsPmuArgvMatch, $p.B3cLsPmuArgsOk)
+        foreach ($w in @(@('argv words', 'B3cLsPmuArgvReadback', 'B3cLsPmuArgvComputed'), @('args context', 'B3cLsPmuArgsWindow', 'B3cLsPmuArgsWindowOff'), @('queue data', 'B3cLsPmuQueueDataWindow', 'B3cLsPmuQueueDataOff'), @('IMEM around last PC', 'B3cLsPmuImemPcWindow', 'B3cLsPmuImemReadOff'))) {
+          if ($null -ne $p.($w[1])) {
+            $wb = [byte[]]$p.($w[1]); $wl = @()
+            for ($i = 0; $i + 4 -le $wb.Length; $i += 4) { $wl += ('{0:X8}' -f [BitConverter]::ToUInt32($wb, $i)) }
+            Sum ('B3c LS PMU {0} window at {1}: {2}' -f $w[0], (Hex $p.($w[2])), ($wl -join ' '))
+          }
+        }
+        if ($null -ne $p.B3cLsPmuFaultRecs) {
+          $fw = [byte[]]$p.B3cLsPmuFaultRecs; $fl = @()
+          for ($i = 0; $i + 4 -le $fw.Length; $i += 4) { $fl += ('{0:X8}' -f [BitConverter]::ToUInt32($fw, $i)) }
+          Sum ('B3c LS PMU MMU fault records (unit, inst, lo, hi, info): ' + ($fl -join ' '))
+        }
+        if ($null -ne $p.B3cLsPmuTranscfg) {
+          $tw = [byte[]]$p.B3cLsPmuTranscfg; $tl = @()
+          for ($i = 0; $i + 4 -le $tw.Length; $i += 4) { $tl += ('{0:X8}' -f [BitConverter]::ToUInt32($tw, $i)) }
+          Sum ('B3c LS PMU TRANSCFG words: ' + ($tl -join ' '))
+        }
+      }
       if ($null -ne $p.B3cFaultRecs) {
         $reasons3 = @('PDE', 'PDE_SIZE', 'PTE', 'VA_LIMIT_VIOLATION', 'UNBOUND_INST_BLOCK', 'PRIV_VIOLATION', 'RO_VIOLATION', 'WO_VIOLATION', 'PITCH_MASK_VIOLATION', 'WORK_CREATION', 'UNSUPPORTED_APERTURE', 'COMPRESSION_FAILURE', 'UNSUPPORTED_KIND', 'REGION_VIOLATION', 'BOTH_PTES_VALID', 'POISONED')
         $fr3 = [byte[]]$p.B3cFaultRecs

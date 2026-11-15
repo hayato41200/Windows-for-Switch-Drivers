@@ -65,13 +65,13 @@ GM20B の GPU に Windows から電源とクロックを入れ、GPU が応答�
 
 固まったら、長押し → R411 で起動 → `Status.cmd`。`last step` が 30〜38 なら B2a のどこか(36〜38 = DMA の 1〜3 回目)。
 
-## 段階 B3a / B3b(FwTest、0.4.16)
+## 段階 B3a / B3b(FwTest、0.4.25)
 
 B2a の結論: 署名のない PMU から物理アドレスで DMA すると、GPU の MMU が権限違反(PRIV_VIOLATION)で止める。nvgpu と nouveau の本番の手順は、署名つきの ACR のブートローダーを PIO で入れて起動し、そのローダーが GPU の仮想アドレスで DMA する。B3a はその前半(ファームウェアの読み込みと PIO での書き込み)だけをする。
 
 準備: 自分の linux-firmware の `nvidia/gm20b` フォルダーを、キットの中に `firmware\nvidia\gm20b` として写す(`acr\bl.bin` 832 バイトと `acr\ucode_load.bin` 18592 バイトを使う)。0.4.1 からは、次の段階のために `pmu\desc.bin`、`pmu\image.bin`、`pmu\sig.bin`、`gr\fecs_bl.bin`、`gr\fecs_inst.bin`、`gr\fecs_data.bin`、`gr\fecs_sig.bin` もレジストリに写す(ドライバーは届いたかと大きさを確かめるだけで、まだ使わない。`B3a other firmware in the registry`)。キットにはファームウェアを入れていない。キットの中に無いときは、`C:\SwitchWOA\firmware\nvidia\gm20b`、`C:\firmware\nvidia\gm20b`、`C:\lib\firmware\nvidia\gm20b` の順に探す。どこにも無いときは、前の FwTest がレジストリに残したものを使う(`firmware ... (registry)` と出る)。
 
-`Install.cmd`(0.4.16 に入れ替え)→ `FwTest.cmd` → `SUMMARY` を写真に撮る。見たいもの:
+`Install.cmd`(0.4.25 に入れ替え)→ `FwTest.cmd` → `SUMMARY` を写真に撮る。見たいもの:
 - `firmware acr\bl.bin: ... SHA256 ...`: キットがレジストリに写したファイル。
 - `B3a firmware` / `B3a load header`: ヘッダーの値。ドライバーはどの値もファイルの大きさの内側にあるかを確かめてから使う。
 - `B3a signed image`: ヒューズ(production / debug)に合う署名を、像の決まった場所に当てた。
@@ -85,7 +85,7 @@ FwTest はCPU側のファームウェア確認だけで、ローダーが使うD
 
 **FwTestの結果を確認してから**使う。実機で確認されたGPUのWPR容量範囲は`0xFEB00000..0xFEB40000`(256 KiB)です。GM20B用Nouveauでは、この範囲を容量確認に使い、WPR像自体は別のINSTメモリーとして確保してACR descriptorの`ucode_blob_base`/`ucode_blob_size`に渡します。AcrTestもこの方式に変更し、通常の連続メモリーにWPR像を置き、512 KiB DMAアリーナにはPMU用の仮想アドレス表を作ります。ACR descriptorのWPR blob情報と`code_dma_base`/`data_dma_base`を設定し、PMUのinstance blockをbindしてから、ACRを一度だけ起動します。待ちは最大2秒。終了時はGPUをリセットしてからSMMU設定を復元し、メモリーを解放します。起動後にPMUが継続実行する場合もあるため、**フリーズ時は電源長押しが必要になる可能性がある**。
 
-`Install.cmd`(0.4.16に入れ替え)→ `AcrTest.cmd` → `SUMMARY`を写真に撮る。Step 47〜56と`AcrBootResult`を確認する。`AcrWprCpuReadback`と`AcrSmmuRestored`はSUMMARYにも表示される。`ACR VM walk`にはGPU側PGD/PTEのindexと64-bit entryが出る。0.4.12では、GPU側のページ表を格納するページに対する外側Tegra SMMUのPDEと、Arena/PGD/PGT/instance/image各ページのPTEを読み返して期待値と並べる。`AcrSmmuMapReadback=1`はメモリ上の表と期待値のreadback一致、`0`は不一致、`2`はGPU SMMU bypassで直接物理アドレスを使ったことを示す。これはCPUから読んだ表の内容の確認で、GPU DMAが成功した証明ではない。また、読戻し不一致でも診断用にログするだけで、従来のACR起動フローは変えない。
+`Install.cmd`(0.4.25に入れ替え)→ `AcrTest.cmd` → `SUMMARY`を写真に撮る。Step 47〜64と`AcrBootResult` / `B3cLsResult`を確認する。`AcrWprCpuReadback`と`AcrSmmuRestored`はSUMMARYにも表示される。`ACR VM walk`にはGPU側PGD/PTEのindexと64-bit entryが出る。0.4.12では、GPU側のページ表を格納するページに対する外側Tegra SMMUのPDEと、Arena/PGD/PGT/instance/image各ページのPTEを読み返して期待値と並べる。`AcrSmmuMapReadback=1`はメモリ上の表と期待値のreadback一致、`0`は不一致、`2`はGPU SMMU bypassで直接物理アドレスを使ったことを示す。これはCPUから読んだ表の内容の確認で、GPU DMAが成功した証明ではない。また、読戻し不一致でも診断用にログするだけで、従来のACR起動フローは変えない。
 
 PDB個別の無効化(Step 54)の後、0.4.11から診断用に全PDBのPAGE_ALL無効化(Step 55、`0x80000003`)も要求してからACRを起動する。これは「個別PDBの無効化範囲またはキャッシュ残留が原因か」を切り分ける追加試験で、全PDB無効化が修正になるとは未確認。`0x100CB8`の読み返しは診断値で、成功判定には使わない。無効化前後の状態、空きスロット数、要求値、ポーリング値を記録する。bit 15 は要求前から1の場合があるため、SUMMARYも要求完了の証明とは扱わない。空きスロットを得られない場合や要求後にbit 15を観測できない場合はACRを起動せず、個別要求は`0xE000006A`、全PDB要求は`0xE000006B`で終了する。待ちは各最大10 ms。`AcrBootResult=0`はブート完了とmailbox0=0を示すが、後続のFECS起動や画面出力までの成功を意味しない。`AcrBindOk`、`AcrDescOk`、両方のPDB invalidateの状態、`AcrBootPolls`、mailbox、IRQ、PCも記録される。
 
@@ -152,3 +152,59 @@ Install.cmd → AcrTest.cmdを1回実行し、C:\SwitchWOA-Gpu.txt全体を保�
 新しいStep57はbindとTLB無効化より前に実行する。読戻しでbit11が立たなければE000006CでACR起動をスキップする。成功なら従来のStep50/51/54/55/56へ進む。SUMMARYのACR page geometry probeでMMU_CTRL変更前後とbit11を確認する。DMACTL、ITFEN、TRANSCFG1はbind前の読み取りのみで、DMACTL.REQUIRE_CTX解除は今回行わない。次候補として比較表に記録した。
 
 Install.cmd→AcrTest.cmdを1回実行し、C:\SwitchWOA-Gpu.txt全体を保存する。タイムアウト時はfaultのVA/type/inst、PC、mailboxが以前と同じかを比較する。GPU reset後のSMMU復元と最終電源状態も確認する。
+
+## 0.4.17: ACR の後のファルコンの状態(読むだけ)
+
+0.4.16 の実機で ACR が最後まで動いた(結果 0、CPUCTL 0x50、mailbox0 0、MMU の fault なし)。段階 B の完了条件は ACR が PMU と FECS を起動することなので、0.4.17 では ACR の後のファルコンの状態を読むだけで記録する。
+
+- PMU: CPUCTL、SCTL(ビット 13〜12 がセキュリティのモード)、mailbox0/1
+- FECS(0x409000)と GPCCS(0x41A000): CPUCTL、SCTL、mailbox0。PMC_ENABLE で GR(ビット 12)がすでに有効なときだけ読む。GR を有効にする書き込みはしない。
+
+`SUMMARY` の `B3c falcons after ACR` と `B3c GR falcons after ACR` の行を見る。書き込みは増やしていない。
+
+## 0.4.19: LS PMU の開始と INIT メッセージ
+
+0.4.18 の実機では、ACR は成功し、その直後の PMU は CPUCTL=0x50、SCTL=0x7021、mailbox=0/0 だった。Step 58 の後は CPUCTL=0x40、SCTL/mailbox は変化せず、MSGQ head/tail(0x4C8/0x4CC)も0/0のまま2秒でタイムアウトした。PMU PC/IRQ と詳細設定値が写真になく、起動失敗点は確定できない。
+
+参照コードの比較では、ACR 成功後に PMU をもう一度リセットしたりファームウェアを再読込したりする手順は見つからなかった。nvgpu は ACR 側の Falcon を HS bootstrap 前に reset し、ACR 後は `CPUCTL_ALIAS.STARTCPU` を書いて LS PMU を開始する。nouveau の `gm20b_pmu_init()` は `nvkm_falcon_get()` 後に args を DMEM へ書き、`nvkm_falcon_start()` を呼ぶ。mesa `tg_gpu_pmu_start()` は PMU halted / secure / mailbox 0 の状態確認、HALT interrupt clear、aperture 設定、32-byte `cmdline_args_v3`(204 MHz、secure_mode=true)、CPUCTL_ALIAS=2 の順で、MSGQ INIT を待つ。0.4.19 はこの順を維持し、args PIO の全word readbackと cursor を検査する。失敗は E0000073。
+
+Step 58 は設定と開始、Step 59 は最大2秒の INIT 待ちとヘッダー読み取り。キュー先頭が unit=7、size=42、msg_type=0 で PIO cursor が44-byte 境界へ進んだ場合だけ INIT と判定する。その他の形式は E0000072、無効なqueue pointerは E0000071。INIT payload はまだ acknowledge せず、WPR init command や FECS の起動にも進まない。タイムアウト時は IRQSTAT、CPUCTL/SCTL/mailbox、PMU PC trace、DMEM size、aperture、args offset/cursor を SUMMARY で確認する。PMU CPUCTL=0x40 は実機の観測値であり、ここでは実行状態の成功判定に使わない。
+
+## 0.4.20: PMU の待ち状態の記録
+
+0.4.19 の実機では LS RTOS の PC trace が 7 個すべて 0x3256、INIT queue head/tail は 0/0 のまま 2 秒で timeout した。比較した MIT ソースには、この実行時ファームウェア内の PC 0x3256 とシンボルの対応はないため、待ちの対象は未確定。0.4.20 は起動手順を変えず、Step 60 で IRQMODE/MASK/DEST、Falcon GPTMR、GPU PTIMER、cmdline args の前後、INIT queue pointer 周辺 DMEM を読み取り専用で記録する。DMEM の内容は B3cLsPmuArgsWindow と B3cLsPmuQueueDataWindow のバイナリ Trace に出る。実機では PC trace とこれらの値を比較し、次の変更箇所を絞る。
+
+## 0.4.21: argv 指定位置と PMU 引数 ABI の一致
+
+実機の 0.4.20 では WPR の `B3bPmuArgv=0x5FD4` に対して Step 58 は `0x5FE0` へ 32 バイトを書いていた。参照コードを照合すると、この WPR の PMU loader_config は `argv = DMEM - sizeof(struct nv_pmu_args)` を使い、GM20B nouveau の `gm20b_pmu_init()` は同じ 44 バイト構造をその位置へ書く。
+
+`nv_pmu_args` の frequency は byte 4、secure_mode は byte 24。mesa `tg_gpu_pmu_start()` の 32 バイト `cmdline_args_v3` は別の直接起動経路で使われるため、WPR が指定する argv ABI より優先しない。
+
+0.4.21 は `B3bPmuArgv` を Step 58 に渡し、指定位置と `DMEM - 44` の一致を確認してから 44 バイトを書き込む。不一致は `E0000074` で止める。書いた 11 word の readback は `B3cLsPmuArgvReadback` に出る。実機では `B3cPmuAppVersion`、argv の advertised/computed/match、size=44、args readback=1 と、DMEM window の先頭 11 word を確認する。想定値は `00000000 0C28CB00 00000000 00000000 00000000 00000000 00000001 00000000 00000000 00000000 00000000`。timeout が続く場合も ACR は再試行せず、既存の GPU reset 経路に入る。
+
+## 0.4.22: LS PMU の IMEM / DMA / FBIF 状態記録
+
+0.4.21 では argv の advertised/computed/readback は一致したが、LS PMU は INIT を出さず、PC trace は 7 回すべて `0x3256` だった。0.4.22 は起動順や DMA 設定を書き換えず、Step 61 で最後の PC 付近の IMEM 16 word、IMEM tag、DMATRFCMD/BASE/MOFFS/FBOFFS、DMACTL、bind/context、FBIF TRANSCFG 0〜7、PFIFO fault、MC error を読み取る。DMEM の args 周辺と queue 周辺も各最大 256 byte まで広げる。
+
+IMEM の PIO read は nvgpu `gk20a_flcn_copy_from_imem()` のブロック/offset/auto-increment 手順を参照する。起動前 bind の手順は参考先にあるが、ACR 後に同じ bind や DMA 設定を再実行する根拠は確認できなかったため、今回は状態の記録だけにした。実機では `B3c LS PMU IMEM` と `IMEM around last PC`、`loader DMA`、`FBIF`、`post-wait faults`、`MMU fault records`、拡張 DMEM windows を確認する。`B3cLsResult=E0000070` は従来どおり INIT timeout を示し、必ず GPU reset 経路に入る。
+
+## 0.4.23: PMU UCODE DMA aperture と古い fault latch の切り分け
+
+0.4.22 では PMU client の fault が VA `0x1000` で発生し、PFIFO fault ID bit 31 が立った。WPR の PMU LSF loader config が DMA index 4 を指定していた一方、nvgpu の `GK20A_PMU_DMAIDX_UCODE` は 0。GM20B の起動前 aperture では index 0 が physical local FB、index 4 が noncoherent sysmem なので、WPR ローダーの設定先とアドレス空間の不一致と判断し、PMU descriptor の index を 0 に修正した。これは実機での再確認前の仮説に基づく修正で、0.4.23 の実機結果で判定する。0.4.23 では WPR 相対 offset を使っていたが、0.4.24 の実機 fault 再発後に nvgpu / Nouveau の処理を再確認した。0.4.25 で PMU の code/data DMA base に絶対 WPR address を設定する。
+
+Step 62 は ACR 直前に fault ID で有効な unit の記録を保存し、Nouveau `gk104_fifo_intr()` の W1C 手順で `0x259C` と PFIFO INTR0 の MMU 関連 bit を ACK して状態を再読する。fault payload レジスターは ACK 後も残り得るので、前後の payload を SUMMARY に 16 進表示する。ID bit が消えなければ `E0000075` で ACR を起動せず、GPU reset 経路に入る。実機では `B3b PMU LS loader` の DMA index 0、Step 62 の clear result、Step 61 の fault id/record を確認する。ログの `B3cLsPmuFaultRecs` は fault ID bit が立っていた unit だけを含む。
+
+## 0.4.24: LS 開始前の DMACTL.REQUIRE_CTX
+
+0.4.23 では、WPR PMU loader config の DMA index を 0 にしても、LS 起動後に PMU fault (unit 0x1F、inst 0、VA 0x1000) が再発した。DMEM offset 0 は ACR boot descriptor であり、WPR の loader config とは別のデータである。`B3bPmuBld` は WPR に組み立てた loader config 全体を示す。SUMMARY に全 word を 16 進表示し、先頭 word の DMA index と `B3bPmuBldOff` を確認できる。`AcrWprCpuReadback=1` はその WPR 像を ACR 用 buffer にコピーした後の CPU readback 一致を示す。
+
+nvgpu `gk20a_falcon_bootstrap()` は Falcon 開始前に `DMACTL.REQUIRE_CTX=0` を設定してから BOOTVEC / STARTCPU を書く。実機では ACR 直後の DMACTL が 1 だったため、0.4.24 は Step 63 で DMACTL を 0 にしようとしたが、実機では 0x1 のまま変わらず `E0000076` で LS start を中止した。0.4.25 では Step 63 を read-only の DMACTL snapshot に戻す。
+
+実機では `B3b PMU WPR loader-config words`、`B3c LS start DMACTL REQUIRE_CTX`、fault の inst/VA、INIT queue と PC trace を確認する。WPR loader config が index 0 で DMACTL が 0 になっても fault が続く場合、この仮説は支持されない。FECS/GPCCS は今回の範囲外。
+## 0.4.25: PMU loader の DMA base に hardware WPR address を含める
+
+再確認で、PMU LSF loader config の `code_dma_base` / `data_dma_base` は WPR image 内の相対値のままではなく、WPR 物理 base を加えたアドレスを 256-byte 単位で格納すると確認した。nvgpu `gm20b_pmu_populate_loader_cfg()` は `wpr_base + ucode_off + app offsets` を使い、Nouveau `gm200_acr_wpr_patch()` は `gm20b_pmu_acr_bld_patch()` を呼んで WPR base relocation を行う。0.4.22/0.4.23 の fault VA `0x1000` は、WPR base を欠いた code DMA address に合うため、0.4.25 は PMU の code/data base に hardware WPR start を加える。表現できない値は `E0000077` で停止する。
+
+0.4.24 で書き込みが無効だった DMACTL は変更しない。Step 63 は開始直前の値を読むだけ。Step 64 で loader config を生成し、`B3bPmuBld` 全 word、`B3cPmuWprBaseLo/Hi`、`B3cPmuCodeDmaBase` / `B3cPmuDataDmaBase`、`AcrWprCpuReadback` を確認できるようにする。DMEM offset 0 の ACR boot descriptor はこの loader config と別物である。
+
+実機では SUMMARY の `B3b PMU WPR loader-config words` の word 0〜5、`B3cPmuWprBaseLo/Hi`、`B3cPmuCodeDmaBase` / `B3cPmuDataDmaBase`、`B3c LS start DMACTL snapshot`、PMU fault の inst/VA、PC trace と INIT queue を確認する。DMA base が WPR 範囲内になっても同じ fault が出る場合、この仮説は支持されない。FECS/GPCCS は今回の範囲外。

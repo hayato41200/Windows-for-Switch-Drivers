@@ -27,6 +27,68 @@ the 128 KiB big-page geometry is retained from the existing probe.
 https://github.com/ruje0504-2/mesa-switch-woa/blob/main/tegra-x1-wddm/core/gm20b_mmu.c
 https://github.com/ruje0504-2/mesa-switch-woa/blob/main/tegra-x1-wddm/platform/t214_mmu.c
 
+The 0.4.18 LS PMU startup register order, aperture values, cmdline_args_v3
+fields, and INIT-queue observation are adapted from the MIT-licensed
+mesa-switch-woa tegra-x1-wddm/platform/t214_pmu.c, tg_gpu_pmu_start(). The
+PMU bootstrap-falcon command selection and FECS-only GM20B scope were checked
+against Switchroot nvgpu gm20b/pmu_gm20b.c, gm20b_load_falcon_ucode() and
+gm20b_pmu_load_lsf(). The current implementation parses the PMU INIT header
+but does not acknowledge it or implement the later queue protocol.
+https://github.com/ruje0504-2/mesa-switch-woa/blob/main/tegra-x1-wddm/platform/t214_pmu.c
+https://github.com/NVIDIA/nvgpu/blob/1ae0167d360287ca78f5a2572f0de42594140312/drivers/gpu/nvgpu/gm20b/pmu_gm20b.c
+
+The 0.4.19 post-ACR PMU sequence and INIT message handling were compared with
+Linux nouveau v6.12 nvkm/subdev/pmu/gm20b.c (Copyright 2016 NVIDIA
+CORPORATION) and nvkm/subdev/acr/gm20b.c (Copyright 2019 Red Hat Inc.).
+No nouveau code is copied; its PMU init, WPR-init, and bootstrap ordering were
+used as a cross-check against the mesa implementation.
+https://github.com/torvalds/linux/blob/v6.12/drivers/gpu/drm/nouveau/nvkm/subdev/pmu/gm20b.c
+https://github.com/torvalds/linux/blob/v6.12/drivers/gpu/drm/nouveau/nvkm/subdev/acr/gm20b.c
+
+The 0.4.20 read-only PMU diagnostic register offsets (IRQMODE, IRQMASK,
+IRQDEST, GPTMRINT, and GPTMRVAL) were checked against the MIT-licensed
+Switchroot nvgpu include/nvgpu/hw/gk20a/hw_falcon_gk20a.h Falcon register map.
+No nvgpu code is copied.
+https://github.com/NVIDIA/nvgpu/blob/1ae0167d360287ca78f5a2572f0de42594140312/drivers/gpu/nvgpu/include/nvgpu/hw/gk20a/hw_falcon_gk20a.h
+
+The 0.4.23 PMU LSF loader DMA index was corrected to DMAIDX_UCODE (0), as
+used by the MIT-licensed Switchroot nvgpu gm20b/acr_gm20b.c
+gm20b_pmu_populate_loader_cfg() and nouveau v6.12
+nvkm/subdev/pmu/gm20b.c:gm20b_pmu_acr_bld_write(). The same descriptor sets
+the code/data addresses from WPR image offsets; nouveau's bld_patch applies
+the WPR relocation. On this board, FBIF TRANSCFG[0]=4 selects physical local
+FB, while TRANSCFG[4]=6 selects noncoherent sysmem. No source code is copied.
+https://github.com/NVIDIA/nvgpu/blob/1ae0167d360287ca78f5a2572f0de42594140312/drivers/gpu/nvgpu/gm20b/acr_gm20b.c
+https://github.com/torvalds/linux/blob/v6.12/drivers/gpu/drm/nouveau/nvkm/subdev/pmu/gm20b.c
+
+The 0.4.23 pre-ACR PFIFO fault acknowledgement sequence was checked against
+MIT-licensed Linux nouveau v6.12 nvkm/engine/fifo/gk104.c:gk104_fifo_intr().
+It snapshots asserted fault units, writes the asserted bits to FAULT_ID
+(0x259C), acknowledges the related INTR0 bits (0x2100), then checks the latch
+bits again. It does not zero the fault payload registers, which are recorded
+again after acknowledgement to identify retained stale data. No source code
+is copied.
+https://github.com/torvalds/linux/blob/v6.12/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gk104.c
+
+The 0.4.21 PMU argv placement and 44-byte nv_pmu_args field layout were
+cross-checked against Linux nouveau v6.12 nvkm/subdev/pmu/gm20b.c
+gm20b_pmu_acr_bld_write()/gm20b_pmu_init() and include/nvfw/pmu.h. No nouveau
+code is copied.
+https://github.com/torvalds/linux/blob/v6.12/drivers/gpu/drm/nouveau/nvkm/subdev/pmu/gm20b.c
+https://github.com/torvalds/linux/blob/v6.12/drivers/gpu/drm/nouveau/include/nvfw/pmu.h
+
+The 0.4.22 post-timeout PMU IMEM PIO read layout and Falcon register offsets
+were checked against MIT-licensed Switchroot nvgpu
+gk20a/flcn_gk20a.c:gk20a_flcn_copy_from_imem() and
+include/nvgpu/hw/gk20a/hw_falcon_gk20a.h. PMU DMA, FBIF, and bind status are
+snapshotted without a post-ACR rebind or DMA reconfiguration; neither the
+GM20B nvgpu PMU setup path nor mesa-switch-woa t214_pmu.c/t214_acr.c supplied
+evidence for such a second setup after ACR. No source code is copied.
+https://github.com/NVIDIA/nvgpu/blob/1ae0167d360287ca78f5a2572f0de42594140312/drivers/gpu/nvgpu/gk20a/flcn_gk20a.c
+https://github.com/NVIDIA/nvgpu/blob/1ae0167d360287ca78f5a2572f0de42594140312/drivers/gpu/nvgpu/include/nvgpu/hw/gk20a/hw_falcon_gk20a.h
+https://github.com/ruje0504-2/mesa-switch-woa/blob/main/tegra-x1-wddm/platform/t214_pmu.c
+https://github.com/ruje0504-2/mesa-switch-woa/blob/main/tegra-x1-wddm/platform/t214_acr.c
+
 Permission is hereby granted, free of charge, to any person obtaining a
 copy of this software and associated documentation files (the "Software"),
 to deal in the Software without restriction, including without limitation
@@ -44,3 +106,17 @@ THE COPYRIGHT HOLDER(S) OR AUTHOR(S) BE LIABLE FOR ANY CLAIM, DAMAGES OR
 OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
 ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
 OTHER DEALINGS IN THE SOFTWARE.
+
+The 0.4.24 pre-start DMACTL.REQUIRE_CTX clear follows the MIT-licensed
+Switchroot nvgpu gk20a/flcn_gk20a.c:gk20a_falcon_bootstrap() sequence, which
+clears REQUIRE_CTX before programming BOOTVEC and starting the Falcon. No
+source code is copied.
+https://github.com/NVIDIA/nvgpu/blob/1ae0167d360287ca78f5a2572f0de42594140312/drivers/gpu/nvgpu/gk20a/flcn_gk20a.c
+The 0.4.25 PMU LSF loader code/data DMA bases include the hardware WPR base,
+following MIT-licensed nvgpu gm20b/acr_gm20b.c:gm20b_pmu_populate_loader_cfg().
+The comparison also covered nouveau v6.12 nvkm/subdev/acr/gm200.c:
+gm200_acr_wpr_patch() and nvkm/subdev/pmu/gm20b.c:gm20b_pmu_acr_bld_patch(),
+which relocate the loader descriptor before ACR execution. No source code is copied.
+https://github.com/NVIDIA/nvgpu/blob/1ae0167d360287ca78f5a2572f0de42594140312/drivers/gpu/nvgpu/gm20b/acr_gm20b.c
+https://github.com/torvalds/linux/blob/v6.12/drivers/gpu/drm/nouveau/nvkm/subdev/acr/gm200.c
+https://github.com/torvalds/linux/blob/v6.12/drivers/gpu/drm/nouveau/nvkm/subdev/pmu/gm20b.c
