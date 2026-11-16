@@ -16,7 +16,7 @@ GM20B の GPU に Windows から電源とクロックを入れ、GPU が応答�
 | `ProbeTest.cmd` | 段階 B1。PowerTest と同じく GPU を 1 回起こし、そのあいだに、ファームウェアを使わない調べもの(GPU の中の部品の一覧、PMU ファルコンのレジスター、DMEM の書き込みと読み返し、priv ring の初期化)をしてから止める。GPU の上では何も動かさない |
 | `DmaTest.cmd` | 段階 B2a。GPU を 1 回起こし、GPU の中の小さな CPU(PMU ファルコン)の DMA で、Windows のメモリーから 256 バイト読み、256 バイト書き戻せるかを確かめてから止める。ファームウェアは使わず、ファルコンの上では何も動かさない |
 | `FwTest.cmd` | 段階 B3a。自分の linux-firmware の ACR のファームウェアを読み、署名を当てた像をメモリーに作り、ACR のブートローダーを PMU の IMEM と DMEM に直接(PIO)書いて読み返す。ファルコンは起動しない |
-| `AcrTest.cmd` | 段階 B3c。GPU の WPR 保護領域と SMMU の範囲を確認し、PMU の仮想アドレス空間を作って署名付き ACR を一度だけ起動する。2 秒で待ちを打ち切り、必ず GPU をリセットしてから一時メモリーと変換表を戻す |
+| `AcrTest.cmd` | 段階 B3c。GPU の WPR 保護領域と SMMU の範囲を確認し、署名付き ACR を一度だけ起動した後、LS PMU と FECS の bootstrap を試す。待ちは上限付きで、必ず GPU をリセットしてから一時メモリーと変換表を戻す |
 | `Remove.cmd` | switchgpu を外す |
 
 どれも右クリックして「管理者として実行」。最後の `SUMMARY` を写真に撮る。記録は `C:\SwitchWOA-Gpu.txt` に追記される。
@@ -71,7 +71,7 @@ B2a の結論: 署名のない PMU から物理アドレスで DMA すると、G
 
 準備: 自分の linux-firmware の `nvidia/gm20b` フォルダーを、キットの中に `firmware\nvidia\gm20b` として写す(`acr\bl.bin` 832 バイトと `acr\ucode_load.bin` 18592 バイトを使う)。0.4.1 からは、次の段階のために `pmu\desc.bin`、`pmu\image.bin`、`pmu\sig.bin`、`gr\fecs_bl.bin`、`gr\fecs_inst.bin`、`gr\fecs_data.bin`、`gr\fecs_sig.bin` もレジストリに写す(ドライバーは届いたかと大きさを確かめるだけで、まだ使わない。`B3a other firmware in the registry`)。キットにはファームウェアを入れていない。キットの中に無いときは、`C:\SwitchWOA\firmware\nvidia\gm20b`、`C:\firmware\nvidia\gm20b`、`C:\lib\firmware\nvidia\gm20b` の順に探す。どこにも無いときは、前の FwTest がレジストリに残したものを使う(`firmware ... (registry)` と出る)。
 
-`Install.cmd`(0.4.25 に入れ替え)→ `FwTest.cmd` → `SUMMARY` を写真に撮る。見たいもの:
+`Install.cmd`(0.4.32 に入れ替え)→ `FwTest.cmd` → `SUMMARY` を写真に撮る。見たいもの:
 - `firmware acr\bl.bin: ... SHA256 ...`: キットがレジストリに写したファイル。
 - `B3a firmware` / `B3a load header`: ヘッダーの値。ドライバーはどの値もファイルの大きさの内側にあるかを確かめてから使う。
 - `B3a signed image`: ヒューズ(production / debug)に合う署名を、像の決まった場所に当てた。
@@ -85,7 +85,7 @@ FwTest はCPU側のファームウェア確認だけで、ローダーが使うD
 
 **FwTestの結果を確認してから**使う。実機で確認されたGPUのWPR容量範囲は`0xFEB00000..0xFEB40000`(256 KiB)です。GM20B用Nouveauでは、この範囲を容量確認に使い、WPR像自体は別のINSTメモリーとして確保してACR descriptorの`ucode_blob_base`/`ucode_blob_size`に渡します。AcrTestもこの方式に変更し、通常の連続メモリーにWPR像を置き、512 KiB DMAアリーナにはPMU用の仮想アドレス表を作ります。ACR descriptorのWPR blob情報と`code_dma_base`/`data_dma_base`を設定し、PMUのinstance blockをbindしてから、ACRを一度だけ起動します。待ちは最大2秒。終了時はGPUをリセットしてからSMMU設定を復元し、メモリーを解放します。起動後にPMUが継続実行する場合もあるため、**フリーズ時は電源長押しが必要になる可能性がある**。
 
-`Install.cmd`(0.4.25に入れ替え)→ `AcrTest.cmd` → `SUMMARY`を写真に撮る。Step 47〜64と`AcrBootResult` / `B3cLsResult`を確認する。`AcrWprCpuReadback`と`AcrSmmuRestored`はSUMMARYにも表示される。`ACR VM walk`にはGPU側PGD/PTEのindexと64-bit entryが出る。0.4.12では、GPU側のページ表を格納するページに対する外側Tegra SMMUのPDEと、Arena/PGD/PGT/instance/image各ページのPTEを読み返して期待値と並べる。`AcrSmmuMapReadback=1`はメモリ上の表と期待値のreadback一致、`0`は不一致、`2`はGPU SMMU bypassで直接物理アドレスを使ったことを示す。これはCPUから読んだ表の内容の確認で、GPU DMAが成功した証明ではない。また、読戻し不一致でも診断用にログするだけで、従来のACR起動フローは変えない。
+`Install.cmd`(0.4.32に入れ替え)→ `AcrTest.cmd` → `SUMMARY`を写真に撮る。Step 47〜72、`AcrBootResult`、`B3cLsResult`、`B3cFecsResult`を確認する。`AcrWprCpuReadback`と`AcrSmmuRestored`はSUMMARYにも表示される。`ACR VM walk`にはGPU側PGD/PTEのindexと64-bit entryが出る。0.4.12では、GPU側のページ表を格納するページに対する外側Tegra SMMUのPDEと、Arena/PGD/PGT/instance/image各ページのPTEを読み返して期待値と並べる。`AcrSmmuMapReadback=1`はメモリ上の表と期待値のreadback一致、`0`は不一致、`2`はGPU SMMU bypassで直接物理アドレスを使ったことを示す。これはCPUから読んだ表の内容の確認で、GPU DMAが成功した証明ではない。また、読戻し不一致でも診断用にログするだけで、従来のACR起動フローは変えない。
 
 PDB個別の無効化(Step 54)の後、0.4.11から診断用に全PDBのPAGE_ALL無効化(Step 55、`0x80000003`)も要求してからACRを起動する。これは「個別PDBの無効化範囲またはキャッシュ残留が原因か」を切り分ける追加試験で、全PDB無効化が修正になるとは未確認。`0x100CB8`の読み返しは診断値で、成功判定には使わない。無効化前後の状態、空きスロット数、要求値、ポーリング値を記録する。bit 15 は要求前から1の場合があるため、SUMMARYも要求完了の証明とは扱わない。空きスロットを得られない場合や要求後にbit 15を観測できない場合はACRを起動せず、個別要求は`0xE000006A`、全PDB要求は`0xE000006B`で終了する。待ちは各最大10 ms。`AcrBootResult=0`はブート完了とmailbox0=0を示すが、後続のFECS起動や画面出力までの成功を意味しない。`AcrBindOk`、`AcrDescOk`、両方のPDB invalidateの状態、`AcrBootPolls`、mailbox、IRQ、PCも記録される。
 
@@ -208,3 +208,74 @@ nvgpu `gk20a_falcon_bootstrap()` は Falcon 開始前に `DMACTL.REQUIRE_CTX=0` 
 0.4.24 で書き込みが無効だった DMACTL は変更しない。Step 63 は開始直前の値を読むだけ。Step 64 で loader config を生成し、`B3bPmuBld` 全 word、`B3cPmuWprBaseLo/Hi`、`B3cPmuCodeDmaBase` / `B3cPmuDataDmaBase`、`AcrWprCpuReadback` を確認できるようにする。DMEM offset 0 の ACR boot descriptor はこの loader config と別物である。
 
 実機では SUMMARY の `B3b PMU WPR loader-config words` の word 0〜5、`B3cPmuWprBaseLo/Hi`、`B3cPmuCodeDmaBase` / `B3cPmuDataDmaBase`、`B3c LS start DMACTL snapshot`、PMU fault の inst/VA、PC trace と INIT queue を確認する。DMA base が WPR 範囲内になっても同じ fault が出る場合、この仮説は支持されない。FECS/GPCCS は今回の範囲外。
+## 0.4.26: PMU から FECS LS を bootstrap
+
+PMU LS が INIT を出した後、Step 65 で INIT の 42-byte payload から HPQ/MSGQ descriptor を取り出し、DMEM 範囲、queue index、重なり、INIT cursor を検証してから INIT を ACK する。Step 66 では PMC_ENABLE の GR bit 12 だけを有効にし、nvgpu `gm20b_load_falcon_ucode()` の順に FECS context-switch mailbox 0 を clear する。Step 67 は PMU ACR unit の bootstrap-falcon command (FECS id 2、RESET_YES) を一度だけ HPQ に post し、最大 2 秒で reply と `0x55AA55AA` ready mailbox を待つ。Step 68 で FECS CPUCTL/SCTL/mailbox、PC trace、IRQ、PFIFO fault を読み取る。失敗は `E0000078` として既存の GPU reset 経路へ進む。
+
+FECS WPR loader descriptor の DMA index は `DMAIDX_UCODE=0`、code/data DMA base は hardware WPR base を加えた物理 address とする。nvgpu `gm20b_gr_acr_bld_write()` は WPR base を含む FECS descriptor を作り、Nouveau `gm20b_gr_acr_bld_patch()` は ACR 前に base relocation を行う。この WPR 修正と PMU command/reply の初回実機確認は未実施。FECS reply payload の ID 解釈、ctxsw mailbox clear register の実機 readback、および GR enable の readback を確認する。FECS が ready でも GR context/channel 初期化や描画成功は意味しない。GPCCS は起動しない。
+
+実機では SUMMARY の `B3c FECS bootstrap result`、HPQ/MSGQ、reply、ready mailbox、FECS CPUCTL/SCTL/mailboxes/PC trace、PFIFO fault records、および `FECS WPR BLD words` を確認する。`B3cFecsResult=0` と ready mailbox `0x55AA55AA` が揃えば FECS LS bootstrap の完了を示す。
+
+## 0.4.27: BAR0 を 16 MB すべてマップ
+
+0.4.26 は FECS のレジスター(0x409000 など)を読んだところでブルースクリーン(PAGE_FAULT_IN_NONPAGED_AREA、switchgpu.sys)になった。ドライバーが BAR0 を 2 MB(0x200000)しかマップしておらず、0x400000 より上の GR/FECS のレジスターがマップの外だったため。ACPI の BAR0 は 16 MB(0x57000000、0x01000000)なので、0.4.27 では 16 MB すべてをマップする。FECS の処理そのものは 0.4.26 と同じ。試し方も同じで、`Install.cmd`(0.4.28 に入れ替え)→ `AcrTest.cmd`。
+
+## 0.4.28: PMU の WPR 初期化を FECS bootstrap より先に実行
+
+0.4.27 では FECS bootstrap command を HPQ に書いた後、PMU message queue に返信が現れず `E0000078` になった。比較すると、nvgpu `gm20b_pmu_init_acr()` は `INIT_WPR_REGION` を先に post し、`pmu_handle_acr_init_wpr_msg()` が成功を記録した後に `gm20b_pmu_load_lsf()` が FECS bootstrap を post する。mesa-switch-woa の `post_wpr()` / `wpr_reply()` も同じ順序で WPR region 1 / offset 0 command を送り、12-byte ACR reply の success code を検査する。0.4.28 はこの前提の欠落を補う。
+
+Step 65 は INIT queue descriptor を検証し、Step 66 は INIT_WPR_REGION command を HPQ に一度 post して最大2秒 reply を待つ。reply unit/size/sequence/type と success code を確認し、失敗は `E0000079`。その後 Step 67 で GR bit 12 を有効にして FECS ctxsw mailbox clear を行い、Step 68 で bootstrap command を一度 post する。Step 69 で FECS state、PFIFO fault、HPQ head/tail と MSGQ head/tail を読む。mesa `post_wpr()` は queue head を更新して command を公開し、別の doorbell write は行っていない。nvgpu の返信処理と mesa の `wpr_reply()` は PMU message head/tail `0x4C8/0x4CC` を使用する。
+
+実機では `B3cFecsWprReplyPolls` / `B3cFecsWprReplyHeader` / `B3cFecsWprReplyCode`、bootstrap reply、`B3cFecsHpqTailAfterWait`、MSGQ head/tail、ctxsw mailbox clear 前後と clear register readback を確認する。ctxsw clear の register address は nvgpu の `gr_fecs_ctxsw_mailbox_clear_r(0)` に基づくが、0.4.27 では mailbox 値が変わらなかったため、今回のログでその挙動を再確認する。0.4.28 はビルド・実機未確認で、FECS ready 成功を保証しない。
+## 0.4.29: 0.4.28 のブルースクリーンを修正
+
+0.4.28 は WPR の初期化の返事まで成功した(返事 1 ms、code 0)が、その後の Step 68 で PAGE_FAULT_IN_NONPAGED_AREA になった。HPQ の head レジスターの位置を入れていた変数を、Step 67 で PMC_ENABLE の値(0xC0013120)の保存に使い回していたため、Step 68 で PMU_FALCON + 0xC0013120 という BAR0 の外を読んでいた。0.4.29 では PMC_ENABLE 用に別の変数を使う。ほかの処理は 0.4.28 と同じ。試し方も同じで、`Install.cmd`(0.4.29 に入れ替え)→ `AcrTest.cmd`。
+
+## 0.4.30: FECS bootstrap command の sequence を進める
+
+0.4.29 では `INIT_WPR_REGION` の reply は sequence 1 で成功し、PMU はこの command を dequeue した。FECS bootstrap も sequence 1 だった。nvgpu の `pmu_seq_acquire()` は command ごとに sequence slot を確保し、reply を対応付けるため、既に完了した command と同じ sequence を続けて使う現在の実装は違いの候補になる。ただし公開されている呼び出し側だけでは、次の ID が必ず 2 になるとは確認できない。0.4.30 は切り分けとして WPR init sequence の次の値(2)を FECS bootstrap に設定し、reply も同じ sequence であることを検証する。queue head の公開方法、command payload、GR/FECS reset 手順は変えない。nvgpu `gm20b_pmu_load_lsf()` は `RESET_YES` flag を ACR command に渡すので、独立した FECS reset write は追加しない。
+
+Step 69 は bootstrap post 直後の PMU IRQSTAT/PC trace と最大2秒間の HPQ tail/IRQSTAT sample を記録する。Step 70 は最終 PMU/FECS state、HPQ/MSGQ pointer、fault を記録する。PMU が bootstrap command の新しい head まで dequeue しなかった場合は `E000007A`、dequeue 後に reply/ready を得られない場合は `E0000078` とする。
+
+実機では `B3cFecsBootstrapSeq` が 2、`B3cFecsBootstrapCommand` の header が `0x02030C0A`、`B3cFecsHpqTailSamples` が command head `0x5048` まで進むかを確認する。併せて `B3cFecsPmuTraceAfterPost` / `B3cFecsPmuTraceAfterWait`、PMU IRQSTAT、MSGQ head/tail、FECS ready mailbox と fault records を見る。sequence 再利用が原因か、2 が適切な次 ID かは未確認。`Install.cmd`(0.4.32 に入れ替え)→ `AcrTest.cmd` を一度実行し、ログを保存する。
+
+## 0.4.31: FECS 準備中の PMU HALT を切り分け
+
+0.4.30 では WPR init の reply 後に PMU IRQSTAT が `0x51` となり、その後の PC trace は変化しなかった。Step 71 は PMU CPUCTL/IRQSTAT/mailbox0/1/PC trace index/trace[0]/EXCI を、WPR ACK 後、GR enable 後、FECS ctxsw mailbox clear の段階、bootstrap 直前の順で記録する。EXCI は nvgpu `gk20a_falcon_dump_stats()` と同じ ICD 読み出しで取得する。
+
+切り分けのため、0.4.31 は `0x419A80` の ctxsw mailbox clear write を一度省く。nvgpu `gm20b_load_falcon_ucode()` はこの write を FECS bootstrap 前に行うため、今回の変更は参照実装との差分を試す診断である。bootstrap 直前に PMU CPUCTL HALT bit が立っていれば command を送らず `E000007B` で既存の GPU reset 経路へ進む。GR enable や ACR の順序は変更しない。
+
+SUMMARY の `B3cPmuCheckpointAfterWprAck`、`B3cPmuCheckpointAfterGrEnable`、`B3cPmuCheckpointAfterCtxswClearStage`、`B3cPmuCheckpointBeforeBootstrap` は各7 word(CPUCTL、IRQSTAT、mailbox0、mailbox1、trace index、trace[0]、EXCI)で、この順に表示される。ctxsw clear write の省略で HALT が消えるかは実機未確認。FECS bootstrap 成功も未確認。
+
+## 0.4.32: FECS bootstrap command の構造体を修正
+
+0.4.31 の command は 12 byte で、payload の先頭 byte が `0x02` だった。nvgpu `gm20b_load_falcon_ucode()` / `gm20b_pmu_load_lsf()` と Nouveau `gm20b_pmu_acr_bootstrap_falcon()` の定義では、ACR unit `0x0A`、command ID `0x01`、`RESET_YES=0`、FECS falcon ID `2` を使い、command 全体は 16 byte になる。header size は 16。command ID の後には 3 byte padding があり、その後に 32-bit flags と 32-bit falcon ID が続く。0.4.32 はこの配置に合わせ、`0x419A80` mailbox clear write を復元する。
+
+Step 72 は bootstrap command を一度 post し、post 直後の PMU CPUCTL を記録する。post 直後に HALT bit が立った場合は `E000007C`、bootstrap 前に既に立っていた場合は `E000007B` とする。各待ちは従来どおり上限付き。実機では SUMMARY の `B3cFecsBootstrapCommand` が `0203100A 00000001 00000000 00000002`、`B3cFecsPmuCpuctlAfterPost`、HPQ tail、reply、FECS ready を確認する。command 形式修正で PMU が受理するかは未確認。
+
+## 0.4.33: PMU bootstrap reply 後に FECS Falcon を開始
+
+0.4.32 では PMU が FECS bootstrap を受理し、成功 reply を返しましたが、FECS の ready mailbox は 2000 回の待ちでも変化しませんでした。Nouveau `gf100_gr_init_ctxctl_ext()` は secure bootstrap の後に FECS DMACTL を 0 にして FECS Falcon を開始し、その後 GR ctxctl ready を待ちます。nvgpu `gr_gm20b_load_ctxsw_ucode()` は FECS ctxsw mailbox を clear し、PMU bootstrap 完了後に ready mailbox を確認します。
+
+Step 73 は FECS DMACTL を記録して 0 にし、Nouveau `nvkm_falcon_v1_start()` と同じく CPUCTL bit 6 が立っていれば CPUCTL_ALIAS.STARTCPU、そうでなければ CPUCTL.STARTCPU に書き込みます。今回の実機では CPUCTL 0x50 なので alias が選ばれる想定です。CPUCTL の HALT bit が最大 2000 回の polling で解除されなければ `E000007D` で既存の GPU reset 経路に進みます。直後の FECS CPUCTL/mailbox0 と HALT-clear poll 数を SUMMARY に記録します。BAR0 16 MB、PMC_ENABLE bit 12 の FECS 読み取りガード、既存の bounded wait を維持します。GPCCS と GR context/channel 初期化は行いません。`Install.cmd` のドライバーを 0.4.33 に更新してから `AcrTest.cmd` を一度実行し、Step 73 と `B3cFecsResult`、`B3cFecsStartUsesAlias`、`B3cFecsCpuctlAfterStart`、`B3cFecsMailbox0AfterStart`、`B3cFecsStartPolls`、ready mailbox、fault を確認してください。
+
+## 0.4.34: GM20B FECS ctxsw mailbox と GPCCS 起動
+
+0.4.33 では FECS Falcon 自体は動き始めましたが、ready 判定に使った `0x419A00` は参照先が示す FECS ctxsw mailbox ではありませんでした。nvgpu `hw_gr_gm20b.h` と `gr_gk20a_wait_ctxsw_ready()` の経路では mailbox 0 は `0x409800`、mailbox clear 0 は `0x409840` です。ready 値は ucode INIT 完了の `0x10` として待ちます。旧 `0x419A00` は比較用に読み取りだけ残し、mailbox 0..7 を待ちの後に記録します。
+
+GPCCS は GM20B では ACR の LS 対象ではありません。Nouveau `gf100_gr_init_ctxctl_ext()` / `gf100_gr_init_fw()` と nvgpu `gr_gm20b_load_ctxsw_ucode()` に合わせ、ユーザーが用意した linux-firmware の `gr/gpccs_inst.bin` と `gr/gpccs_data.bin` を GPCCS IMEM/DMEM に PIO し、GPCCS、FECS の順に起動します。Step 74 が PIO load、Step 75 が mailbox clear/set と両 Falcon の起動です。GR context/channel の初期化は対象外です。
+
+`FwTest` / `AcrTest` は GPCCS firmware も `FwGpccsInst` / `FwGpccsData` としてレジストリへ取り込みます。ファームウェアはユーザー提供のものを実行時に読み、リポジトリやキットには含めません。SUMMARY で確認する項目は `B3cGpccsInstLen` / `B3cGpccsDataLen`、GPCCS PIO word 数、start CPUCTL/alias/HALT poll、`B3cFecsReadyMailbox` (期待値 `0x10`)、`B3cFecsCtxswMailboxWords`、旧 mailbox の比較値、PMU/FECS 状態と MMU fault です。欠落 firmware は `E000007E`、サイズ/容量不整合は `E000007F`、GPCCS HALT timeout は `E0000080` で GPU reset 経路に進みます。ビルドと実機結果は未確認です。
+## 0.4.36: PMU INIT キューの確認をゆるめる (Claude)
+
+0.4.35 の実機テストで、PMU の INIT を待つところ (Step 59) が 2 回目の読み取りで head/tail 0x51D8/0x51AC の組を見て E0000071 で終わり、FECS の段階まで進まなかった。PMU がキューの位置を設定している途中の値を一瞬読んだと考えられる。0.4.36 では、おかしな組を 1 回見ても失敗にせず、記録して待ち続ける。2000 回待っても正しい組にならないときだけ E0000071 にする。最初に見たおかしな組と回数は `B3cLsPmuInitBadPairs/Head/Tail/Poll` に残る。FECS/GPCCS の処理は 0.4.35 と同じ。
+
+## 0.4.35: FECS handshake と GPCCS 診断
+
+0.4.34 の FECS ready wait は `0x409800` が 0 のまま timeout しました。参照実装を照合し、FECS 起動前に nvgpu `gr_gm20b_load_ctxsw_ucode()` の secure path と同じ順で、clear mailbox 0 に `0xFFFFFFFF`、mailbox 1 に `1`、clear mailbox 6 に `0xFFFFFFFF` を書きます。追加で mailbox 0 自体を 0 に書く操作はしません。Nouveau `gf100_gr_init_ctxctl_ext()` が行う GPCCS DMACTL=0、FECS DMACTL=0、GPCCS 起動、FECS 起動の順も維持します。
+
+ready 条件は nvgpu `gr_gk20a_wait_ctxsw_ready()` が期待する ucode INIT complete の `0x10` 完全一致と、Nouveau が使う mailbox 0 bit 0 の検査を照合しました。Step 75 は `0x10` または bit 0 を成功として扱い、待ち中の最初の非ゼロ値、値の変化回数、最終値を記録します。FECS mailbox 0..7 も待ち後に記録します。別の既存 mailbox `0x419A00` は比較用に読み取りのみです。
+
+GPCCS は引き続きユーザー提供の `gpccs_inst.bin` / `gpccs_data.bin` を IMEM/DMEM offset 0 へ PIO します。Nouveau `gf100_gr_init_fw()` / `nvkm_falcon_v1_load_imem()` に合わせ、IMEM は 256-byte block (64 dword) 単位でタグを進め、末尾をゼロ padding します。Nouveau の直接 PIO 起動経路に BOOTVEC 書き込みはないため変更せず、前後値を記録します。Step 70 は GPCCS CPUCTL/SCTL、Falcon mailbox、PC trace、IRQ、ctxsw mailbox 0..7 を追加記録します。既存の `E0000078` ready timeout を使います。
+
+確認する SUMMARY 行は FECS pre-start mailbox sequence、FECS ctxsw ready value/first-nonzero/change-count/polls、FECS ctxsw mailbox 0..7、GPCCS firmware source/padded IMEM words、BOOTVEC、GPCCS PC/IRQ/ctxsw mailboxes です。ビルドと実機結果は未確認です。

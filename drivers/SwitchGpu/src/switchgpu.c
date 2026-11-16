@@ -39,7 +39,7 @@
 #include <wdf.h>
 #include <spb.h>
 
-#define SWGPU_VERSION      0x00000419u   /* 0.4.25 */
+#define SWGPU_VERSION      0x00000424u   /* 0.4.36 */
 
 #define CAR_PHYS           0x60006000ull
 #define CAR_LEN            0x1000u
@@ -47,7 +47,7 @@
 #define PMC_LEN            0x1000u
 #define MC_PHYS            0x70019000ull
 #define MC_LEN             0x1000u
-#define BAR0_MAP_LEN       0x200000u    /* up to NV_PFB (0x100000) */
+#define BAR0_MAP_LEN       0x1000000u   /* Claude: full 16 MB BAR0 (ACPI); GR/FECS are at 0x400000+ */
 
 #define CAR_CLK_OUT_ENB_H  0x014
 #define CAR_CLK_ENB_H_SET  0x328
@@ -1733,12 +1733,20 @@ static ULONG BuildWprB3b(ULONG PmuDmemSize, ULONGLONG WprBase, PUCHAR *OutWpr, P
         WprPutLe32(wpr + pmuBldOff + i * 4u, pmuBld[i]);
 
     RtlZeroMemory(fecsBld, sizeof(fecsBld));
-    fecsBld[8] = DMA_IDX;
-    fecsBld[9] = (fecsImgOff + fecsBootPad) >> 8;
+    /* GM20B FECS LS loader uses DMAIDX_UCODE and physical WPR addresses.
+     * nvgpu gm20b_gr_acr_bld_write() builds this descriptor from WPR base;
+     * Nouveau gm20b_gr_acr_bld_patch() applies the equivalent relocation. */
+    fecsBld[8] = PMU_UCODE_DMA_IDX;
+    if (((WprBase + (ULONGLONG)fecsImgOff + fecsBootPad) >> 8) > 0xFFFFFFFFull ||
+        ((WprBase + (ULONGLONG)fecsImgOff + fecsBootPad + fecsInstPad) >> 8) > 0xFFFFFFFFull) {
+        result = 0xE0000077u;
+        goto done;
+    }
+    fecsBld[9] = (ULONG)((WprBase + (ULONGLONG)fecsImgOff + fecsBootPad) >> 8);
     fecsBld[10] = 0;
     fecsBld[11] = fecsInstPad;
     fecsBld[14] = 0;
-    fecsBld[15] = (fecsImgOff + fecsBootPad + fecsInstPad) >> 8;
+    fecsBld[15] = (ULONG)((WprBase + (ULONGLONG)fecsImgOff + fecsBootPad + fecsInstPad) >> 8);
     fecsBld[16] = fecsDataPad;
     for (i = 0; i < RTL_NUMBER_OF(fecsBld); ++i)
         WprPutLe32(wpr + fecsBldOff + i * 4u, fecsBld[i]);
@@ -1753,7 +1761,9 @@ static ULONG BuildWprB3b(ULONG PmuDmemSize, ULONGLONG WprBase, PUCHAR *OutWpr, P
           Le32(wpr + pmuLsbOff + 72) == 0 && Le32(wpr + fecsLsbOff + 72) == 2 &&
           Le32(wpr + pmuLsbOff + 76) == pmuImgOff &&
           Le32(wpr + fecsLsbOff + 76) == fecsImgOff &&
-          Le32(wpr + pmuBldOff) == PMU_UCODE_DMA_IDX && Le32(wpr + fecsBldOff + 32) == DMA_IDX &&
+          Le32(wpr + pmuBldOff) == PMU_UCODE_DMA_IDX && Le32(wpr + fecsBldOff + 32) == PMU_UCODE_DMA_IDX &&
+          Le32(wpr + fecsBldOff + 36) == fecsBld[9] &&
+          Le32(wpr + fecsBldOff + 60) == fecsBld[15] &&
           RtlCompareMemory(wpr + pmuImgOff, pmuImage, imageSize) == imageSize &&
           RtlCompareMemory(wpr + fecsImgOff, fecsImage, fecsImageLen) == fecsImageLen) ? 1u : 0u;
     Trace(L"B3cPmuCodeDmaBase", pmuBld[1]);
@@ -1763,8 +1773,11 @@ static ULONG BuildWprB3b(ULONG PmuDmemSize, ULONGLONG WprBase, PUCHAR *OutWpr, P
     Trace(L"B3cPmuWprBaseHi", (ULONG)(WprBase >> 32));
     Trace(L"B3cPmuDmaBaseAbsolute", WprBase != 0 ? 1u : 0u);
     Trace(L"B3bPmuArgv", pmuBld[9]);
-    Trace(L"B3bFecsCodeDmaRel", fecsBld[9]);
-    Trace(L"B3bFecsDataDmaRel", fecsBld[15]);
+    Trace(L"B3cFecsDmaIdx", fecsBld[8]);
+    Trace(L"B3cFecsCodeDmaBase", fecsBld[9]);
+    Trace(L"B3cFecsDataDmaBase", fecsBld[15]);
+    Trace(L"B3cFecsDmaBaseAbsolute", WprBase != 0 ? 1u : 0u);
+    TraceBin(L"B3cFecsBldWords", fecsBld, sizeof(fecsBld));
     TraceDurable(L"B3bWprCpuReadback", ok);
     result = ok ? 0 : 0xE0000060u;
 
@@ -1801,6 +1814,7 @@ static ULONG B3cStartPmuLs(PSWGPU_DEVICE Dev, ULONG PmuArgv)
     ULONG args[11] = { 0, 204000000u, 0, 0, 0, 0, 1, 0, 0, 0, 0 };
     ULONG argsReadback[11];
     ULONG cpuctl, irq, hwcfg, dmemSize = 0, argsOff = 0, i, polls = 0, head, tail, result = 0;
+    ULONG initBadPairs = 0, initBadHead = 0, initBadTail = 0, initBadPoll = 0;
     ULONG dmaCtlBeforeStart, dmaCtlAtStart;
     ULONG traceIdx, traceNr, traceSlot, tracePc[8], argsOk, argsCursor;
     ULONG initWords[11], initHdr, initType, initCursor;
@@ -1889,14 +1903,25 @@ static ULONG B3cStartPmuLs(PSWGPU_DEVICE Dev, ULONG PmuArgv)
         if (head != tail) {
             if ((head & 3u) || (tail & 3u) || head > argsOff || tail >= argsOff ||
                 head < tail || head - tail < 44u) {
-                result = 0xE0000071u;
-                goto done;
+                /* Claude 0.4.36: the PMU may still be setting up its queue
+                 * pointers; a mixed head/tail pair seen once is not fatal.
+                 * Record it and keep polling; fail only if it never settles. */
+                if (initBadPairs == 0u) { initBadHead = head; initBadTail = tail; initBadPoll = polls; }
+                ++initBadPairs;
+                Ms(1);
+                continue;
             }
             break; /* INIT is published; parsing/acknowledgment is a later stage. */
         }
         Ms(1);
     }
-    if (polls == 2000u) result = 0xE0000070u;
+    Trace(L"B3cLsPmuInitBadPairs", initBadPairs);
+    if (initBadPairs) {
+        Trace(L"B3cLsPmuInitBadHead", initBadHead);
+        Trace(L"B3cLsPmuInitBadTail", initBadTail);
+        Trace(L"B3cLsPmuInitBadPoll", initBadPoll);
+    }
+    if (polls == 2000u) result = initBadPairs ? 0xE0000071u : 0xE0000070u;
     else {
         tail = Rd(B, PMU_FALCON + 0x4CC);
         if (tail > argsOff || argsOff - tail < 44u) result = 0xE0000071u;
@@ -2048,6 +2073,406 @@ done:
     return result;
 }
 
+/* Consume PMU INIT, submit one ACR bootstrap-falcon command for FECS, and
+ * wait for the reply plus the nvgpu FECS context-switch ready mailbox. */
+/* Match nvgpu's Falcon dump: EXCI is Falcon register index 28, read through
+ * ICD_CMD/ICD_RDATA. The MMIO writes only select the trace/ICD read target. */
+static VOID TraceB3cPmuCheckpoint(volatile UCHAR *B, PCWSTR Name)
+{
+    ULONG snap[7];
+    snap[0] = Rd(B, PMU_FALCON + FALCON_CPUCTL);
+    snap[1] = Rd(B, PMU_FALCON + 0x008u);
+    snap[2] = Rd(B, PMU_FALCON + 0x040u);
+    snap[3] = Rd(B, PMU_FALCON + 0x044u);
+    snap[4] = Rd(B, PMU_FALCON + 0x148u);
+    Wr(B, PMU_FALCON + 0x148u, 0u);
+    snap[5] = Rd(B, PMU_FALCON + 0x14Cu);
+    Wr(B, PMU_FALCON + 0x200u, 0x1C08u); /* ICD read EXCI (index 28) */
+    snap[6] = Rd(B, PMU_FALCON + 0x20Cu);
+    TraceBin(Name, snap, sizeof(snap));
+}
+
+static ULONG B3cStartFecsLs(PSWGPU_DEVICE Dev)
+{
+    volatile UCHAR *B = Dev->Bar0;
+    PUCHAR gpccsInst = NULL, gpccsData = NULL;
+    ULONG gpccsInstLen = 0, gpccsDataLen = 0;
+    ULONG words[11], wprCmd[4] = { 0x0103100Au, 0u, 1u, 0u };
+    /* bootstrap_falcon: 4-byte header, cmd_type + 3 pad, u32 flags,
+     * u32 falcon_id. RESET_YES is zero; FECS is falcon ID 2; sizeof = 16. */
+    ULONG cmd[4] = { 0x0203100Au, 0x00000001u, 0u, 2u };
+    ULONG result = 0, dmemSize, msgHead, msgTail, hpqSize, hpqBase, hpqIndex;
+    ULONG msgSize, msgBase, msgEnd, hpqEnd, cursor, i, reg, qhead, qtail, pmcEnable;
+    ULONG replyHead = 0, replyTail = 0, replyHdr = 0, replyCtrl = 0, replyPayload = 0, polls = 0;
+    ULONG wprReplyHdr = 0, wprReplyCtrl = 0, wprReplyCode = 0, hpqTailAfterWait = 0;
+    ULONG bootstrapSeq = 0, hpqSampleNr = 0, hpqTailSamples[8], hpqIrqSamples[8], hpqSamplePolls[8];
+    ULONG fecsStartPolls = 0, fecsCpuctlBeforeStart = 0, fecsStartReg = 0;
+    ULONG fecsCpuctlAfterStart = 0, fecsMailboxAfterStart = 0;
+    ULONG pmuTraceIdx, pmuTraceNr, pmuPcNow[8], pmuPcAfterWait[8], pmuPcNrAfterWait;
+    ULONG fecsReady = 0, fecsReadyFirstNonzero = 0, fecsReadyPrev = 0, fecsReadyChangeCount = 0;
+    ULONG fecsTraceIdx, fecsTraceNr, fecsPc[8], faultId, faultCount = 0;
+    ULONG gpccsHwcfg, gpccsImemSize, gpccsDmemSize, gpccsImemWords, gpccsImemPaddedWords, gpccsDmemWords;
+    ULONG fwWord, fwByte, gpccsCpuctlBeforeStart = 0, gpccsStartReg = 0, gpccsCpuctlAfterStart = 0;
+    ULONG gpccsStartPolls = 0, gpccsMailboxAfterStart = 0, fecsMailboxWords[8], gpccsCtxswMailboxWords[8];
+    ULONG gpccsTraceIdx, gpccsTraceNr, gpccsPc[8], gpccsBootvecBeforeStart = 0;
+    ULONG faultRecs[32][5], unit, pcSlot;
+
+    hpqIndex = 0;
+    hpqTailAfterWait = 0xFFFFFFFFu;
+    Step(65);
+    dmemSize = ((Rd(B, PMU_FALCON + FALCON_HWCFG) >> 9) & 0x1FFu) << 8;
+    msgHead = Rd(B, PMU_FALCON + 0x4C8);
+    msgTail = Rd(B, PMU_FALCON + 0x4CC);
+    Trace(L"B3cFecsInitHead", msgHead);
+    Trace(L"B3cFecsInitTail", msgTail);
+    if (dmemSize < 256u || msgHead == 0xFFFFFFFFu || msgTail == 0xFFFFFFFFu ||
+        (msgHead & 3u) || (msgTail & 3u) || msgHead < msgTail || msgHead - msgTail < 44u ||
+        msgTail > dmemSize - 44u) { result = 0xE0000078u; goto done; }
+    Wr(B, PMU_FALCON + FALCON_DMEMC0, (1u << 25) | msgTail);
+    for (i = 0; i < RTL_NUMBER_OF(words); ++i) words[i] = Rd(B, PMU_FALCON + FALCON_DMEMD0);
+    cursor = Rd(B, PMU_FALCON + FALCON_DMEMC0) & 0xFFFFu;
+    if ((words[0] & 0xFFFFu) != 0x2A07u || (words[1] & 0xFFu) != 0u || cursor != msgTail + 44u) {
+        result = 0xE0000078u; goto done;
+    }
+    hpqSize = words[2] & 0xFFFFu; hpqBase = words[2] >> 16; hpqIndex = words[3] & 0xFFu;
+    msgSize = words[8] & 0xFFFFu; msgBase = words[8] >> 16;
+    hpqEnd = hpqBase + hpqSize; msgEnd = msgBase + msgSize;
+    Trace(L"B3cFecsHpqBase", hpqBase); Trace(L"B3cFecsHpqSize", hpqSize);
+    Trace(L"B3cFecsHpqIndex", hpqIndex); Trace(L"B3cFecsMsgqBase", msgBase);
+    Trace(L"B3cFecsMsgqSize", msgSize); Trace(L"B3cFecsInitCursor", cursor);
+    if (hpqIndex >= 4u || hpqBase < 4u || msgBase < 4u || hpqSize < 32u || msgSize < 64u ||
+        hpqEnd > dmemSize || msgEnd > dmemSize ||
+        (hpqBase < msgEnd && msgBase < hpqEnd) || msgTail < msgBase || msgTail + 44u > msgEnd ||
+        msgHead < msgBase || msgHead >= msgEnd) { result = 0xE0000078u; goto done; }
+    Wr(B, PMU_FALCON + 0x4CC, msgTail + 44u); /* acknowledge the validated INIT */
+
+    reg = 0x4A0u + hpqIndex * 4u;
+    qhead = Rd(B, PMU_FALCON + reg);
+    qtail = Rd(B, PMU_FALCON + 0x4B0u + hpqIndex * 4u);
+    hpqEnd = hpqBase + hpqSize;
+    Trace(L"B3cFecsHpqHeadBefore", qhead); Trace(L"B3cFecsHpqTail", qtail);
+    if ((qhead & 3u) || (qtail & 3u) || qhead < hpqBase || qhead >= hpqEnd || qtail < hpqBase || qtail >= hpqEnd) {
+        result = 0xE0000078u; goto done;
+    }
+    Step(66);
+    /* INIT_WPR_REGION (region 1, offset 0) is required before bootstrap.
+     * mesa-switch-woa post_wpr() publishes it by updating HPQ head; it does
+     * not use a separate doorbell register. Keep one dword empty in the ring. */
+    if (qhead >= qtail && hpqEnd - qhead < 20u) {
+        if (qtail <= hpqBase + 16u) { result = 0xE0000079u; goto done; }
+        Wr(B, PMU_FALCON + FALCON_DMEMC0, (1u << 24) | qhead);
+        Wr(B, PMU_FALCON + FALCON_DMEMD0, 4u);
+        qhead = hpqBase;
+    }
+    if (qhead < qtail && qtail - qhead <= 16u) { result = 0xE0000079u; goto done; }
+    Wr(B, PMU_FALCON + FALCON_DMEMC0, (1u << 24) | qhead);
+    for (i = 0; i < RTL_NUMBER_OF(wprCmd); ++i) Wr(B, PMU_FALCON + FALCON_DMEMD0, wprCmd[i]);
+    KeMemoryBarrier();
+    qhead += sizeof(wprCmd);
+    Wr(B, PMU_FALCON + reg, qhead);
+    Trace(L"B3cFecsWprCommandHeadAfter", qhead);
+    TraceBin(L"B3cFecsWprInitCommand", wprCmd, sizeof(wprCmd));
+    for (polls = 0; polls < 2000u; ++polls) {
+        replyHead = Rd(B, PMU_FALCON + 0x4C8); replyTail = Rd(B, PMU_FALCON + 0x4CC);
+        if (replyHead == 0xFFFFFFFFu || replyTail == 0xFFFFFFFFu || (replyHead & 3u) || (replyTail & 3u) ||
+            replyHead < msgBase || replyHead >= msgEnd || replyTail < msgBase || replyTail >= msgEnd) {
+            result = 0xE0000079u; goto done;
+        }
+        if (replyHead != replyTail) break;
+        Ms(1);
+    }
+    Trace(L"B3cFecsWprReplyPolls", polls);
+    if (polls == 2000u) { result = 0xE0000079u; goto done; }
+    if (replyHead < replyTail || replyHead - replyTail < 12u) { result = 0xE0000079u; goto done; }
+    Wr(B, PMU_FALCON + FALCON_DMEMC0, (1u << 25) | replyTail);
+    wprReplyHdr = Rd(B, PMU_FALCON + FALCON_DMEMD0);
+    wprReplyCtrl = Rd(B, PMU_FALCON + FALCON_DMEMD0);
+    wprReplyCode = Rd(B, PMU_FALCON + FALCON_DMEMD0);
+    Trace(L"B3cFecsWprReplyHeader", wprReplyHdr); Trace(L"B3cFecsWprReplyCtrl", wprReplyCtrl);
+    Trace(L"B3cFecsWprReplyCode", wprReplyCode);
+    if ((wprReplyHdr & 0xFFu) != 0x0Au || ((wprReplyHdr >> 8) & 0xFFu) != 12u ||
+        ((wprReplyHdr >> 24) & 0xFFu) != 1u || ((wprReplyHdr >> 18) & 1u) ||
+        (wprReplyCtrl & 0xFFu) != 0u || wprReplyCode != 0u) {
+        result = 0xE0000079u; goto done;
+    }
+    Wr(B, PMU_FALCON + 0x4CC, replyTail + 12u);
+    Trace(L"B3cFecsHpqHeadAfterWprInit", Rd(B, PMU_FALCON + reg));
+    Trace(L"B3cFecsHpqTailAfterWprInit", Rd(B, PMU_FALCON + 0x4B0u + hpqIndex * 4u));
+    TraceB3cPmuCheckpoint(B, L"B3cPmuCheckpointAfterWprAck");
+
+    Step(67);
+    /* Claude: keep 'reg' as the HPQ head register offset; 0.4.28 reused it for
+     * PMC_ENABLE, so Step 68 accessed PMU_FALCON + 0xC0013120 (bugcheck). */
+    pmcEnable = Rd(B, NV_PMC_ENABLE);
+    Trace(L"B3cFecsPmcEnableBefore", pmcEnable);
+    Wr(B, NV_PMC_ENABLE, pmcEnable | (1u << 12));
+    (VOID)Rd(B, NV_PMC_ENABLE);
+    Trace(L"B3cFecsPmcEnableAfter", Rd(B, NV_PMC_ENABLE));
+    if (!(Rd(B, NV_PMC_ENABLE) & (1u << 12))) { result = 0xE0000078u; goto done; }
+    TraceB3cPmuCheckpoint(B, L"B3cPmuCheckpointAfterGrEnable");
+    /* Retain 0x419A00 only as a legacy comparison. The GM20B FECS ctxsw
+     * mailbox sequence is written immediately before the FECS start below. */
+    Trace(L"B3cFecsLegacyMailbox419A00BeforeStartSeq", Rd(B, 0x419A00u));
+    Trace(L"B3cFecsCtxswMailbox0BeforeStartSeq", Rd(B, 0x409800u));
+    TraceB3cPmuCheckpoint(B, L"B3cPmuCheckpointBeforeFecsStartMailboxSeq");
+    Step(68);
+    qhead = Rd(B, PMU_FALCON + reg);
+    qtail = Rd(B, PMU_FALCON + 0x4B0u + hpqIndex * 4u);
+    Trace(L"B3cFecsHpqHeadBeforeBootstrap", qhead); Trace(L"B3cFecsHpqTailBeforeBootstrap", qtail);
+    if ((qhead & 3u) || (qtail & 3u) || qhead < hpqBase || qhead >= hpqEnd || qtail < hpqBase || qtail >= hpqEnd) {
+        result = 0xE0000078u; goto done;
+    }
+    if (qhead >= qtail && hpqEnd - qhead < sizeof(cmd) + 4u) {
+        if (qtail <= hpqBase + sizeof(cmd)) { result = 0xE0000078u; goto done; }
+        Wr(B, PMU_FALCON + FALCON_DMEMC0, (1u << 24) | qhead);
+        Wr(B, PMU_FALCON + FALCON_DMEMD0, 4u);
+        qhead = hpqBase;
+    }
+    if (qhead < qtail && qtail - qhead <= sizeof(cmd)) { result = 0xE0000078u; goto done; }
+    Wr(B, PMU_FALCON + FALCON_DMEMC0, (1u << 24) | qhead);
+    bootstrapSeq = ((wprReplyHdr >> 24) & 0xFFu) + 1u;
+    if (bootstrapSeq == 0 || bootstrapSeq > 0xFFu) bootstrapSeq = 1u;
+    cmd[0] = (cmd[0] & 0x00FFFFFFu) | (bootstrapSeq << 24);
+    Trace(L"B3cFecsBootstrapSeq", bootstrapSeq);
+    Step(71);
+    TraceB3cPmuCheckpoint(B, L"B3cPmuCheckpointBeforeBootstrap");
+    if (Rd(B, PMU_FALCON + FALCON_CPUCTL) & 0x10u) { result = 0xE000007Bu; goto done; }
+    Step(72);
+    for (i = 0; i < RTL_NUMBER_OF(cmd); ++i) Wr(B, PMU_FALCON + FALCON_DMEMD0, cmd[i]);
+    KeMemoryBarrier();
+    qhead += sizeof(cmd);
+    Wr(B, PMU_FALCON + reg, qhead);
+    Trace(L"B3cFecsCommandHeadAfter", qhead);
+    TraceBin(L"B3cFecsBootstrapCommand", cmd, sizeof(cmd));
+
+    Step(69);
+    Trace(L"B3cFecsPmuIrqStatAfterPost", Rd(B, PMU_FALCON + 0x008));
+    Trace(L"B3cFecsPmuCpuctlAfterPost", Rd(B, PMU_FALCON + FALCON_CPUCTL));
+    if (Rd(B, PMU_FALCON + FALCON_CPUCTL) & 0x10u) { result = 0xE000007Cu; goto done; }
+    pmuTraceIdx = Rd(B, PMU_FALCON + 0x148);
+    pmuTraceNr = (pmuTraceIdx >> 16) & 0xFFu;
+    if (pmuTraceNr > RTL_NUMBER_OF(pmuPcNow)) pmuTraceNr = RTL_NUMBER_OF(pmuPcNow);
+    Trace(L"B3cFecsPmuTraceIdxAfterPost", pmuTraceIdx);
+    Trace(L"B3cFecsPmuTraceCountAfterPost", pmuTraceNr);
+    for (i = 0; i < pmuTraceNr; ++i) { Wr(B, PMU_FALCON + 0x148, i); pmuPcNow[i] = Rd(B, PMU_FALCON + 0x14C); }
+    if (pmuTraceNr) TraceBin(L"B3cFecsPmuTraceAfterPost", pmuPcNow, pmuTraceNr * sizeof(ULONG));
+    for (polls = 0; polls < 2000u; ++polls) {
+        replyHead = Rd(B, PMU_FALCON + 0x4C8); replyTail = Rd(B, PMU_FALCON + 0x4CC);
+        if (replyHead == 0xFFFFFFFFu || replyTail == 0xFFFFFFFFu || (replyHead & 3u) || (replyTail & 3u) ||
+            replyHead < msgBase || replyHead >= msgEnd || replyTail < msgBase || replyTail >= msgEnd) {
+            result = 0xE0000078u; goto done;
+        }
+        if ((polls % 250u) == 0u && hpqSampleNr < RTL_NUMBER_OF(hpqTailSamples)) {
+            hpqSamplePolls[hpqSampleNr] = polls;
+            hpqTailSamples[hpqSampleNr] = Rd(B, PMU_FALCON + 0x4B0u + hpqIndex * 4u);
+            hpqIrqSamples[hpqSampleNr] = Rd(B, PMU_FALCON + 0x008);
+            ++hpqSampleNr;
+        }
+        if (replyHead != replyTail) break;
+        Ms(1);
+    }
+    Trace(L"B3cFecsHpqSampleCount", hpqSampleNr);
+    if (hpqSampleNr) {
+        TraceBin(L"B3cFecsHpqSamplePolls", hpqSamplePolls, hpqSampleNr * sizeof(ULONG));
+        TraceBin(L"B3cFecsHpqTailSamples", hpqTailSamples, hpqSampleNr * sizeof(ULONG));
+        TraceBin(L"B3cFecsPmuIrqSamples", hpqIrqSamples, hpqSampleNr * sizeof(ULONG));
+    }
+    Trace(L"B3cFecsReplyPolls", polls);
+    if (polls == 2000u) {
+        result = (Rd(B, PMU_FALCON + 0x4B0u + hpqIndex * 4u) != qhead) ? 0xE000007Au : 0xE0000078u;
+        goto done;
+    }
+    /* The response is the ACR unit's 12-byte reply; reject wrap/short records. */
+    if (replyHead < replyTail || replyHead - replyTail < 12u) { result = 0xE0000078u; goto done; }
+    Wr(B, PMU_FALCON + FALCON_DMEMC0, (1u << 25) | replyTail);
+    replyHdr = Rd(B, PMU_FALCON + FALCON_DMEMD0);
+    replyCtrl = Rd(B, PMU_FALCON + FALCON_DMEMD0);
+    replyPayload = Rd(B, PMU_FALCON + FALCON_DMEMD0);
+    Trace(L"B3cFecsReplyHeader", replyHdr); Trace(L"B3cFecsReplyCtrl", replyCtrl);
+    Trace(L"B3cFecsReplyPayload", replyPayload);
+    if ((replyHdr & 0xFFu) != 0x0Au || ((replyHdr >> 8) & 0xFFu) != 12u ||
+        ((replyHdr >> 24) & 0xFFu) != bootstrapSeq || ((replyHdr >> 18) & 1u) ||
+        replyPayload != 2u) {
+        result = 0xE0000078u; goto done;
+    }
+    Wr(B, PMU_FALCON + 0x4CC, replyTail + 12u);
+    /* GPCCS is non-secure on GM20B. Nouveau gf100_gr_init_ctxctl_ext() calls
+     * gf100_gr_init_fw() for GPCCS, then starts GPCCS before FECS; nvgpu
+     * gr_gm20b_load_ctxsw_ucode() uses the direct Falcon IMEM/DMEM path too. */
+    Step(73);
+    Trace(L"B3cFecsDmaCtlBeforeStartPrep", Rd(B, 0x40910Cu));
+    gpccsInst = ReadBinParam(L"FwGpccsInst", 0x20000u, &gpccsInstLen);
+    gpccsData = ReadBinParam(L"FwGpccsData", 0x20000u, &gpccsDataLen);
+    Trace(L"B3cGpccsInstLen", gpccsInstLen);
+    Trace(L"B3cGpccsDataLen", gpccsDataLen);
+    if (gpccsInst == NULL || gpccsData == NULL) { result = 0xE000007Eu; goto done; }
+    gpccsHwcfg = Rd(B, 0x41A108u);
+    gpccsImemSize = (gpccsHwcfg & 0x1FFu) << 8;
+    gpccsDmemSize = ((gpccsHwcfg >> 9) & 0x1FFu) << 8;
+    gpccsImemWords = (gpccsInstLen + 3u) / 4u;
+    /* Nouveau nvkm_falcon_v1_load_imem() pads code to a 0x40-word block. */
+    gpccsImemPaddedWords = (gpccsImemWords + 0x3Fu) & ~0x3Fu;
+    gpccsDmemWords = (gpccsDataLen + 3u) / 4u;
+    Trace(L"B3cGpccsHwcfg", gpccsHwcfg);
+    Trace(L"B3cGpccsImemSize", gpccsImemSize);
+    Trace(L"B3cGpccsDmemSize", gpccsDmemSize);
+    Trace(L"B3cGpccsImemSourceWords", gpccsImemWords);
+    Trace(L"B3cGpccsImemPaddedWords", gpccsImemPaddedWords);
+    if (!gpccsInstLen || !gpccsDataLen || gpccsInstLen > 0x20000u || gpccsDataLen > 0x20000u ||
+        gpccsImemSize < 4u || gpccsDmemSize < 4u || gpccsImemPaddedWords > gpccsImemSize / 4u ||
+        gpccsDmemWords > gpccsDmemSize / 4u) { result = 0xE000007Fu; goto done; }
+    Step(74);
+    /* Nouveau gf100_gr_init_fw() loads both segments at offset zero.
+     * nvkm_falcon_v1_load_imem() advances tags and pads to 0x40 words. */
+    Wr(B, 0x41A1C0u, (1u << 24));
+    for (i = 0; i < gpccsDmemWords; ++i) {
+        fwWord = 0;
+        for (fwByte = 0; fwByte < 4u && i * 4u + fwByte < gpccsDataLen; ++fwByte)
+            fwWord |= ((ULONG)gpccsData[i * 4u + fwByte]) << (fwByte * 8u);
+        Wr(B, 0x41A1C4u, fwWord);
+    }
+    Wr(B, 0x41A180u, (1u << 24));
+    for (i = 0; i < gpccsImemPaddedWords; ++i) {
+        fwWord = 0;
+        for (fwByte = 0; fwByte < 4u && i * 4u + fwByte < gpccsInstLen; ++fwByte)
+            fwWord |= ((ULONG)gpccsInst[i * 4u + fwByte]) << (fwByte * 8u);
+        if ((i & 0x3Fu) == 0u) Wr(B, 0x41A188u, i >> 6);
+        Wr(B, 0x41A184u, fwWord);
+    }
+    Trace(L"B3cGpccsImemWordsWritten", gpccsImemPaddedWords);
+    Trace(L"B3cGpccsDmemWordsWritten", gpccsDmemWords);
+
+    Step(75);
+    /* Match nvgpu gr_gm20b_load_ctxsw_ucode() secure-start order: clear
+     * mailbox 0, write mailbox 1 = 1, then clear mailbox 6. Nouveau
+     * gf100_gr_init_ctxctl_ext() separately clears MB0 and DMACTL before
+     * starting GPCCS followed by FECS. */
+    Trace(L"B3cFecsCtxswMailbox0BeforeSecureSeq", Rd(B, 0x409800u));
+    Wr(B, 0x409840u, 0xFFFFFFFFu);
+    Trace(L"B3cFecsCtxswMailbox0AfterClear", Rd(B, 0x409800u));
+    Wr(B, 0x409804u, 1u);
+    Trace(L"B3cFecsCtxswMailbox1Set", Rd(B, 0x409804u));
+    Wr(B, 0x409858u, 0xFFFFFFFFu);
+    Trace(L"B3cFecsCtxswMailboxClear6Snapshot", Rd(B, 0x409858u));
+    Trace(L"B3cFecsCtxswMailbox6", Rd(B, 0x409818u));
+    Trace(L"B3cFecsCtxswClearRegSnapshot", Rd(B, 0x409840u));
+    Trace(L"B3cFecsCtxswMailbox0AfterSecureSeq", Rd(B, 0x409800u));
+    Trace(L"B3cGpccsDmaCtlBeforeStart", Rd(B, 0x41A10Cu));
+    Wr(B, 0x41A10Cu, 0u);
+    Trace(L"B3cGpccsDmaCtlAfterStartPrep", Rd(B, 0x41A10Cu));
+    Trace(L"B3cFecsDmaCtlBeforeStart", Rd(B, 0x40910Cu));
+    Wr(B, 0x40910Cu, 0u);
+    Trace(L"B3cFecsDmaCtlAfterStartPrep", Rd(B, 0x40910Cu));
+    /* Nouveau's direct PIO path starts GPCCS without programming BOOTVEC. */
+    gpccsBootvecBeforeStart = Rd(B, 0x41A104u);
+    Trace(L"B3cGpccsBootvecBeforeStart", gpccsBootvecBeforeStart);
+    gpccsCpuctlBeforeStart = Rd(B, 0x41A100u);
+    gpccsStartReg = (gpccsCpuctlBeforeStart & 0x40u) ? 0x41A130u : 0x41A100u;
+    Trace(L"B3cGpccsCpuctlBeforeStart", gpccsCpuctlBeforeStart);
+    Trace(L"B3cGpccsStartUsesAlias", gpccsStartReg == 0x41A130u ? 1u : 0u);
+    Wr(B, gpccsStartReg, 2u);
+    gpccsCpuctlAfterStart = Rd(B, 0x41A100u);
+    gpccsMailboxAfterStart = Rd(B, 0x41A040u);
+    Trace(L"B3cGpccsCpuctlAfterStart", gpccsCpuctlAfterStart);
+    Trace(L"B3cGpccsMailbox0AfterStart", gpccsMailboxAfterStart);
+    Trace(L"B3cGpccsBootvecAfterStart", Rd(B, 0x41A104u));
+    for (gpccsStartPolls = 0; gpccsStartPolls < 2000u; ++gpccsStartPolls) {
+        gpccsCpuctlAfterStart = Rd(B, 0x41A100u);
+        if (!(gpccsCpuctlAfterStart & 0x10u)) break;
+        Ms(1);
+    }
+    Trace(L"B3cGpccsStartPolls", gpccsStartPolls);
+    if (gpccsStartPolls == 2000u) { result = 0xE0000080u; goto done; }
+
+    fecsCpuctlBeforeStart = Rd(B, 0x409100u);
+    fecsStartReg = (fecsCpuctlBeforeStart & 0x40u) ? 0x409130u : 0x409100u;
+    Trace(L"B3cFecsCpuctlBeforeStart", fecsCpuctlBeforeStart);
+    Trace(L"B3cFecsStartUsesAlias", (fecsStartReg == 0x409130u) ? 1u : 0u);
+    Wr(B, fecsStartReg, 2u); /* nvkm_falcon_v1_start(): CPUCTL_ALIAS when bit 6 is enabled */
+    fecsCpuctlAfterStart = Rd(B, 0x409100u);
+    fecsMailboxAfterStart = Rd(B, 0x409040u);
+    Trace(L"B3cFecsCpuctlAfterStart", fecsCpuctlAfterStart);
+    Trace(L"B3cFecsMailbox0AfterStart", fecsMailboxAfterStart);
+    for (fecsStartPolls = 0; fecsStartPolls < 2000u; ++fecsStartPolls) {
+        fecsCpuctlAfterStart = Rd(B, 0x409100u);
+        if (!(fecsCpuctlAfterStart & 0x10u)) break;
+        Ms(1);
+    }
+    Trace(L"B3cFecsStartPolls", fecsStartPolls);
+    if (fecsStartPolls == 2000u) { result = 0xE000007Du; goto done; }
+    for (polls = 0; polls < 2000u; ++polls) {
+        fecsReady = Rd(B, 0x409800u);
+        if (fecsReady != fecsReadyPrev) { fecsReadyPrev = fecsReady; ++fecsReadyChangeCount; }
+        if (fecsReady != 0u && fecsReadyFirstNonzero == 0u) fecsReadyFirstNonzero = fecsReady;
+        if (fecsReady == 0x10u || (fecsReady & 1u)) break;
+        Ms(1);
+    }
+    Trace(L"B3cFecsReadyMailbox", fecsReady); Trace(L"B3cFecsReadyFirstNonzero", fecsReadyFirstNonzero);
+    Trace(L"B3cFecsReadyMailboxChanges", fecsReadyChangeCount); Trace(L"B3cFecsReadyPolls", polls);
+    if (polls == 2000u) result = 0xE0000078u;
+    Trace(L"B3cFecsLegacyMailbox419A00AfterWait", Rd(B, 0x419A00u));
+    for (i = 0; i < RTL_NUMBER_OF(fecsMailboxWords); ++i) fecsMailboxWords[i] = Rd(B, 0x409800u + i * 4u);
+    TraceBin(L"B3cFecsCtxswMailboxWords", fecsMailboxWords, sizeof(fecsMailboxWords));
+done:
+    Step(70);
+    TraceDurable(L"B3cFecsStepResult", result);
+    if (hpqIndex < 4u) {
+        hpqTailAfterWait = Rd(B, PMU_FALCON + 0x4B0u + hpqIndex * 4u);
+        Trace(L"B3cFecsHpqHeadAfterWait", Rd(B, PMU_FALCON + 0x4A0u + hpqIndex * 4u));
+        Trace(L"B3cFecsHpqTailAfterWait", hpqTailAfterWait);
+    } else {
+        Trace(L"B3cFecsHpqHeadAfterWait", 0xFFFFFFFFu);
+        Trace(L"B3cFecsHpqTailAfterWait", 0xFFFFFFFFu);
+    }
+    Trace(L"B3cFecsMsgHeadAfterWait", Rd(B, PMU_FALCON + 0x4C8));
+    Trace(L"B3cFecsMsgTailAfterWait", Rd(B, PMU_FALCON + 0x4CC));
+    Trace(L"B3cFecsPmuIrqStatAfterWait", Rd(B, PMU_FALCON + 0x008));
+    pmuTraceIdx = Rd(B, PMU_FALCON + 0x148);
+    pmuPcNrAfterWait = (pmuTraceIdx >> 16) & 0xFFu;
+    if (pmuPcNrAfterWait > RTL_NUMBER_OF(pmuPcAfterWait)) pmuPcNrAfterWait = RTL_NUMBER_OF(pmuPcAfterWait);
+    Trace(L"B3cFecsPmuTraceIdxAfterWait", pmuTraceIdx);
+    Trace(L"B3cFecsPmuTraceCountAfterWait", pmuPcNrAfterWait);
+    for (i = 0; i < pmuPcNrAfterWait; ++i) { Wr(B, PMU_FALCON + 0x148, i); pmuPcAfterWait[i] = Rd(B, PMU_FALCON + 0x14C); }
+    if (pmuPcNrAfterWait) TraceBin(L"B3cFecsPmuTraceAfterWait", pmuPcAfterWait, pmuPcNrAfterWait * sizeof(ULONG));
+    /* Touch GR/FECS registers only when GR is enabled (an early exit before
+     * Step 67 leaves PMC_ENABLE bit 12 clear). */
+    Trace(L"B3cFecsGrEnabledAtRead", (Rd(B, NV_PMC_ENABLE) >> 12) & 1u);
+    if (Rd(B, NV_PMC_ENABLE) & (1u << 12)) {
+    Trace(L"B3cFecsCpuctl", Rd(B, 0x409100u)); Trace(L"B3cFecsSctl", Rd(B, 0x409200u));
+    Trace(L"B3cFecsMailbox0", Rd(B, 0x409040u)); Trace(L"B3cFecsMailbox1", Rd(B, 0x409044u));
+    Trace(L"B3cFecsLegacyMailbox419A00Final", Rd(B, 0x419A00u));
+    fecsTraceIdx = Rd(B, 0x409148u); fecsTraceNr = (fecsTraceIdx >> 16) & 0xFFu;
+    if (fecsTraceNr > RTL_NUMBER_OF(fecsPc)) fecsTraceNr = RTL_NUMBER_OF(fecsPc);
+    Trace(L"B3cFecsTraceIdx", fecsTraceIdx); Trace(L"B3cFecsTraceCount", fecsTraceNr);
+    for (pcSlot = 0; pcSlot < fecsTraceNr; ++pcSlot) { Wr(B, 0x409148u, pcSlot); fecsPc[pcSlot] = Rd(B, 0x40914Cu); }
+    if (fecsTraceNr) TraceBin(L"B3cFecsTracePc", fecsPc, fecsTraceNr * sizeof(ULONG));
+    Trace(L"B3cFecsIrqStat", Rd(B, 0x409008u)); Trace(L"B3cFecsIrqMask", Rd(B, 0x409018u));
+    Trace(L"B3cGpccsCpuctl", Rd(B, 0x41A100u)); Trace(L"B3cGpccsSctl", Rd(B, 0x41A240u));
+    Trace(L"B3cGpccsFalconMailbox0", Rd(B, 0x41A040u)); Trace(L"B3cGpccsFalconMailbox1", Rd(B, 0x41A044u));
+    Trace(L"B3cGpccsBootvecFinal", Rd(B, 0x41A104u));
+    gpccsTraceIdx = Rd(B, 0x41A148u); gpccsTraceNr = (gpccsTraceIdx >> 16) & 0xFFu;
+    if (gpccsTraceNr > RTL_NUMBER_OF(gpccsPc)) gpccsTraceNr = RTL_NUMBER_OF(gpccsPc);
+    Trace(L"B3cGpccsTraceIdx", gpccsTraceIdx); Trace(L"B3cGpccsTraceCount", gpccsTraceNr);
+    for (pcSlot = 0; pcSlot < gpccsTraceNr; ++pcSlot) { Wr(B, 0x41A148u, pcSlot); gpccsPc[pcSlot] = Rd(B, 0x41A14Cu); }
+    if (gpccsTraceNr) TraceBin(L"B3cGpccsTracePc", gpccsPc, gpccsTraceNr * sizeof(ULONG));
+    Trace(L"B3cGpccsIrqStat", Rd(B, 0x41A008u)); Trace(L"B3cGpccsIrqMask", Rd(B, 0x41A018u));
+    for (i = 0; i < RTL_NUMBER_OF(gpccsCtxswMailboxWords); ++i) gpccsCtxswMailboxWords[i] = Rd(B, 0x41A800u + i * 4u);
+    TraceBin(L"B3cGpccsCtxswMailboxWords", gpccsCtxswMailboxWords, sizeof(gpccsCtxswMailboxWords));
+    }
+    Trace(L"B3cFecsPfifoIntr0", Rd(B, 0x2100)); faultId = Rd(B, 0x259C); Trace(L"B3cFecsFaultId", faultId);
+    for (unit = 0; unit < 32u && faultCount < RTL_NUMBER_OF(faultRecs); ++unit) if (faultId & (1u << unit)) {
+        faultRecs[faultCount][0] = unit; faultRecs[faultCount][1] = Rd(B, 0x2800u + unit * 0x10u);
+        faultRecs[faultCount][2] = Rd(B, 0x2804u + unit * 0x10u); faultRecs[faultCount][3] = Rd(B, 0x2808u + unit * 0x10u);
+        faultRecs[faultCount][4] = Rd(B, 0x280Cu + unit * 0x10u); ++faultCount;
+    }
+    Trace(L"B3cFecsFaultRecCount", faultCount);
+    if (faultCount) TraceBin(L"B3cFecsFaultRecs", faultRecs, faultCount * sizeof(faultRecs[0]));
+    TraceDurable(L"B3cFecsResult", result);
+    if (gpccsData != NULL) ExFreePoolWithTag(gpccsData, SWGPU_TAG);
+    if (gpccsInst != NULL) ExFreePoolWithTag(gpccsInst, SWGPU_TAG);
+    return result;
+}
+
 static VOID ProbeB3a(PSWGPU_DEVICE Dev, BOOLEAN RunAcr)
 {
     volatile UCHAR *B = Dev->Bar0;
@@ -2059,7 +2484,7 @@ static VOID ProbeB3a(PSWGPU_DEVICE Dev, BOOLEAN RunAcr)
     ULONG nsOff, nsSize, dataBase, dataSize, numApps, app0Off, app0Size, sigSrc;
     ULONG hwcfg, imemSize, dmemSize, imemBase, dbgFused;
     ULONG wprRawStart, wprRawLimit, wprAllocLen = 0, wprUsed = 0;
-    ULONG bootPolls, pmuArgv = 0;
+    ULONG bootPolls, pmuArgv = 0, fecsErr = 0;
     BOOLEAN acrAttempted = FALSE;
     ULONGLONG arenaIova = 0, instIova = 0;
     ULONGLONG wprStart, wprEnd;
@@ -2487,6 +2912,10 @@ static VOID ProbeB3a(PSWGPU_DEVICE Dev, BOOLEAN RunAcr)
         if (err == 0) {
             err = B3cStartPmuLs(Dev, pmuArgv);
             TraceDurable(L"B3cLsResult", err);
+            if (err == 0) {
+                fecsErr = B3cStartFecsLs(Dev);
+                if (fecsErr != 0) err = fecsErr;
+            }
         }
     } else {
         /* CPU-only WPR layout and readback; no GPU DMA or ACR/PMU start. */
