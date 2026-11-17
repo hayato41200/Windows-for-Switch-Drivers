@@ -25,7 +25,7 @@
  *   r2p_reboot_to_payload, plat_psci_handlers.c tegra_soc_prepare_system_reset):
  *     CAR SCLK_BURST_POLICY (0x28) = 0x10000000, SCLK_RATE (0x30) = 0, 1 ms
  *     clear IRAM 0x40010000-0x4003FFFF, copy the payload to 0x40010000,
- *       zero the 32-byte boot configuration at +0x94 (bl31 r2p_bcfg)
+ *       write the 32-byte boot configuration at +0x94 (bl31 r2p_bcfg; 0 = menu)
  *     PMC_SCRATCH0 (0x50) |= WARMBOOT (bit 0)
  *     PMC_SCRATCH45 (0x234) = 0x2E38DFFF, PMC_SCRATCH46 (0x238) = 0x6001DC28
  *     PMC_SCRATCH33 (0x120) = 0x40010000, PMC_SCRATCH40 (0x13C) = 0x6000F208
@@ -55,6 +55,15 @@
  *                  3 plain PMC reset, 4 backlight off only (test)
  *   PowerOffMethod 0 PMIC (default), 1 backlight off only (test), 2 Windows
  *   PayloadPath    REG_SZ, default \Device\Harddisk0\Partition1\bootloader\update.bin
+ *   RebootToId     REG_SZ, up to 7 printable ASCII characters: after a restart hekate
+ *                  autoboots the hekate_ipl.ini entry with this id= key (hekate
+ *                  boot_cfg_t: boot_cfg = AUTOBOOT_EN | FROM_ID, id[8]). Empty
+ *                  (default): the hekate menu.
+ *   RebootToIndex  DWORD, used when RebootToId is empty: autoboot entry N of
+ *                  hekate_ipl.ini (the first entry after [config] is 1); 0 = menu.
+ *   Holding VOL- while hekate starts still opens its menu. The boot configuration
+ *   goes to the payload at +0x94 (R2P from Windows) or, before PSCI, to
+ *   switchroot's bl31 through SiP 0xC2FFFE04 (R2P_SET_CFG).
  */
 #include <ntddk.h>
 #include <ntstrsafe.h>
@@ -69,7 +78,7 @@
 #define ONOFFIRQ_EN0_R       0x08
 #define POLL_MS              50
 #define REPORT_ID_SYSTEM     1
-#define DRIVER_VERSION       2
+#define DRIVER_VERSION       3
 
 /* MAX77620 power-off (Linux include/linux/mfd/max77620.h) */
 #define MAX77620_I2C_ADDR    0x3C
@@ -109,6 +118,12 @@
 #define T210_I2C5_BASE       0x7000D000ull
 #define T210_I2C_SIZE        0x100
 #define PSCI_SYSTEM_RESET    0x84000009ull
+#define TEGRA_SIP_R2P_SET_CFG 0xC2FFFE04ull     /* switch-atf plat_sip_calls.c */
+
+/* hekate boot_cfg_t (bdk/utils/types.h): boot_cfg, autoboot, autoboot_list, extra_cfg, id[8] */
+#define BOOT_CFG_AUTOBOOT_EN 0x01
+#define BOOT_CFG_FROM_ID     0x04
+#define BOOT_ID_CHARS        7
 
 /* Tegra I2C controller (drivers/Tegra210I2c) */
 #define I2C_TX_FIFO          0x050
@@ -165,6 +180,7 @@ typedef struct _SWPWR_DEVICE {
     PUCHAR Payload;
     ULONG PayloadSize;        /* bytes in the file */
     ULONG PayloadTries;
+    DECLSPEC_ALIGN(8) UCHAR BootCfg[PAYLOAD_BOOTCFG_SIZE];   /* hekate boot_cfg_t, first 32 bytes */
 } SWPWR_DEVICE, *PSWPWR_DEVICE;
 WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(SWPWR_DEVICE, SwPwrGetDevice)
 
@@ -224,16 +240,17 @@ static VOID SwPwrUnmap(volatile UCHAR **Va, SIZE_T Size)
 }
 
 /* SMC Calling Convention: function in x0, result in x0; x4-x17 may be clobbered. */
-static ULONG64 SwPwrSmc(ULONG64 Function)
+static ULONG64 SwPwrSmc(ULONG64 Function, ULONG64 A1, ULONG64 A2, ULONG64 A3, ULONG64 A4)
 {
     register ULONG64 X0 __asm__("x0") = Function;
-    register ULONG64 X1 __asm__("x1") = 0;
-    register ULONG64 X2 __asm__("x2") = 0;
-    register ULONG64 X3 __asm__("x3") = 0;
+    register ULONG64 X1 __asm__("x1") = A1;
+    register ULONG64 X2 __asm__("x2") = A2;
+    register ULONG64 X3 __asm__("x3") = A3;
+    register ULONG64 X4 __asm__("x4") = A4;
     __asm__ volatile("smc #0"
-                     : "+r"(X0), "+r"(X1), "+r"(X2), "+r"(X3)
+                     : "+r"(X0), "+r"(X1), "+r"(X2), "+r"(X3), "+r"(X4)
                      :
-                     : "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15",
+                     : "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15",
                        "x16", "x17", "memory");
     return X0;
 }
@@ -421,10 +438,18 @@ static VOID SwPwrReadConfig(PSWPWR_DEVICE Dev)
     DECLARE_CONST_UNICODE_STRING(NameRestart, L"RestartMethod");
     DECLARE_CONST_UNICODE_STRING(NamePowerOff, L"PowerOffMethod");
     DECLARE_CONST_UNICODE_STRING(NamePath, L"PayloadPath");
+    DECLARE_CONST_UNICODE_STRING(NameId, L"RebootToId");
+    DECLARE_CONST_UNICODE_STRING(NameIndex, L"RebootToIndex");
     WCHAR Buffer[PAYLOAD_PATH_CHARS];
-    UNICODE_STRING Path;
+    WCHAR IdBuffer[16];
+    DECLSPEC_ALIGN(8) UCHAR BootCfg[PAYLOAD_BOOTCFG_SIZE];
+    UNICODE_STRING Path, IdString;
+    BOOLEAN IdOk = TRUE;
     WDFKEY Key;
-    ULONG Value;
+    ULONG Value, Index;
+
+    RtlZeroMemory(BootCfg, sizeof(BootCfg));
+    RtlZeroMemory(IdBuffer, sizeof(IdBuffer));
 
     Dev->ResetEnable = 1;
     Dev->RestartMethod = RESTART_AUTO;
@@ -440,6 +465,25 @@ static VOID SwPwrReadConfig(PSWPWR_DEVICE Dev)
         }
         if (NT_SUCCESS(WdfRegistryQueryULong(Key, &NamePowerOff, &Value))) {
             Dev->PowerOffMethod = Value;
+        }
+        /* Where hekate goes after a restart: an ini entry by its id= key, or by index, or the menu. */
+        RtlInitEmptyUnicodeString(&IdString, IdBuffer, sizeof(IdBuffer) - sizeof(WCHAR));
+        if (NT_SUCCESS(WdfRegistryQueryUnicodeString(Key, &NameId, NULL, &IdString))) {
+            for (Index = 0; Index < IdString.Length / sizeof(WCHAR); ++Index) {
+                if (IdBuffer[Index] <= L' ' || IdBuffer[Index] > L'~' || Index >= BOOT_ID_CHARS) {
+                    IdOk = FALSE;           /* printable ASCII, at most 7 characters */
+                }
+            }
+            if (IdOk && IdString.Length != 0) {
+                BootCfg[0] = BOOT_CFG_AUTOBOOT_EN | BOOT_CFG_FROM_ID;
+                for (Index = 0; Index < IdString.Length / sizeof(WCHAR); ++Index) {
+                    BootCfg[4 + Index] = (UCHAR)IdBuffer[Index];
+                }
+            }
+        }
+        if (BootCfg[0] == 0 && NT_SUCCESS(WdfRegistryQueryULong(Key, &NameIndex, &Value)) && Value != 0 && Value < 256) {
+            BootCfg[0] = BOOT_CFG_AUTOBOOT_EN;
+            BootCfg[1] = (UCHAR)Value;      /* entry number in hekate_ipl.ini, first after [config] = 1 */
         }
         RtlInitEmptyUnicodeString(&Path, Buffer, sizeof(Buffer) - sizeof(WCHAR));
         if (NT_SUCCESS(WdfRegistryQueryUnicodeString(Key, &NamePath, NULL, &Path)) && Path.Length != 0) {
@@ -457,7 +501,10 @@ static VOID SwPwrReadConfig(PSWPWR_DEVICE Dev)
     }
     SwPwrTrace(L"CfgResetEnable", Dev->ResetEnable);
     SwPwrTrace(L"CfgRestartMethod", Dev->RestartMethod);
+    RtlCopyMemory(Dev->BootCfg, BootCfg, sizeof(BootCfg));
     SwPwrTrace(L"CfgPowerOffMethod", Dev->PowerOffMethod);
+    SwPwrTrace(L"CfgBootCfg", *(PULONG)&BootCfg[0]);       /* boot_cfg, autoboot, list, extra */
+    SwPwrTrace(L"CfgBootIdOk", IdOk);
 }
 
 /* Read the payload into nonpaged memory. PASSIVE_LEVEL, while the system runs. */
@@ -556,7 +603,7 @@ static VOID SwPwrRestart(PSWPWR_DEVICE Dev)
                 Wr32(Dev->Iram, Offset, *(PULONG)(Dev->Payload + Offset));
             }
             for (Offset = 0; Offset < PAYLOAD_BOOTCFG_SIZE; Offset += 4) {
-                Wr32(Dev->Iram, PAYLOAD_BOOTCFG + Offset, 0);
+                Wr32(Dev->Iram, PAYLOAD_BOOTCFG + Offset, *(PULONG)&Dev->BootCfg[Offset]);
             }
             SwPwrDsb();
             Wr32(Dev->Pmc, PMC_SCRATCH0, Rd32(Dev->Pmc, PMC_SCRATCH0) | PMC_SCRATCH0_WARMBOOT);
@@ -573,7 +620,12 @@ static VOID SwPwrRestart(PSWPWR_DEVICE Dev)
         KeStallExecutionProcessor(100000);
     }
     /* PSCI method, or the PMC reset did not happen. */
-    (VOID)SwPwrSmc(PSCI_SYSTEM_RESET);
+    /* switchroot bl31 copies r2p_bcfg to the payload at +0x94; other firmware answers SMC_UNK. */
+    if (Dev->BootCfg[0] != 0) {
+        (VOID)SwPwrSmc(TEGRA_SIP_R2P_SET_CFG, *(PULONG64)&Dev->BootCfg[0], *(PULONG64)&Dev->BootCfg[8],
+                       *(PULONG64)&Dev->BootCfg[16], *(PULONG64)&Dev->BootCfg[24]);
+    }
+    (VOID)SwPwrSmc(PSCI_SYSTEM_RESET, 0, 0, 0, 0);
     KeStallExecutionProcessor(100000);
     KeLowerIrql(OldIrql);
 }

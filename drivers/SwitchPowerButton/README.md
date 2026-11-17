@@ -58,6 +58,13 @@ the hekate chain).
 | `RestartMethod` | 0 auto (payload loaded: R2P; else PSCI), 1 PMC only, 2 PSCI `SYSTEM_RESET`, 3 plain PMC reset, 4 backlight off only (test) |
 | `PowerOffMethod` | 0 PMIC (default), 1 backlight off only (test), 2 leave it to Windows |
 | `PayloadPath` | REG_SZ, NT path of the payload |
+| `RebootToId` | REG_SZ, 1–7 printable ASCII characters, no spaces (1.0.3.0). After a restart hekate autoboots the `hekate_ipl.ini` entry whose `id=` key matches. Empty (default): the hekate menu |
+| `RebootToIndex` | DWORD (1.0.3.0), used when `RebootToId` is empty: autoboot entry N of `hekate_ipl.ini` (the first entry after `[config]` is 1). 0: the menu |
+
+The restart target is passed as hekate's boot configuration (`boot_cfg_t`, hekate `bdk/utils/types.h`):
+`boot_cfg` = 0x05 (AUTOBOOT_EN | FROM_ID) with `id[8]`, or `boot_cfg` = 0x01 with `autoboot` = N. It is
+written to the payload at +0x94 for R2P from Windows, or handed to switchroot's bl31 with SiP
+0xC2FFFE04 (R2P_SET_CFG) before PSCI. Holding VOL- while hekate starts still opens its menu.
 
 The driver writes its state to the same key (`DriverVersion`, `Hidrev`, `Erista`, `Mapped`,
 `PayloadStatus`, `PayloadSize`, `PayloadWord0`, …); `kits/Switch-PowerButton/Status.cmd` shows them.
