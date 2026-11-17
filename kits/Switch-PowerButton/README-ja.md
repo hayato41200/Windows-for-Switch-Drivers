@@ -17,6 +17,7 @@
 | `Status.cmd` | 再起動・電源オフの状態を表示する(読むだけ) |
 | `Reset-Disable.cmd` / `Reset-Enable.cmd` | ドライバーによる再起動・電源オフを止める / 戻す |
 | `Restart-Psci.cmd` / `Restart-Auto.cmd` | 再起動のやり方を PSCI(bl31 任せ)にする / 標準に戻す |
+| `RebootTo-Windows.cmd` / `RebootTo-Menu.cmd` | 再起動のあと、hekate が Windows を自動で起動する / hekate のメニューを出す(1.0.3.0 から) |
 | `Reset.ps1` | 上の .cmd の本体。ログは `C:\SwitchWOA-Reset.txt` |
 
 .cmd は、どれも右クリック →「管理者として実行」で使う。
@@ -37,6 +38,24 @@
 5. **再起動とシャットダウンを試す。**
 
 コントロールセンターの「ドライバー」タブから更新したときは、payload の場所は既定(`\Device\Harddisk0\Partition1\bootloader\update.bin`)になる。SD が 1 枚だけなら、たいていこれで合っている。`Status.cmd` で `loaded` になっていなければ、`Install.cmd` を実行する。
+
+## 再起動したら Windows を自動で起動する(1.0.3.0 から)
+
+既定では、再起動すると hekate のメニューに戻る。hekate がそのまま Windows を起動するようにもできる。
+
+1. **SD の `bootloader\hekate_ipl.ini` の、Windows の項目に `id=SWOA` の 1 行を足す。** PC で SD を開くか、hekate の中で編集する。例:
+   ```ini
+   [Windows]
+   id=SWOA
+   ...(今ある行はそのまま)
+   ```
+2. **`RebootTo-Windows.cmd` を管理者として実行する。** `after a restart: autoboot the ini entry with id=SWOA` と出れば設定済み。
+3. **再起動する。** hekate が Windows の項目を自動で起動する。
+   - hekate のメニューに入りたいときは、hekate が起動するときに音量の「−」ボタンを押したままにする。
+   - メニューに戻す設定は `RebootTo-Menu.cmd`。
+   - 項目の番号で指定することもできる: `Reset.ps1 -Mode RebootTo -Index 2`(`[config]` の次の項目が 1)。
+- 自動で起動するのは、Windows から再起動したときだけ。PC から payload を入れて起動したときは、今までどおりメニューが出る。
+- 設定はレジストリ(`RebootToId`、`RebootToIndex`)にあり、ドライバーは 10 秒ごとに読み直す。ほかのアプリやメニューから変えてもよい(値の意味は `drivers\SwitchPowerButton\README-ja.md`)。
 
 ## 再起動・シャットダウンのしくみ
 

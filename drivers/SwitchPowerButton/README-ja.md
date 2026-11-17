@@ -40,6 +40,10 @@ Windows はシャットダウンを最後まで終えるが、最後のファー
 | `RestartMethod` | 0 自動(payload があれば R2P、なければ PSCI)、1 PMC だけ、2 PSCI `SYSTEM_RESET`、3 普通の PMC リセット、4 バックライトを消すだけ(試験用) |
 | `PowerOffMethod` | 0 PMIC(既定)、1 バックライトを消すだけ(試験用)、2 Windows に任せる |
 | `PayloadPath` | REG_SZ。payload の NT パス |
+| `RebootToId` | REG_SZ、空白なしの ASCII で 1〜7 文字(1.0.3.0 から)。再起動のあと、hekate が `hekate_ipl.ini` の `id=` がこの値の項目を自動で起動する。空(既定)なら hekate のメニュー |
+| `RebootToIndex` | DWORD(1.0.3.0 から)。`RebootToId` が空のときに使う。`hekate_ipl.ini` の N 番目の項目を自動で起動する(`[config]` の次が 1)。0 ならメニュー |
+
+再起動の行き先は、hekate の起動設定(`boot_cfg_t`、hekate の `bdk/utils/types.h`)として渡す。id のときは `boot_cfg` = 0x05(AUTOBOOT_EN と FROM_ID)と `id[8]`、番号のときは `boot_cfg` = 0x01 と `autoboot` = N。Windows から R2P をするときは payload の +0x94 に書き、PSCI を呼ぶときは先に switchroot の bl31 の SiP 0xC2FFFE04(R2P_SET_CFG)で渡す。hekate が起動するときに音量の「−」ボタンを押していれば、メニューが出る。
 
 ドライバーは、同じキーに状態を書く(`DriverVersion`、`Hidrev`、`Erista`、`Mapped`、`PayloadStatus`、`PayloadSize`、`PayloadWord0` など)。`kits/Switch-PowerButton/Status.cmd` で見られる。
 
