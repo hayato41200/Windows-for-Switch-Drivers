@@ -1,47 +1,62 @@
-# 電源ボタン：Nintendo Switch の電源ボタンドライバー
+# 電源ボタン・再起動・シャットダウン(switchpwrbtn)
+
+## できること
+
+- **電源ボタン:** 押すと、Windows の電源オプションの「電源ボタンを押したときの動作」をする(画面を消す、シャットダウンなど)。
+- **再起動で hekate に戻る(1.0.2.0 から):** Windows の再起動で、hekate のメニューに戻る。PC から payload を入れ直さなくてよい。
+- **シャットダウンで電源が切れる(1.0.2.0 から):** 前は、画面が黒・バックライトがついたまま止まっていた。
+- 2026-11-17 に実機で確かめた(Erista、hekate から起動した Windows 11)。
 
 ## 中身
 
 | ファイル | 内容 |
 |---|---|
-| `switchpwrbtn.sys` | KMDF ドライバー（ARM64、テスト署名）。ソースは `..\SwitchPowerButton\src\switchpwrbtn.c` |
-| `switchpwrbtn.inf` | `ACPI\SWOA0601`。下に Windows 標準の `vhf.sys` を付ける（タッチと同じ） |
-| `PowerButton.ps1` | Install、Status、Watch、SetAction、Remove |
+| `switchpwrbtn.sys/.inf/.cat` | ドライバー(ARM64、テスト署名)。ソースと説明は `drivers\SwitchPowerButton` |
+| `PowerButton.ps1` | ボタン: Install、Status、Watch、SetAction、Remove |
+| `Install.cmd` | ドライバーを入れ、hekate の payload の場所を設定する(`Reset.ps1 -Mode Install`) |
+| `Status.cmd` | 再起動・電源オフの状態を表示する(読むだけ) |
+| `Reset-Disable.cmd` / `Reset-Enable.cmd` | ドライバーによる再起動・電源オフを止める / 戻す |
+| `Restart-Psci.cmd` / `Restart-Auto.cmd` | 再起動のやり方を PSCI(bl31 任せ)にする / 標準に戻す |
+| `Reset.ps1` | 上の .cmd の本体。ログは `C:\SwitchWOA-Reset.txt` |
 
-## ドライバーの作り
+.cmd は、どれも右クリック →「管理者として実行」で使う。
 
-- **ボタンのつながり:** 電源ボタンは SoC の GPIO ではなく、PMIC（MAX77620）の EN0 につながっている。
-- **読み方:** ドライバーは、I2C5 の MAX77620（0x3C）を 50 ms ごとに読む。
-  - ONOFFSTAT（0x15）の bit 2: 押している間は 1。
-  - ONOFFIRQ（0x0B）: 読むと消える。50 ms より短い押し方も、ここで拾う。
-- **Windows への渡し方:** HID の「System Power Down」ボタンとして報告する。押したときに何をするかは、Windows の電源オプションの「電源ボタンを押したときの動作」で決まる。
-- **長押し:** 数秒押し続けると、これまでどおり PMIC が自分で電源を切る。ドライバーは関係しない。
+## 入れ方
 
-## 手順
-
-1. **Switch を UEFI R374 で起動する。** ペイロードは `D:\Codex\coreboot-R374.rom`。
+1. **UEFI R374 以降で起動する。** I2C のドライバー(Stage3)を先に入れておく。
 2. **このフォルダーを Switch に移す。** 例: `C:\SwitchWOA\PowerButton`。
-3. **先に、ボタンを押したときの動作を「画面を消す」にする。** この Switch は、スリープ（S3 やモダンスタンバイ）がまだ動くかわからない。そのため最初は、安全な「画面を消す」で試す。
+3. **`Install.cmd` を管理者として実行する。** 最後の表示で次を確かめる。
+   - `driver version: 2 OK`
+   - `payload: status=0x00000000 (loaded)`
+   - `restart will use: R2P from Windows …`
+4. **ボタンの動作を決める。** 最初は安全な「画面を消す」がよい。
    ```bat
    powershell -ExecutionPolicy Bypass -File C:\SwitchWOA\PowerButton\PowerButton.ps1 -Mode SetAction -Action Display
    ```
-4. **インストールする。**
-   ```bat
-   powershell -ExecutionPolicy Bypass -File C:\SwitchWOA\PowerButton\PowerButton.ps1 -Mode Install
-   ```
-5. **電源ボタンを短く押す。** 画面が消えれば成功。タッチするか、もう一度ボタンを押すと、画面が戻るはず。
-6. **結果を共有する。** `-Mode Status` の出力を見せてほしい。
-   - 押しても何も起きないとき: `-Mode Watch` を実行して、ボタンを押したときに `presses` と `reports` が増えるか見る。
+   ほかに `-Action Shutdown`、`Nothing`、`Sleep` がある。スリープは、動くか確かめるまで使わないでほしい。
+5. **再起動とシャットダウンを試す。**
 
-## 結果（2026-10-25、ユーザー報告）
+コントロールセンターの「ドライバー」タブから更新したときは、payload の場所は既定(`\Device\Harddisk0\Partition1\bootloader\update.bin`)になる。SD が 1 枚だけなら、たいていこれで合っている。`Status.cmd` で `loaded` になっていなければ、`Install.cmd` を実行する。
 
-- **成功した。** 動作を「画面を消す」にして電源ボタンを押すと、画面が消えて、ロックされた。もう一度押すと、画面がついた。
+## 再起動・シャットダウンのしくみ
 
-## ほかの動作にしたいとき
+- Windows はシャットダウンを最後まで終えるが、最後のファームウェアの呼び出しが効かない。そこでドライバーが、シャットダウンの最後(デバイスの電源を切る段階。ファイルとレジストリの書き出しはもう終わっている)に、自分で処理する。
+- **再起動:** hekate の payload を IRAM 0x40010000 に置いて、PMC でリセットする(reboot-to-payload。switchroot の bl31 と同じ手順)。
+  - payload は、起動した SD の 1 番目の区画(hekate の FAT)の `bootloader\update.bin`(hekate の SD にある、hekate 自身のコピー)。ほかのファイルにするときは `Reset.ps1 -Mode Path -Payload \payload.bin` のようにする。Windows の起動後に読むだけで、SD には書かない。
+  - 読めなかったときは PSCI SYSTEM_RESET を呼ぶ。hekate から起動していれば、bl31 が hekate に戻す。RCM(coreboot)から起動したときは、普通のリセットになる。
+- **シャットダウン:** PMIC(MAX77620)に電源オフを命じる。電源が切れたあとの起動は今までどおり(Erista の AutoRCM なら RCM になるので、payload を入れる)。
+- 処理の直前にバックライトを消す。うまくいかなかったときに、どこで止まったかの目印になる。
 
-- 押したらシャットダウンする:
-  ```bat
-  powershell -ExecutionPolicy Bypass -File C:\SwitchWOA\PowerButton\PowerButton.ps1 -Mode SetAction -Action Shutdown
-  ```
-- 何もしない: `-Action Nothing`
-- スリープ: `-Action Sleep`（スリープが動くか確かめるまでは、使わないでほしい）
+## うまくいかないとき
+
+- **再起動で、バックライトが消えて止まる:** ドライバーは動いたが、リセットが効かなかった。長押しで切ってから起動し、`Restart-Psci.cmd` を実行して、もう一度試す。
+- **再起動・シャットダウンで、バックライトがついたまま止まる:** ドライバーの処理まで来ていない。`Status.cmd` の結果を共有してほしい。
+- **シャットダウンで、バックライトだけ消えて止まる:** PMIC への命令が届かなかった。
+- 長押しでの電源断は、Windows のシャットダウンが終わったあとなので、ファイルは書き出し済み。
+- **元に戻す:** `Reset-Disable.cmd`(前の止まる動きに戻るだけ)。
+- **注意:** Mariko(新型)では R2P ができないので、ドライバーは自動で PSCI を使う。payload を読むときに Windows が FAT の区画をマウントするので、ファイルの最終アクセス日が更新されることはある。
+
+## 結果
+
+- 2026-10-25: 動作を「画面を消す」にして電源ボタンを押すと、画面が消えてロックされた。もう一度押すと、画面がついた。
+- 2026-11-17(1.0.2.0、hekate から起動): 再起動で hekate に戻った。シャットダウンで電源が完全に切れた。RCM(coreboot)から起動した場合はまだ確かめていない。
