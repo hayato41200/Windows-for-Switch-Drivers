@@ -44,8 +44,9 @@ registry hives are flushed before that. `WdfDeviceGetSystemPowerAction` tells wh
   means the driver got there.
 - Other power actions (device removal, driver update, hibernate, sleep) do nothing.
 
-Tested on hardware on 2026-11-17 (Erista, Windows 11 booted from hekate): restart returns to the
-hekate menu and shut down powers the console off. Not yet tested when booted from RCM (coreboot).
+Tested on hardware on 2026-11-17 (Erista, Windows 11): restart returns to the hekate menu both when
+Windows was booted from hekate and from RCM (coreboot); shut down powers the console off (tested on
+the hekate chain).
 
 ## Parameters
 
