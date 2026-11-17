@@ -1,0 +1,52 @@
+;
+; switchdisplay.inf - Nintendo Switch built-in panel, WDDM display-only driver
+; on the DSDT device DISP (ACPI\SWOA0E01, UEFI R408 or later)
+;
+
+[Version]
+Signature   = "$WINDOWS NT$"
+Class       = Display
+ClassGuid   = {4d36e968-e325-11ce-bfc1-08002be10318}
+Provider    = %Mfg%
+CatalogFile = switchdisplay.cat
+DriverVer   = 11/08/2026,1.2.2.0
+PnpLockdown = 1
+
+[DestinationDirs]
+DefaultDestDir = 12
+
+[SourceDisksNames]
+1 = %DiskName%
+
+[SourceDisksFiles]
+switchdisplay.sys = 1
+
+[Manufacturer]
+%Mfg% = Std, NTarm64
+
+[Std.NTarm64]
+%DeviceDesc% = SwDisp_Inst, ACPI\SWOA0E01
+
+[SwDisp_Inst.NT]
+FeatureScore = F9
+CopyFiles = SwDisp_Copy
+
+[SwDisp_Copy]
+switchdisplay.sys
+
+[SwDisp_Inst.NT.Services]
+AddService = switchdisplay, 0x00000002, SwDisp_Service
+
+[SwDisp_Service]
+DisplayName   = %ServiceDesc%
+ServiceType   = 1
+StartType     = 3
+ErrorControl  = 0
+ServiceBinary = %12%\switchdisplay.sys
+LoadOrderGroup = Video
+
+[Strings]
+Mfg         = "SwitchWOA"
+DiskName    = "SwitchWOA Display"
+DeviceDesc  = "Nintendo Switch Display (display-only)"
+ServiceDesc = "Nintendo Switch Display"

@@ -28,6 +28,7 @@ the UEFI starts it (not `bootmgfw.efi` directly). Other `0xD…` codes: see "ブ
 | `switchwlan` | `ACPI\SWOA0D01` | R405 | Wi-Fi（ベータ）。WPA2-Personalで接続、DHCP、インターネット接続。Wi-Fi 5（802.11ac）、866/866 Mbit/s。2026-11-08に実機確認：fast.com 下り55 Mbit/s・上り39 Mbit/s。ファームウェア `brcmfmac4356(A3)-pcie.bin/.txt` は各自で用意（動作確認済み 7.35.252.108）。`switchwlan.sys` 0.6.13 |
 | `switchaudio`（ベータ） | ACPI\SWOA0C01 | R403（R402 ならスピーカーだけ） | 音声。スピーカーとヘッドホンへの再生（PortCls WaveRT、48 kHz・16 ビット・ステレオ）。ヘッドホンを抜き差しすると自動で切り替わる。Windows に見える出力は「スピーカー」の1つで、音量も共通。マイクは無い |
 | `switchsensor` | ACPI\SWOA0901 | R379 | 傾きセンサー（画面の自動回転）。明るさセンサーは、この本体では見つからず使えていない |
+| `switchdisplay`（ベータ） | ACPI\SWOA0E01 | R408 | 内蔵パネルの表示（WDDM の表示専用ドライバー。Basic Display の代わり）。回転（設定と SwitchCenter の自動回転）。画面オフのときにパネルをスリープさせ、表示コントローラーも止める。描画は今までどおり CPU（GPU による高速化は無い）。入れ替えは次の起動のとき（`kits/Switch-Display`） |
 | `swoadiag` | —（読み込んだときだけ） | — | USB（XUSB）のレジスタを読むだけの診断用 |
 | `nvtsdhc` | ACPI\NVDA0101 | —（SD のローダーがデバイスを足す） | Windows 11 を SD から起動するための SD ホスト（sdport）。SwitchPatcher が SD に入れる（`kits/Switch-Sd`）。起動できないときは、ブルースクリーンに診断用のコードを出す（下の「ブルースクリーンのストップコード」） |
 

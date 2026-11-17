@@ -1,0 +1,56 @@
+;
+; switchgpu.inf - Nintendo Switch GM20B GPU bring-up test driver (stage A: power the GPU,
+; read NV_PMC_BOOT_0). Device GPU0 = ACPI\SWOA0F01 from UEFI R410.
+;
+
+[Version]
+Signature   = "$WINDOWS NT$"
+Class       = System
+ClassGuid   = {4d36e97d-e325-11ce-bfc1-08002be10318}
+Provider    = %Mfg%
+CatalogFile = switchgpu.cat
+DriverVer   = 11/16/2026,0.4.36.0
+PnpLockdown = 1
+
+[DestinationDirs]
+DefaultDestDir = 12
+
+[SourceDisksNames]
+1 = %DiskName%
+
+[SourceDisksFiles]
+switchgpu.sys = 1
+
+[Manufacturer]
+%Mfg% = Std, NTarm64
+
+[Std.NTarm64]
+%DeviceDesc% = SwGpu_Inst, ACPI\SWOA0F01
+
+[SwGpu_Inst.NT]
+CopyFiles = SwGpu_Copy
+
+[SwGpu_Copy]
+switchgpu.sys
+
+[SwGpu_Inst.NT.Services]
+AddService = switchgpu, 0x00000002, SwGpu_Service
+
+[SwGpu_Service]
+DisplayName   = %ServiceDesc%
+ServiceType   = 1
+StartType     = 3
+ErrorControl  = 1
+ServiceBinary = %12%\switchgpu.sys
+
+[SwGpu_Inst.NT.Wdf]
+KmdfService = switchgpu, SwGpu_WdfSection
+
+[SwGpu_WdfSection]
+KmdfLibraryVersion = 1.15
+
+[Strings]
+Mfg         = "SwitchWOA"
+DiskName    = "SwitchWOA GPU test"
+DeviceDesc  = "Nintendo Switch GPU (GM20B, bring-up test)"
+ServiceDesc = "Nintendo Switch GPU bring-up test"
