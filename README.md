@@ -5,7 +5,8 @@ Windows on ARM (ARM64) で動く、Nintendo Switch（Tegra210 / Erista）用の�
 UEFI と DSDT は [Windows-for-Switch](https://github.com/hayato41200/Windows-for-Switch) にあります。このリポジトリのドライバーは、そちらの UEFI（R367 以降）が DSDT に追加するデバイスを使います。
 
 English summary: KMDF drivers (GPIO, I2C, battery + USB-C role, fan + backlight, touch screen,
-power button, CPU clock, RTC, light and tilt sensors, Bluetooth) and a tray / control-center app for Windows on ARM (ARM64) on the
+power button (since 1.0.2.0 also restart back to hekate by reboot-to-payload, and power-off at
+shutdown; see drivers/SwitchPowerButton/README.md), CPU clock, RTC, light and tilt sensors, Bluetooth) and a tray / control-center app for Windows on ARM (ARM64) on the
 Nintendo Switch. Install from the release ZIPs; build with `release/Make-Release.ps1`.
 Tested on Windows 11 Arm64 22H2 (22621); bring your own Windows image and license.
 Blue screen with stop code `0xD0000FF0` when booting Windows 11 from SD: the SD driver (`nvtsdhc`) loaded but
@@ -21,7 +22,7 @@ the UEFI starts it (not `bootmgfw.efi` directly). Other `0xD…` codes: see "ブ
 | `switchbattery` | ACPI\SWOA0301 | R371（USB-C は R378） | バッテリー（battc）、USB-C の抜き差しに合わせた VBUS・充電の切り替え |
 | `switchfan` | ACPI\SWOA0401 | R372（明るさは R376） | 温度によるファンの制御、画面の明るさ、画面オフでのバックライトの消灯 |
 | `switchtouch` | ACPI\SWOA0501 | R373 | タッチパネル（VHF の HID マルチタッチ） |
-| `switchpwrbtn` | ACPI\SWOA0601 | R374 | 電源ボタン（VHF の HID） |
+| `switchpwrbtn` | ACPI\SWOA0601 | R374 | 電源ボタン（VHF の HID）。1.0.2.0 から、Windows の再起動で hekate に戻り（reboot-to-payload、Erista）、シャットダウンで電源が切れる（MAX77620）。説明は `drivers/SwitchPowerButton`（[日本語](drivers/SwitchPowerButton/README-ja.md)・[English](drivers/SwitchPowerButton/README.md)） |
 | `switchcpu` | ACPI\SWOA0701 | R375 | CPU のクロックのプロファイル（614〜1766 MHz）、温度による制限 |
 | `switchrtc` | ACPI\SWOA0801 | R377 | 時計（MAX77620 の RTC を読み、ずれを覚えて時刻を合わせる） |
 | `switchbt` | ACPI\SWOA0B01 | R390 | Bluetooth（UART-D の BCM4356A3 を、Windows 標準の BthMini につなぐ）。3 Mbps。ファームウェアのパッチ `BCM4356A3.hcd` は各自で用意（配布しない）。今は電波がとても近くまでしか届かない（Wi-Fi 側が動いていないため） |
@@ -50,7 +51,7 @@ Windows のイメージとライセンスは、各自で用意してください
    3. バッテリー
    4. ファン
    5. タッチ
-   6. 電源ボタン
+   6. 電源ボタン（再起動で hekate に戻る・シャットダウンで電源が切れる機能も入る。`Install.cmd`）
    7. CPU
    8. RTC
    9. センサー
