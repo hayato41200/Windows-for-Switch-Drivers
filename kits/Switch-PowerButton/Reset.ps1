@@ -10,8 +10,8 @@
   -Mode Enable   : ResetEnable=1 (default)
   -Mode Disable  : ResetEnable=0 (restart and shut down are left to Windows again)
   -Mode Path     : -Payload <path on partition 1, e.g. \payload.bin>
-  -Mode RebootTo : where hekate goes after a restart. -Id SWOA = autoboot the hekate_ipl.ini
-                   entry with id=SWOA; -Index 2 = autoboot entry 2; neither = the hekate menu
+  -Mode RebootTo : where hekate goes after a restart. -Id SWOAHKT = autoboot the hekate_ipl.ini
+                   entry with id=SWOAHKT; -Index 2 = autoboot entry 2; neither = the hekate menu
 
   Log: C:\SwitchWOA-Reset.txt
 #>

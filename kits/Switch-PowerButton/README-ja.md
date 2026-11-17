@@ -43,14 +43,15 @@
 
 既定では、再起動すると hekate のメニューに戻る。hekate がそのまま Windows を起動するようにもできる。
 
-1. **SD の `bootloader\hekate_ipl.ini` の、Windows の項目に `id=SWOA` の 1 行を足す。** PC で SD を開くか、hekate の中で編集する。例:
+1. **SD の `bootloader\hekate_ipl.ini` の、Windows の項目に `id=SWOAHKT` があるか確かめる。** SwitchWOA の hekate キットの項目には、はじめから入っている。ほかの項目名で作ったときは、その項目に 1 行足す(PC で SD を開くか、hekate の中で編集する)。例:
    ```ini
-   [Windows]
-   id=SWOA
-   ...(今ある行はそのまま)
+   [Windows (SwitchWOA)]
+   l4t=1
+   boot_prefixes=switchroot/switchwoa/
+   id=SWOAHKT
    ```
-2. **`RebootTo-Windows.cmd` を管理者として実行する。** `after a restart: autoboot the ini entry with id=SWOA` と出れば設定済み。
-3. **再起動する。** hekate が Windows の項目を自動で起動する。
+2. **`RebootTo-Windows.cmd` を管理者として実行する。** `after a restart: autoboot the ini entry with id=SWOAHKT` と出れば設定済み。
+3. **再起動する。** hekate が Windows の項目を自動で起動する。id は ini と大文字・小文字まで同じでないと一致しない(別の id にするときは `Reset.ps1 -Mode RebootTo -Id <id>`)。
    - hekate のメニューに入りたいときは、hekate が起動するときに音量の「−」ボタンを押したままにする。
    - メニューに戻す設定は `RebootTo-Menu.cmd`。
    - 項目の番号で指定することもできる: `Reset.ps1 -Mode RebootTo -Index 2`(`[config]` の次の項目が 1)。
