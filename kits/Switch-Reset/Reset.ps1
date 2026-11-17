@@ -32,7 +32,7 @@ function Log([string]$s) { Write-Host $s; Add-Content -Path $Log -Value $s -Enco
 $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 if (-not $isAdmin) { Write-Host 'Run this from an elevated (Administrator) prompt (right click - Run as administrator).'; exit 1 }
 
-function U32($v) { if ($null -eq $v) { return [uint32]0 } return [BitConverter]::ToUInt32([BitConverter]::GetBytes([int32]$v), 0) }
+function U32($v) { if ($null -eq $v) { return [uint32]0 } return [uint32]([int64]$v -band [int64]4294967295) }
 function Ensure-Key { if (-not (Test-Path $Key)) { New-Item -Path $Key -Force | Out-Null } }
 function Set-Dword([string]$name, [int]$value) { Ensure-Key; New-ItemProperty -Path $Key -Name $name -PropertyType DWord -Value $value -Force | Out-Null }
 
@@ -82,7 +82,7 @@ function Show-Status {
     $auto = if ([int]$p.CfgRestartMethod -ne 0) { $rm[[int]$p.CfgRestartMethod] } elseif ($st -eq 0 -and $p.PayloadSize -gt 0 -and $p.Erista -eq 1) { 'R2P from Windows (payload in IRAM, PMC reset)' } else { 'PSCI SYSTEM_RESET (bl31)' }
     Log "restart will use: $auto"
   }
-  Log ("i2c: OpenI2cStatus=0x{0:X} FirstReadStatus=0x{1:X} Failures={2}" -f (U32 $p.OpenI2cStatus), (U32 $p.FirstReadStatus), $p.Failures)
+  Log ("i2c: OpenI2cStatus=0x{0:X} FirstReadStatus=0x{1:X} Failures={2} (count at the last error; 0 is not written back) LastI2cError=0x{3:X8}" -f (U32 $p.OpenI2cStatus), (U32 $p.FirstReadStatus), $p.Failures, (U32 $p.LastI2cError))
 }
 
 Log ''
