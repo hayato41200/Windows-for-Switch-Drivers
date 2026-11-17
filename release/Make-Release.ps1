@@ -77,10 +77,10 @@ $Drivers = @(
   @{ Dir = 'SwitchRtc';         Name = 'switchrtc';     Src = 'switchrtc.c';     Libs = @();                             Inc = $Spb; Kit = 'Switch-Rtc';         Hwid = 'ACPI\SWOA0801'; MinUefi = 'R377'; Ja = '時計（RTC）'; En = 'Clock (RTC)'; Boot = $false }
   @{ Dir = 'SwitchSensor';      Name = 'switchsensor';  Src = 'switchsensor.c';  Libs = @();                             Inc = $Spb; Kit = 'Switch-Sensor';      Hwid = 'ACPI\SWOA0901'; MinUefi = 'R379'; Ja = '明るさ・傾きセンサー'; En = 'Light, tilt sensors'; Boot = $false }
   @{ Dir = 'SwitchBluetooth';   Name = 'switchbt';      Src = 'switchbt.c';      Libs = @();                             Inc = @();  Kit = 'Switch-Bluetooth';   Hwid = 'ACPI\SWOA0B01'; MinUefi = 'R390'; Ja = 'Bluetooth'; En = 'Bluetooth'; Boot = $false }
-  @{ Dir = 'SwitchAudio';       Name = 'switchaudio';   Src = 'switchaudio.cpp'; Libs = @('portcls.lib', 'libcntpr.lib'); Inc = $Spb; Kit = 'Switch-Audio';       Hwid = 'ACPI\SWOA0C01'; MinUefi = 'R402'; Ja = '音声（スピーカー）'; En = 'Audio (speaker)'; Boot = $false; Beta = $true; Wdm = $true }
+  @{ Dir = 'SwitchAudio';       Name = 'switchaudio';   Src = 'switchaudio.cpp'; Libs = @('portcls.lib', 'libcntpr.lib'); Inc = $Spb; Kit = 'Switch-Audio';       Hwid = 'ACPI\SWOA0C01'; MinUefi = 'R402'; Ja = '音声（スピーカー）'; En = 'Audio (speaker)'; Boot = $false; Wdm = $true }
   # Wi-Fi: two sources against the 10.0.26100 WDK, built by its own script. Firmware, NVRAM and the
   # console's MAC are never in the release: SwitchCenter copies them from the user's own files.
-  @{ Dir = 'SwitchWlan';        Name = 'switchwlan';    Build = 'drivers\SwitchWlan\build.ps1';                                      Kit = 'Switch-Wlan';        Hwid = 'ACPI\SWOA0D01'; MinUefi = 'R405'; Ja = 'Wi-Fi'; En = 'Wi-Fi'; Boot = $false; Beta = $true }
+  @{ Dir = 'SwitchWlan';        Name = 'switchwlan';    Build = 'drivers\SwitchWlan\build.ps1';                                      Kit = 'Switch-Wlan';        Hwid = 'ACPI\SWOA0D01'; MinUefi = 'R405'; Ja = 'Wi-Fi'; En = 'Wi-Fi'; Boot = $false }
   # Display: WDDM display-only driver against the 10.0.26100 WDK, own build script. Replaced at the next
   # boot like GPIO/I2C: swapping the display driver live can leave the screen black until a restart.
   @{ Dir = 'SwitchDisplay';     Name = 'switchdisplay'; Build = 'drivers\SwitchDisplay\build.ps1';                                Kit = 'Switch-Display';     Hwid = 'ACPI\SWOA0E01'; MinUefi = 'R408'; Ja = '画面（表示専用ドライバー）'; En = 'Display (display-only)'; Boot = $true; Beta = $true }
