@@ -1,178 +1,172 @@
 # Windows for Switch — Drivers
 
-Windows on ARM (ARM64) で動く、Nintendo Switch（Tegra210 / Erista）用のドライバーと、コントロールセンター（SwitchCenter）です。
+English | [日本語](README-ja.md)
 
-UEFI と DSDT は [Windows-for-Switch](https://github.com/hayato41200/Windows-for-Switch) にあります。このリポジトリのドライバーは、そちらの UEFI（R367 以降）が DSDT に追加するデバイスを使います。
+Drivers and a control center (SwitchCenter) for Windows on ARM (ARM64) on the Nintendo Switch (Tegra210 / Erista).
 
-English summary: KMDF drivers (GPIO, I2C, battery + USB-C role, fan + backlight, touch screen,
-power button (since 1.0.2.0 also restart back to hekate by reboot-to-payload, and power-off at
-shutdown; see drivers/SwitchPowerButton/README.md), CPU clock, RTC, light and tilt sensors, Bluetooth) and a tray / control-center app for Windows on ARM (ARM64) on the
-Nintendo Switch. Install from the release ZIPs; build with `release/Make-Release.ps1`.
-Tested on Windows 11 Arm64 22H2 (22621); bring your own Windows image and license.
-Blue screen with stop code `0xD0000FF0` when booting Windows 11 from SD: the SD driver (`nvtsdhc`) loaded but
-the SD host device is missing; check that `EFI\Boot\bootaa64.efi` on the ESP is `SDLOADAA64-NOCID.EFI` and that
-the UEFI starts it (not `bootmgfw.efi` directly). Other `0xD…` codes: see "ブルースクリーンのストップコード" below.
+The UEFI and DSDT live in [Windows-for-Switch](https://github.com/hayato41200/Windows-for-Switch). The drivers here use the devices that its UEFI (R367 or later) adds to the DSDT.
 
-## ドライバー
+## Drivers
 
-| ドライバー | デバイス | 必要な UEFI | 内容 |
+| Driver | Device | UEFI needed | What it does |
 |---|---|---|---|
-| `tegra210gpio` | ACPI\SWOA0101 | R367 | GPIO コントローラー（GpioClx） |
-| `tegra210i2c` | ACPI\SWOA0201 | R370 | I2C コントローラー（SpbCx）。I2C1 / I2C3 / I2C5 |
-| `switchbattery` | ACPI\SWOA0301 | R371（USB-C は R378） | バッテリー（battc）、USB-C の抜き差しに合わせた VBUS・充電の切り替え |
-| `switchfan` | ACPI\SWOA0401 | R372（明るさは R376） | 温度によるファンの制御、画面の明るさ、画面オフでのバックライトの消灯 |
-| `switchtouch` | ACPI\SWOA0501 | R373 | タッチパネル（VHF の HID マルチタッチ） |
-| `switchpwrbtn` | ACPI\SWOA0601 | R374 | 電源ボタン（VHF の HID）。1.0.2.0 から、Windows の再起動で hekate に戻り（reboot-to-payload、Erista）、シャットダウンで電源が切れる（MAX77620）。説明は `drivers/SwitchPowerButton`（[日本語](drivers/SwitchPowerButton/README-ja.md)・[English](drivers/SwitchPowerButton/README.md)） |
-| `switchcpu` | ACPI\SWOA0701 | R375 | CPU のクロックのプロファイル（614〜1766 MHz）、温度による制限 |
-| `switchrtc` | ACPI\SWOA0801 | R377 | 時計（MAX77620 の RTC を読み、ずれを覚えて時刻を合わせる） |
-| `switchbt` | ACPI\SWOA0B01 | R390 | Bluetooth（UART-D の BCM4356A3 を、Windows 標準の BthMini につなぐ）。3 Mbps。ファームウェアのパッチ `BCM4356A3.hcd` は各自で用意（配布しない）。今は電波がとても近くまでしか届かない（Wi-Fi 側が動いていないため） |
-| `switchwlan` | `ACPI\SWOA0D01` | R405 | Wi-Fi（ベータ）。WPA2-Personalで接続、DHCP、インターネット接続。Wi-Fi 5（802.11ac）、866/866 Mbit/s。2026-11-08に実機確認：fast.com 下り55 Mbit/s・上り39 Mbit/s。ファームウェア `brcmfmac4356(A3)-pcie.bin/.txt` は各自で用意（動作確認済み 7.35.252.108）。`switchwlan.sys` 0.6.13 |
-| `switchaudio`（ベータ） | ACPI\SWOA0C01 | R403（R402 ならスピーカーだけ） | 音声。スピーカーとヘッドホンへの再生（PortCls WaveRT、48 kHz・16 ビット・ステレオ）。ヘッドホンを抜き差しすると自動で切り替わる。Windows に見える出力は「スピーカー」の1つで、音量も共通。マイクは無い |
-| `switchsensor` | ACPI\SWOA0901 | R379 | 傾きセンサー（画面の自動回転）。明るさセンサーは、この本体では見つからず使えていない |
-| `switchdisplay`（ベータ） | ACPI\SWOA0E01 | R408 | 内蔵パネルの表示（WDDM の表示専用ドライバー。Basic Display の代わり）。回転（設定と SwitchCenter の自動回転）。画面オフのときにパネルをスリープさせ、表示コントローラーも止める。描画は今までどおり CPU（GPU による高速化は無い）。入れ替えは次の起動のとき（`kits/Switch-Display`） |
-| `swoadiag` | —（読み込んだときだけ） | — | USB（XUSB）のレジスタを読むだけの診断用 |
-| `nvtsdhc` | ACPI\NVDA0101 | —（SD のローダーがデバイスを足す） | Windows 11 を SD から起動するための SD ホスト（sdport）。SwitchPatcher が SD に入れる（`kits/Switch-Sd`）。起動できないときは、ブルースクリーンに診断用のコードを出す（下の「ブルースクリーンのストップコード」） |
+| `tegra210gpio` | ACPI\SWOA0101 | R367 | GPIO controller (GpioClx) |
+| `tegra210i2c` | ACPI\SWOA0201 | R370 | I2C controller (SpbCx). I2C1 / I2C3 / I2C5 |
+| `switchbattery` | ACPI\SWOA0301 | R371 (USB-C: R378) | Battery (battc); switches VBUS and charging when a USB-C device is plugged in or removed |
+| `switchfan` | ACPI\SWOA0401 | R372 (brightness: R376) | Fan control by temperature, screen brightness, backlight off when the screen turns off |
+| `switchtouch` | ACPI\SWOA0501 | R373 | Touch screen (VHF HID multi-touch) |
+| `switchpwrbtn` | ACPI\SWOA0601 | R374 | Power button (VHF HID). Since 1.0.2.0 a Windows restart returns to hekate (reboot-to-payload, Erista) and shut down powers the console off (MAX77620). Details: `drivers/SwitchPowerButton` ([English](drivers/SwitchPowerButton/README.md), [日本語](drivers/SwitchPowerButton/README-ja.md)) |
+| `switchcpu` | ACPI\SWOA0701 | R375 | CPU clock profiles (614–1766 MHz), thermal limits |
+| `switchrtc` | ACPI\SWOA0801 | R377 | Clock (reads the MAX77620 RTC, remembers the offset and sets the time) |
+| `switchbt` | ACPI\SWOA0B01 | R390 | Bluetooth (the BCM4356A3 on UART-D, connected to the inbox BthMini). 3 Mbps. Bring your own firmware patch `BCM4356A3.hcd` (not distributed). The range is very short for now (the Wi-Fi side is not running) |
+| `switchwlan` | `ACPI\SWOA0D01` | R405 | Wi-Fi (beta). WPA2-Personal, DHCP, internet access. Wi-Fi 5 (802.11ac), 866/866 Mbit/s link. Tested on hardware on 2026-11-08: fast.com 55 Mbit/s down, 39 Mbit/s up. Bring your own firmware `brcmfmac4356(A3)-pcie.bin/.txt` (tested with 7.35.252.108). `switchwlan.sys` 0.6.13 |
+| `switchaudio` (beta) | ACPI\SWOA0C01 | R403 (R402: speaker only) | Audio playback to the speakers and headphones (PortCls WaveRT, 48 kHz, 16-bit, stereo). Switches automatically when headphones are plugged in or removed. Windows sees one output, "Speakers", with one volume. No microphone |
+| `switchsensor` | ACPI\SWOA0901 | R379 | Tilt sensor (automatic screen rotation). The light sensor was not found on this unit and is not used |
+| `switchdisplay` (beta) | ACPI\SWOA0E01 | R408 | Built-in panel (WDDM display-only driver, replaces Basic Display). Rotation (Settings and SwitchCenter auto-rotate). Puts the panel to sleep and stops the display controller when the screen turns off. Drawing is still done by the CPU (no GPU acceleration). Replaced at the next boot (`kits/Switch-Display`) |
+| `swoadiag` | — (only while loaded) | — | Diagnostic: reads the USB (XUSB) registers |
+| `nvtsdhc` | ACPI\NVDA0101 | — (the SD loader adds the device) | SD host (sdport) for booting Windows 11 from SD. SwitchPatcher puts it on the SD (`kits/Switch-Sd`). If boot fails it shows a diagnostic code on a blue screen (see "Blue screen stop codes" below) |
 
-## 動作を確かめた OS
+## Tested OS
 
-- Windows 11 Arm64 22H2（ビルド 22621）
+- Windows 11 Arm64 22H2 (build 22621)
 
-Windows のイメージとライセンスは、各自で用意してください。このリポジトリには、Windows は含まれていません。
+Bring your own Windows image and license. This repository does not contain Windows.
 
-## 入れ方
+## Installing
 
-1. [Releases](https://github.com/hayato41200/Windows-for-Switch-Drivers/releases) から、最新の `SwitchDrivers-<版>.zip` と `SwitchCenter-<版>-arm64.zip` を取ってくる。
-2. **テスト署名の準備（最初の1回だけ）:**
-   - `Switch-Stage0` の手順で、テスト署名モードを有効にする。
-   - 同梱の `SwitchWOA-Test.cer` を、Switch の「信頼されたルート証明機関」と「信頼された発行元」に入れる。
-3. **ドライバーを入れる:** ZIP を展開して、各 `Switch-*` フォルダーのスクリプトで、次の順に入れる。手順は、各フォルダーの README にある。
-   1. GPIO（Stage1）
-   2. I2C（Stage3）
-   3. バッテリー
-   4. ファン
-   5. タッチ
-   6. 電源ボタン（再起動で hekate に戻る・シャットダウンで電源が切れる機能も入る。`Install.cmd`）
+1. Download the latest `SwitchDrivers-<version>.zip` and `SwitchCenter-<version>-arm64.zip` from [Releases](https://github.com/hayato41200/Windows-for-Switch-Drivers/releases).
+2. **Test signing (first time only):**
+   - Enable test signing as described in `Switch-Stage0`.
+   - Add the included `SwitchWOA-Test.cer` to the Switch's "Trusted Root Certification Authorities" and "Trusted Publishers".
+3. **Install the drivers:** extract the ZIP and use the script in each `Switch-*` folder, in this order. Each folder's README has the steps (the kit READMEs are in Japanese).
+   1. GPIO (Stage1)
+   2. I2C (Stage3)
+   3. Battery
+   4. Fan
+   5. Touch
+   6. Power button (includes restart to hekate and power-off at shut down; `Install.cmd`)
    7. CPU
    8. RTC
-   9. センサー
-   10. Bluetooth（UEFI R390 以降。キットの README を見て、ファームウェアのパッチを入れる）
-4. **コントロールセンターを使う:** `SwitchCenter-<版>-arm64.zip` を展開して、`SwitchCenter.exe` を起動する。通知領域のアイコンから、次のことができる。
-   - CPU のプロファイル
-   - 画面の明るさ
-   - 状態の確認
-   - 電源の設定
-   - ドライバーの一覧
+   9. Sensor
+   10. Bluetooth (UEFI R390 or later; see the kit README for the firmware patch)
+4. **Control center:** extract `SwitchCenter-<version>-arm64.zip` and run `SwitchCenter.exe`. From the notification area icon you can:
+   - choose the CPU profile
+   - set the screen brightness
+   - check the status
+   - change power settings
+   - see the driver list
 
-## SwitchPatcher（PC で SD に入れる道具）
+## SwitchPatcher (PC tool for the SD)
 
-Switch の SD を PC に挿して、SD の Windows にドライバー、テストモード、コントロールセンターを入れる道具。ARM64 の Windows のイメージを、SD に入れ直すこともできる。
+Put the Switch's SD in a PC, and SwitchPatcher installs the drivers, test mode and the control center into the Windows on the SD. It can also rewrite an ARM64 Windows image to the SD.
 
-- **入手:** リリースの `SwitchPatcher-<版>-x64.zip`
-- **使い方:** `kits/Switch-Patcher/README-ja.md`
-- **設計:** `docs/Design-SwitchPatcher-ja.md`
-- **状態:** 本物の SD と Switch で動作を確かめた（0.3.0、Windows 11 Arm64 22H2）。
+- **Get it:** `SwitchPatcher-<version>-x64.zip` in the releases
+- **How to use:** `kits/Switch-Patcher/README-ja.md` (Japanese)
+- **Design:** `docs/Design-SwitchPatcher-ja.md` (Japanese)
+- **Status:** tested with a real SD and Switch (0.3.0, Windows 11 Arm64 22H2).
 
-## ブルースクリーンのストップコード
+## Blue screen stop codes
 
-このリポジトリのドライバーは、原因を画面に残すために、自分でブルースクリーンを出すことがある。起動に失敗すると、ログもダンプも残らないため。ブルースクリーンの「Stop code:」の行を写真に撮れば、どこで止まったかが分かる。
+Some drivers here raise a blue screen themselves, to leave the cause on the screen: when boot fails there is no log and no dump. A photo of the "Stop code:" line tells where it stopped.
 
-### `0xD???????`（`nvtsdhc`、SD から起動するとき）
+### `0xD???????` (`nvtsdhc`, booting from SD)
 
-Windows 11 の SD で、ドライバーが読み込まれてから 2.5 秒たっても SD を読めていないと出る。コードは `0xD S F CC EE K` の形で、1桁ずつ意味がある。
+Shown on a Windows 11 SD when the SD still cannot be read 2.5 seconds after the driver loaded. The code has the form `0xD S F CC EE K`, one meaning per digit.
 
-| 部分 | 意味 |
+| Part | Meaning |
 |---|---|
-| `D` | 目印（いつも D） |
-| `S` | 段階。0: SD の差し込み口（スロット）が一度も初期化されていない。1: SD にコマンドを1つも送っていない。2: 成功したコマンドが1つも無い |
-| `F` | 足し算した印。1: カードがある、2: カードが安定している（どちらも初期化したときのコントローラーの状態）。4: 割り込みが来た。8: コントローラーのリセットに失敗した |
-| `CC` | 最後に送ったコマンドの番号（16 進） |
-| `EE` | 最後にエラーになったコマンドの番号（16 進。`FF` はエラー無し） |
-| `K` | 最後のエラーの種類。0: 無し、1: コマンドの応答が来ない、2: コマンドの CRC、3: コマンドの終わりのビットか番号、4: データが来ない、5: データの CRC、6: データの終わりのビット、7: そのほか、8: 要求を出せなかった |
+| `D` | Marker (always D) |
+| `S` | Stage. 0: the SD slot was never initialized. 1: no command was sent to the SD. 2: no command succeeded |
+| `F` | Flags, added together. 1: card present, 2: card stable (both from the controller state at initialization). 4: an interrupt arrived. 8: the controller reset failed |
+| `CC` | Last command sent (hex) |
+| `EE` | Last command that failed (hex; `FF` = no error) |
+| `K` | Kind of the last error. 0: none, 1: no command response, 2: command CRC, 3: command end bit or index, 4: no data, 5: data CRC, 6: data end bit, 7: other, 8: the request could not be sent |
 
-コマンドが通り始めたら（段階 3 以降）、カードの準備に時間がかかっているだけなので、このブルースクリーンは出さない。
+Once commands go through (stage 3 and later), the card is only slow to get ready, and this blue screen is not raised.
 
-よくある例:
+Common cases:
 
-- **`0xD0000FF0`（段階 0、何も記録が無い）:** ドライバーは読み込まれたが、SD ホストのデバイスが Windows に見えていない。SD ホストのデバイスは、ESP の `EFI\Boot\bootaa64.efi`（SwitchPatcher が入れる `SDLOADAA64-NOCID.EFI`）が起動のたびに足している。次のことを確かめる。
-  - ESP の `EFI\Boot\bootaa64.efi` が `SDLOADAA64-NOCID.EFI` になっているか。SwitchPatcher で入れ直すと確実。
-  - UEFI が `bootmgfw.efi` を直接起動していないか。ローダーを通らないと、SD ホストのデバイスが足されない。
-  - [Windows-for-Switch](https://github.com/hayato41200/Windows-for-Switch) の UEFI を使っているか。ほかの UEFI では確かめていない。
-- **段階 1・2（`0xD1…`、`0xD2…`）:** デバイスは見えていて、SD とのやりとりで止まっている。`K` がエラーの種類、`EE` がそのコマンド。この形のコードは、写真と一緒に Issue で知らせてほしい。
+- **`0xD0000FF0` (stage 0, nothing recorded):** the driver loaded, but Windows does not see the SD host device. The SD host device is added at every boot by `EFI\Boot\bootaa64.efi` on the ESP (`SDLOADAA64-NOCID.EFI`, put there by SwitchPatcher). Check:
+  - that `EFI\Boot\bootaa64.efi` on the ESP is `SDLOADAA64-NOCID.EFI`. Reinstalling with SwitchPatcher is the sure way.
+  - that the UEFI does not start `bootmgfw.efi` directly. Without the loader the SD host device is not added.
+  - that you use the UEFI from [Windows-for-Switch](https://github.com/hayato41200/Windows-for-Switch). Other UEFIs have not been tested.
+- **Stages 1 and 2 (`0xD1…`, `0xD2…`):** the device is visible, and the exchange with the SD stops. `K` is the kind of error, `EE` the command. Please report codes like this in an Issue, with the photo.
 
-ブルースクリーンを出さない設定は無い。このコードが出る場面では SD を読めていないので、出さなくても Windows は起動ドライブが見つからずに止まる（`INACCESSIBLE_BOOT_DEVICE`）。
+There is no setting to turn this blue screen off. When the code appears the SD cannot be read, so without it Windows would stop anyway because it cannot find the boot drive (`INACCESSIBLE_BOOT_DEVICE`).
 
-### `0xDEADDEAD`（`switchaudio`）
+### `0xDEADDEAD` (`switchaudio`)
 
-音声のドライバーの内部の誤り（呼んではいけない関数が呼ばれた）。普通は出ない。出たら、ドライバーの版と一緒に Issue で知らせてほしい。
+An internal error in the audio driver (a function that must not be called was called). It should not happen. If it does, please report it in an Issue with the driver version.
 
-### そのほか
+### Others
 
-- `WHEA_UNCORRECTABLE_ERROR`: `nvtsdhc` 0.2.2〜0.2.5 で出ていた。新しい版に入れ替える。
-- それ以外の名前の付いたコード（`INACCESSIBLE_BOOT_DEVICE` など）は Windows 自身が出すもの。使っている UEFI の版、ドライバーの版、直前に変えたことを添えて知らせてほしい。
+- `WHEA_UNCORRECTABLE_ERROR`: happened with `nvtsdhc` 0.2.2 to 0.2.5. Replace it with a newer version.
+- Other named codes (`INACCESSIBLE_BOOT_DEVICE` and so on) come from Windows itself. Please report them with your UEFI version, the driver versions and what you changed last.
 
-## ビルド（PC）
+## Building (PC)
 
-必要なもの:
-- LLVM（clang-cl、lld-link）
-- WDK のヘッダーとライブラリ（10.0.19041 と 10.0.26100）
-- .NET SDK（.NET 8 を対象にできるもの）
-- 証明書ストアにある、テスト署名の証明書（「CN=SwitchWOA Test Driver Signing」）。秘密鍵はリポジトリに入っていない。
+You need:
+- LLVM (clang-cl, lld-link)
+- WDK headers and libraries (10.0.19041 and 10.0.26100)
+- .NET SDK (able to target .NET 8)
+- The test-signing certificate ("CN=SwitchWOA Test Driver Signing") in the certificate store. The private key is not in the repository.
 
 ```powershell
 .\release\Make-Release.ps1 -Version 2026.10.26
 ```
 
-`out\<版>\` に、リリースに付ける4つのファイルができる。
-- `SwitchDrivers-<版>.zip`
-- `SwitchCenter-<版>-arm64.zip`
-- `SwitchPatcher-<版>-x64.zip`
+This makes the four release files in `out\<version>\`:
+- `SwitchDrivers-<version>.zip`
+- `SwitchCenter-<version>-arm64.zip`
+- `SwitchPatcher-<version>-x64.zip`
 - `manifest.json`
 
-GitHub でリリースを作って（タグは `drivers-<版>`）、この4つを付ける。
+Create a GitHub release (tag `drivers-<version>`) and attach the four files.
 
-`-Beta` を付けると、プレリリース（ベータ版）を作る。表で `Beta` の印を付けたドライバーは、ベータ版にだけ入る。コントロールセンターの「更新の種類」でベータ版を選ぶと、プレリリースも更新の候補になる。
+`-Beta` makes a pre-release (beta). Drivers marked `Beta` in the table are only in beta releases. When "Update channel" in the control center is set to beta, pre-releases are offered as updates too.
 
-GitHub CLI（`gh auth login` 済み）があれば、`-Publish` を付けるとリリースの作成とアップロードまで自動で行う。すでに作ったファイルをあとから公開するときは、`-PublishOnly` を使う。
+With the GitHub CLI (logged in with `gh auth login`), `-Publish` also creates the release and uploads the files. To publish files made earlier, use `-PublishOnly`.
 
-## OTA（コントロールセンターからの更新）
+## OTA (updates from the control center)
 
-設計は `docs/Design-DriverRepo-OTA-ja.md`。コントロールセンターは、このリポジトリの最新のリリースの `manifest.json` を読んで、入っているドライバーと版を比べる。更新を入れる前に、次の3つを確かめる。
-- HTTPS で取ってきたものか
-- SHA-256 が合っているか
-- テスト署名の証明書で署名されているか
+Design: `docs/Design-DriverRepo-OTA-ja.md` (Japanese). The control center reads `manifest.json` of the latest release in this repository and compares it with the installed drivers and versions. Before installing an update it checks three things:
+- it was downloaded over HTTPS
+- the SHA-256 matches
+- it is signed with the test-signing certificate
 
-インストールは、管理者の確認を出してから行う。管理者として起動し直したコントロールセンターが、同じリリースを GitHub から自分で取り直して、上の3つを確かめてから `pnputil` で入れる。
+Installing asks for administrator approval first. The control center, restarted as administrator, downloads the same release from GitHub again by itself, checks the three things, and installs it with `pnputil`.
 
-使い方: コントロールセンターの「ドライバー」タブで「更新を確認」→ 青い行（更新できるもの）を見て「更新する」。コントロールセンター v0.5.0 以降で使える。
+How to use: in the control center's "Drivers" tab, "Check for updates" → look at the blue rows (updates available) → "Update". Available from control center v0.5.0.
 
-GPIO と I2C は、ほかのドライバーが使っているので、その場では入れ替えない。Windows に登録して、次に起動したときに入れ替える（v0.5.1 以降）。
+GPIO and I2C are not replaced on the spot, since the other drivers sit on them. They are registered with Windows and replaced at the next boot (v0.5.1 and later).
 
-コントロールセンター自身も、新しい版があれば同じタブから更新できる（v0.5.1 以降）。ZIP の SHA-256 を確かめてから、自分を上書きして起動し直す。
+The control center can update itself from the same tab when a new version exists (v0.5.1 and later). It checks the ZIP's SHA-256, overwrites itself and restarts.
 
-新しいデバイスのドライバーも、コントロールセンターを直さずに配れる（v0.5.2 以降）。コントロールセンターは、manifest の各ドライバーの次の項目を使う。
-- `hwid`: 見に行くデバイス
-- `nameJa`、`nameEn`: 表示する名前
-- `installAt`: `boot`（次の起動で入れ替える）か `live`（その場で入れる）
-- `minUefi`: デバイスが無いときに、必要な UEFI の版として表示する
+Drivers for new devices can be shipped without changing the control center (v0.5.2 and later). It uses these fields of each driver in the manifest:
+- `hwid`: the device to look for
+- `nameJa`, `nameEn`: display names
+- `installAt`: `boot` (replaced at the next boot) or `live` (installed on the spot)
+- `minUefi`: shown as the UEFI version needed when the device is missing
 
-新しいドライバーを足すときは、`release/Make-Release.ps1` の表に1行足す。
+To add a new driver, add one line to the table in `release/Make-Release.ps1`.
 
-## フォルダー
+## Folders
 
-| 場所 | 内容 |
+| Path | Contents |
 |---|---|
-| `drivers/` | 各ドライバーのソースと INF |
-| `kits/` | Switch で使う導入スクリプトと README（バイナリはリリースの ZIP に入る） |
-| `app/SwitchCenter/` | コントロールセンター（.NET 8、WinForms、win-arm64） |
-| `app/SwitchPatcher/` | SwitchPatcher（.NET 8、WinForms、win-x64、PC 用） |
-| `app/Shared/` | 両方で使う、リリースの読み込みと確かめ |
-| `tools/` | `Build-Driver.ps1`（clang-cl + lld-link で KMDF をビルドし、テスト署名する）、テスト証明書の公開鍵 |
+| `drivers/` | Source and INF of each driver |
+| `kits/` | Install scripts and READMEs used on the Switch (the binaries are in the release ZIP) |
+| `app/SwitchCenter/` | Control center (.NET 8, WinForms, win-arm64) |
+| `app/SwitchPatcher/` | SwitchPatcher (.NET 8, WinForms, win-x64, for the PC) |
+| `app/Shared/` | Release reading and checking, used by both |
+| `tools/` | `Build-Driver.ps1` (builds KMDF drivers with clang-cl + lld-link and test-signs them), the test certificate's public key |
 | `release/` | `Make-Release.ps1` |
-| `docs/` | 設計のメモ |
+| `docs/` | Design notes (Japanese) |
 
-## クレジット
-Claude:このGithubリポジトリや、Readmeの作成、など手伝ってくれてありがとう。
+## Credits
 
-## ライセンス
+Claude: thank you for helping with this GitHub repository, the READMEs and more.
 
-GPL-2.0（Windows-for-Switch と同じ）。レジスタの手順の一部は、Hekate と Linux（どちらも GPL-2.0）に従っています。
+## License
+
+GPL-2.0 (same as Windows-for-Switch). Some of the register sequences follow Hekate and Linux (both GPL-2.0).
