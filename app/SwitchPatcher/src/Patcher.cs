@@ -22,6 +22,10 @@ namespace SwitchPatcher
         public int ImageIndex;
         public bool Drivers, TestMode, ControlCenter;
         public string FirmwareFolder;     // the user's own firmware (SwitchFirmware); null = none
+        public bool HekateBoot;           // put bl33 + the hekate menu entry on the ESP (Hekate.cs)
+        public bool HekateInstall;        // also put hekate itself (latest official release) on the ESP
+        public string Bl31;               // the user's bl31.bin; null = keep the one on the ESP
+        public string Bl33;               // a local bl33.bin instead of the release's; null = the release's
     }
 
     static class Patcher
@@ -78,6 +82,30 @@ namespace SwitchPatcher
                     appSource = Path.Combine(work, "app", "SwitchCenter");
                     if (!File.Exists(Path.Combine(appSource, "SwitchCenter.exe"))) throw new InvalidDataException("SwitchCenter.exe");
                 }
+                HekateFiles hekate = null;
+                if (o.HekateBoot)
+                {
+                    hekate = new HekateFiles { Bl31 = o.Bl31 };
+                    if (o.Bl33 != null)
+                    {
+                        hekate.Bl33 = o.Bl33;
+                        hekate.Bl33Label = Path.GetFileName(o.Bl33);
+                    }
+                    else
+                    {
+                        if (rel.Uefi == null)
+                            throw new InvalidDataException(T($"リリース {rel.Tag} には、hekate 用の UEFI（bl33.bin）がありません。bl33.bin のファイルを選んでください。",
+                                                             $"Release {rel.Tag} has no UEFI for hekate (bl33.bin). Choose a bl33.bin file."));
+                        hekate.Bl33 = Path.Combine(work, rel.Uefi.Bl33File);
+                        hekate.Bl33Label = rel.Uefi.Version;
+                        log(T($"{rel.Uefi.Bl33File}（UEFI {rel.Uefi.Version}）をダウンロードしています…", $"Downloading {rel.Uefi.Bl33File} (UEFI {rel.Uefi.Version})..."));
+                        await ReleaseClient.DownloadAsync(rel.Uefi.Bl33Url, hekate.Bl33, rel.Uefi.Bl33Sha256);
+                    }
+                    Hekate.CheckBl33(hekate.Bl33);
+                    if (hekate.Bl31 != null) Hekate.CheckBl31(hekate.Bl31);
+                    if (o.HekateInstall)
+                        (hekate.HekateDir, hekate.HekateVersion) = await Hekate.DownloadLatestAsync(work, log);
+                }
                 log(T("ダウンロードしたものは、すべて確かめました。", "Everything downloaded has been checked."));
                 FirmwareSet firmware = null;
                 if (o.FirmwareFolder != null)
@@ -101,6 +129,9 @@ namespace SwitchPatcher
                 string win = await Disks.EnsureLetter(o.Disk.Number, o.Windows, assigned) + @":\";
                 string esp = await Disks.EnsureLetter(o.Disk.Number, espPart, assigned) + @":\";
                 log(T($"Windows の区画: {win}  ESP: {esp}", $"Windows partition: {win}  ESP: {esp}"));
+                if (hekate != null && hekate.Bl31 == null && !File.Exists(Path.Combine(esp, @"switchroot\switchwoa\bl31.bin")))
+                    throw new InvalidOperationException(T("ESP に switchroot\\switchwoa\\bl31.bin がありません。bl31.bin を選んでから、もう一度始めてください。",
+                                                          "There is no switchroot\\switchwoa\\bl31.bin on the ESP. Choose a bl31.bin and start again."));
 
                 // ---- Windows image
                 string backup = null;
@@ -180,6 +211,9 @@ namespace SwitchPatcher
                     SwitchFirmware.CopyToEsp(firmware, esp, log);
                     SwitchFirmware.CopyToWindows(firmware, win, log);
                 }
+
+                // ---- hekate boot: bl33 (+ bl31, hekate) and the menu entry on the ESP
+                if (hekate != null) Hekate.PutOnEsp(esp, hekate, log);
 
                 // ---- offline registry: the SD drivers load at every boot (needed to boot from the Switch's SD)
                 await Offline.WithHive(win, "SYSTEM", system =>

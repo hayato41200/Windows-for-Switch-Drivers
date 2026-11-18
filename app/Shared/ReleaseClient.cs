@@ -41,12 +41,22 @@ namespace SwitchCenter
         public int MinBuild;
     }
 
+    /// <summary>
+    /// The Switch UEFI built for the hekate boot chain (manifest "uefi"): bl33.bin, a separate
+    /// release file. SwitchPatcher puts it in switchroot\switchwoa on the ESP.
+    /// </summary>
+    sealed class UefiBoot
+    {
+        public string Version, Bl33File, Bl33Sha256, Bl33Url;
+    }
+
     sealed class Release
     {
         public string Tag, PageUrl, AppVersion, AppFile, AppSha256, AppUrl, DriversFile, DriversSha256, DriversUrl;
         public bool Prerelease;           // a GitHub pre-release: beta drivers (Make-Release.ps1 -Beta)
         public List<ManifestDriver> Drivers = new List<ManifestDriver>();
         public SdBoot Sd;                 // null in releases without it
+        public UefiBoot Uefi;             // null in releases without it
     }
 
     static class ReleaseClient
@@ -213,6 +223,19 @@ namespace SwitchCenter
                 };
                 if (!ServicePattern.IsMatch(r.Sd.Service) || !System.Version.TryParse(r.Sd.Version, out _))
                     throw new InvalidDataException("bad manifest entry sd");
+            }
+            if (root.TryGetProperty("uefi", out JsonElement uefi))
+            {
+                JsonElement bl33 = uefi.GetProperty("bl33");
+                r.Uefi = new UefiBoot
+                {
+                    Version = uefi.GetProperty("version").GetString(),
+                    Bl33File = bl33.GetProperty("file").GetString(),
+                    Bl33Sha256 = bl33.GetProperty("sha256").GetString().ToLowerInvariant(),
+                };
+                if (!Regex.IsMatch(r.Uefi.Version ?? "", @"^R\d{3,4}[A-Z]?$") || !Regex.IsMatch(r.Uefi.Bl33File ?? "", @"^[A-Za-z0-9._-]{1,64}$"))
+                    throw new InvalidDataException("bad manifest entry uefi");
+                if (!assets.TryGetValue(r.Uefi.Bl33File, out r.Uefi.Bl33Url)) throw new InvalidDataException(r.Uefi.Bl33File + " is missing in " + r.Tag);
             }
             return r;
         }

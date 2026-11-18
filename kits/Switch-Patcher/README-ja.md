@@ -9,6 +9,23 @@ PC で動く道具です。Switch の SD を PC に挿して、SD の Windows �
 Windows のイメージ（ARM64）を、SD に入れ直すこともできます。設計は `docs/Design-SwitchPatcher-ja.md`。
 
 
+## v0.6.0（2026-11-18）: hekate からの起動
+
+- 「4. hekate」を足した。「hekate から起動できるようにする」を選ぶと、SD の ESP（hekate が読む FAT の区画）に次のものを置く。
+
+  | ESP のどこに | 中身 | どこから |
+  |---|---|---|
+  | `switchroot\switchwoa\bl33.bin` | hekate 用の Switch UEFI | このプロジェクトのリリース（manifest の `uefi`）。ファイルを選べば、そちらを使う |
+  | `switchroot\switchwoa\bl31.bin` | ARM Trusted Firmware | **配布しない。** 自分で用意したファイル（LineageOS の Switch 版から取り出したもの）を選ぶ。SD にすでにあれば選ばなくてよい。新しい SD では必要 |
+  | `bootloader\hekate_ipl.ini` | `[Windows (SwitchWOA)]` の項目（`l4t=1`、`boot_prefixes=switchroot/switchwoa/`、`id=SWOAHKT`） | 項目がなければ足す。ini がなければ作る |
+  | `bootloader\...`、`hekate_ctcaer_<版>.bin`、`bootloader\update.bin` | hekate そのもの | 「hekate も入れる・新しくする」を選んだときだけ。hekate の公式リリース（GitHub の CTCaer/hekate）の最新版を、その場でダウンロードする |
+
+- 前からある `bl33.bin`、`bl31.bin`、`hekate_ipl.ini` は、`.bak-<日時>` の名前で残してから書き換える。同じ中身なら書き換えない。
+- `id=SWOAHKT` は、電源ボタンのドライバー（switchpwrbtn 1.0.3.0 以降）が、Windows の再起動で hekate から Windows に直接戻るときに使う。
+- 置く前に確かめること: bl33.bin は大きさと UEFI のファームウェアボリューム（`_FVH`）、bl31.bin は大きさ。hekate の zip は、`bootloader\sys\l4t` の 3 つのファイルとペイロードがあること。
+- 試したこと（2026-11-18）: PC 上の空のフォルダーを ESP に見立てて、hekate v6.5.5 のダウンロード、置き方、ini の作成と追記、2 回目に何も変えないこと、bl31 がないときに止まることを確かめた。
+- 未確認: 本物の SD での書き込みと、それを Switch で起動すること。「新しい SD」（GPT、先頭が ESP）を hekate が読めるかどうか。
+
 ## v0.5.0（2026-11-08）: ファームウェアのフォルダー
 
 - 「3. 入れるもの」に「ファームウェア」のフォルダーを選ぶ欄を足した（任意）。ユーザーが自分の Switchroot Linux からコピーしたファイルを、SD の次の場所に入れる。どのファイルもリリースやこのツールには入っていない。
