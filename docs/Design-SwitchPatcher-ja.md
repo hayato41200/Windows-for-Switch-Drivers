@@ -69,6 +69,6 @@ Windows そのものは配らない。イメージとライセンスは、利用
 
 ## まだやらないこと
 
-- hekate の設定（`hekate_ipl.ini`、ペイロード）と、hekate の区画と並べること
+- hekate の区画（Linux や Android 用の区画）と並べること。hekate からの起動は 0.6.0 で足した（ESP に bl33・bl31・ini の項目・hekate を置く。`kits/Switch-Patcher/README-ja.md` を参照）。bl31 と hekate は配らない（bl31 は利用者が用意し、hekate は公式リリースからその場で取る）
 - MBR の SD
 - すでに入っているドライバーの入れ替え（コントロールセンターの OTA で行う）

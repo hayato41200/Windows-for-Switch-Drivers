@@ -27,6 +27,13 @@ namespace SwitchPatcher
         readonly TextBox firmwarePath = new TextBox { Width = 430, ReadOnly = true };
         readonly Button firmwareBrowse = new Button { Width = 84, Height = 28 };
         readonly Label firmwareNote = new Label { AutoSize = true, MaximumSize = new Size(640, 0) };
+        readonly CheckBox hekateBoot = new CheckBox { AutoSize = true, Checked = false };
+        readonly CheckBox hekateInstall = new CheckBox { AutoSize = true, Checked = true, Margin = new Padding(23, 3, 3, 3) };
+        readonly TextBox bl31Path = new TextBox { Width = 430, ReadOnly = true };
+        readonly Button bl31Browse = new Button { Width = 84, Height = 28 };
+        readonly TextBox bl33Path = new TextBox { Width = 430, ReadOnly = true };
+        readonly Button bl33Browse = new Button { Width = 84, Height = 28 };
+        readonly Label hekateNote = new Label { AutoSize = true, MaximumSize = new Size(640, 0) };
         readonly Button start = new Button { Width = 160, Height = 36 };
         readonly Label progressLabel = new Label { AutoSize = true };
         readonly TextBox logBox = new TextBox { Multiline = true, ReadOnly = true, ScrollBars = ScrollBars.Vertical, Dock = DockStyle.Fill, Font = new Font("Consolas", 9f) };
@@ -38,7 +45,7 @@ namespace SwitchPatcher
             Font = new Font("Yu Gothic UI", 9.5f);
             AutoScaleMode = AutoScaleMode.Dpi;
             StartPosition = FormStartPosition.CenterScreen;
-            ClientSize = new Size(700, 860);
+            ClientSize = new Size(700, 1000);
             MinimumSize = new Size(600, 600);
 
             var refresh = new Button { Text = T("再読み込み", "Refresh"), Width = 100, Height = 28 };
@@ -58,6 +65,15 @@ namespace SwitchPatcher
             firmwareBrowse.Click += (_, _) => ChooseFirmware();
             firmwareNote.Text = T("任意: 自分の Switchroot Linux からコピーしたファームウェアのフォルダー（tegra21x_xusb_firmware、brcmfmac4356A3-pcie.bin/.txt、BCM4356A3.hcd、wifi-mac.txt）。USB・Wi-Fi・Bluetooth に使います。",
                                   "Optional: a folder with firmware copied from your own Switchroot Linux (tegra21x_xusb_firmware, brcmfmac4356A3-pcie.bin/.txt, BCM4356A3.hcd, wifi-mac.txt), for USB, Wi-Fi and Bluetooth.");
+            hekateBoot.Text = T("hekate から起動できるようにする（UEFI と hekate の起動項目を ESP に置く）", "Boot from hekate (put the UEFI and a hekate menu entry on the ESP)");
+            hekateInstall.Text = T("hekate も入れる・新しくする（公式の最新リリースから）", "Also add or update hekate (latest official release)");
+            hekateBoot.CheckedChanged += (_, _) => UpdateEnabled();
+            bl31Browse.Text = T("bl31…", "bl31...");
+            bl31Browse.Click += (_, _) => ChooseFile(bl31Path, T("bl31.bin（自分で用意したもの）", "bl31.bin (your own)"), "bl31.bin|*.bin|*.*|*.*");
+            bl33Browse.Text = T("bl33…", "bl33...");
+            bl33Browse.Click += (_, _) => ChooseFile(bl33Path, T("bl33.bin（hekate 用の Switch UEFI）", "bl33.bin (the Switch UEFI for hekate)"), "bl33.bin|*.bin|*.*|*.*");
+            hekateNote.Text = T("bl31.bin は配布していません。自分で用意したファイル（LineageOS の Switch 版から取り出したもの）を選んでください。SD にすでにあれば空のままでかまいません（新しい SD では必要）。bl33.bin は空ならリリースのものを使います。",
+                                "bl31.bin is not distributed: choose your own file (taken from LineageOS for the Switch). Leave it empty if the SD already has one (a new SD needs it). bl33.bin: empty = the release's.");
             start.Text = T("開始", "Start");
             start.Click += async (_, _) => await Run();
 
@@ -90,6 +106,19 @@ namespace SwitchPatcher
             firmwareRow.Controls.Add(firmwareBrowse);
             top.Controls.Add(firmwareRow);
             top.Controls.Add(firmwareNote);
+            top.Controls.Add(Caption(T("4. hekate", "4. hekate")));
+            top.Controls.Add(hekateBoot);
+            top.Controls.Add(hekateInstall);
+            var bl31Row = new FlowLayoutPanel { AutoSize = true, Margin = new Padding(20, 0, 0, 0) };
+            bl31Row.Controls.Add(bl31Path);
+            bl31Row.Controls.Add(bl31Browse);
+            top.Controls.Add(bl31Row);
+            var bl33Row = new FlowLayoutPanel { AutoSize = true, Margin = new Padding(20, 0, 0, 0) };
+            bl33Row.Controls.Add(bl33Path);
+            bl33Row.Controls.Add(bl33Browse);
+            top.Controls.Add(bl33Row);
+            hekateNote.Margin = new Padding(23, 3, 3, 3);
+            top.Controls.Add(hekateNote);
             var runRow = new FlowLayoutPanel { AutoSize = true, Margin = new Padding(3, 14, 3, 3) };
             runRow.Controls.Add(start);
             progressLabel.Margin = new Padding(10, 10, 3, 3);
@@ -131,7 +160,23 @@ namespace SwitchPatcher
             imagePath.Enabled = browse.Enabled = editionBox.Enabled = idle && !patchRadio.Checked;
             diskBox.Enabled = patchRadio.Enabled = installRadio.Enabled = newSdRadio.Enabled = idle;
             partBox.Enabled = idle && !newSdRadio.Checked;      // a new SD gets its partitions made
-            drivers.Enabled = testMode.Enabled = controlCenter.Enabled = start.Enabled = idle;
+            drivers.Enabled = testMode.Enabled = controlCenter.Enabled = start.Enabled = hekateBoot.Enabled = idle;
+            hekateInstall.Enabled = bl31Path.Enabled = bl31Browse.Enabled = bl33Path.Enabled = bl33Browse.Enabled = idle && hekateBoot.Checked;
+        }
+
+        void ChooseFile(TextBox box, string title, string filter)
+        {
+            using var dlg = new OpenFileDialog { Title = title, Filter = filter };
+            if (dlg.ShowDialog(this) != DialogResult.OK) return;
+            try
+            {
+                if (box == bl31Path) Hekate.CheckBl31(dlg.FileName); else Hekate.CheckBl33(dlg.FileName);
+                box.Text = dlg.FileName;
+            }
+            catch (Exception e) when (e is InvalidDataException || e is IOException)
+            {
+                MessageBox.Show(this, e.Message, Text, MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            }
         }
 
         async Task LoadDisks()
@@ -238,7 +283,16 @@ namespace SwitchPatcher
                 Disk = disk, Windows = part, InitializeDisk = newSd, InstallImage = !patchRadio.Checked,
                 Drivers = drivers.Checked, TestMode = testMode.Checked, ControlCenter = controlCenter.Checked,
                 FirmwareFolder = firmwarePath.Text.Length > 0 ? firmwarePath.Text : null,
+                HekateBoot = hekateBoot.Checked, HekateInstall = hekateBoot.Checked && hekateInstall.Checked,
+                Bl31 = hekateBoot.Checked && bl31Path.Text.Length > 0 ? bl31Path.Text : null,
+                Bl33 = hekateBoot.Checked && bl33Path.Text.Length > 0 ? bl33Path.Text : null,
             };
+            if (o.HekateBoot && o.Bl31 == null && (newSd || disk.Esp == null))
+            {
+                MessageBox.Show(this, T("新しい SD には bl31.bin がないので、bl31.bin（自分で用意したもの）を選んでください。",
+                                        "A new SD has no bl31.bin: choose your own bl31.bin."), Text);
+                return;
+            }
             if (o.InstallImage)
             {
                 if (editionBox.SelectedItem is not ImageEdition e)
@@ -273,6 +327,10 @@ namespace SwitchPatcher
             if (o.TestMode) steps.Add(T("・テスト証明書を入れて、テストモードを有効にする（BCD は先に PC に保存する）", "- Add the test certificate and turn on test signing (the BCD is saved to the PC first)"));
             if (o.ControlCenter) steps.Add(T("・コントロールセンターを C:\\SwitchWOA\\SwitchCenter に置く", "- Put the control center in C:\\SwitchWOA\\SwitchCenter"));
             if (o.FirmwareFolder != null) steps.Add(T("・フォルダーのファームウェアを入れる（USB は ESP、Wi-Fi・Bluetooth は Windows の中）", "- Add the firmware from the folder (USB on the ESP, Wi-Fi and Bluetooth inside Windows)"));
+            if (o.HekateInstall) steps.Add(T("・hekate の最新の公式リリースを ESP に入れる（bootloader フォルダー、ペイロード）", "- Put the latest official hekate release on the ESP (bootloader folder, payload)"));
+            if (o.HekateBoot)
+                steps.Add(T($"・ESP の switchroot\\switchwoa に UEFI（bl33.bin{(o.Bl33 != null ? "、選んだファイル" : "、リリースのもの")}）{(o.Bl31 != null ? "と bl31.bin" : "")}を置き、hekate_ipl.ini に Windows の項目（id={Hekate.EntryId}）を足す",
+                            $"- Put the UEFI (bl33.bin, {(o.Bl33 != null ? "your file" : "the release's")}){(o.Bl31 != null ? " and bl31.bin" : "")} in switchroot\\switchwoa on the ESP and add a Windows entry (id={Hekate.EntryId}) to hekate_ipl.ini"));
             if (steps.Count == 0) return;
             if (MessageBox.Show(this, $"{disk}\n\n" + string.Join("\n", steps) + T("\n\n始めますか？", "\n\nStart?"), Text,
                                 MessageBoxButtons.OKCancel, o.InstallImage ? MessageBoxIcon.Warning : MessageBoxIcon.Question) != DialogResult.OK) return;

@@ -20,7 +20,11 @@ param(
   [Parameter(Mandatory = $true)][ValidatePattern('^\d{4}\.\d{1,2}\.\d{1,2}(\.\d+)?$')][string]$Version,
   [switch]$Publish,
   [switch]$PublishOnly,
-  [switch]$Beta                   # pre-release: also the drivers marked Beta (stable releases leave them out)
+  [switch]$Beta,                  # pre-release: also the drivers marked Beta (stable releases leave them out)
+  # The Switch UEFI built for hekate (bl33.bin from the UEFI repository's hekate build) and its
+  # version (R419H). Attached as bl33-<UefiVersion>.bin; SwitchPatcher puts it on the ESP.
+  [string]$HekateBl33,
+  [ValidatePattern('^(R\d{3,4}[A-Z]?)?$')][string]$UefiVersion
 )
 
 $Repo = 'hayato41200/Windows-for-Switch-Drivers'
@@ -40,6 +44,7 @@ function Publish-Release([string]$dir) {
   $notes += $m.drivers.items | ForEach-Object { "| $($_.service)$(if ($_.beta) { ' (beta)' }) | $($_.version) | $($_.hwid) | $($_.minUefi) |" }
   $notes += '', "Control center: $($m.app.version) ($($m.app.file))"
   if ($m.patcher) { $notes += "SwitchPatcher (PC): $($m.patcher.version) ($($m.patcher.file))" }
+  if ($m.uefi) { $notes += "UEFI for the hekate boot chain: $($m.uefi.version) ($($m.uefi.bl33.file)). SwitchPatcher puts it on the SD; bl31.bin is not included (use your own)." }
   $notes += '', 'SHA-256 values are in manifest.json.'
   $notes += '', 'Firmware is not included: USB (tegra21x_xusb_firmware), Wi-Fi (brcmfmac4356A3-pcie.bin/.txt) and Bluetooth (BCM4356A3.hcd) come from your own Switchroot Linux install (/lib/firmware, /lib/firmware/brcm). Add them with SwitchPatcher (Firmware folder) or, for Wi-Fi and Bluetooth, the control center (Drivers > Firmware).'
   $notes += 'ファームウェアは入っていません。USB（tegra21x_xusb_firmware）、Wi-Fi（brcmfmac4356A3-pcie.bin/.txt）、Bluetooth（BCM4356A3.hcd）は、自分の Switchroot Linux のインストールファイル（/lib/firmware、/lib/firmware/brcm）から取り出して、SwitchPatcher の「ファームウェア」か、コントロールセンターの「ドライバー」タブ（Wi-Fi・BT）で入れてください。' 
@@ -61,6 +66,8 @@ $Root = Split-Path -Parent $PSScriptRoot
 $Out = Join-Path $Root "out\$Version"
 $Stage = Join-Path $Out 'stage'
 if (Test-Path $Out) { throw "$Out already exists; use a new version." }
+if ([bool]$HekateBl33 -ne [bool]$UefiVersion) { throw '-HekateBl33 and -UefiVersion go together.' }
+if ($HekateBl33 -and -not (Test-Path $HekateBl33)) { throw "$HekateBl33 not found" }
 New-Item -ItemType Directory -Force $Stage | Out-Null
 
 $Spb = '$Kits\Include\10.0.19041.0\km\spb\1.0', '$Kits\Include\10.0.26100.0\shared'
@@ -177,6 +184,13 @@ $manifest = [ordered]@{
   patcher   = [ordered]@{ version = $patcherVersion; file = (Split-Path $patcherZip -Leaf); sha256 = (Sha256 $patcherZip) }
   drivers   = [ordered]@{ file = (Split-Path $driversZip -Leaf); sha256 = (Sha256 $driversZip); items = $manifestDrivers }
   sd        = $manifestSd
+}
+if ($HekateBl33) {
+  # Only this project's UEFI. bl31 (ARM Trusted Firmware) and hekate are never attached:
+  # SwitchPatcher takes hekate from its official release and bl31 from the user.
+  $bl33Name = "bl33-$UefiVersion.bin"
+  Copy-Item $HekateBl33 (Join-Path $Out $bl33Name)
+  $manifest.uefi = [ordered]@{ version = $UefiVersion; bl33 = [ordered]@{ file = $bl33Name; sha256 = (Sha256 (Join-Path $Out $bl33Name)) } }
 }
 $manifest | ConvertTo-Json -Depth 6 | Set-Content (Join-Path $Out 'manifest.json') -Encoding utf8
 Remove-Item $Stage -Recurse -Force
