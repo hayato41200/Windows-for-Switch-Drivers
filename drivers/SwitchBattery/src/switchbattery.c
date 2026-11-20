@@ -31,6 +31,18 @@
  * after 2 bad polls it turns the boost off and on again (REG01 charge, then
  * OTG), at most 3 times in a row and then once every 5 s. When a partner is
  * inserted but neither role is taken for 5 s, STATUS1/2 are traced.
+ *
+ * v7: USB-C DisplayPort Alt Mode (the UEFI R424/R425/R432 steps, done again in
+ * Windows so a hub/dock plugged in after boot can drive a TV). After the sink
+ * setup, when the Switch is DFP: Discover Identity; a partner answering as the
+ * Nintendo dock (057E:2003) that also offers the standard DP SVID (FF01) and
+ * any other DP partner enter standard DP; the real dock enters Nintendo mode
+ * and gets the dock VDMs (state, LED, USB hub). Then DP_ENTER_MODE, pin D
+ * (2 lanes) and DP_CFG_AND_START_HPD. This driver stays the only reader of the
+ * BM92T (ALERT is read-to-clear). The state goes to switchdisplay through the
+ * kernel callback \Callback\SwitchWoaDpAlt (Argument1 = 1 up / 0 down,
+ * Argument2 = DP_STATUS), on every change and every 5 s while up. Registry
+ * DpAlt=0 turns it off.
  */
 #include <ntddk.h>
 #include <ntstrsafe.h>
@@ -83,6 +95,27 @@
 #define USBC_BOOST_QUICK 3              /* quick restarts, then one every USBC_BOOST_WAIT polls */
 #define USBC_BOOST_WAIT  10
 #define USBC_STUCK_POLLS 10
+/* v7: DP Alt Mode (BM92T, UEFI R424) */
+#define BM_ALERT_STATUS         0x02
+#define BM_DP_STATUS            0x18
+#define BM_DP_ALERT_EN          0x19
+#define BM_INCOMING_VDM         0x50
+#define BM_OUTGOING_VDM         0x60
+#define BM_ALERT_CMD_DONE       (1u << 2)
+#define BM_ALERT_VDM_RECEIVED   (1u << 11)
+#define BM_CMD_SEND_VDM         0x1111u
+#define BM_CMD_ACCEPT_VDM       0x1616u
+#define BM_CMD_DP_ENTER_MODE    0x3131u
+#define BM_CMD_DP_CFG_START_HPD 0x3636u
+#define BM_DP_SIGNAL_ON         (1u << 7)
+#define BM_DP_EN                (1u << 15)
+#define VDO_DP_UFP_D            (1u << 0)
+#define VDO_DP_U_UFP_D          (1u << 1)
+#define VDO_DP_SUPPORT          (1u << 2)
+#define VDO_DP_RECEPTACLE       (1u << 6)
+#define VDO_DP_PIN_C            (1u << 2)
+#define VDO_DP_PIN_D            (1u << 3)
+#define DPALT_NOTIFY_POLLS      10              /* re-notify every 5 s while up */
 
 typedef enum _USBC_STATE { UsbcIdle = 0, UsbcHost = 1, UsbcSink = 2 } USBC_STATE;
 
@@ -104,6 +137,12 @@ typedef struct _SWBAT_DEVICE {
     ULONG UsbcChanges;
     ULONG BoostBad, BoostRestartsInRow, BoostWait, BoostRestarts;
     ULONG StuckPolls;
+    /* v7 DP Alt Mode */
+    BOOLEAN DpAllowed;
+    BOOLEAN DpUp;
+    ULONG DpTries, DpUps, DpNotifyPolls;
+    USHORT DpStatus;
+    PCALLBACK_OBJECT DpCallback;
 } SWBAT_DEVICE, *PSWBAT_DEVICE;
 WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(SWBAT_DEVICE, SwBatGetDevice)
 
@@ -136,6 +175,26 @@ static VOID SwBatTrace(PCWSTR Name, ULONG Value)
     if (SwBatParamsPath[0] != L'\0' && KeGetCurrentIrql() == PASSIVE_LEVEL) {
         (VOID)RtlWriteRegistryValue(RTL_REGISTRY_ABSOLUTE, SwBatParamsPath, Name, REG_DWORD, &Value, sizeof(Value));
     }
+}
+
+static ULONG SwBatRegGet(PCWSTR Name, ULONG Default)
+{
+    RTL_QUERY_REGISTRY_TABLE Q[2];
+    ULONG Value = Default, Def = Default;
+    if (SwBatParamsPath[0] == L'\0') {
+        return Default;
+    }
+    RtlZeroMemory(Q, sizeof(Q));
+    Q[0].Flags = RTL_QUERY_REGISTRY_DIRECT | RTL_QUERY_REGISTRY_TYPECHECK;
+    Q[0].Name = (PWSTR)Name;
+    Q[0].EntryContext = &Value;
+    Q[0].DefaultType = (REG_DWORD << RTL_QUERY_REGISTRY_TYPECHECK_SHIFT) | REG_DWORD;
+    Q[0].DefaultData = &Def;
+    Q[0].DefaultLength = sizeof(Def);
+    if (!NT_SUCCESS(RtlQueryRegistryValues(RTL_REGISTRY_ABSOLUTE, SwBatParamsPath, Q, NULL, NULL))) {
+        return Default;
+    }
+    return Value;
 }
 
 /* ------------------------------------------------------------------- I2C */
@@ -218,6 +277,29 @@ static NTSTATUS SwBatWriteRegs(WDFIOTARGET Target, UCHAR Register, const UCHAR *
     Options.Timeout = WDF_REL_TIMEOUT_IN_MS(500);
     Status = WdfIoTargetSendWriteSynchronously(Target, NULL, &Memory, NULL, &Options, &Bytes);
     if (NT_SUCCESS(Status) && Bytes != 1 + Length) {
+        Status = STATUS_DEVICE_PROTOCOL_ERROR;
+    }
+    return Status;
+}
+
+/* v7: Buf[0] is the register, Len <= 16 bytes in total. */
+static NTSTATUS SwBatWriteBlock(WDFIOTARGET Target, const UCHAR *Buf, ULONG Len)
+{
+    UCHAR Buffer[16];
+    WDF_MEMORY_DESCRIPTOR Memory;
+    WDF_REQUEST_SEND_OPTIONS Options;
+    ULONG_PTR Bytes = 0;
+    NTSTATUS Status;
+
+    if (Target == NULL || Len < 2 || Len > sizeof(Buffer)) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    RtlCopyMemory(Buffer, Buf, Len);
+    WDF_MEMORY_DESCRIPTOR_INIT_BUFFER(&Memory, Buffer, Len);
+    WDF_REQUEST_SEND_OPTIONS_INIT(&Options, WDF_REQUEST_SEND_OPTION_TIMEOUT);
+    Options.Timeout = WDF_REL_TIMEOUT_IN_MS(500);
+    Status = WdfIoTargetSendWriteSynchronously(Target, NULL, &Memory, NULL, &Options, &Bytes);
+    if (NT_SUCCESS(Status) && Bytes != Len) {
         Status = STATUS_DEVICE_PROTOCOL_ERROR;
     }
     return Status;
@@ -383,6 +465,226 @@ static VOID SwBatCheckBoost(PSWBAT_DEVICE Dev, UCHAR Sys)
 }
 
 /* One 500 ms step of the role state machine. Caller holds Dev->Lock. */
+/* ------------------------------------------------- DP Alt Mode (v7) */
+
+static VOID SwBatDpNotify(PSWBAT_DEVICE Dev)
+{
+    if (Dev->DpCallback != NULL) {
+        ExNotifyCallback(Dev->DpCallback, (PVOID)(ULONG_PTR)(Dev->DpUp ? 1 : 0), (PVOID)(ULONG_PTR)Dev->DpStatus);
+    }
+}
+
+static VOID SwBatDpSetUp(PSWBAT_DEVICE Dev, BOOLEAN Up, USHORT DpStatus)
+{
+    BOOLEAN Changed = Dev->DpUp != Up;
+    Dev->DpUp = Up;
+    Dev->DpStatus = DpStatus;
+    Dev->DpNotifyPolls = 0;
+    if (Changed) {
+        if (Up) {
+            SwBatTrace(L"DpAltUps", ++Dev->DpUps);
+        }
+        SwBatTrace(L"DpAltUp", Up ? 1 : 0);
+        SwBatTrace(L"DpAltDpStatus", DpStatus);
+    }
+    SwBatDpNotify(Dev);
+}
+
+static VOID SwBatDpWaitNotBusy(PSWBAT_DEVICE Dev)
+{
+    USHORT S1 = 0;
+    ULONG I;
+    for (I = 0; I < 40; ++I) {
+        if (NT_SUCCESS(SwBatRead16(Dev->Pd, BM_STATUS1, &S1)) && (S1 & BM_CMD_BUSY) == 0) {
+            return;
+        }
+        SwBatSleepMs(5);
+    }
+}
+
+static NTSTATUS SwBatDpCmd(PSWBAT_DEVICE Dev, USHORT Cmd)
+{
+    UCHAR B[2] = { (UCHAR)(Cmd & 0xFF), (UCHAR)(Cmd >> 8) };
+    SwBatDpWaitNotBusy(Dev);
+    return SwBatWriteRegs(Dev->Pd, BM_COMMAND, B, 2);
+}
+
+/* ALERT is read-to-clear: OR of all bits seen until one of Want, 0 on timeout. */
+static USHORT SwBatDpWaitAlert(PSWBAT_DEVICE Dev, USHORT Want, ULONG TimeoutMs)
+{
+    USHORT A = 0, Seen = 0;
+    ULONG T;
+    for (T = 0; T < TimeoutMs; T += 10) {
+        if (NT_SUCCESS(SwBatRead16(Dev->Pd, BM_ALERT_STATUS, &A))) {
+            Seen |= A;
+            if ((Seen & Want) != 0) {
+                return Seen;
+            }
+        }
+        SwBatSleepMs(10);
+    }
+    return 0;
+}
+
+/* One VDM: Msg[0] = OUTGOING_VDM, Msg[1] = length. Reply[29] = INCOMING_VDM. */
+static BOOLEAN SwBatDpVdm(PSWBAT_DEVICE Dev, const UCHAR *Msg, ULONG Len, PUCHAR Reply)
+{
+    USHORT A = 0;
+    RtlZeroMemory(Reply, 29);
+    (VOID)SwBatRead16(Dev->Pd, BM_ALERT_STATUS, &A);         /* drop stale alerts */
+    SwBatDpWaitNotBusy(Dev);
+    if (!NT_SUCCESS(SwBatWriteBlock(Dev->Pd, Msg, Len)) || !NT_SUCCESS(SwBatDpCmd(Dev, BM_CMD_SEND_VDM))) {
+        return FALSE;
+    }
+    if ((SwBatDpWaitAlert(Dev, BM_ALERT_VDM_RECEIVED, 1500) & BM_ALERT_VDM_RECEIVED) == 0) {
+        return FALSE;
+    }
+    if (!NT_SUCCESS(SwBatDpCmd(Dev, BM_CMD_ACCEPT_VDM))) {
+        return FALSE;
+    }
+    (VOID)SwBatDpWaitAlert(Dev, BM_ALERT_CMD_DONE, 1000);
+    return NT_SUCCESS(SwBatReadRegs(Dev->Pd, BM_INCOMING_VDM, Reply, 29));
+}
+
+/* Standard DP SVID: does the partner offer a UFP_D DP mode? */
+static BOOLEAN SwBatDpGenericModes(PSWBAT_DEVICE Dev)
+{
+    static const UCHAR DiscSvid[6] = { BM_OUTGOING_VDM, 4, 0x02, 0x80, 0x00, 0xFF };
+    static const UCHAR DiscMode[6] = { BM_OUTGOING_VDM, 4, 0x03, 0x80, 0x01, 0xFF };
+    UCHAR Vdm[29];
+    if (!SwBatDpVdm(Dev, DiscSvid, sizeof(DiscSvid), Vdm) || !SwBatDpVdm(Dev, DiscMode, sizeof(DiscMode), Vdm)) {
+        return FALSE;
+    }
+    return Vdm[0] > 4 && Vdm[1] == (0x40 | 0x03) && Vdm[3] == 0x01 && Vdm[4] == 0xFF &&
+           (Vdm[5] & VDO_DP_UFP_D) != 0 && (Vdm[5] & VDO_DP_SUPPORT) != 0;
+}
+
+/* The UEFI R424 stage 1. Returns the step reached (traced as DpAltStep):
+ * 1 not DFP, 2 no Discover Identity, 3 not a DP partner, 4 Nintendo mode not
+ * entered, 5 DP_ENTER_MODE, 6 no pin C/D, 7 DP configure, 10 done. Caller
+ * holds Dev->Lock. */
+static ULONG SwBatDpAltEnter(PSWBAT_DEVICE Dev)
+{
+    static const UCHAR DiscId[6]   = { BM_OUTGOING_VDM, 4, 0x01, 0x80, 0x00, 0xFF };
+    static const UCHAR EnterNin[6] = { BM_OUTGOING_VDM, 4, 0x04, 0x81, 0x7E, 0x05 };
+    static const UCHAR Query[10]   = { BM_OUTGOING_VDM, 8, 0x00, 0x00, 0x7E, 0x05, 0x00, 0x01, 0x16, 0x00 };
+    static const UCHAR HubOn[10]   = { BM_OUTGOING_VDM, 8, 0x00, 0x00, 0x7E, 0x05, 0x01, 0x01, 0x20, 0x00 };
+    static const UCHAR Led[14]     = { BM_OUTGOING_VDM, 12, 0x00, 0x00, 0x7E, 0x05, 0x01, 0x01, 0x01, 0x00,
+                                       64, 0, 0, 128 };
+    UCHAR Vdm[29], Caps[5], Cfg[6];
+    USHORT S1 = 0, Dp = 0, A, Vid, Pid;
+    ULONG W0, W2, Type, I;
+    BOOLEAN Dock, Generic;
+    UCHAR Pin;
+
+    SwBatTrace(L"DpAltTries", ++Dev->DpTries);
+    if (!NT_SUCCESS(SwBatRead16(Dev->Pd, BM_STATUS1, &S1)) || ((S1 >> BM_DR_SHIFT) & 3) != BM_DR_DFP) {
+        return 1;
+    }
+    (VOID)SwBatWriteRegs(Dev->Pd, BM_DP_ALERT_EN, (const UCHAR *)"\0\0", 2);   /* as L4T */
+    if (!SwBatDpVdm(Dev, DiscId, sizeof(DiscId), Vdm) || Vdm[1] != (0x40 | 0x01) || Vdm[0] < 16) {
+        return 2;
+    }
+    W0 = SwBatLe32(&Vdm[5]);
+    W2 = SwBatLe32(&Vdm[13]);
+    Vid = (USHORT)(W0 & 0xFFFF);
+    Type = (W0 >> 27) & 7;
+    Pid = (USHORT)(W2 >> 16);
+    SwBatTrace(L"DpAltPartner", ((ULONG)Vid << 16) | Pid);
+    Dock = Type == 5 && Vid == 0x057E && Pid == 0x2003;
+    /* R432: a hub answering as the dock gets HDMI only in standard DP. */
+    Generic = SwBatDpGenericModes(Dev);
+    if (!Generic) {
+        if (!Dock) {
+            return 3;
+        }
+        if (!SwBatDpVdm(Dev, EnterNin, sizeof(EnterNin), Vdm) || Vdm[1] != (0x40 | 0x04) || Vdm[2] != 0x81 ||
+            Vdm[3] != 0x7E || Vdm[4] != 0x05) {
+            return 4;
+        }
+    }
+    SwBatTrace(L"DpAltGeneric", Generic ? 1 : 0);
+
+    (VOID)SwBatRead16(Dev->Pd, BM_ALERT_STATUS, &A);
+    if (!NT_SUCCESS(SwBatDpCmd(Dev, BM_CMD_DP_ENTER_MODE))) {
+        return 5;
+    }
+    SwBatSleepMs(100);
+    if ((SwBatDpWaitAlert(Dev, BM_ALERT_CMD_DONE, 3000) & BM_ALERT_CMD_DONE) == 0 ||
+        !NT_SUCCESS(SwBatReadRegs(Dev->Pd, BM_INCOMING_VDM, Caps, sizeof(Caps)))) {
+        return 5;
+    }
+    SwBatTrace(L"DpAltCaps", SwBatLe32(&Caps[1]));
+    /* L4T: pin D (2 lanes) first, then C. The dock uses the receptacle field. */
+    Cfg[0] = BM_OUTGOING_VDM; Cfg[1] = 4; Cfg[2] = VDO_DP_SUPPORT | VDO_DP_U_UFP_D;
+    Cfg[3] = 0; Cfg[4] = 0; Cfg[5] = 0;
+    Pin = 0;
+    for (I = 0; I < 2 && Pin == 0; ++I) {
+        UCHAR Try = (I == 0) ? VDO_DP_PIN_D : VDO_DP_PIN_C;
+        if (!Generic) {
+            if ((Caps[3] & Try) != 0) { Cfg[4] = Try; Pin = Try; }
+        } else if ((Caps[1] & VDO_DP_RECEPTACLE) == 0) {
+            if ((Caps[2] & Try) != 0) { Cfg[3] = Try; Pin = Try; }
+        } else {
+            if ((Caps[3] & Try) != 0) { Cfg[3] = Try; Pin = Try; }
+        }
+    }
+    if (Caps[0] != 4 || Pin == 0) {
+        return 6;
+    }
+    (VOID)SwBatRead16(Dev->Pd, BM_ALERT_STATUS, &A);
+    SwBatDpWaitNotBusy(Dev);
+    if (!NT_SUCCESS(SwBatWriteBlock(Dev->Pd, Cfg, sizeof(Cfg))) || !NT_SUCCESS(SwBatDpCmd(Dev, BM_CMD_DP_CFG_START_HPD))) {
+        return 7;
+    }
+    A = SwBatDpWaitAlert(Dev, BM_ALERT_CMD_DONE, 3000);
+    (VOID)SwBatRead16(Dev->Pd, BM_STATUS1, &S1);
+    SwBatTrace(L"DpAltCfgStatus1", S1);
+    if ((A & BM_ALERT_CMD_DONE) == 0 || (S1 & BM_INSERT) == 0 || ((S1 >> 4) & 7) != 0) {
+        return 7;
+    }
+    if (!Generic) {
+        /* Nintendo dock VDMs; failures do not undo DP. */
+        (VOID)SwBatDpVdm(Dev, Query, sizeof(Query), Vdm);
+        (VOID)SwBatDpVdm(Dev, Led, sizeof(Led), Vdm);
+        SwBatSleepMs(500);
+        for (I = 0; I < 10; ++I) {
+            if (!SwBatDpVdm(Dev, HubOn, sizeof(HubOn), Vdm)) {
+                break;
+            }
+            if (!(Vdm[6] == 2 && Vdm[7] == 0x21 && (Vdm[5] & 1) != 0)) {
+                break;
+            }
+            SwBatSleepMs(250);
+        }
+    }
+    /* Wait up to 3 s for the partner to raise the DP signal (HPD). */
+    for (I = 0; I < 30; ++I) {
+        if (NT_SUCCESS(SwBatRead16(Dev->Pd, BM_DP_STATUS, &Dp)) && (Dp & BM_DP_SIGNAL_ON) != 0) {
+            break;
+        }
+        SwBatSleepMs(100);
+    }
+    SwBatDpSetUp(Dev, TRUE, Dp);
+    return 10;
+}
+
+/* Sink state reached (UEFI or this driver): enter DP Alt Mode if the partner
+ * has it and UEFI did not already. Caller holds Dev->Lock. */
+static VOID SwBatDpAltCheck(PSWBAT_DEVICE Dev)
+{
+    USHORT Dp = 0;
+    if (!Dev->DpAllowed || Dev->Pd == NULL) {
+        return;
+    }
+    if (NT_SUCCESS(SwBatRead16(Dev->Pd, BM_DP_STATUS, &Dp)) && (Dp & BM_DP_EN) != 0) {
+        SwBatTrace(L"DpAltStep", 11);                       /* already in DP mode (UEFI) */
+        SwBatDpSetUp(Dev, TRUE, Dp);
+        return;
+    }
+    SwBatTrace(L"DpAltStep", SwBatDpAltEnter(Dev));
+}
+
 static VOID SwBatUsbcPoll(PSWBAT_DEVICE Dev)
 {
     USHORT S1 = 0, S2 = 0;
@@ -417,6 +719,7 @@ static VOID SwBatUsbcPoll(PSWBAT_DEVICE Dev)
             Status = SwBatConfigureSink(Dev);
             SwBatTrace(L"UsbcSinkStatus", (ULONG)Status);
             Dev->Usbc = UsbcSink;
+            SwBatDpAltCheck(Dev);
         } else if (Dev->HostStreak >= USBC_STREAK) {
             if ((S1 & BM_VSAFE) != 0 || PartnerPower) {
                 SwBatTrace(L"UsbcVbusRefused", S1);         /* the partner already powers VBUS */
@@ -436,6 +739,9 @@ static VOID SwBatUsbcPoll(PSWBAT_DEVICE Dev)
     case UsbcSink:
         Dev->GoneStreak = Inserted ? 0 : Dev->GoneStreak + 1;
         if (Dev->GoneStreak >= 2) {
+            if (Dev->DpUp) {
+                SwBatDpSetUp(Dev, FALSE, 0);
+            }
             if (Dev->Usbc == UsbcHost) {
                 SwBatTrace(L"UsbcVbusOffStatus", (ULONG)SwBatSetBqMode(Dev, BQ_MODE_CHARGE));
             }
@@ -443,6 +749,10 @@ static VOID SwBatUsbcPoll(PSWBAT_DEVICE Dev)
             Dev->HostStreak = Dev->SinkStreak = Dev->GoneStreak = Dev->StuckPolls = 0;
         } else if (Dev->Usbc == UsbcHost && Inserted) {
             SwBatCheckBoost(Dev, Sys);
+        } else if (Dev->DpUp && ++Dev->DpNotifyPolls >= DPALT_NOTIFY_POLLS) {
+            USHORT Dp = Dev->DpStatus;
+            (VOID)SwBatRead16(Dev->Pd, BM_DP_STATUS, &Dp);
+            SwBatDpSetUp(Dev, (Dp & BM_DP_EN) != 0, Dp);
         }
         break;
     }
@@ -466,6 +776,7 @@ static VOID SwBatUsbcStart(PSWBAT_DEVICE Dev)
     } else if (NT_SUCCESS(SwBatRead16(Dev->Pd, BM_STATUS1, &S1)) && (S1 & BM_INSERT) != 0 &&
                (S1 & BM_SRC_MODE) == 0 && (S1 & BM_VSAFE) != 0) {
         Dev->Usbc = UsbcSink;                       /* UEFI R363 already configured charging */
+        SwBatDpAltCheck(Dev);                       /* v7: UEFI R424 may have entered DP too */
     }
     SwBatTrace(L"UsbcStartState", Dev->Usbc);
     SwBatTrace(L"UsbcState", Dev->Usbc);           /* v5: otherwise a value from an earlier boot stays */
@@ -782,6 +1093,14 @@ NTSTATUS SwBatEvtSelfManagedIoInit(WDFDEVICE Device)
         SwBatTrace(L"OpenPdStatus", (ULONG)Status);
     }
     if (Dev->Pd != NULL) {
+        Dev->DpAllowed = SwBatRegGet(L"DpAlt", 1) != 0;
+        if (Dev->DpCallback == NULL) {
+            UNICODE_STRING Name;
+            OBJECT_ATTRIBUTES Oa;
+            RtlInitUnicodeString(&Name, L"\\Callback\\SwitchWoaDpAlt");
+            InitializeObjectAttributes(&Oa, &Name, OBJ_CASE_INSENSITIVE | OBJ_PERMANENT | OBJ_KERNEL_HANDLE, NULL, NULL);
+            SwBatTrace(L"DpAltCallbackStatus", (ULONG)ExCreateCallback(&Dev->DpCallback, &Oa, TRUE, TRUE));
+        }
         WdfWaitLockAcquire(Dev->Lock, NULL);
         SwBatUsbcStart(Dev);
         WdfWaitLockRelease(Dev->Lock);
@@ -817,6 +1136,10 @@ VOID SwBatEvtSelfManagedIoCleanup(WDFDEVICE Device)
     }
     if (Dev->UsbcTimer != NULL) {
         WdfTimerStop(Dev->UsbcTimer, TRUE);
+    }
+    if (Dev->DpCallback != NULL) {
+        ObDereferenceObject(Dev->DpCallback);       /* the object itself stays (OBJ_PERMANENT) */
+        Dev->DpCallback = NULL;
     }
     if (Dev->ClassHandle != NULL) {
         (VOID)BatteryClassUnload(Dev->ClassHandle);
@@ -882,7 +1205,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
         RtlCopyMemory(&SwBatParamsPath[RegistryPath->Length / sizeof(WCHAR)], L"\\Parameters", sizeof(L"\\Parameters"));
         (VOID)RtlCreateRegistryKey(RTL_REGISTRY_ABSOLUTE, SwBatParamsPath);
     }
-    SwBatTrace(L"DriverVersion", 6);
+    SwBatTrace(L"DriverVersion", 7);
 
     WDF_DRIVER_CONFIG_INIT(&Config, SwBatEvtDeviceAdd);
     return WdfDriverCreate(DriverObject, RegistryPath, WDF_NO_OBJECT_ATTRIBUTES, &Config, WDF_NO_HANDLE);
