@@ -53,7 +53,7 @@ namespace SwitchCenter
     sealed class Release
     {
         public string Tag, PageUrl, AppVersion, AppFile, AppSha256, AppUrl, DriversFile, DriversSha256, DriversUrl;
-        public bool Prerelease;           // a GitHub pre-release: beta drivers (Make-Release.ps1 -Beta)
+        public bool Prerelease;           // a GitHub pre-release (none since 2026-11-20; releases/latest skips them)
         public List<ManifestDriver> Drivers = new List<ManifestDriver>();
         public SdBoot Sd;                 // null in releases without it
         public UefiBoot Uefi;             // null in releases without it
@@ -122,33 +122,6 @@ namespace SwitchCenter
                 return await File.ReadAllTextAsync(tmp);
             }
             finally { try { File.Delete(tmp); } catch (IOException) { } }
-        }
-
-        /// <summary>
-        /// The newest release of a channel: stable = releases/latest (GitHub skips pre-releases there),
-        /// beta = the newest release including pre-releases.
-        /// </summary>
-        public static async Task<Release> FetchChannelAsync(bool beta)
-        {
-            if (!beta) return await FetchAsync(null);
-            await EnsureTokenAsync();
-            string newest = null;
-            Version newestVersion = null;
-            using (HttpClient http = NewClient())
-            using (JsonDocument list = await GetJsonAsync(http, $"https://api.github.com/repos/{Repo}/releases?per_page=30"))
-            {
-                // GitHub orders the list by the tagged commit's date, not by publishing, so
-                // releases tagged on the same commit come in any order: compare the tags instead.
-                foreach (JsonElement rel in list.RootElement.EnumerateArray())
-                {
-                    string tag = rel.GetProperty("tag_name").GetString();
-                    if (rel.GetProperty("draft").GetBoolean() || tag == null || !TagPattern.IsMatch(tag)) continue;
-                    Version v = System.Version.Parse(tag.Substring("drivers-".Length));
-                    if (newestVersion == null || v > newestVersion) { newest = tag; newestVersion = v; }
-                }
-            }
-            if (newest == null) throw new InvalidDataException("no release found");
-            return await FetchAsync(newest);
         }
 
         /// <summary>Reads releases/latest (tag == null) or the given tag, and its manifest.json.</summary>
