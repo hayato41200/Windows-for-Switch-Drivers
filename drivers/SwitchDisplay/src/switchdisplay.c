@@ -24,13 +24,19 @@
  *   - boot-loop guard: two starts in a row that did not survive 60 s make the
  *     next start fail, so Windows keeps the Basic Display Driver
  *   - an EDID builder, off unless UseEdid=1 (with it Windows may raise the scale)
+ *   - 1.3.0, TV mirror over USB-C DP Alt Mode: when UEFI (R434H and later) left
+ *     DC-B scanning out 1280x720 to SOR1, DC-B window A is pointed at a 1280x720
+ *     buffer of this driver and every present is copied there too, unrotated: a
+ *     landscape 1280x720 desktop fills the TV, a portrait one is shrunk to 405x720
+ *     in the middle. Windows still sees one display. Registry TvMirror=0 turns it
+ *     off. No hot-plug yet: the TV must be connected when UEFI starts.
  *
  * Trace: HKLM\SYSTEM\CurrentControlSet\Services\switchdisplay\Parameters
  */#define DXGKDDI_INTERFACE_VERSION 0x4002 /* DXGKDDI_INTERFACE_VERSION_WDDM1_3 */
 #include <ntddk.h>
 #include <dispmprt.h>
 
-#define SWD_VERSION        0x00010202u   /* 1.2.2 */
+#define SWD_VERSION        0x00010300u   /* 1.3.0 */
 #define SWD_TAG            'DwsS'
 
 /* Boot framebuffer (coreboot display.c / UEFI MemoryMap.h "Display Reserved") */
@@ -85,6 +91,40 @@
 #define DCS_EXIT_SLEEP     0x11u
 #define DCS_DISPLAY_OFF    0x28u
 #define DCS_DISPLAY_ON     0x29u
+
+/* 1.3.0 TV mirror: DC-B (head 1) driving SOR1, set up by UEFI R434H+. The
+ * disp2 clock and reset are checked in CAR first: DC-B registers must not be
+ * touched while its clock is off. */
+#define CAR_PHYS           0x60006000ull
+#define CAR_MAP_SIZE       0x1000u
+#define CAR_RST_DEVICES_L  0x04u
+#define CAR_CLK_OUT_ENB_L  0x10u
+#define CAR_DISP2_BIT      (1u << 26)
+#define DC_B_PHYS          0x54240000ull
+#define DC_DISP_WIN_OPTIONS (0x402u * 4u)
+#define DC_DISP_ACTIVE     (0x409u * 4u)
+#define DC_SOR1_ENABLE     (1u << 26)
+#define DC_WIN_BUF_CTRL    (0x702u * 4u)
+#define DC_WIN_POSITION    (0x704u * 4u)
+#define DC_WIN_PRESCALED   (0x706u * 4u)
+#define DC_WIN_H_INIT_DDA  (0x707u * 4u)
+#define DC_WIN_V_INIT_DDA  (0x708u * 4u)
+#define DC_WIN_DDA_INC     (0x709u * 4u)
+#define DC_WIN_DV_CTRL     (0x70Eu * 4u)
+#define DC_WIN_BLEND_1WIN  (0x716u * 4u)
+#define DC_WINBUF_H_OFF    (0x806u * 4u)
+#define DC_WINBUF_V_OFF    (0x808u * 4u)
+#define DC_WINBUF_KIND     (0x80Bu * 4u)
+#define DC_WINBUF_START_HI (0x80Du * 4u)
+#define DC_WIN_A_SELECT    0x10u
+#define WIN_A_UPDATE       (1u << 9)
+#define WIN_A_ACT_REQ      (1u << 1)
+#define DC_WIN_ENABLE      (1u << 30)
+#define DC_DEPTH_B8G8R8A8  12u
+#define TV_W               1280u
+#define TV_H               720u
+#define TV_PITCH           (TV_W * 4u)
+#define TV_REGS            17
 
 #define GUARD_SECONDS      60
 #define FLUSH_SECONDS      10
@@ -141,6 +181,14 @@ typedef struct _SWD_CONTEXT {
     volatile LONG        IsrOther;
     volatile LONG        VsyncEnables;
     volatile LONG        VsyncDisables;
+
+    /* 1.3.0 TV mirror (DC-B) */
+    PUCHAR               TvDc;          /* DC-B registers */
+    PUCHAR               TvVa;          /* 1280x720 buffer, write-combined */
+    PHYSICAL_ADDRESS     TvPhys;
+    ULONG                TvSaved[TV_REGS];
+    LONG                 TvLastW, TvLastH;
+    volatile LONG        TvPresents;
 } SWD_CONTEXT, *PSWD_CONTEXT;
 
 static WCHAR  gParamPathBuf[512];
@@ -213,6 +261,7 @@ static VOID FlushCounters(PSWD_CONTEXT Ctx)
     RegPutDword(L"IsrOther", (ULONG)Ctx->IsrOther);
     RegPutDword(L"VsyncEnables", (ULONG)Ctx->VsyncEnables);
     RegPutDword(L"VsyncDisables", (ULONG)Ctx->VsyncDisables);
+    RegPutDword(L"TvPresents", (ULONG)Ctx->TvPresents);
     {
         int i;
         for (i = 0; i < D_COUNT; i++) {
@@ -506,6 +555,189 @@ static VOID BltRect(PSWD_CONTEXT Ctx, PUCHAR SrcBase, LONG SrcTop, LONG Pitch, R
 #undef DSTROW
 }
 
+/* ------------------------------------------------------------ 1.3.0: TV mirror */
+
+/* Window A registers written for the TV, in write order (WIN_OPTIONS last). */
+static const ULONG gTvRegs[TV_REGS] = {
+    DC_WIN_COLOR_DEPTH, DC_WIN_POSITION, DC_WIN_H_INIT_DDA, DC_WIN_V_INIT_DDA, DC_WIN_PRESCALED,
+    DC_WIN_DDA_INC, DC_WIN_SIZE, DC_WIN_LINE_STRIDE, DC_WIN_BUF_CTRL, DC_WIN_DV_CTRL, DC_WINBUF_KIND,
+    DC_WINBUF_START, DC_WINBUF_START_HI, DC_WINBUF_H_OFF, DC_WINBUF_V_OFF, DC_WIN_BLEND_1WIN, DC_WIN_OPTIONS
+};
+
+#define TVRD(o)    READ_REGISTER_ULONG((PULONG)(Ctx->TvDc + (o)))
+#define TVWR(o, v) WRITE_REGISTER_ULONG((PULONG)(Ctx->TvDc + (o)), (v))
+
+/* Writes window A of DC-B (assembly copy) and latches it at the next frame. */
+static VOID TvWriteWindow(PSWD_CONTEXT Ctx, const ULONG *Values)
+{
+    ULONG hdr = TVRD(DC_WINDOW_HEADER), i;
+    TVWR(DC_CMD_STATE_ACCESS_REG, 0);
+    TVWR(DC_WINDOW_HEADER, DC_WIN_A_SELECT);
+    for (i = 0; i < TV_REGS; i++) TVWR(gTvRegs[i], Values[i]);
+    TVWR(DC_CMD_STATE_CONTROL_REG, GENERAL_UPDATE | WIN_A_UPDATE);
+    TVWR(DC_CMD_STATE_CONTROL_REG, GENERAL_ACT_REQ | WIN_A_ACT_REQ);
+    TVWR(DC_WINDOW_HEADER, hdr);
+}
+
+/* Copies source rect Rc of a Ws x Hs upright surface to the TV buffer: 1:1 when
+ * it is 1280x720, otherwise point-sampled to fit the TV, centred. Only rows of
+ * Rc are read from the source (the caller locked just those). */
+static VOID TvBlt(PSWD_CONTEXT Ctx, PUCHAR SrcBase, LONG SrcTop, LONG Pitch, RECT Rc, LONG Ws, LONG Hs)
+{
+    LONG outW, outH, x0, y0, dy, dx, dys, dye, dxs, dxe;
+#define TSRC(x, y) (((const ULONG *)(SrcBase + (SIZE_T)((y) - SrcTop) * (SIZE_T)Pitch))[(x)])
+#define TDST(y)    ((ULONG *)(Ctx->TvVa + (SIZE_T)(y) * TV_PITCH))
+
+    if (Rc.left < 0) Rc.left = 0;
+    if (Rc.top < 0) Rc.top = 0;
+    if (Rc.right > Ws) Rc.right = Ws;
+    if (Rc.bottom > Hs) Rc.bottom = Hs;
+    if (Rc.left >= Rc.right || Rc.top >= Rc.bottom || Ws <= 0 || Hs <= 0) return;
+
+    if (Ws == (LONG)TV_W && Hs == (LONG)TV_H) {
+        for (dy = Rc.top; dy < Rc.bottom; dy++)
+            RtlCopyMemory(TDST(dy) + Rc.left, &TSRC(Rc.left, dy), (SIZE_T)(Rc.right - Rc.left) * 4);
+        return;
+    }
+    outH = (LONG)TV_H;
+    outW = Ws * (LONG)TV_H / Hs;
+    if (outW > (LONG)TV_W) { outW = (LONG)TV_W; outH = Hs * (LONG)TV_W / Ws; }
+    if (outW <= 0 || outH <= 0) return;
+    x0 = ((LONG)TV_W - outW) / 2;
+    y0 = ((LONG)TV_H - outH) / 2;
+    /* destination pixels whose sample falls inside Rc */
+    dys = y0 + (Rc.top * outH + Hs - 1) / Hs;
+    dye = y0 + (Rc.bottom * outH + Hs - 1) / Hs;
+    dxs = x0 + (Rc.left * outW + Ws - 1) / Ws;
+    dxe = x0 + (Rc.right * outW + Ws - 1) / Ws;
+    if (dye > y0 + outH) dye = y0 + outH;
+    if (dxe > x0 + outW) dxe = x0 + outW;
+    for (dy = dys; dy < dye; dy++) {
+        LONG sy = (dy - y0) * Hs / outH;
+        ULONG *d = TDST(dy);
+        for (dx = dxs; dx < dxe; dx++) d[dx] = TSRC((dx - x0) * Ws / outW, sy);
+    }
+#undef TSRC
+#undef TDST
+}
+
+static VOID TvClear(PSWD_CONTEXT Ctx)
+{
+    ULONG y;
+    for (y = 0; y < TV_H; y++) RtlZeroMemory(Ctx->TvVa + (SIZE_T)y * TV_PITCH, TV_PITCH);
+}
+
+/* StartDevice: take DC-B over if UEFI left it running for a TV. */
+static VOID TvStart(PSWD_CONTEXT Ctx)
+{
+    PHYSICAL_ADDRESS pa, lo, hi, skip;
+    PUCHAR car;
+    ULONG rst, clk, cmd, wopt, act, i;
+    ULONG v[TV_REGS];
+
+    if (RegGetDword(L"TvMirror", 1) == 0) { RegPutDword(L"TvState", 1); return; }
+    pa.QuadPart = (LONGLONG)CAR_PHYS;
+    car = (PUCHAR)MmMapIoSpaceEx(pa, CAR_MAP_SIZE, PAGE_READWRITE | PAGE_NOCACHE);
+    if (!car) { RegPutDword(L"TvState", 2); return; }
+    rst = READ_REGISTER_ULONG((PULONG)(car + CAR_RST_DEVICES_L));
+    clk = READ_REGISTER_ULONG((PULONG)(car + CAR_CLK_OUT_ENB_L));
+    MmUnmapIoSpace(car, CAR_MAP_SIZE);
+    RegPutDword(L"TvCarRst", rst);
+    RegPutDword(L"TvCarClk", clk);
+    if ((clk & CAR_DISP2_BIT) == 0 || (rst & CAR_DISP2_BIT) != 0) { RegPutDword(L"TvState", 3); return; }
+
+    pa.QuadPart = (LONGLONG)DC_B_PHYS;
+    Ctx->TvDc = (PUCHAR)MmMapIoSpaceEx(pa, DC_MAP_SIZE, PAGE_READWRITE | PAGE_NOCACHE);
+    if (!Ctx->TvDc) { RegPutDword(L"TvState", 2); return; }
+    cmd = TVRD(DC_CMD_DISPLAY_COMMAND_REG);
+    wopt = TVRD(DC_DISP_WIN_OPTIONS);
+    act = TVRD(DC_DISP_ACTIVE);
+    RegPutDword(L"TvDispCmd", cmd);
+    RegPutDword(L"TvDispWinOpt", wopt);
+    RegPutDword(L"TvActive", act);
+    if ((cmd & DISP_CTRL_MODE_C_DISPLAY) == 0 || (wopt & DC_SOR1_ENABLE) == 0 || act != ((TV_H << 16) | TV_W)) {
+        MmUnmapIoSpace(Ctx->TvDc, DC_MAP_SIZE);
+        Ctx->TvDc = NULL;
+        RegPutDword(L"TvState", 4);
+        return;
+    }
+
+    lo.QuadPart = 0;
+    hi.QuadPart = 0xFFFFFFFFll;     /* START_HI stays 0 */
+    skip.QuadPart = 0;
+    Ctx->TvVa = (PUCHAR)MmAllocateContiguousMemorySpecifyCache((SIZE_T)TV_PITCH * TV_H, lo, hi, skip, MmWriteCombined);
+    if (!Ctx->TvVa) {
+        MmUnmapIoSpace(Ctx->TvDc, DC_MAP_SIZE);
+        Ctx->TvDc = NULL;
+        RegPutDword(L"TvState", 5);
+        return;
+    }
+    Ctx->TvPhys = MmGetPhysicalAddress(Ctx->TvVa);
+    TvClear(Ctx);
+    /* Until the desktop draws: the boot image, as UEFI showed it. */
+    if (Ctx->FbVa) {
+        RECT all;
+        all.left = 0; all.top = 0; all.right = (LONG)Ctx->FbWidth; all.bottom = (LONG)Ctx->FbHeight;
+        TvBlt(Ctx, Ctx->FbVa, 0, (LONG)Ctx->FbPitch, all, (LONG)Ctx->FbWidth, (LONG)Ctx->FbHeight);
+    }
+    Ctx->TvLastW = 0;
+    Ctx->TvLastH = 0;
+    KeMemoryBarrier();
+
+    {
+        ULONG hdr = TVRD(DC_WINDOW_HEADER);
+        TVWR(DC_CMD_STATE_ACCESS_REG, 0);
+        TVWR(DC_WINDOW_HEADER, DC_WIN_A_SELECT);
+        for (i = 0; i < TV_REGS; i++) Ctx->TvSaved[i] = TVRD(gTvRegs[i]);
+        TVWR(DC_WINDOW_HEADER, hdr);
+    }
+    v[0] = DC_DEPTH_B8G8R8A8;               /* same as the boot framebuffer on DC-A */
+    v[1] = 0;                               /* position 0,0 */
+    v[2] = 0;
+    v[3] = 0;
+    v[4] = (TV_H << 16) | TV_PITCH;         /* prescaled: H in bytes */
+    v[5] = (0x1000u << 16) | 0x1000u;       /* DDA 1.0, no scaling */
+    v[6] = (TV_H << 16) | TV_W;
+    v[7] = TV_PITCH;
+    v[8] = 0;
+    v[9] = 0;
+    v[10] = 0;                              /* pitch linear */
+    v[11] = Ctx->TvPhys.LowPart;
+    v[12] = 0;
+    v[13] = 0;
+    v[14] = 0;
+    v[15] = (1u << 24) | 255u;              /* opaque */
+    v[16] = DC_WIN_ENABLE;
+    TvWriteWindow(Ctx, v);
+    RegPutDword(L"TvSavedStart", Ctx->TvSaved[11]);
+    RegPutDword(L"TvBufLo", Ctx->TvPhys.LowPart);
+    RegPutDword(L"TvBufHi", (ULONG)Ctx->TvPhys.HighPart);
+    RegPutDword(L"TvState", 6);
+}
+
+/* Stop: give window A back to what UEFI set (the boot framebuffer), wait for
+ * DC-B to latch it, then free the buffer. */
+static VOID TvStop(PSWD_CONTEXT Ctx)
+{
+    LARGE_INTEGER t;
+    if (Ctx->TvDc && Ctx->TvVa) {
+        TvWriteWindow(Ctx, Ctx->TvSaved);
+        t.QuadPart = -50ll * 10 * 1000;     /* 3 frames */
+        KeDelayExecutionThread(KernelMode, FALSE, &t);
+    }
+    if (Ctx->TvVa) {
+        MmFreeContiguousMemorySpecifyCache(Ctx->TvVa, (SIZE_T)TV_PITCH * TV_H, MmWriteCombined);
+        Ctx->TvVa = NULL;
+    }
+    if (Ctx->TvDc) {
+        MmUnmapIoSpace(Ctx->TvDc, DC_MAP_SIZE);
+        Ctx->TvDc = NULL;
+    }
+}
+
+#undef TVRD
+#undef TVWR
+
 /* ------------------------------------------------------------ stage 2: panel sleep */
 
 static VOID SleepMs(ULONG Ms)
@@ -757,6 +989,7 @@ NTSTATUS SwdStartDevice(IN_CONST_PVOID MiniportDeviceContext, IN_PDXGK_START_INF
     ctx->Rotation = D3DKMDT_VPPR_IDENTITY;
     ctx->Active = TRUE;      /* the boot image stays until the first commit */
     ctx->Visible = TRUE;
+    TvStart(ctx);
 
     KeClearEvent(&ctx->StopEvent);
     InitializeObjectAttributes(&oa, NULL, OBJ_KERNEL_HANDLE, NULL, NULL);
@@ -783,6 +1016,7 @@ static VOID StopCommon(PSWD_CONTEXT Ctx)
     VsyncSet(Ctx, FALSE);
     StopGuardThread(Ctx);
     FlushCounters(Ctx);
+    TvStop(Ctx);
     UnmapFb(Ctx);
     Ctx->Started = FALSE;
     Ctx->Active = FALSE;
@@ -826,6 +1060,7 @@ NTSTATUS SwdRemoveDevice(IN_CONST_PVOID MiniportDeviceContext)
     PSWD_CONTEXT ctx = (PSWD_CONTEXT)MiniportDeviceContext;
     if (ctx) {
         StopGuardThread(ctx);
+        TvStop(ctx);
         UnmapFb(ctx);
         if (ctx->IrqDc) {
             WRITE_REGISTER_ULONG((PULONG)(ctx->IrqDc + DC_CMD_INT_MASK_REG), 0);
@@ -1527,6 +1762,17 @@ NTSTATUS SwdPresentDisplayOnly(IN_CONST_HANDLE hAdapter, IN_CONST_PDXGKARG_PRESE
          * from the source at its destination like a dirty rect. */
         for (i = 0; i < pPresent->NumMoves; i++) BltRect(ctx, src, top, pPresent->Pitch, pPresent->pMoves[i].DestRect, ws, hs, rot);
         for (i = 0; i < pPresent->NumDirtyRects; i++) BltRect(ctx, src, top, pPresent->Pitch, pPresent->pDirtyRect[i], ws, hs, rot);
+        if (ctx->TvVa) {
+            /* The DWM surface is upright: the TV gets it without the rotation. */
+            if (ws != ctx->TvLastW || hs != ctx->TvLastH) {
+                TvClear(ctx);
+                ctx->TvLastW = ws;
+                ctx->TvLastH = hs;
+            }
+            for (i = 0; i < pPresent->NumMoves; i++) TvBlt(ctx, src, top, pPresent->Pitch, pPresent->pMoves[i].DestRect, ws, hs);
+            for (i = 0; i < pPresent->NumDirtyRects; i++) TvBlt(ctx, src, top, pPresent->Pitch, pPresent->pDirtyRect[i], ws, hs);
+            InterlockedIncrement(&ctx->TvPresents);
+        }
         KeMemoryBarrier();
     } else {
         st = STATUS_INSUFFICIENT_RESOURCES;
