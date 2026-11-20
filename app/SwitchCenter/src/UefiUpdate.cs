@@ -33,6 +33,22 @@ namespace SwitchCenter
         const string Dir = @"switchroot\switchwoa", PrevDir = @"switchroot\switchwoa-prev";
         const string PrevEntry = "[Windows (previous UEFI)]\r\nl4t=1\r\nboot_prefixes=switchroot/switchwoa-prev/\r\nid=SWOAPRV\r\n";
 
+        /// <summary>
+        /// The running UEFI's version from SMBIOS (BIOS version "1.09 R442H (commit)", from R442 on):
+        /// "R442H" = hekate build, "R442" = RCM (coreboot) build. null for older UEFIs, which carry only the commit.
+        /// </summary>
+        public static string RunningVersion()
+        {
+            using Microsoft.Win32.RegistryKey k = Microsoft.Win32.Registry.LocalMachine.OpenSubKey(@"HARDWARE\DESCRIPTION\System\BIOS");
+            Match m = Regex.Match(k?.GetValue("BIOSVersion") as string ?? "", @"\b(R\d{3,4}H?)\b");
+            return m.Success ? m.Groups[1].Value : null;
+        }
+
+        public static int Number(string version) =>
+            version != null && Regex.Match(version, @"^R(\d{3,4})") is { Success: true } m ? int.Parse(m.Groups[1].Value) : 0;
+
+        public static bool IsHekate(string version) => version != null && version.EndsWith("H");
+
         /// <summary>Starts this program elevated to update bl33.bin from the release tag. null = UAC declined.</summary>
         public static async Task<int?> RunElevatedAsync(string tag)
         {

@@ -23,6 +23,7 @@ param(
   [switch]$Publish,
   [switch]$PublishOnly,
   [switch]$Beta,                  # pre-release: also the drivers marked Beta (stable releases leave them out)
+  [string]$Target,                # the commit or branch to tag (default: the repository's default branch)
   # The Switch UEFI built for hekate (bl33.bin from the UEFI repository's hekate build) and its
   # version (R419H). Attached as bl33-<UefiVersion>.bin; SwitchPatcher puts it on the ESP.
   [string]$HekateBl33,
@@ -61,7 +62,8 @@ function Publish-Release([string]$dir) {
   $notes -join "`n" | Set-Content $notesFile -Encoding utf8
   $files = Get-ChildItem $dir -File | Where-Object { $_.Name -ne 'release-notes.md' } | ForEach-Object FullName
   $preArg = @(if ($pre) { '--prerelease' })          # @() keeps it an array (a lone string would not splat as one argument)
-  & $gh release create "drivers-$Version" @files --repo $Repo --title $title --notes-file $notesFile @preArg
+  $targetArg = @(if ($Target) { '--target', $Target })
+  & $gh release create "drivers-$Version" @files --repo $Repo --title $title --notes-file $notesFile @preArg @targetArg
   if ($LASTEXITCODE -ne 0) { throw 'gh release create failed' }
 }
 

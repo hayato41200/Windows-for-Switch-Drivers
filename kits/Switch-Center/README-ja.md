@@ -9,6 +9,9 @@
   - 同じ中身なら何もしない（「もう最新」）。
   - 今の `bl33.bin` と `bl31.bin` を `switchroot\switchwoa-prev\` にコピーし、`hekate_ipl.ini` に「Windows (previous UEFI)」（`boot_prefixes=switchroot/switchwoa-prev/`、`id=SWOAPRV`）を一度だけ足す。古い ini は `.bak-<日時>` で残す。
   - 新しい bl33 を `bl33.bin.new` に置いて確かめてから、`bl33.bin` と入れ替える。
+- 今の UEFI の版を出す。UEFI R442 から、SMBIOS の BIOS の版（`1.09 R442H (<commit>)`、Windows では `HKLM\HARDWARE\DESCRIPTION\System\BIOS\BIOSVersion`）に版が入る。末尾の `H` は hekate 用、ないものは RCM（coreboot）用。
+  - 版が分かるときは「UEFI: R442H（hekate から起動）」と出し、ボタンも「R442H から R4xxH にする」「最新です」になる。RCM で起動しているときは、ボタンを出さない。
+  - R442 より前の UEFI は版を出さないので、今までどおり DSDT のデバイスからの推定を出す。
 - 新しい UEFI は、次に hekate から Windows を起動したときから使われる。起動しなかったら、hekate で「Windows (previous UEFI)」を選ぶと前の UEFI で起動できる（PC はいらない）。
 - 試したこと: PC 上のフォルダーを ESP に見立てて、bl33 がないときに止まること、R422H から R423H への入れ替え、2 回目は何もしないこと、前の UEFI の項目とファイルを確かめた。
 - 未確認: Switch の上での `mountvol /s`（hekate で起動したときに SD の ESP が開くか）、実際の入れ替えと、そのあとの起動。

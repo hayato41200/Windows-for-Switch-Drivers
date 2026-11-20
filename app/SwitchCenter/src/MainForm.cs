@@ -467,7 +467,8 @@ namespace SwitchCenter
             bottom.Controls.Add(updateStatus);
             bottom.Controls.Add(releaseLink);
             updateStatus.Text = T($"コントロールセンター {AppVersion}。「更新を確認」で、GitHub の最新のリリースと比べます。",
-                                  $"Control center {AppVersion}. \"Check for updates\" compares with the latest release on GitHub.");
+                                  $"Control center {AppVersion}. \"Check for updates\" compares with the latest release on GitHub.") +
+                                "\n" + UefiLine(Updater.EstimateUefi());
             page.Controls.Add(driverList);
             page.Controls.Add(bottom);
             return page;
@@ -589,15 +590,21 @@ namespace SwitchCenter
                     (count > 0 ? T($"更新できるドライバー: {count} 件（青い行）", $"Driver updates: {count} (blue rows)")
                                : T("ドライバーはすべて最新です。", "All drivers are up to date.")) + "\n" +
                     (pending > 0 ? T($"再起動を待っているデバイス: {pending} 個\n", $"Devices waiting for a restart: {pending}\n") : "") +
-                    T($"UEFI: R{uefi} 以降（DSDT のデバイスからの推定）", $"UEFI: R{uefi} or later (estimated from the DSDT devices)");
+                    UefiLine(uefi);
                 bool newApp = Updater.AppIsOlder(latest) && latest.AppUrl != null;
                 appButton.Visible = newApp;
                 appButton.Enabled = true;
                 appButton.Text = T($"コントロールセンターを {latest.AppVersion} に更新", $"Update the control center to {latest.AppVersion}");
-                uefiButton.Visible = latest.Uefi != null;
-                uefiButton.Enabled = true;
+                // The button only when it can help: a release UEFI, and not known to be RCM or already that version.
+                string running = UefiUpdate.RunningVersion();
+                bool rcm = running != null && !UefiUpdate.IsHekate(running);
+                bool same = running != null && latest.Uefi != null && running == latest.Uefi.Version;
+                uefiButton.Visible = latest.Uefi != null && !rcm;
+                uefiButton.Enabled = !same;
                 if (latest.Uefi != null)
-                    uefiButton.Text = T($"UEFI を {latest.Uefi.Version} にする（hekate から起動のとき）…", $"UEFI {latest.Uefi.Version} (when booted from hekate)...");
+                    uefiButton.Text = same ? T($"UEFI は最新です（{running}）", $"UEFI is up to date ({running})")
+                                    : running != null ? T($"UEFI を {running} から {latest.Uefi.Version} にする…", $"Update the UEFI from {running} to {latest.Uefi.Version}...")
+                                    : T($"UEFI を {latest.Uefi.Version} にする（hekate から起動のとき）…", $"UEFI {latest.Uefi.Version} (when booted from hekate)...");
                 releaseLink.Visible = true;
             }
             catch (SignInRequiredException e)
@@ -647,6 +654,17 @@ namespace SwitchCenter
             };
             checkButton.Enabled = true;
             LoadDrivers();
+        }
+
+        /// <summary>"UEFI: R442H (hekate)" from SMBIOS, or the DSDT estimate for UEFIs older than R442.</summary>
+        static string UefiLine(int estimate)
+        {
+            string v = UefiUpdate.RunningVersion();
+            if (v != null)
+                return UefiUpdate.IsHekate(v) ? T($"UEFI: {v}（hekate から起動）", $"UEFI: {v} (booted from hekate)")
+                                              : T($"UEFI: {v}（RCM・coreboot から起動）", $"UEFI: {v} (booted from RCM / coreboot)");
+            return T($"UEFI: R{estimate} 以降（DSDT のデバイスからの推定。R442 より前の UEFI は版を出しません）",
+                     $"UEFI: R{estimate} or later (estimated from the DSDT devices; UEFIs before R442 do not report a version)");
         }
 
         /// <summary>hekate chain only: bl33.bin on the ESP, replaced by the elevated --update-uefi process.</summary>
