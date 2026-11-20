@@ -385,8 +385,6 @@ namespace SwitchCenter
         readonly Label updateStatus = new Label { AutoSize = true, MaximumSize = new Size(520, 0), Margin = new Padding(3, 8, 3, 3) };
         // Kept away from the buttons (a tap meant for them opened it), at the bottom.
         readonly LinkLabel releaseLink = new LinkLabel { AutoSize = true, MaximumSize = new Size(520, 0), Visible = false, Margin = new Padding(3, 24, 3, 3) };
-        readonly ComboBox channel = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = 330 };
-        const string ChannelKey = @"Software\SwitchWOA\SwitchClock";     // DriverChannel: 0 stable, 1 beta
         Release latest;                       // set by "Check for updates"
         // GitHub sign-in: the releases can be read only by invited accounts (GitHubAuth).
         readonly Label signStatus = new Label { AutoSize = true, MaximumSize = new Size(330, 0), Margin = new Padding(3, 10, 3, 3) };
@@ -436,14 +434,6 @@ namespace SwitchCenter
             uefiButton.Click += async (_, _) => await UpdateUefi();
             releaseLink.Text = T("リリースのページを開く", "Open the release page");
             releaseLink.LinkClicked += (_, _) => { if (latest != null) OpenInBrowser(latest.PageUrl); };
-            channel.Items.Add(T("安定版のドライバー", "Stable drivers"));
-            channel.Items.Add(T("ベータ版のドライバー（試験中のものを含む）", "Beta drivers (includes ones in testing)"));
-            channel.SelectedIndex = ReadChannel();
-            channel.SelectionChangeCommitted += async (_, _) => await ChangeChannel();
-            var channelRow = new FlowLayoutPanel { AutoSize = true };
-            channelRow.Controls.Add(new Label { Text = T("更新の種類:", "Channel:"), AutoSize = true, Margin = new Padding(3, 10, 3, 3) });
-            channelRow.Controls.Add(channel);
-            bottom.Controls.Add(channelRow);
             var signRow = new FlowLayoutPanel { AutoSize = true };
             signButton.Click += async (_, _) => await SignInOrOut();
             signRow.Controls.Add(signButton);
@@ -516,33 +506,6 @@ namespace SwitchCenter
             System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(url) { UseShellExecute = true })?.Dispose();
         }
 
-        static int ReadChannel()
-        {
-            using Microsoft.Win32.RegistryKey k = Microsoft.Win32.Registry.CurrentUser.OpenSubKey(ChannelKey);
-            return k?.GetValue("DriverChannel") is int v && v == 1 ? 1 : 0;
-        }
-
-        bool Beta => channel.SelectedIndex == 1;
-
-        async System.Threading.Tasks.Task ChangeChannel()
-        {
-            if (Beta && ReadChannel() == 0 &&
-                MessageBox.Show(this,
-                    T("ベータ版では、GitHub のプレリリースにある試験中のドライバーも、更新の候補になります。\n\n" +
-                      "まだ十分に試していないので、動かなかったり、起動に影響したりすることがあります。" +
-                      "そのときは、「安定版」に戻して、ドライバーを入れ直してください。\n\nベータ版にしますか？",
-                      "With the beta channel, drivers still in testing (GitHub pre-releases) are offered as updates too.\n\n" +
-                      "They are not fully tested and may not work or may affect booting. If that happens, switch back to stable and reinstall the drivers.\n\nUse the beta channel?"),
-                    T("ベータ版のドライバー", "Beta drivers"), MessageBoxButtons.OKCancel, MessageBoxIcon.Warning) != DialogResult.OK)
-            {
-                channel.SelectedIndex = 0;
-                return;
-            }
-            using (Microsoft.Win32.RegistryKey k = Microsoft.Win32.Registry.CurrentUser.CreateSubKey(ChannelKey))
-                k.SetValue("DriverChannel", channel.SelectedIndex);
-            if (latest != null) await CheckUpdates();      // compare with the other channel's release right away
-        }
-
         void LoadDrivers()
         {
             List<DriverRow> rows = DriverStatus.Read(latest);
@@ -578,14 +541,13 @@ namespace SwitchCenter
             updateStatus.Text = T("GitHub を確認しています…", "Checking GitHub...");
             try
             {
-                latest = await Updater.FetchChannelAsync(Beta);
+                latest = await Updater.FetchAsync(null);     // releases/latest (one channel, no beta)
                 LoadDrivers();
                 int count = updates.FindAll(x => x.Update).Count;
                 int pending = updates.Sum(x => x.Pending);
                 int uefi = Updater.EstimateUefi();
                 updateStatus.Text =
-                    T($"最新のリリース: {latest.Tag}", $"Latest release: {latest.Tag}") +
-                    (latest.Prerelease ? T("（ベータ版）", " (beta)") : "") + "\n" +
+                    T($"最新のリリース: {latest.Tag}", $"Latest release: {latest.Tag}") + "\n" +
                     T($"コントロールセンター: 今 {AppVersion} / 最新 {latest.AppVersion}", $"Control center: {AppVersion} installed / {latest.AppVersion} latest") + "\n" +
                     (count > 0 ? T($"更新できるドライバー: {count} 件（青い行）", $"Driver updates: {count} (blue rows)")
                                : T("ドライバーはすべて最新です。", "All drivers are up to date.")) + "\n" +
@@ -634,12 +596,9 @@ namespace SwitchCenter
                 ? T("\n\nGPIO と I2C は、ほかのドライバーが使っているので、今は Windows に登録だけして、次に起動したときに入れ替えます。",
                     "\n\nGPIO and I2C are used by the other drivers, so they are only added now and replaced at the next boot.")
                 : "";
-            string betaNote = latest.Prerelease
-                ? T("\n\nこれはベータ版（プレリリース）です。試験中のドライバーが含まれます。", "\n\nThis is a beta (pre-release) with drivers still in testing.")
-                : "";
             if (MessageBox.Show(this,
-                    T($"{latest.Tag} から、次のドライバーを入れます。\n\n{list}\n\n管理者の確認が出ます。入れる前に、SHA-256 と署名を確かめます。{bootNote}{betaNote}",
-                      $"Install these drivers from {latest.Tag}?\n\n{list}\n\nWindows will ask for administrator approval. SHA-256 and signatures are checked first.{bootNote}{betaNote}"),
+                    T($"{latest.Tag} から、次のドライバーを入れます。\n\n{list}\n\n管理者の確認が出ます。入れる前に、SHA-256 と署名を確かめます。{bootNote}",
+                      $"Install these drivers from {latest.Tag}?\n\n{list}\n\nWindows will ask for administrator approval. SHA-256 and signatures are checked first.{bootNote}"),
                     T("ドライバーの更新", "Driver update"), MessageBoxButtons.OKCancel, MessageBoxIcon.Question) != DialogResult.OK) return;
 
             installButton.Enabled = checkButton.Enabled = false;
@@ -675,11 +634,11 @@ namespace SwitchCenter
                     T($"ESP の UEFI（switchroot\\switchwoa\\bl33.bin）を、{latest.Tag} の {latest.Uefi.Version} にします。\n\n" +
                       "hekate から Windows を起動しているときだけ使えます（RCM の ROM は PC で更新してください）。\n" +
                       "今の UEFI は、hekate のメニューの「Windows (previous UEFI)」として残します。新しい UEFI で起動しなかったら、そちらを選んでください。\n\n" +
-                      "管理者の確認が出ます。置く前に SHA-256 を確かめます。" + (latest.Prerelease ? "\n\nこれはベータ版（プレリリース）の UEFI です。" : ""),
+                      "管理者の確認が出ます。置く前に SHA-256 を確かめます。",
                       $"Replace the UEFI on the ESP (switchroot\\switchwoa\\bl33.bin) with {latest.Uefi.Version} from {latest.Tag}?\n\n" +
                       "Only when Windows is booted from hekate (update an RCM ROM on your PC).\n" +
                       "The current UEFI stays as \"Windows (previous UEFI)\" in the hekate menu; choose it if the new one does not boot.\n\n" +
-                      "Windows will ask for administrator approval. The SHA-256 is checked first." + (latest.Prerelease ? "\n\nThis is a beta (pre-release) UEFI." : "")),
+                      "Windows will ask for administrator approval. The SHA-256 is checked first."),
                     T("UEFI の更新", "UEFI update"), MessageBoxButtons.OKCancel, MessageBoxIcon.Question) != DialogResult.OK) return;
             uefiButton.Enabled = checkButton.Enabled = false;
             int? code = await UefiUpdate.RunElevatedAsync(latest.Tag);

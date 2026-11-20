@@ -19,16 +19,16 @@ UEFI と DSDT は [Windows-for-Switch](https://github.com/hayato41200/Windows-fo
 | `switchcpu` | ACPI\SWOA0701 | R375 | CPU のクロックのプロファイル（614〜1766 MHz）、温度による制限 |
 | `switchrtc` | ACPI\SWOA0801 | R377 | 時計（MAX77620 の RTC を読み、ずれを覚えて時刻を合わせる） |
 | `switchbt` | ACPI\SWOA0B01 | R390 | Bluetooth（UART-D の BCM4356A3 を、Windows 標準の BthMini につなぐ）。3 Mbps。ファームウェアのパッチ `BCM4356A3.hcd` は各自で用意（配布しない）。今は電波がとても近くまでしか届かない（Wi-Fi 側が動いていないため） |
-| `switchwlan` | `ACPI\SWOA0D01` | R405 | Wi-Fi（ベータ）。WPA2-Personalで接続、DHCP、インターネット接続。Wi-Fi 5（802.11ac）、866/866 Mbit/s。2026-11-08に実機確認：fast.com 下り55 Mbit/s・上り39 Mbit/s。ファームウェア `brcmfmac4356(A3)-pcie.bin/.txt` は各自で用意（動作確認済み 7.35.252.108）。`switchwlan.sys` 0.6.13 |
-| `switchaudio`（ベータ） | ACPI\SWOA0C01 | R403（R402 ならスピーカーだけ） | 音声。スピーカーとヘッドホンへの再生（PortCls WaveRT、48 kHz・16 ビット・ステレオ）。ヘッドホンを抜き差しすると自動で切り替わる。Windows に見える出力は「スピーカー」の1つで、音量も共通。マイクは無い |
+| `switchwlan` | `ACPI\SWOA0D01` | R405 | Wi-Fi。WPA2-Personalで接続、DHCP、インターネット接続。Wi-Fi 5（802.11ac）、866/866 Mbit/s。2026-11-08に実機確認：fast.com 下り55 Mbit/s・上り39 Mbit/s。ファームウェア `brcmfmac4356(A3)-pcie.bin/.txt` は各自で用意（動作確認済み 7.35.252.108）。`switchwlan.sys` 0.6.13 |
+| `switchaudio` | ACPI\SWOA0C01 | R403（R402 ならスピーカーだけ） | 音声。スピーカーとヘッドホンへの再生（PortCls WaveRT、48 kHz・16 ビット・ステレオ）。ヘッドホンを抜き差しすると自動で切り替わる。Windows に見える出力は「スピーカー」の1つで、音量も共通。マイクは無い |
 | `switchsensor` | ACPI\SWOA0901 | R379 | 傾きセンサー（画面の自動回転）。明るさセンサーは、この本体では見つからず使えていない |
-| `switchdisplay`（ベータ） | ACPI\SWOA0E01 | R408 | 内蔵パネルの表示（WDDM の表示専用ドライバー。Basic Display の代わり）。回転（設定と SwitchCenter の自動回転）。画面オフのときにパネルをスリープさせ、表示コントローラーも止める。描画は今までどおり CPU（GPU による高速化は無い）。入れ替えは次の起動のとき（`kits/Switch-Display`）。1.4.x で USB-C のテレビ出力（本体と同じ画面をテレビに映す。Windows に入ってからの抜き差し、回転にも追従）。1.4.2 で、1.2.0 から起動直後に止められていた（エラー 43）のを直した |
+| `switchdisplay` | ACPI\SWOA0E01 | R408 | 内蔵パネルの表示（WDDM の表示専用ドライバー。Basic Display の代わり）。回転（設定と SwitchCenter の自動回転）。画面オフのときにパネルをスリープさせ、表示コントローラーも止める。描画は今までどおり CPU（GPU による高速化は無い）。入れ替えは次の起動のとき（`kits/Switch-Display`）。1.4.x で USB-C のテレビ出力（本体と同じ画面をテレビに映す。Windows に入ってからの抜き差し、回転にも追従）。1.4.2 で、1.2.0 から起動直後に止められていた（エラー 43）のを直した |
 | `swoadiag` | —（読み込んだときだけ） | — | USB（XUSB）のレジスタを読むだけの診断用 |
 | `nvtsdhc` | ACPI\NVDA0101 | —（SD のローダーがデバイスを足す） | Windows 11 を SD から起動するための SD ホスト（sdport）。SwitchPatcher が SD に入れる（`kits/Switch-Sd`）。起動できないときは、ブルースクリーンに診断用のコードを出す（下の「ブルースクリーンのストップコード」） |
 
 ## テレビ出力（USB-C DisplayPort Alt Mode）
 
-- **要るもの:** DP Alt に対応した USB-C ハブ（HDMI 出力つき、電源をつないだもの）、UEFI R440H 以降（hekate 用は R441H）、`switchbattery` 1.0.0.7、`switchdisplay` 1.4.4（ベータ）。
+- **要るもの:** DP Alt に対応した USB-C ハブ（HDMI 出力つき、電源をつないだもの）、UEFI R440H 以降（hekate 用は R441H）、`switchbattery` 1.0.0.7、`switchdisplay` 1.4.4。
 - **できること:** 本体と同じ画面を、テレビに 1280x720 で映す。起動時からつないでいれば UEFI の画面から映り、Windows に入ってからつないでも映る。本体を横向きにするとテレビいっぱいに、縦向きなら中央に縮めて出す。
 - **今後実装する予定:**
   - テレビを2つ目の画面として使う（拡張表示）
@@ -135,7 +135,7 @@ Windows 11 の SD で、ドライバーが読み込まれてから 2.5 秒たっ
 
 GitHub でリリースを作って（タグは `drivers-<版>`）、この4つを付ける。
 
-`-Beta` を付けると、プレリリース（ベータ版）を作る。表で `Beta` の印を付けたドライバーは、ベータ版にだけ入る。コントロールセンターの「更新の種類」でベータ版を選ぶと、プレリリースも更新の候補になる。
+ベータ版（プレリリース）は作らない（2026-11-20 から）。リリースは 1 種類だけで、コントロールセンターと SwitchPatcher は、いつもいちばん新しいリリースを使う。そのため、リリースノート（`release/notes/<版>.md`）には、実機で試したものと、まだ試していないものを書き分ける。リリースに入れるのは、実機で試したものだけにする。
 
 GitHub CLI（`gh auth login` 済み）があれば、`-Publish` を付けるとリリースの作成とアップロードまで自動で行う。すでに作ったファイルをあとから公開するときは、`-PublishOnly` を使う。
 
