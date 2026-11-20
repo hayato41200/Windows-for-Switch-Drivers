@@ -12,7 +12,7 @@ UEFI と DSDT は [Windows-for-Switch](https://github.com/hayato41200/Windows-fo
 |---|---|---|---|
 | `tegra210gpio` | ACPI\SWOA0101 | R367 | GPIO コントローラー（GpioClx） |
 | `tegra210i2c` | ACPI\SWOA0201 | R370 | I2C コントローラー（SpbCx）。I2C1 / I2C3 / I2C5 |
-| `switchbattery` | ACPI\SWOA0301 | R371（USB-C は R378） | バッテリー（battc）、USB-C の抜き差しに合わせた VBUS・充電の切り替え |
+| `switchbattery` | ACPI\SWOA0301 | R371（USB-C は R378、テレビは R440H） | バッテリー（battc）、USB-C の抜き差しに合わせた VBUS・充電の切り替え。1.0.0.7 から、DP Alt に対応したハブをつなぐと DP Alt Mode に入り、switchdisplay に知らせる |
 | `switchfan` | ACPI\SWOA0401 | R372（明るさは R376） | 温度によるファンの制御、画面の明るさ、画面オフでのバックライトの消灯 |
 | `switchtouch` | ACPI\SWOA0501 | R373 | タッチパネル（VHF の HID マルチタッチ） |
 | `switchpwrbtn` | ACPI\SWOA0601 | R374 | 電源ボタン（VHF の HID）。1.0.2.0 から、Windows の再起動で hekate に戻り（reboot-to-payload、Erista）、シャットダウンで電源が切れる（MAX77620）。説明は `drivers/SwitchPowerButton`（[日本語](drivers/SwitchPowerButton/README-ja.md)・[English](drivers/SwitchPowerButton/README.md)） |
@@ -22,9 +22,21 @@ UEFI と DSDT は [Windows-for-Switch](https://github.com/hayato41200/Windows-fo
 | `switchwlan` | `ACPI\SWOA0D01` | R405 | Wi-Fi（ベータ）。WPA2-Personalで接続、DHCP、インターネット接続。Wi-Fi 5（802.11ac）、866/866 Mbit/s。2026-11-08に実機確認：fast.com 下り55 Mbit/s・上り39 Mbit/s。ファームウェア `brcmfmac4356(A3)-pcie.bin/.txt` は各自で用意（動作確認済み 7.35.252.108）。`switchwlan.sys` 0.6.13 |
 | `switchaudio`（ベータ） | ACPI\SWOA0C01 | R403（R402 ならスピーカーだけ） | 音声。スピーカーとヘッドホンへの再生（PortCls WaveRT、48 kHz・16 ビット・ステレオ）。ヘッドホンを抜き差しすると自動で切り替わる。Windows に見える出力は「スピーカー」の1つで、音量も共通。マイクは無い |
 | `switchsensor` | ACPI\SWOA0901 | R379 | 傾きセンサー（画面の自動回転）。明るさセンサーは、この本体では見つからず使えていない |
-| `switchdisplay`（ベータ） | ACPI\SWOA0E01 | R408 | 内蔵パネルの表示（WDDM の表示専用ドライバー。Basic Display の代わり）。回転（設定と SwitchCenter の自動回転）。画面オフのときにパネルをスリープさせ、表示コントローラーも止める。描画は今までどおり CPU（GPU による高速化は無い）。入れ替えは次の起動のとき（`kits/Switch-Display`） |
+| `switchdisplay`（ベータ） | ACPI\SWOA0E01 | R408 | 内蔵パネルの表示（WDDM の表示専用ドライバー。Basic Display の代わり）。回転（設定と SwitchCenter の自動回転）。画面オフのときにパネルをスリープさせ、表示コントローラーも止める。描画は今までどおり CPU（GPU による高速化は無い）。入れ替えは次の起動のとき（`kits/Switch-Display`）。1.4.x で USB-C のテレビ出力（本体と同じ画面をテレビに映す。Windows に入ってからの抜き差し、回転にも追従）。1.4.2 で、1.2.0 から起動直後に止められていた（エラー 43）のを直した |
 | `swoadiag` | —（読み込んだときだけ） | — | USB（XUSB）のレジスタを読むだけの診断用 |
 | `nvtsdhc` | ACPI\NVDA0101 | —（SD のローダーがデバイスを足す） | Windows 11 を SD から起動するための SD ホスト（sdport）。SwitchPatcher が SD に入れる（`kits/Switch-Sd`）。起動できないときは、ブルースクリーンに診断用のコードを出す（下の「ブルースクリーンのストップコード」） |
+
+## テレビ出力（USB-C DisplayPort Alt Mode）
+
+- **要るもの:** DP Alt に対応した USB-C ハブ（HDMI 出力つき、電源をつないだもの）、UEFI R440H 以降（hekate 用は R441H）、`switchbattery` 1.0.0.7、`switchdisplay` 1.4.4（ベータ）。
+- **できること:** 本体と同じ画面を、テレビに 1280x720 で映す。起動時からつないでいれば UEFI の画面から映り、Windows に入ってからつないでも映る。本体を横向きにするとテレビいっぱいに、縦向きなら中央に縮めて出す。
+- **今後実装する予定:**
+  - テレビを2つ目の画面として使う（拡張表示）
+  - 1280x720 以外の解像度（テレビの EDID から選ぶ）
+  - HDMI からの音声
+  - Nintendo 純正のドックでの確認
+  - 電源の無いハブ・変換ケーブルへの対応
+- **切りたいとき:** `HKLM\SYSTEM\CurrentControlSet\Services\switchbattery\Parameters` の DWORD `DpAlt` = 0（DP Alt Mode に入らない）、`switchdisplay\Parameters` の `TvHotplug` = 0（抜き差しの処理をしない）、`TvMirror` = 0（テレビに写さない）。
 
 ## 動作を確かめた OS
 
