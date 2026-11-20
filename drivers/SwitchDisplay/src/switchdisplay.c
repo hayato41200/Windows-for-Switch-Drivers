@@ -47,7 +47,7 @@
 #include <ntstrsafe.h>
 #include <stdarg.h>
 
-#define SWD_VERSION        0x00010400u   /* 1.4.0 */
+#define SWD_VERSION        0x00010401u   /* 1.4.1 */
 #define SWD_TAG            'DwsS'
 
 /* Boot framebuffer (coreboot display.c / UEFI MemoryMap.h "Display Reserved") */
@@ -327,6 +327,7 @@ static VOID GuardThread(PVOID Context)
         st = KeWaitForMultipleObjects(2, objs, WaitAny, Executive, KernelMode, FALSE, &timeout, NULL);
         if (st == STATUS_WAIT_1) {
             DpHandle(ctx);
+            FlushCounters(ctx);             /* 1.4.1: the 5 s notes kept the timeout from firing */
             continue;
         }
         FlushCounters(ctx);
@@ -899,15 +900,22 @@ static VOID DpBringUp(PSWD_CONTEXT Ctx)
     mR426Ok = FALSE; mR427Ok = FALSE; mR429Ok = FALSE;
     mR426Step = NULL; mR427Step = NULL; mR429Step = NULL;
     mR426Hpd = FALSE; mR426DpcdOk = FALSE; mR426EdidOk = FALSE;
-    DpLog(L"switchdisplay 1.4.0 DP Alt bring-up (attempt %u)\r\n", Ctx->DpFails + 1);
+    DpLog(L"switchdisplay 1.4.1 DP Alt bring-up (attempt %u)\r\n", Ctx->DpFails + 1);
     if (!DpMap()) {
         DpLog(L"register mapping failed\r\n");
     } else {
-        step = 1;
+        /* 1.4.1: the stage and the log so far go to the registry before each
+         * stage, so a stage that never returns still shows where it is. */
+        ULONGLONG t0 = KeQueryInterruptTime();
+#define DP_STAGE(n) do { step = (n); DpLog(L"--- stage %u at %u ms\r\n", (ULONG)(n), \
+        (ULONG)((KeQueryInterruptTime() - t0) / 10000)); DpLogFlush(); RegPutDword(L"DpLastStep", 0x100u | (n)); } while (0)
+        DP_STAGE(1);
         R426DpAuxStage2a();
-        if (mR426Ok) { step = 2; R427DpLinkStage2b(); }
-        if (mR427Ok) { step = 3; R429DpVideoStage3(); }
-        if (mR429Ok) { step = 4; TvStart(Ctx); if (Ctx->TvVa) step = 5; }
+        if (mR426Ok) { DP_STAGE(2); R427DpLinkStage2b(); }
+        if (mR427Ok) { DP_STAGE(3); R429DpVideoStage3(); }
+        if (mR429Ok) { DP_STAGE(4); TvStart(Ctx); if (Ctx->TvVa) step = 5; }
+        DpLog(L"--- done at %u ms\r\n", (ULONG)((KeQueryInterruptTime() - t0) / 10000));
+#undef DP_STAGE
     }
     DpLog(L"result: step %u (1 DPAUX/HPD, 2 link, 3 DC-B, 4 window, 5 TV on)\r\n", step);
     DpLogFlush();
