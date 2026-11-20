@@ -381,6 +381,7 @@ namespace SwitchCenter
         readonly Button checkButton = new Button { Width = 160, Height = 40 };
         readonly Button installButton = new Button { Width = 200, Height = 40, Enabled = false };
         readonly Button appButton = new Button { Width = 370, Height = 40, Visible = false, Margin = new Padding(3, 8, 3, 3) };
+        readonly Button uefiButton = new Button { Width = 370, Height = 40, Visible = false, Margin = new Padding(3, 8, 3, 3) };
         readonly Label updateStatus = new Label { AutoSize = true, MaximumSize = new Size(520, 0), Margin = new Padding(3, 8, 3, 3) };
         // Kept away from the buttons (a tap meant for them opened it), at the bottom.
         readonly LinkLabel releaseLink = new LinkLabel { AutoSize = true, MaximumSize = new Size(520, 0), Visible = false, Margin = new Padding(3, 24, 3, 3) };
@@ -424,7 +425,7 @@ namespace SwitchCenter
             driverList.Columns.Add(T("入っている版", "Installed"), 90);
             driverList.Columns.Add(T("動作中", "Running"), 60);
             driverList.Columns.Add(T("最新", "Latest"), 100);
-            var bottom = new FlowLayoutPanel { Dock = DockStyle.Bottom, Height = 350, FlowDirection = FlowDirection.TopDown, WrapContents = false };
+            var bottom = new FlowLayoutPanel { Dock = DockStyle.Bottom, Height = 400, FlowDirection = FlowDirection.TopDown, WrapContents = false };
             var reload = new Button { Text = T("再読み込み", "Reload"), Width = 120, Height = 40 };
             reload.Click += (_, _) => LoadDrivers();
             checkButton.Text = T("更新を確認", "Check for updates");
@@ -432,6 +433,7 @@ namespace SwitchCenter
             installButton.Text = T("更新する", "Update");
             installButton.Click += async (_, _) => await InstallUpdates();
             appButton.Click += async (_, _) => await UpdateApp();
+            uefiButton.Click += async (_, _) => await UpdateUefi();
             releaseLink.Text = T("リリースのページを開く", "Open the release page");
             releaseLink.LinkClicked += (_, _) => { if (latest != null) OpenInBrowser(latest.PageUrl); };
             channel.Items.Add(T("安定版のドライバー", "Stable drivers"));
@@ -461,10 +463,12 @@ namespace SwitchCenter
             buttons.Controls.Add(installButton);
             bottom.Controls.Add(buttons);
             bottom.Controls.Add(appButton);
+            bottom.Controls.Add(uefiButton);
             bottom.Controls.Add(updateStatus);
             bottom.Controls.Add(releaseLink);
             updateStatus.Text = T($"コントロールセンター {AppVersion}。「更新を確認」で、GitHub の最新のリリースと比べます。",
-                                  $"Control center {AppVersion}. \"Check for updates\" compares with the latest release on GitHub.");
+                                  $"Control center {AppVersion}. \"Check for updates\" compares with the latest release on GitHub.") +
+                                "\n" + UefiLine(Updater.EstimateUefi());
             page.Controls.Add(driverList);
             page.Controls.Add(bottom);
             return page;
@@ -586,11 +590,21 @@ namespace SwitchCenter
                     (count > 0 ? T($"更新できるドライバー: {count} 件（青い行）", $"Driver updates: {count} (blue rows)")
                                : T("ドライバーはすべて最新です。", "All drivers are up to date.")) + "\n" +
                     (pending > 0 ? T($"再起動を待っているデバイス: {pending} 個\n", $"Devices waiting for a restart: {pending}\n") : "") +
-                    T($"UEFI: R{uefi} 以降（DSDT のデバイスからの推定）", $"UEFI: R{uefi} or later (estimated from the DSDT devices)");
+                    UefiLine(uefi);
                 bool newApp = Updater.AppIsOlder(latest) && latest.AppUrl != null;
                 appButton.Visible = newApp;
                 appButton.Enabled = true;
                 appButton.Text = T($"コントロールセンターを {latest.AppVersion} に更新", $"Update the control center to {latest.AppVersion}");
+                // The button only when it can help: a release UEFI, and not known to be RCM or already that version.
+                string running = UefiUpdate.RunningVersion();
+                bool rcm = running != null && !UefiUpdate.IsHekate(running);
+                bool same = running != null && latest.Uefi != null && running == latest.Uefi.Version;
+                uefiButton.Visible = latest.Uefi != null && !rcm;
+                uefiButton.Enabled = !same;
+                if (latest.Uefi != null)
+                    uefiButton.Text = same ? T($"UEFI は最新です（{running}）", $"UEFI is up to date ({running})")
+                                    : running != null ? T($"UEFI を {running} から {latest.Uefi.Version} にする…", $"Update the UEFI from {running} to {latest.Uefi.Version}...")
+                                    : T($"UEFI を {latest.Uefi.Version} にする（hekate から起動のとき）…", $"UEFI {latest.Uefi.Version} (when booted from hekate)...");
                 releaseLink.Visible = true;
             }
             catch (SignInRequiredException e)
@@ -640,6 +654,45 @@ namespace SwitchCenter
             };
             checkButton.Enabled = true;
             LoadDrivers();
+        }
+
+        /// <summary>"UEFI: R442H (hekate)" from SMBIOS, or the DSDT estimate for UEFIs older than R442.</summary>
+        static string UefiLine(int estimate)
+        {
+            string v = UefiUpdate.RunningVersion();
+            if (v != null)
+                return UefiUpdate.IsHekate(v) ? T($"UEFI: {v}（hekate から起動）", $"UEFI: {v} (booted from hekate)")
+                                              : T($"UEFI: {v}（RCM・coreboot から起動）", $"UEFI: {v} (booted from RCM / coreboot)");
+            return T($"UEFI: R{estimate} 以降（DSDT のデバイスからの推定。R442 より前の UEFI は版を出しません）",
+                     $"UEFI: R{estimate} or later (estimated from the DSDT devices; UEFIs before R442 do not report a version)");
+        }
+
+        /// <summary>hekate chain only: bl33.bin on the ESP, replaced by the elevated --update-uefi process.</summary>
+        async System.Threading.Tasks.Task UpdateUefi()
+        {
+            if (latest?.Uefi == null) return;
+            if (MessageBox.Show(this,
+                    T($"ESP の UEFI（switchroot\\switchwoa\\bl33.bin）を、{latest.Tag} の {latest.Uefi.Version} にします。\n\n" +
+                      "hekate から Windows を起動しているときだけ使えます（RCM の ROM は PC で更新してください）。\n" +
+                      "今の UEFI は、hekate のメニューの「Windows (previous UEFI)」として残します。新しい UEFI で起動しなかったら、そちらを選んでください。\n\n" +
+                      "管理者の確認が出ます。置く前に SHA-256 を確かめます。" + (latest.Prerelease ? "\n\nこれはベータ版（プレリリース）の UEFI です。" : ""),
+                      $"Replace the UEFI on the ESP (switchroot\\switchwoa\\bl33.bin) with {latest.Uefi.Version} from {latest.Tag}?\n\n" +
+                      "Only when Windows is booted from hekate (update an RCM ROM on your PC).\n" +
+                      "The current UEFI stays as \"Windows (previous UEFI)\" in the hekate menu; choose it if the new one does not boot.\n\n" +
+                      "Windows will ask for administrator approval. The SHA-256 is checked first." + (latest.Prerelease ? "\n\nThis is a beta (pre-release) UEFI." : "")),
+                    T("UEFI の更新", "UEFI update"), MessageBoxButtons.OKCancel, MessageBoxIcon.Question) != DialogResult.OK) return;
+            uefiButton.Enabled = checkButton.Enabled = false;
+            int? code = await UefiUpdate.RunElevatedAsync(latest.Tag);
+            updateStatus.ForeColor = code is UefiUpdate.ExitUpdated or UefiUpdate.ExitUpToDate ? Color.DarkGreen : Color.Firebrick;
+            updateStatus.Text = code switch
+            {
+                null => T("管理者の確認がキャンセルされました。", "Administrator approval was cancelled."),
+                UefiUpdate.ExitUpdated => T($"UEFI を {latest.Uefi.Version} にしました。次に hekate から起動したときに新しくなります。", $"UEFI {latest.Uefi.Version} is in place; it starts at the next boot from hekate."),
+                UefiUpdate.ExitUpToDate => T($"UEFI はもう {latest.Uefi.Version} です。", $"The UEFI is already {latest.Uefi.Version}."),
+                UefiUpdate.ExitNotHekate => T("hekate から起動していないので、UEFI は変えていません。RCM の ROM は PC で更新してください。", "Not booted from hekate, so the UEFI was not changed. Update an RCM ROM on your PC."),
+                _ => T("UEFI を更新できませんでした。理由は、更新の画面に出ています。", "The UEFI update failed; the update window shows why."),
+            };
+            uefiButton.Enabled = checkButton.Enabled = true;
         }
 
         async System.Threading.Tasks.Task UpdateApp()

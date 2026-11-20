@@ -73,6 +73,8 @@ namespace SwitchCenter
         /// </summary>
         public static int EstimateUefi()
         {
+            int exact = UefiUpdate.Number(UefiUpdate.RunningVersion());     // R442 and later say it in SMBIOS
+            if (exact > 0) return exact;
             (string Hwid, int Rev)[] added =
             {
                 ("SWOA0801", 377), ("SWOA0701", 375), ("SWOA0601", 374), ("SWOA0501", 373),
