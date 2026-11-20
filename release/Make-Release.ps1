@@ -8,6 +8,8 @@
     out\<Version>\manifest.json                    versions, hardware IDs, minimum UEFI, SHA-256
   Upload the three files to a release tagged drivers-<Version>, or pass -Publish
   to have the GitHub CLI (gh, logged in with `gh auth login`) create the release.
+  The release notes start with release\notes\<Version>.md: what changed in this
+  release (and what is planned). It must exist before a release is made.
   -PublishOnly publishes files that an earlier run already made.
 
   Needs (on the PC): LLVM, the WDK 10.0.19041 + 10.0.26100 headers, the .NET SDK,
@@ -29,6 +31,13 @@ param(
 
 $Repo = 'hayato41200/Windows-for-Switch-Drivers'
 
+# What changed in this release: release\notes\<Version>.md, written by hand, required.
+function Get-ChangeNotes {
+  $f = Join-Path $PSScriptRoot "notes\$Version.md"
+  if (-not (Test-Path $f)) { throw "Write what changed in this release in $f first (it goes at the top of the release notes)." }
+  return (Get-Content $f -Raw -Encoding utf8).TrimEnd()
+}
+
 function Publish-Release([string]$dir) {
   $gh = (Get-Command gh -ErrorAction SilentlyContinue).Source
   if (-not $gh) { $gh = Join-Path $env:ProgramFiles 'GitHub CLI\gh.exe' }
@@ -38,7 +47,7 @@ function Publish-Release([string]$dir) {
   $m = Get-Content (Join-Path $dir 'manifest.json') -Raw | ConvertFrom-Json
   $pre = [bool]$m.prerelease
   $title = if ($pre) { "Drivers $Version (beta)" } else { "Drivers $Version" }
-  $notes = @($title, '')
+  $notes = @($title, '', (Get-ChangeNotes), '')
   if ($pre) { $notes += 'Beta: includes drivers still in testing (marked beta). The control center offers them only on the beta channel.', '' }
   $notes += '| Driver | Version | Device | Needs UEFI |', '|---|---|---|---|'
   $notes += $m.drivers.items | ForEach-Object { "| $($_.service)$(if ($_.beta) { ' (beta)' }) | $($_.version) | $($_.hwid) | $($_.minUefi) |" }
@@ -62,6 +71,7 @@ if ($PublishOnly) {
 }
 
 $ErrorActionPreference = 'Stop'
+$null = Get-ChangeNotes            # fail before building when the change notes are missing
 $Root = Split-Path -Parent $PSScriptRoot
 $Out = Join-Path $Root "out\$Version"
 $Stage = Join-Path $Out 'stage'
