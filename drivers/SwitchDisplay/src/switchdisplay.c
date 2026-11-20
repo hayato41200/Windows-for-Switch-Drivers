@@ -47,7 +47,7 @@
 #include <ntstrsafe.h>
 #include <stdarg.h>
 
-#define SWD_VERSION        0x00010402u   /* 1.4.2 */
+#define SWD_VERSION        0x00010403u   /* 1.4.3 */
 #define SWD_TAG            'DwsS'
 
 /* Boot framebuffer (coreboot display.c / UEFI MemoryMap.h "Display Reserved") */
@@ -611,12 +611,17 @@ static VOID TvWriteWindow(PSWD_CONTEXT Ctx, const ULONG *Values)
     TVWR(DC_WINDOW_HEADER, hdr);
 }
 
-/* Copies source rect Rc of a Ws x Hs upright surface to the TV buffer: 1:1 when
- * it is 1280x720, otherwise point-sampled to fit the TV, centred. Only rows of
- * Rc are read from the source (the caller locked just those). */
-static VOID TvBlt(PSWD_CONTEXT Ctx, PUCHAR SrcBase, LONG SrcTop, LONG Pitch, RECT Rc, LONG Ws, LONG Hs)
+/* Copies source rect Rc of a Ws x Hs surface to the TV buffer, upright: Baked
+ * is the rotation already in the surface (1.4.3: without Flags.Rotate the DWM
+ * hands over the picture in panel orientation, so 180 came out upside down on
+ * the TV). The upright picture goes 1:1 when it is 1280x720, otherwise
+ * point-sampled to fit, centred. Only rows of Rc are read from the source
+ * (the caller locked just those). The inverse mappings follow BltRect. */
+static VOID TvBlt(PSWD_CONTEXT Ctx, PUCHAR SrcBase, LONG SrcTop, LONG Pitch, RECT Rc, LONG Ws, LONG Hs,
+                  D3DKMDT_VIDPN_PRESENT_PATH_ROTATION Baked)
 {
-    LONG outW, outH, x0, y0, dy, dx, dys, dye, dxs, dxe;
+    LONG uw, uh, outW, outH, x0, y0, dy, dx, dys, dye, dxs, dxe;
+    RECT u;
 #define TSRC(x, y) (((const ULONG *)(SrcBase + (SIZE_T)((y) - SrcTop) * (SIZE_T)Pitch))[(x)])
 #define TDST(y)    ((ULONG *)(Ctx->TvVa + (SIZE_T)(y) * TV_PITCH))
 
@@ -626,29 +631,59 @@ static VOID TvBlt(PSWD_CONTEXT Ctx, PUCHAR SrcBase, LONG SrcTop, LONG Pitch, REC
     if (Rc.bottom > Hs) Rc.bottom = Hs;
     if (Rc.left >= Rc.right || Rc.top >= Rc.bottom || Ws <= 0 || Hs <= 0) return;
 
-    if (Ws == (LONG)TV_W && Hs == (LONG)TV_H) {
-        for (dy = Rc.top; dy < Rc.bottom; dy++)
-            RtlCopyMemory(TDST(dy) + Rc.left, &TSRC(Rc.left, dy), (SIZE_T)(Rc.right - Rc.left) * 4);
+    /* upright size and the upright rect covered by Rc */
+    switch (Baked) {
+    case D3DKMDT_VPPR_ROTATE90:     /* upright(a,b) = s(uh-1-b, a) */
+        uw = Hs; uh = Ws;
+        u.left = Rc.top; u.right = Rc.bottom; u.top = uh - Rc.right; u.bottom = uh - Rc.left;
+        break;
+    case D3DKMDT_VPPR_ROTATE270:    /* upright(a,b) = s(b, uw-1-a) */
+        uw = Hs; uh = Ws;
+        u.left = uw - Rc.bottom; u.right = uw - Rc.top; u.top = Rc.left; u.bottom = Rc.right;
+        break;
+    case D3DKMDT_VPPR_ROTATE180:    /* upright(a,b) = s(Ws-1-a, Hs-1-b) */
+        uw = Ws; uh = Hs;
+        u.left = Ws - Rc.right; u.right = Ws - Rc.left; u.top = Hs - Rc.bottom; u.bottom = Hs - Rc.top;
+        break;
+    default:
+        Baked = D3DKMDT_VPPR_IDENTITY;
+        uw = Ws; uh = Hs; u = Rc;
+        break;
+    }
+#define USRC(a, b) (Baked == D3DKMDT_VPPR_ROTATE90  ? TSRC(uh - 1 - (b), (a)) : \
+                    Baked == D3DKMDT_VPPR_ROTATE270 ? TSRC((b), uw - 1 - (a)) : \
+                    Baked == D3DKMDT_VPPR_ROTATE180 ? TSRC(Ws - 1 - (a), Hs - 1 - (b)) : TSRC((a), (b)))
+
+    if (uw == (LONG)TV_W && uh == (LONG)TV_H) {
+        for (dy = u.top; dy < u.bottom; dy++) {
+            ULONG *d = TDST(dy);
+            if (Baked == D3DKMDT_VPPR_IDENTITY) {
+                RtlCopyMemory(d + u.left, &TSRC(u.left, dy), (SIZE_T)(u.right - u.left) * 4);
+            } else {
+                for (dx = u.left; dx < u.right; dx++) d[dx] = USRC(dx, dy);
+            }
+        }
         return;
     }
     outH = (LONG)TV_H;
-    outW = Ws * (LONG)TV_H / Hs;
-    if (outW > (LONG)TV_W) { outW = (LONG)TV_W; outH = Hs * (LONG)TV_W / Ws; }
+    outW = uw * (LONG)TV_H / uh;
+    if (outW > (LONG)TV_W) { outW = (LONG)TV_W; outH = uh * (LONG)TV_W / uw; }
     if (outW <= 0 || outH <= 0) return;
     x0 = ((LONG)TV_W - outW) / 2;
     y0 = ((LONG)TV_H - outH) / 2;
-    /* destination pixels whose sample falls inside Rc */
-    dys = y0 + (Rc.top * outH + Hs - 1) / Hs;
-    dye = y0 + (Rc.bottom * outH + Hs - 1) / Hs;
-    dxs = x0 + (Rc.left * outW + Ws - 1) / Ws;
-    dxe = x0 + (Rc.right * outW + Ws - 1) / Ws;
+    /* destination pixels whose sample falls inside u */
+    dys = y0 + (u.top * outH + uh - 1) / uh;
+    dye = y0 + (u.bottom * outH + uh - 1) / uh;
+    dxs = x0 + (u.left * outW + uw - 1) / uw;
+    dxe = x0 + (u.right * outW + uw - 1) / uw;
     if (dye > y0 + outH) dye = y0 + outH;
     if (dxe > x0 + outW) dxe = x0 + outW;
     for (dy = dys; dy < dye; dy++) {
-        LONG sy = (dy - y0) * Hs / outH;
+        LONG sb = (dy - y0) * uh / outH;
         ULONG *d = TDST(dy);
-        for (dx = dxs; dx < dxe; dx++) d[dx] = TSRC((dx - x0) * Ws / outW, sy);
+        for (dx = dxs; dx < dxe; dx++) d[dx] = USRC((dx - x0) * uw / outW, sb);
     }
+#undef USRC
 #undef TSRC
 #undef TDST
 }
@@ -721,7 +756,7 @@ static VOID TvStartLocked(PSWD_CONTEXT Ctx)
     if (Ctx->FbVa) {
         RECT all;
         all.left = 0; all.top = 0; all.right = (LONG)Ctx->FbWidth; all.bottom = (LONG)Ctx->FbHeight;
-        TvBlt(Ctx, Ctx->FbVa, 0, (LONG)Ctx->FbPitch, all, (LONG)Ctx->FbWidth, (LONG)Ctx->FbHeight);
+        TvBlt(Ctx, Ctx->FbVa, 0, (LONG)Ctx->FbPitch, all, (LONG)Ctx->FbWidth, (LONG)Ctx->FbHeight, D3DKMDT_VPPR_IDENTITY);
     }
     Ctx->TvLastW = 0;
     Ctx->TvLastH = 0;
@@ -900,7 +935,7 @@ static VOID DpBringUp(PSWD_CONTEXT Ctx)
     mR426Ok = FALSE; mR427Ok = FALSE; mR429Ok = FALSE;
     mR426Step = NULL; mR427Step = NULL; mR429Step = NULL;
     mR426Hpd = FALSE; mR426DpcdOk = FALSE; mR426EdidOk = FALSE;
-    DpLog(L"switchdisplay 1.4.2 DP Alt bring-up (attempt %u)\r\n", Ctx->DpFails + 1);
+    DpLog(L"switchdisplay 1.4.3 DP Alt bring-up (attempt %u)\r\n", Ctx->DpFails + 1);
     if (!DpMap()) {
         DpLog(L"register mapping failed\r\n");
     } else {
@@ -2010,14 +2045,17 @@ NTSTATUS SwdPresentDisplayOnly(IN_CONST_HANDLE hAdapter, IN_CONST_PDXGKARG_PRESE
         for (i = 0; i < pPresent->NumDirtyRects; i++) BltRect(ctx, src, top, pPresent->Pitch, pPresent->pDirtyRect[i], ws, hs, rot);
         TvLock(ctx);
         if (ctx->TvVa) {
-            /* The DWM surface is upright: the TV gets it without the rotation. */
-            if (ws != ctx->TvLastW || hs != ctx->TvLastH) {
+            /* The TV gets the picture upright: with Flags.Rotate the surface is
+             * upright already; without it the rotation is baked in (1.4.3). */
+            D3DKMDT_VIDPN_PRESENT_PATH_ROTATION baked = pPresent->Flags.Rotate ? D3DKMDT_VPPR_IDENTITY : ctx->Rotation;
+            LONG tw = IsRotated(baked) ? hs : ws, th = IsRotated(baked) ? ws : hs;
+            if (tw != ctx->TvLastW || th != ctx->TvLastH) {
                 TvClear(ctx);
-                ctx->TvLastW = ws;
-                ctx->TvLastH = hs;
+                ctx->TvLastW = tw;
+                ctx->TvLastH = th;
             }
-            for (i = 0; i < pPresent->NumMoves; i++) TvBlt(ctx, src, top, pPresent->Pitch, pPresent->pMoves[i].DestRect, ws, hs);
-            for (i = 0; i < pPresent->NumDirtyRects; i++) TvBlt(ctx, src, top, pPresent->Pitch, pPresent->pDirtyRect[i], ws, hs);
+            for (i = 0; i < pPresent->NumMoves; i++) TvBlt(ctx, src, top, pPresent->Pitch, pPresent->pMoves[i].DestRect, ws, hs, baked);
+            for (i = 0; i < pPresent->NumDirtyRects; i++) TvBlt(ctx, src, top, pPresent->Pitch, pPresent->pDirtyRect[i], ws, hs, baked);
             InterlockedIncrement(&ctx->TvPresents);
         }
         TvUnlock(ctx);
