@@ -11,7 +11,8 @@ namespace SwitchCenter
         /// <param name="args">--open: show the control center window right away.
         /// --install-drivers &lt;tag&gt; &lt;service,...&gt;: the elevated driver installer.
         /// --self-update &lt;folder&gt; &lt;pid&gt;: an unpacked new version replacing the one in folder.
-        /// --wifi-firmware &lt;folder&gt;: the elevated copy of the user's Wi-Fi firmware files.</param>
+        /// --wifi-firmware &lt;folder&gt;: the elevated copy of the user's Wi-Fi firmware files.
+        /// --update-uefi &lt;tag&gt;: the elevated UEFI (bl33.bin) update for the hekate chain.</param>
         [STAThread]
         static void Main(string[] args)
         {
@@ -22,6 +23,17 @@ namespace SwitchCenter
                 Application.SetHighDpiMode(HighDpiMode.SystemAware);
                 Lang.Load();
                 using var form = new InstallForm(args[1], args[2].Split(','));
+                Application.Run(form);
+                Environment.ExitCode = form.Result;
+                return;
+            }
+            if (args.Length == 2 && args[0] == "--update-uefi")
+            {
+                // Elevated UEFI (bl33.bin, hekate chain) update started by the Drivers tab (UefiUpdate.RunElevatedAsync).
+                Application.EnableVisualStyles();
+                Application.SetHighDpiMode(HighDpiMode.SystemAware);
+                Lang.Load();
+                using var form = new UefiUpdateForm(args[1]);
                 Application.Run(form);
                 Environment.ExitCode = form.Result;
                 return;
