@@ -47,7 +47,7 @@
 #include <ntstrsafe.h>
 #include <stdarg.h>
 
-#define SWD_VERSION        0x00010403u   /* 1.4.3 */
+#define SWD_VERSION        0x00010404u   /* 1.4.4 */
 #define SWD_TAG            'DwsS'
 
 /* Boot framebuffer (coreboot display.c / UEFI MemoryMap.h "Display Reserved") */
@@ -631,7 +631,11 @@ static VOID TvBlt(PSWD_CONTEXT Ctx, PUCHAR SrcBase, LONG SrcTop, LONG Pitch, REC
     if (Rc.bottom > Hs) Rc.bottom = Hs;
     if (Rc.left >= Rc.right || Rc.top >= Rc.bottom || Ws <= 0 || Hs <= 0) return;
 
-    /* upright size and the upright rect covered by Rc */
+    /* upright size and the upright rect covered by Rc. 1.4.4: the DWM bakes
+     * 90/270 the other way round from BltRect (1.4.3 showed landscape upside
+     * down on the TV), so the two inverse mappings are swapped. */
+    if (Baked == D3DKMDT_VPPR_ROTATE90) Baked = D3DKMDT_VPPR_ROTATE270;
+    else if (Baked == D3DKMDT_VPPR_ROTATE270) Baked = D3DKMDT_VPPR_ROTATE90;
     switch (Baked) {
     case D3DKMDT_VPPR_ROTATE90:     /* upright(a,b) = s(uh-1-b, a) */
         uw = Hs; uh = Ws;
@@ -935,7 +939,7 @@ static VOID DpBringUp(PSWD_CONTEXT Ctx)
     mR426Ok = FALSE; mR427Ok = FALSE; mR429Ok = FALSE;
     mR426Step = NULL; mR427Step = NULL; mR429Step = NULL;
     mR426Hpd = FALSE; mR426DpcdOk = FALSE; mR426EdidOk = FALSE;
-    DpLog(L"switchdisplay 1.4.3 DP Alt bring-up (attempt %u)\r\n", Ctx->DpFails + 1);
+    DpLog(L"switchdisplay 1.4.4 DP Alt bring-up (attempt %u)\r\n", Ctx->DpFails + 1);
     if (!DpMap()) {
         DpLog(L"register mapping failed\r\n");
     } else {
