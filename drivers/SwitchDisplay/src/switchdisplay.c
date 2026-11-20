@@ -29,14 +29,25 @@
  *     buffer of this driver and every present is copied there too, unrotated: a
  *     landscape 1280x720 desktop fills the TV, a portrait one is shrunk to 405x720
  *     in the middle. Windows still sees one display. Registry TvMirror=0 turns it
- *     off. No hot-plug yet: the TV must be connected when UEFI starts.
+ *     off.
+ *   - 1.4.0, DP Alt hot-plug: switchbattery 1.0.0.7 enters DP Alt Mode when a
+ *     hub/dock is plugged in under Windows and calls \Callback\SwitchWoaDpAlt
+ *     (1 up / 0 down). This driver's thread then runs the UEFI R426 (DPAUX1,
+ *     HPD, DPCD, EDID), R427 (PLLDP, SOR1 pads, link training) and R429/R433
+ *     (DC-B power, PLLD2 74.25 MHz, 1280x720 raster, SOR1 attach) steps,
+ *     ported unchanged in dpalt_port.inc, and then the TV window above. On
+ *     unplug the window goes back, DC-B stops and SOR1/DC-B are held in reset.
+ *     The SOR1 pad rail (MAX77620 LDO8) is turned on by UEFI R440H at boot.
+ *     The bring-up log is in the registry value TvLog (Status.cmd shows it).
  *
  * Trace: HKLM\SYSTEM\CurrentControlSet\Services\switchdisplay\Parameters
  */#define DXGKDDI_INTERFACE_VERSION 0x4002 /* DXGKDDI_INTERFACE_VERSION_WDDM1_3 */
 #include <ntddk.h>
 #include <dispmprt.h>
+#include <ntstrsafe.h>
+#include <stdarg.h>
 
-#define SWD_VERSION        0x00010300u   /* 1.3.0 */
+#define SWD_VERSION        0x00010400u   /* 1.4.0 */
 #define SWD_TAG            'DwsS'
 
 /* Boot framebuffer (coreboot display.c / UEFI MemoryMap.h "Display Reserved") */
@@ -189,6 +200,15 @@ typedef struct _SWD_CONTEXT {
     ULONG                TvSaved[TV_REGS];
     LONG                 TvLastW, TvLastH;
     volatile LONG        TvPresents;
+    KEVENT               TvLock;        /* 1.4.0: a mutex (synchronization event) for TvVa */
+
+    /* 1.4.0 DP Alt hot-plug */
+    KEVENT               DpEvent;
+    volatile LONG        DpWant;        /* last switchbattery state: 1 up, 0 down */
+    PCALLBACK_OBJECT     DpCbObject;
+    PVOID                DpCbHandle;
+    ULONG                DpFails;       /* bring-up failures since the last unplug */
+    volatile LONG        DpUps, DpDowns, DpNotes;
 } SWD_CONTEXT, *PSWD_CONTEXT;
 
 static WCHAR  gParamPathBuf[512];
@@ -262,6 +282,7 @@ static VOID FlushCounters(PSWD_CONTEXT Ctx)
     RegPutDword(L"VsyncEnables", (ULONG)Ctx->VsyncEnables);
     RegPutDword(L"VsyncDisables", (ULONG)Ctx->VsyncDisables);
     RegPutDword(L"TvPresents", (ULONG)Ctx->TvPresents);
+    RegPutDword(L"DpNotes", (ULONG)Ctx->DpNotes);
     {
         int i;
         for (i = 0; i < D_COUNT; i++) {
@@ -288,6 +309,8 @@ static VOID FlushCounters(PSWD_CONTEXT Ctx)
 
 /* Clears the boot-loop guard after GUARD_SECONDS and flushes the counters
  * every FLUSH_SECONDS until the device stops. */
+static VOID DpHandle(PSWD_CONTEXT Ctx);
+
 static VOID GuardThread(PVOID Context)
 {
     PSWD_CONTEXT ctx = (PSWD_CONTEXT)Context;
@@ -297,7 +320,15 @@ static VOID GuardThread(PVOID Context)
 
     timeout.QuadPart = -(LONGLONG)FLUSH_SECONDS * 10 * 1000 * 1000;
     for (;;) {
-        NTSTATUS st = KeWaitForSingleObject(&ctx->StopEvent, Executive, KernelMode, FALSE, &timeout);
+        PVOID objs[2];
+        NTSTATUS st;
+        objs[0] = &ctx->StopEvent;
+        objs[1] = &ctx->DpEvent;            /* 1.4.0: DP Alt plug / unplug */
+        st = KeWaitForMultipleObjects(2, objs, WaitAny, Executive, KernelMode, FALSE, &timeout, NULL);
+        if (st == STATUS_WAIT_1) {
+            DpHandle(ctx);
+            continue;
+        }
         FlushCounters(ctx);
         if (st != STATUS_TIMEOUT) break;
         elapsed += FLUSH_SECONDS;
@@ -628,7 +659,18 @@ static VOID TvClear(PSWD_CONTEXT Ctx)
 }
 
 /* StartDevice: take DC-B over if UEFI left it running for a TV. */
+static VOID TvStartLocked(PSWD_CONTEXT Ctx);
+static VOID TvLock(PSWD_CONTEXT Ctx)   { KeWaitForSingleObject(&Ctx->TvLock, Executive, KernelMode, FALSE, NULL); }
+static VOID TvUnlock(PSWD_CONTEXT Ctx) { KeSetEvent(&Ctx->TvLock, IO_NO_INCREMENT, FALSE); }
+
 static VOID TvStart(PSWD_CONTEXT Ctx)
+{
+    TvLock(Ctx);
+    if (!Ctx->TvVa) TvStartLocked(Ctx);
+    TvUnlock(Ctx);
+}
+
+static VOID TvStartLocked(PSWD_CONTEXT Ctx)
 {
     PHYSICAL_ADDRESS pa, lo, hi, skip;
     PUCHAR car;
@@ -720,14 +762,18 @@ static VOID TvStart(PSWD_CONTEXT Ctx)
 static VOID TvStop(PSWD_CONTEXT Ctx)
 {
     LARGE_INTEGER t;
-    if (Ctx->TvDc && Ctx->TvVa) {
+    PUCHAR va;
+    TvLock(Ctx);                            /* Present no longer copies to the TV after this */
+    va = Ctx->TvVa;
+    Ctx->TvVa = NULL;
+    TvUnlock(Ctx);
+    if (Ctx->TvDc && va) {
         TvWriteWindow(Ctx, Ctx->TvSaved);
         t.QuadPart = -50ll * 10 * 1000;     /* 3 frames */
         KeDelayExecutionThread(KernelMode, FALSE, &t);
     }
-    if (Ctx->TvVa) {
-        MmFreeContiguousMemorySpecifyCache(Ctx->TvVa, (SIZE_T)TV_PITCH * TV_H, MmWriteCombined);
-        Ctx->TvVa = NULL;
+    if (va) {
+        MmFreeContiguousMemorySpecifyCache(va, (SIZE_T)TV_PITCH * TV_H, MmWriteCombined);
     }
     if (Ctx->TvDc) {
         MmUnmapIoSpace(Ctx->TvDc, DC_MAP_SIZE);
@@ -737,6 +783,190 @@ static VOID TvStop(PSWD_CONTEXT Ctx)
 
 #undef TVRD
 #undef TVWR
+
+/* ------------------------------------------------------------ 1.4.0: DP Alt hot-plug */
+
+/* UEFI types and helpers for dpalt_port.inc (generated from the UEFI source). */
+typedef SIZE_T UINTN;
+typedef WCHAR  CHAR16;
+#define STATIC static
+#define CONST  const
+static PUCHAR gDpCar, gDpPmc, gDpAux, gDpSor, gDpDcb;
+static WCHAR  gDpLog[12288];
+static SIZE_T gDpLogLen;
+
+static VOID DpStall(UINTN Us)
+{
+    if (Us >= 1000) {
+        LARGE_INTEGER t;
+        t.QuadPart = -(LONGLONG)Us * 10;
+        KeDelayExecutionThread(KernelMode, FALSE, &t);
+    } else {
+        KeStallExecutionProcessor((ULONG)Us);
+    }
+}
+
+static VOID DpLog(PCWSTR Fmt, ...)
+{
+    WCHAR line[512];
+    va_list ap;
+    SIZE_T n = 0;
+    va_start(ap, Fmt);
+    (VOID)RtlStringCbVPrintfW(line, sizeof(line), Fmt, ap);
+    va_end(ap);
+    (VOID)RtlStringCchLengthW(line, RTL_NUMBER_OF(line), &n);
+    if (gDpLogLen + n + 1 < RTL_NUMBER_OF(gDpLog)) {
+        RtlCopyMemory(&gDpLog[gDpLogLen], line, n * sizeof(WCHAR));
+        gDpLogLen += n;
+        gDpLog[gDpLogLen] = 0;
+    }
+}
+
+#define CompareMem(a, b, n) (RtlCompareMemory((a), (b), (n)) == (SIZE_T)(n) ? 0 : 1)
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wunused-but-set-variable"
+#pragma clang diagnostic ignored "-Wunused-function"
+#include "dpalt_port.inc"
+#pragma clang diagnostic pop
+
+#define CAR_PHYS_PAGE   0x60006000ull
+#define PMC_PHYS_PAGE   0x7000E000ull       /* PMC registers start at +0x400 */
+#define DPAUX1_PHYS     0x54040000ull
+#define SOR1_PHYS       0x54580000ull
+
+static VOID DpUnmap(VOID)
+{
+    if (gDpCar) { MmUnmapIoSpace(gDpCar, 0x1000); gDpCar = NULL; }
+    if (gDpPmc) { MmUnmapIoSpace(gDpPmc - 0x400, 0x1000); gDpPmc = NULL; }
+    if (gDpAux) { MmUnmapIoSpace(gDpAux, 0x1000); gDpAux = NULL; }
+    if (gDpSor) { MmUnmapIoSpace(gDpSor, 0x1000); gDpSor = NULL; }
+    if (gDpDcb) { MmUnmapIoSpace(gDpDcb, DC_MAP_SIZE); gDpDcb = NULL; }
+}
+
+static BOOLEAN DpMap(VOID)
+{
+    PHYSICAL_ADDRESS pa;
+    PUCHAR pmc;
+    if (gDpCar && gDpPmc && gDpAux && gDpSor && gDpDcb) return TRUE;
+    DpUnmap();
+    pa.QuadPart = (LONGLONG)CAR_PHYS_PAGE; gDpCar = (PUCHAR)MmMapIoSpaceEx(pa, 0x1000, PAGE_READWRITE | PAGE_NOCACHE);
+    pa.QuadPart = (LONGLONG)PMC_PHYS_PAGE; pmc = (PUCHAR)MmMapIoSpaceEx(pa, 0x1000, PAGE_READWRITE | PAGE_NOCACHE);
+    gDpPmc = pmc ? pmc + 0x400 : NULL;
+    pa.QuadPart = (LONGLONG)DPAUX1_PHYS;  gDpAux = (PUCHAR)MmMapIoSpaceEx(pa, 0x1000, PAGE_READWRITE | PAGE_NOCACHE);
+    pa.QuadPart = (LONGLONG)SOR1_PHYS;    gDpSor = (PUCHAR)MmMapIoSpaceEx(pa, 0x1000, PAGE_READWRITE | PAGE_NOCACHE);
+    pa.QuadPart = (LONGLONG)DC_B_PHYS;    gDpDcb = (PUCHAR)MmMapIoSpaceEx(pa, DC_MAP_SIZE, PAGE_READWRITE | PAGE_NOCACHE);
+    if (gDpCar && gDpPmc && gDpAux && gDpSor && gDpDcb) return TRUE;
+    DpUnmap();
+    return FALSE;
+}
+
+static VOID DpLogFlush(VOID)
+{
+    if (gParamPath.Buffer) {
+        (VOID)RtlWriteRegistryValue(RTL_REGISTRY_ABSOLUTE, gParamPath.Buffer, L"TvLog", REG_SZ, gDpLog,
+                                    (ULONG)((gDpLogLen + 1) * sizeof(WCHAR)));
+    }
+}
+
+/* Unplugged: give the window back, stop DC-B, hold SOR1 and DC-B in reset
+ * (the next bring-up starts both from reset, as in UEFI). */
+static VOID DpTearDown(PSWD_CONTEXT Ctx)
+{
+    volatile ULONG *car;
+    TvStop(Ctx);
+    if (!DpMap()) return;
+    car = (volatile ULONG *)gDpCar;
+    if ((car[0x10 / 4] & (1u << 26)) != 0 && (car[0x04 / 4] & (1u << 26)) == 0) {
+        volatile ULONG *dc = (volatile ULONG *)gDpDcb;
+        dc[0x40] = 0;                                   /* STATE_ACCESS: assembly */
+        dc[0x32] = DISP_CTRL_MODE_STOP;                 /* DISP_CMD */
+        dc[0x41] = GENERAL_UPDATE;
+        dc[0x41] = GENERAL_ACT_REQ;
+        DpStall(40000);
+    }
+    car[0x290 / 4] = 1u << 23;                          /* RST_DEV_X_SET: SOR1 */
+    car[0x300 / 4] = 1u << 26;                          /* RST_DEV_L_SET: disp2 */
+    InterlockedIncrement(&Ctx->DpDowns);
+    RegPutDword(L"DpDowns", (ULONG)Ctx->DpDowns);
+}
+
+/* Plugged in (switchbattery entered DP Alt Mode): the UEFI R426/R427/R429 steps. */
+static VOID DpBringUp(PSWD_CONTEXT Ctx)
+{
+    ULONG step = 0;
+    gDpLogLen = 0;
+    gDpLog[0] = 0;
+    mR426Ok = FALSE; mR427Ok = FALSE; mR429Ok = FALSE;
+    mR426Step = NULL; mR427Step = NULL; mR429Step = NULL;
+    mR426Hpd = FALSE; mR426DpcdOk = FALSE; mR426EdidOk = FALSE;
+    DpLog(L"switchdisplay 1.4.0 DP Alt bring-up (attempt %u)\r\n", Ctx->DpFails + 1);
+    if (!DpMap()) {
+        DpLog(L"register mapping failed\r\n");
+    } else {
+        step = 1;
+        R426DpAuxStage2a();
+        if (mR426Ok) { step = 2; R427DpLinkStage2b(); }
+        if (mR427Ok) { step = 3; R429DpVideoStage3(); }
+        if (mR429Ok) { step = 4; TvStart(Ctx); if (Ctx->TvVa) step = 5; }
+    }
+    DpLog(L"result: step %u (1 DPAUX/HPD, 2 link, 3 DC-B, 4 window, 5 TV on)\r\n", step);
+    DpLogFlush();
+    RegPutDword(L"DpLastStep", step);
+    if (step == 5) {
+        Ctx->DpFails = 0;
+        InterlockedIncrement(&Ctx->DpUps);
+        RegPutDword(L"DpUps", (ULONG)Ctx->DpUps);
+    } else {
+        Ctx->DpFails++;
+        RegPutDword(L"DpFails", Ctx->DpFails);
+    }
+}
+
+/* Thread side: act on the last state switchbattery sent. */
+static VOID DpHandle(PSWD_CONTEXT Ctx)
+{
+    if (Ctx->DpWant) {
+        if (!Ctx->TvVa && Ctx->DpFails < 3) DpBringUp(Ctx);
+    } else {
+        if (Ctx->TvVa || (gDpCar && (((PULONG)gDpCar)[0x04 / 4] & (1u << 26)) == 0)) DpTearDown(Ctx);
+        Ctx->DpFails = 0;
+    }
+}
+
+/* \Callback\SwitchWoaDpAlt from switchbattery: Argument1 = 1 up / 0 down. */
+static VOID DpCallback(PVOID Context, PVOID Argument1, PVOID Argument2)
+{
+    PSWD_CONTEXT ctx = (PSWD_CONTEXT)Context;
+    UNREFERENCED_PARAMETER(Argument2);
+    InterlockedIncrement(&ctx->DpNotes);
+    InterlockedExchange(&ctx->DpWant, Argument1 ? 1 : 0);
+    KeSetEvent(&ctx->DpEvent, IO_NO_INCREMENT, FALSE);
+}
+
+static VOID DpRegister(PSWD_CONTEXT Ctx)
+{
+    UNICODE_STRING name;
+    OBJECT_ATTRIBUTES oa;
+    NTSTATUS st;
+    if (RegGetDword(L"TvHotplug", 1) == 0) { RegPutDword(L"DpRegister", 1); return; }
+    RtlInitUnicodeString(&name, L"\\Callback\\SwitchWoaDpAlt");
+    InitializeObjectAttributes(&oa, &name, OBJ_CASE_INSENSITIVE | OBJ_PERMANENT | OBJ_KERNEL_HANDLE, NULL, NULL);
+    st = ExCreateCallback(&Ctx->DpCbObject, &oa, TRUE, TRUE);
+    RegPutDword(L"DpRegister", (ULONG)st);
+    if (!NT_SUCCESS(st)) { Ctx->DpCbObject = NULL; return; }
+    Ctx->DpCbHandle = ExRegisterCallback(Ctx->DpCbObject, DpCallback, Ctx);
+    if (!Ctx->DpCbHandle) {
+        ObDereferenceObject(Ctx->DpCbObject);
+        Ctx->DpCbObject = NULL;
+        RegPutDword(L"DpRegister", 2);
+    }
+}
+
+static VOID DpUnregister(PSWD_CONTEXT Ctx)
+{
+    if (Ctx->DpCbHandle) { ExUnregisterCallback(Ctx->DpCbHandle); Ctx->DpCbHandle = NULL; }
+    if (Ctx->DpCbObject) { ObDereferenceObject(Ctx->DpCbObject); Ctx->DpCbObject = NULL; }
+}
 
 /* ------------------------------------------------------------ stage 2: panel sleep */
 
@@ -826,6 +1056,8 @@ NTSTATUS SwdAddDevice(IN_CONST_PDEVICE_OBJECT PhysicalDeviceObject, OUT_PPVOID M
     ctx->Rotation = D3DKMDT_VPPR_IDENTITY;
     ctx->Visible = TRUE;
     KeInitializeEvent(&ctx->StopEvent, NotificationEvent, FALSE);
+    KeInitializeEvent(&ctx->DpEvent, SynchronizationEvent, FALSE);
+    KeInitializeEvent(&ctx->TvLock, SynchronizationEvent, TRUE);
     /* 1.2.1: dxgkrnl may connect the DC-A interrupt (level, UEFI R409) before
      * StartDevice. 1.2.0 masked the DC interrupts only in StartDevice, and the
      * device failed with problem 43 right after starting. Map DC-A here and
@@ -1001,6 +1233,8 @@ NTSTATUS SwdStartDevice(IN_CONST_PVOID MiniportDeviceContext, IN_PDXGK_START_INF
         ctx->ThreadHandle = NULL;
     }
 
+    DpRegister(ctx);                         /* 1.4.0: after the thread exists */
+
     *NumberOfVideoPresentSources = 1;
     *NumberOfChildren = 1;
     ctx->Started = TRUE;
@@ -1014,9 +1248,11 @@ static VOID VsyncSet(PSWD_CONTEXT Ctx, BOOLEAN On);
 static VOID StopCommon(PSWD_CONTEXT Ctx)
 {
     VsyncSet(Ctx, FALSE);
+    DpUnregister(Ctx);
     StopGuardThread(Ctx);
     FlushCounters(Ctx);
     TvStop(Ctx);
+    DpUnmap();
     UnmapFb(Ctx);
     Ctx->Started = FALSE;
     Ctx->Active = FALSE;
@@ -1059,8 +1295,10 @@ NTSTATUS SwdRemoveDevice(IN_CONST_PVOID MiniportDeviceContext)
 {
     PSWD_CONTEXT ctx = (PSWD_CONTEXT)MiniportDeviceContext;
     if (ctx) {
+        DpUnregister(ctx);
         StopGuardThread(ctx);
         TvStop(ctx);
+        DpUnmap();
         UnmapFb(ctx);
         if (ctx->IrqDc) {
             WRITE_REGISTER_ULONG((PULONG)(ctx->IrqDc + DC_CMD_INT_MASK_REG), 0);
@@ -1762,6 +2000,7 @@ NTSTATUS SwdPresentDisplayOnly(IN_CONST_HANDLE hAdapter, IN_CONST_PDXGKARG_PRESE
          * from the source at its destination like a dirty rect. */
         for (i = 0; i < pPresent->NumMoves; i++) BltRect(ctx, src, top, pPresent->Pitch, pPresent->pMoves[i].DestRect, ws, hs, rot);
         for (i = 0; i < pPresent->NumDirtyRects; i++) BltRect(ctx, src, top, pPresent->Pitch, pPresent->pDirtyRect[i], ws, hs, rot);
+        TvLock(ctx);
         if (ctx->TvVa) {
             /* The DWM surface is upright: the TV gets it without the rotation. */
             if (ws != ctx->TvLastW || hs != ctx->TvLastH) {
@@ -1773,6 +2012,7 @@ NTSTATUS SwdPresentDisplayOnly(IN_CONST_HANDLE hAdapter, IN_CONST_PDXGKARG_PRESE
             for (i = 0; i < pPresent->NumDirtyRects; i++) TvBlt(ctx, src, top, pPresent->Pitch, pPresent->pDirtyRect[i], ws, hs);
             InterlockedIncrement(&ctx->TvPresents);
         }
+        TvUnlock(ctx);
         KeMemoryBarrier();
     } else {
         st = STATUS_INSUFFICIENT_RESOURCES;
