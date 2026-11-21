@@ -43,6 +43,13 @@
  *     TV lists it and it fits the DP link, else 1280x720@60. The 1280x720 TV
  *     buffer stays; DC-B window A scales it to the raster (DDA, point sampled;
  *     registry TvFilter=1 also sets the window's H/V filters, untested).
+ *   - 1.6.0, TV audio: when the TV picture is on, SOR1 takes DP audio from the
+ *     Tegra HDA codec (switchaudio 1.1.0 plays into it), as L4T hda_dc.c does
+ *     for DP: HDA clocks on, AUDIO_CTRL source HDA, HBR advertised, DP audio
+ *     h/vblank symbols from the mode and the link, DP_AUDIO_CTRL with the
+ *     stream parameters from the codec, a fixed ELD (2 ch LPCM 48 kHz) and the
+ *     presence bits (the codec's pin sense, switchaudio's jack). Registry
+ *     TvAudio=0 turns it off.
  *
  * Trace: HKLM\SYSTEM\CurrentControlSet\Services\switchdisplay\Parameters
  */#define DXGKDDI_INTERFACE_VERSION 0x4002 /* DXGKDDI_INTERFACE_VERSION_WDDM1_3 */
@@ -51,7 +58,7 @@
 #include <ntstrsafe.h>
 #include <stdarg.h>
 
-#define SWD_VERSION        0x00010500u   /* 1.5.0 */
+#define SWD_VERSION        0x00010600u   /* 1.6.0 */
 #define SWD_TAG            'DwsS'
 
 /* Boot framebuffer (coreboot display.c / UEFI MemoryMap.h "Display Reserved") */
@@ -708,6 +715,7 @@ static VOID TvClear(PSWD_CONTEXT Ctx)
 
 /* StartDevice: take DC-B over if UEFI left it running for a TV. */
 static VOID TvStartLocked(PSWD_CONTEXT Ctx);
+static VOID TvAudioUp(ULONG Act);
 static VOID TvLock(PSWD_CONTEXT Ctx)   { KeWaitForSingleObject(&Ctx->TvLock, Executive, KernelMode, FALSE, NULL); }
 static VOID TvUnlock(PSWD_CONTEXT Ctx) { KeSetEvent(&Ctx->TvLock, IO_NO_INCREMENT, FALSE); }
 
@@ -810,6 +818,7 @@ static VOID TvStartLocked(PSWD_CONTEXT Ctx)
     RegPutDword(L"TvBufLo", Ctx->TvPhys.LowPart);
     RegPutDword(L"TvBufHi", (ULONG)Ctx->TvPhys.HighPart);
     RegPutDword(L"TvState", 6);
+    TvAudioUp(act);
 }
 
 /* Stop: give window A back to what UEFI set (the boot framebuffer), wait for
@@ -923,11 +932,129 @@ static VOID DpLogFlush(VOID)
     }
 }
 
+/* ------------------------------------------------------------ 1.6.0: TV audio */
+
+/* SOR registers (word offsets, L4T sor_regs.h). */
+#define SOR_W_CLK_CNTRL         0x13u
+#define SOR_W_LINKCTL0          0x4Cu
+#define SOR_W_DP_AUDIO_CTRL     0x62u
+#define SOR_W_DP_AUDIO_HBLANK   0x63u
+#define SOR_W_DP_AUDIO_VBLANK   0x64u
+#define SOR_W_AUDIO_CTRL        0xFCu
+#define SOR_W_AUDIO_SPARE0      0xFEu
+#define SOR_W_ELD_BUFWR         0x10Cu
+#define SOR_W_HDA_PRESENCE      0x10Du
+#define SOR_W_AUDIO_GEN_CTRL    0x117u
+#define SOR_W_DP_CH_STATUS2     0x13Bu
+#define SOR_AUDIO_CTRL_HDA      ((2u << 20) | (1u << 12))   /* source HDA, AFIFO flush */
+#define SOR_DP_AUDIO_ON         ((1u << 31) | (0x1Fu << 16) | 1u) /* new settings, CA/SS/SF/CC/CT from HW, enable */
+
+/* CAR: the HDA clocks (Linux tegra210: hda 51 MHz, hda2codec_2x 48 MHz from
+ * pll_p; L4T DP: maud 102 MHz from pll_p; hda2hdmi is a gate). */
+#define CARW(o)                 (((volatile ULONG *)gDpCar)[(o) / 4])
+#define CAR_X_SOR1              (1u << 23)          /* CLK_OUT_ENB_X 0x280, RST_DEVICES_X 0x28C */
+#define CAR_V_HDA               (1u << 29)
+#define CAR_V_HDA2CODEC         (1u << 15)
+#define CAR_W_HDA2HDMI          (1u << 0)
+#define CAR_Y_MAUD              (1u << 10)
+#define PMC_PG_SOR              (1u << 17)          /* PWRGATE_STATUS (PMC + 0x38) */
+
+/* Shared with switchaudio 1.1.0 (same steps, same values): turn on, never off. */
+static ULONG HdaClocksOn(VOID)
+{
+    ULONG before = (CARW(0x360) & (CAR_V_HDA | CAR_V_HDA2CODEC)) | (CARW(0x364) & CAR_W_HDA2HDMI) |
+                   ((CARW(0x298) & CAR_Y_MAUD) ? 0x100u : 0u);
+    if ((CARW(0x298) & CAR_Y_MAUD) == 0) {
+        CARW(0x6D4) = 6u;                           /* maud: pll_p / 4 = 102 MHz */
+        CARW(0x29C) = CAR_Y_MAUD;
+    }
+    if ((CARW(0x360) & CAR_V_HDA) == 0 || (CARW(0x358) & CAR_V_HDA) != 0) {
+        CARW(0x428) = 14u;                          /* hda: pll_p / 8 = 51 MHz */
+        CARW(0x3E4) = 15u;                          /* hda2codec_2x: pll_p / 8.5 = 48 MHz */
+        CARW(0x440) = CAR_V_HDA | CAR_V_HDA2CODEC;
+        CARW(0x448) = CAR_W_HDA2HDMI;
+        KeStallExecutionProcessor(10);
+        CARW(0x434) = CAR_V_HDA | CAR_V_HDA2CODEC;  /* RST_DEVICES_CLR_V */
+        CARW(0x43C) = CAR_W_HDA2HDMI;               /* RST_DEVICES_CLR_W */
+        KeStallExecutionProcessor(10);
+    }
+    return before;
+}
+
+/* A fixed ELD (L4T hda_dc.c layout): version 2, DP, "TV", one SAD = LPCM 2 ch
+ * 48 kHz 16 bit. Windows never sees it (switchaudio has its own formats). */
+static const UCHAR gTvEld[25] = {
+    0x10, 0x00, 0x06, 0x00,                         /* ELD v2, baseline 21 bytes = 6 dwords */
+    0x62,                                           /* CEA-861-D, monitor name 2 bytes */
+    0x14,                                           /* 1 SAD, conn_type DP */
+    0x00, 0x01,                                     /* sync delay, speakers FL/FR */
+    0, 0, 0, 0, 0, 0, 0, 0,                         /* port id */
+    0, 0, 0, 0,                                     /* manufacturer, product */
+    'T', 'V',
+    0x09, 0x04, 0x01,                               /* LPCM 2 ch, 48 kHz, 16 bit */
+};
+
+/* Called at the end of TvStartLocked (picture on). */
+static VOID TvAudioUp(ULONG Act)
+{
+    volatile ULONG *sor;
+    ULONG code, lanes, ef, pclk, hblank, hact, i, before;
+    LONGLONG hs, vs;
+
+    if (RegGetDword(L"TvAudio", 1) == 0) { RegPutDword(L"TvAudioState", 1); return; }
+    if (!DpMap()) { RegPutDword(L"TvAudioState", 2); return; }
+    if ((CARW(0x280) & CAR_X_SOR1) == 0 || (CARW(0x28C) & CAR_X_SOR1) != 0) { RegPutDword(L"TvAudioState", 3); return; }
+    if ((((volatile ULONG *)gDpPmc)[0x38 / 4] & PMC_PG_SOR) == 0) { RegPutDword(L"TvAudioState", 4); return; }
+    before = HdaClocksOn();
+    RegPutDword(L"TvAudioClocks", before);
+    sor = (volatile ULONG *)gDpSor;
+
+    code = (sor[SOR_W_CLK_CNTRL] >> 2) & 0x1Fu;     /* 0x0A = 2.7 Gbps: link clock code * 27 MHz */
+    i = (sor[SOR_W_LINKCTL0] >> 16) & 0x1Fu;        /* lane mask */
+    for (lanes = 0; i; i >>= 1) lanes += i & 1u;
+    ef = (sor[SOR_W_LINKCTL0] >> 14) & 1u;          /* enhanced framing */
+    if (Act == TV_ACT_1080) { pclk = 148500; hblank = 280; hact = 1920; }
+    else                    { pclk = 74250;  hblank = 370; hact = 1280; }
+    if (code == 0 || lanes == 0) { RegPutDword(L"TvAudioState", 5); return; }
+    /* L4T dp.c tegra_dc_dp_calc_config: link clock / pixel clock in kHz. */
+    hs = (LONGLONG)(hblank - 7u) * (code * 27000u) / pclk - 3 * (LONGLONG)ef - (LONGLONG)(12u / lanes);
+    vs = (LONGLONG)(hact - 25u) * (code * 27000u) / pclk - (LONGLONG)(36u / lanes) - 4;
+    if (hs < 0) hs = 0;
+    if (vs < 0) vs = 0;
+
+    sor[SOR_W_HDA_PRESENCE] = 0;                    /* presence off while the ELD is written */
+    sor[SOR_W_AUDIO_CTRL] = SOR_AUDIO_CTRL_HDA;
+    sor[SOR_W_AUDIO_SPARE0] |= 1u << 27;            /* advertise HBR */
+    sor[SOR_W_DP_AUDIO_HBLANK] = (sor[SOR_W_DP_AUDIO_HBLANK] & ~0x1FFFFu) | ((ULONG)hs & 0x1FFFFu);
+    sor[SOR_W_DP_AUDIO_VBLANK] = (sor[SOR_W_DP_AUDIO_VBLANK] & ~0x1FFFFu) | ((ULONG)vs & 0x1FFFFu);
+    sor[SOR_W_DP_AUDIO_CTRL] = SOR_DP_AUDIO_ON;
+    sor[SOR_W_DP_CH_STATUS2] &= ~(1u << 31);        /* no channel status override */
+    for (i = 0; i < 96; i++) sor[SOR_W_ELD_BUFWR] = (i << 8) | (i < sizeof(gTvEld) ? gTvEld[i] : 0u);
+    sor[SOR_W_HDA_PRESENCE] = 3u;                   /* ELDV + PD */
+
+    RegPutDword(L"TvAudioLink", (code << 8) | (lanes << 4) | ef);
+    RegPutDword(L"TvAudioSym", ((ULONG)hs << 16) | ((ULONG)vs & 0xFFFFu));
+    RegPutDword(L"TvAudioDevId", sor[SOR_W_AUDIO_GEN_CTRL] >> 16);
+    RegPutDword(L"TvAudioCtrl", sor[SOR_W_DP_AUDIO_CTRL]);
+    RegPutDword(L"TvAudioState", 6);
+}
+
+/* Unplug: presence off first, so switchaudio's jack goes to unplugged. */
+static VOID TvAudioDown(VOID)
+{
+    if (!DpMap()) return;
+    if ((CARW(0x280) & CAR_X_SOR1) == 0 || (CARW(0x28C) & CAR_X_SOR1) != 0) return;
+    ((volatile ULONG *)gDpSor)[SOR_W_HDA_PRESENCE] = 0;
+    ((volatile ULONG *)gDpSor)[SOR_W_DP_AUDIO_CTRL] = 0;
+    RegPutDword(L"TvAudioState", 7);
+}
+
 /* Unplugged: give the window back, stop DC-B, hold SOR1 and DC-B in reset
  * (the next bring-up starts both from reset, as in UEFI). */
 static VOID DpTearDown(PSWD_CONTEXT Ctx)
 {
     volatile ULONG *car;
+    TvAudioDown();
     TvStop(Ctx);
     if (!DpMap()) return;
     car = (volatile ULONG *)gDpCar;
@@ -954,7 +1081,7 @@ static VOID DpBringUp(PSWD_CONTEXT Ctx)
     mR426Ok = FALSE; mR427Ok = FALSE; mR429Ok = FALSE;
     mR426Step = NULL; mR427Step = NULL; mR429Step = NULL;
     mR426Hpd = FALSE; mR426DpcdOk = FALSE; mR426EdidOk = FALSE;
-    DpLog(L"switchdisplay 1.5.0 DP Alt bring-up (attempt %u)\r\n", Ctx->DpFails + 1);
+    DpLog(L"switchdisplay 1.6.0 DP Alt bring-up (attempt %u)\r\n", Ctx->DpFails + 1);
     if (!DpMap()) {
         DpLog(L"register mapping failed\r\n");
     } else {

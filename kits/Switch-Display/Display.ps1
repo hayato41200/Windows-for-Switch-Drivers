@@ -126,6 +126,10 @@ function Show-Trace {
   if ($null -ne $p.TvState) {
     $tvs = @{ 1 = 'off (TvMirror=0)'; 2 = 'could not map registers'; 3 = 'no TV (DC-B clock off: UEFI did not start DP Alt)'; 4 = 'no TV (DC-B not driving SOR1 at 1280x720)'; 5 = 'no memory for the TV buffer'; 6 = 'ON' }
     Sum ('TV mirror (DP Alt): {0}  DC-B cmd 0x{1:X} winopt 0x{2:X} active 0x{3:X}  buffer 0x{4:X8}  presents {5}  mode {6}x{7}' -f $tvs[[int]$p.TvState], [uint32]$p.TvDispCmd, [uint32]$p.TvDispWinOpt, [uint32]$p.TvActive, [uint32]$p.TvBufLo, $p.TvPresents, ([uint32]$p.TvActive -band 0xFFFF), ([uint32]$p.TvActive -shr 16))
+    if ($null -ne $p.TvAudioState) {
+      # 1.6.0: 1 off (TvAudio=0), 2 mapping failed, 3 SOR1 clock off, 4 SOR partition off, 5 no link, 6 on, 7 off after unplug
+      Sum ('TV audio (SOR1): state {0} (6 = on)  HDA clocks before 0x{1:X}  link 0x{2:X} (code/lanes/EF)  h/v blank symbols 0x{3:X8}  codec dev id 0x{4:X}  DP_AUDIO_CTRL 0x{5:X8}' -f $p.TvAudioState, [uint32]$p.TvAudioClocks, [uint32]$p.TvAudioLink, [uint32]$p.TvAudioSym, [uint32]$p.TvAudioDevId, [uint32]$p.TvAudioCtrl)
+    }
     Sum ('TV hot-plug: notes {0}  bring-ups OK {1}  unplugs {2}  failures {3}  last step 0x{4:X} (5 = TV on, 0x10N = stuck in stage N)  callback 0x{5:X}' -f $p.DpNotes, $p.DpUps, $p.DpDowns, $p.DpFails, $p.DpLastStep, [uint32]$p.DpRegister)
     if ($p.TvLog) { Log '--- TV bring-up log (last attempt)'; foreach ($l in ($p.TvLog -split "`r?`n")) { if ($l) { Log ('  ' + $l) } } }
   }
