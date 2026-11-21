@@ -50,6 +50,9 @@
  *     stream parameters from the codec, a fixed ELD (2 ch LPCM 48 kHz) and the
  *     presence bits (the codec's pin sense, switchaudio's jack). Registry
  *     TvAudio=0 turns it off.
+ *     1.6.1: TvAudioState is reset to 0 at every start, so switchaudio can
+ *     read it (6 = on, 7 = off after unplug) next to the codec's pin sense,
+ *     which stayed 0 after an unplug and re-plug with 1.6.0.
  *
  * Trace: HKLM\SYSTEM\CurrentControlSet\Services\switchdisplay\Parameters
  */#define DXGKDDI_INTERFACE_VERSION 0x4002 /* DXGKDDI_INTERFACE_VERSION_WDDM1_3 */
@@ -58,7 +61,7 @@
 #include <ntstrsafe.h>
 #include <stdarg.h>
 
-#define SWD_VERSION        0x00010600u   /* 1.6.0 */
+#define SWD_VERSION        0x00010601u   /* 1.6.1 */
 #define SWD_TAG            'DwsS'
 
 /* Boot framebuffer (coreboot display.c / UEFI MemoryMap.h "Display Reserved") */
@@ -1031,6 +1034,8 @@ static VOID TvAudioUp(ULONG Act)
     sor[SOR_W_DP_CH_STATUS2] &= ~(1u << 31);        /* no channel status override */
     for (i = 0; i < 96; i++) sor[SOR_W_ELD_BUFWR] = (i << 8) | (i < sizeof(gTvEld) ? gTvEld[i] : 0u);
     sor[SOR_W_HDA_PRESENCE] = 3u;                   /* ELDV + PD */
+    RegPutDword(L"TvAudioPresence", sor[SOR_W_HDA_PRESENCE]);
+    RegPutDword(L"TvAudioUps", RegGetDword(L"TvAudioUps", 0) + 1);
 
     RegPutDword(L"TvAudioLink", (code << 8) | (lanes << 4) | ef);
     RegPutDword(L"TvAudioSym", ((ULONG)hs << 16) | ((ULONG)vs & 0xFFFFu));
@@ -1081,7 +1086,7 @@ static VOID DpBringUp(PSWD_CONTEXT Ctx)
     mR426Ok = FALSE; mR427Ok = FALSE; mR429Ok = FALSE;
     mR426Step = NULL; mR427Step = NULL; mR429Step = NULL;
     mR426Hpd = FALSE; mR426DpcdOk = FALSE; mR426EdidOk = FALSE;
-    DpLog(L"switchdisplay 1.6.0 DP Alt bring-up (attempt %u)\r\n", Ctx->DpFails + 1);
+    DpLog(L"switchdisplay 1.6.1 DP Alt bring-up (attempt %u)\r\n", Ctx->DpFails + 1);
     if (!DpMap()) {
         DpLog(L"register mapping failed\r\n");
     } else {
@@ -1283,6 +1288,7 @@ NTSTATUS SwdStartDevice(IN_CONST_PVOID MiniportDeviceContext, IN_PDXGK_START_INF
     ctx->Dxgk = *DxgkInterface;
 
     RegPutDword(L"Version", SWD_VERSION);
+    RegPutDword(L"TvAudioState", 0);        /* 1.6.1: switchaudio reads it (6 = TV audio on) */
     {
         /* Values only the 1.0.x test builds wrote. */
         static const PCWSTR old[] = { L"TgtVariant", L"TgtAddSt", L"TgtAssignSt", L"MonVariant", L"QaiTypes",

@@ -87,6 +87,12 @@
  * in MMDevices as not present, with no jack property call and no event
  * subscription. The jack automation table moves from pin 1 to the topology
  * filter (SYSVAD layout); the event is generated as a filter event.
+ *
+ * 1.1.3: with 1.1.2 Windows asked about the jack and the endpoint became
+ * "unplugged", but after an unplug and re-plug the pin sense stayed 0 while
+ * the TV picture and SOR1 audio came back. Presence = pin sense OR
+ * switchdisplay's TvAudioState == 6 (switchdisplay 1.6.1). TvSenseRaw and
+ * TvDisplayState are traced at each change.
  */
 
 #define INITGUID
@@ -688,7 +694,28 @@ static VOID TvScratchFormat(ULONG Format)
     (VOID)TvVerb(g_Tv.Afg, V_NV_SCRATCH0_BYTE3, v);
 }
 
-/* Pin sense: bit 31 presence (SOR1 HDA_PRESENCE.PD from switchdisplay). */
+/* 1.1.3: switchdisplay 1.6.1 keeps its TV audio state in its registry
+   (6 = on, reset to 0 at its start). */
+static ULONG TvDisplayState(VOID)
+{
+    RTL_QUERY_REGISTRY_TABLE Table[2];
+    ULONG Value = 0;
+    RtlZeroMemory(Table, sizeof(Table));
+    Table[0].Flags = RTL_QUERY_REGISTRY_DIRECT | RTL_QUERY_REGISTRY_REQUIRED | RTL_QUERY_REGISTRY_TYPECHECK;
+    Table[0].Name = (PWSTR)L"TvAudioState";
+    Table[0].EntryContext = &Value;
+    Table[0].DefaultType = (REG_DWORD << RTL_QUERY_REGISTRY_TYPECHECK_SHIFT) | REG_NONE;
+    if (!NT_SUCCESS(RtlQueryRegistryValues(RTL_REGISTRY_SERVICES, (PWSTR)L"switchdisplay\\Parameters", Table, NULL, NULL))) {
+        return 0;
+    }
+    return Value;
+}
+
+static ULONG g_TvSenseRaw;
+
+/* Pin sense: bit 31 presence (SOR1 HDA_PRESENCE.PD from switchdisplay).
+   1.1.3: or switchdisplay says TV audio is on (the pin sense stayed 0 after
+   an unplug and re-plug with 1.1.2). */
 static BOOLEAN TvSense(VOID)
 {
     ULONG Sense;
@@ -697,7 +724,9 @@ static BOOLEAN TvSense(VOID)
         TvStall(1000);
     }
     Sense = TvVerb(g_Tv.Pin, V_GET_PIN_SENSE, 0);
-    return Sense != TV_VERB_FAIL && (Sense & 0x80000000u) != 0;
+    g_TvSenseRaw = Sense;
+    if (Sense != TV_VERB_FAIL && (Sense & 0x80000000u) != 0) return TRUE;
+    return TvDisplayState() == 6;
 }
 
 /* Stream descriptor: reset, BDL over the buffer (no entry across 4 KB), format. */
@@ -1764,6 +1793,8 @@ static VOID TvJackThread(PVOID Context)
         if (Now != g_Tv.Present) {
             InterlockedExchange(&g_Tv.Present, Now);
             SaTrace(L"TvPresent", (ULONG)Now);
+            SaTrace(L"TvSenseRaw", g_TvSenseRaw);
+            SaTrace(L"TvDisplayState", TvDisplayState());
             SaTrace(L"TvJackChanges", ++Changes);
             if (g_Tv.PortEvents != NULL) {
                 ((PPORTEVENTS)g_Tv.PortEvents)->GenerateEventList((GUID *)&KSEVENTSETID_PinCapsChange,

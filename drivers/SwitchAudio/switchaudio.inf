@@ -9,7 +9,7 @@ Class       = MEDIA
 ClassGuid   = {4d36e96c-e325-11ce-bfc1-08002be10318}
 Provider    = %Mfg%
 CatalogFile = switchaudio.cat
-DriverVer   = 11/21/2026,1.1.2.0
+DriverVer   = 11/21/2026,1.1.3.0
 PnpLockdown = 1
 
 [DestinationDirs]

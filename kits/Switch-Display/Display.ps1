@@ -113,7 +113,7 @@ function Show-Adapters {
 function Show-Trace {
   $p = Get-ItemProperty $Key -ErrorAction SilentlyContinue
   if (-not $p) { Log 'switchdisplay trace: (no Parameters key)'; return }
-  $vals = $p.PSObject.Properties | Where-Object { $_.Name -notmatch '^PS' } | ForEach-Object { '{0}=0x{1:X}' -f $_.Name, [uint32]$_.Value }
+  $vals = $p.PSObject.Properties | Where-Object { $_.Name -notmatch '^PS' -and $_.Value -isnot [string] } | ForEach-Object { '{0}=0x{1:X}' -f $_.Name, [uint32]$_.Value }
   Log ('switchdisplay trace: ' + ($vals -join ' '))
   if ($null -ne $p.Version) { Sum ('switchdisplay {0}.{1}.{2}  starts {3}' -f ($p.Version -shr 16), (($p.Version -shr 8) -band 0xFF), ($p.Version -band 0xFF), $p.StartCount) }
   $src = @{ 0 = 'none (start refused)'; 1 = 'taken from Basic Display (POST)'; 2 = 'fixed 0xdfb80000' }
