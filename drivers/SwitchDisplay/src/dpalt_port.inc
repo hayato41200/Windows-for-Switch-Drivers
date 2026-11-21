@@ -54,6 +54,7 @@ STATIC BOOLEAN mR426Hpd;
 STATIC UINT8 mR426Dpcd[16];
 STATIC BOOLEAN mR426DpcdOk;
 STATIC BOOLEAN mR426EdidOk;
+STATIC BOOLEAN mR426Has1080;   // R443: the EDID lists 1920x1080@60 (DTD 148.5 MHz or standard timing D1 C0)
 STATIC CHAR16 mR426Mfg[4];
 STATIC CHAR16 mR426Name[14];
 STATIC UINT32 mR426W, mR426H, mR426Hz;
@@ -149,6 +150,7 @@ STATIC VOID R426ParseEdid (CONST UINT8 *E) {
   UINT16 M;
   UINT32 Pclk, Ha, Hb, Va, Vb, Tot;
   CONST UINT8 *D;
+  mR426Has1080 = FALSE;
   for (I = 0; I < 128; ++I) Sum = (UINT8)(Sum + E[I]);
   if (CompareMem (E, Hdr, 8) != 0) {
     DpLog (L"R426 EDID: bad header\r\n");
@@ -182,6 +184,16 @@ STATIC VOID R426ParseEdid (CONST UINT8 *E) {
     DpLog (L"R426 EDID preferred: %ux%u @ %u Hz (pixel clock %u.%02u MHz)\r\n",
            Ha, Va, mR426Hz, Pclk / 100, Pclk % 100);
   }
+  // R443: does the sink take CEA 1920x1080@60 (any detailed timing, or a standard timing)?
+  for (K = 0; K < 4; ++K) {
+    D = E + 54 + 18 * K;
+    if ((UINT32)(D[0] | (D[1] << 8)) == 14850U && (D[2] | ((UINT32)(D[4] >> 4) << 8)) == 1920U &&
+        (D[5] | ((UINT32)(D[7] >> 4) << 8)) == 1080U && (D[17] & 0x80U) == 0)
+      mR426Has1080 = TRUE;
+  }
+  for (K = 38; K < 54; K += 2)
+    if (E[K] == 0xD1 && E[K + 1] == 0xC0) mR426Has1080 = TRUE;
+  DpLog (L"R443 EDID: 1920x1080@60 %s\r\n", mR426Has1080 ? L"listed" : L"not listed");
   DpLog (L"R426 EDID: maker %s product %04x name \"%s\" version %u.%u extensions %u checksum %s\r\n",
          mR426Mfg, (UINT32)(E[10] | (E[11] << 8)), mR426Name, E[18], E[19], E[126],
          Sum == 0 ? L"OK" : L"BAD");
@@ -758,16 +770,28 @@ STATIC VOID R427DpLinkStage2b (VOID) {
 #define R429_SOR_CSTM           0x1BU
 #define R429_SOR_HBLANK_SYM     0x63U
 #define R429_SOR_VBLANK_SYM     0x64U
-// CEA-861 mode 4: 1280x720@60, +hsync +vsync
-#define R429_HACT  1280U
-#define R429_HFP   110U
-#define R429_HSYNC 40U
-#define R429_HBP   220U
-#define R429_VACT  720U
-#define R429_VFP   5U
-#define R429_VSYNC 5U
-#define R429_VBP   20U
-#define R429_PCLK  74250000U   // R433: PLLD2 594/8 = 74.25 MHz, shift divider 1
+// R443: the TV mode is chosen from the EDID. CEA-861 mode 4 (1280x720@60) or
+// mode 16 (1920x1080@60), both +hsync +vsync. PLLD2 VCO is 1188 MHz; PllP is
+// the hardware post-divider code (tegra210 pll_qlin: 16 -> 11, 8 -> 6).
+typedef struct {
+  UINT32 Hact, Hfp, Hsync, Hbp, Vact, Vfp, Vsync, Vbp, Pclk, PllP;
+  CONST CHAR16 *Name;
+  CONST CHAR16 *Clock;
+} R443_MODE;
+STATIC CONST R443_MODE mR443Modes[2] = {
+  { 1280, 110, 40, 220, 720, 5, 5, 20, 74250000U, 11, L"1280x720@60", L"PLLD2 74.25 MHz" },
+  { 1920, 88, 44, 148, 1080, 4, 5, 36, 148500000U, 6, L"1920x1080@60", L"PLLD2 148.5 MHz" },
+};
+STATIC CONST R443_MODE *mR443Mode = &mR443Modes[0];
+#define R429_HACT  (mR443Mode->Hact)
+#define R429_HFP   (mR443Mode->Hfp)
+#define R429_HSYNC (mR443Mode->Hsync)
+#define R429_HBP   (mR443Mode->Hbp)
+#define R429_VACT  (mR443Mode->Vact)
+#define R429_VFP   (mR443Mode->Vfp)
+#define R429_VSYNC (mR443Mode->Vsync)
+#define R429_VBP   (mR443Mode->Vbp)
+#define R429_PCLK  (mR443Mode->Pclk)   // R433: PLLD2 1188 MHz / P, shift divider 1
 
 STATIC CONST CHAR16 *mR429Step = NULL;
 STATIC BOOLEAN mR429Ok;
@@ -903,7 +927,7 @@ STATIC BOOLEAN R433PllD2 (VOID) {
   Car[R433_PLLD2_MISC2 / 4] = 0;
   Car[R433_PLLD2_MISC3 / 4] = 0x00000E00U;       // SDM din
   DpStall (1);
-  B = R427_PLL_IDDQ | (11U << 19) | (30U << 8) | 1U;
+  B = R427_PLL_IDDQ | (mR443Mode->PllP << 19) | (30U << 8) | 1U;   // R443: P from the TV mode
   Car[R433_PLLD2_BASE / 4] = B;
   DpStall (2);
   B &= ~R427_PLL_IDDQ;
@@ -972,8 +996,19 @@ STATIC VOID R429DpVideoStage3 (VOID) {
   INT32 Hb, Vb;
   UINT8 Ls[6];
 
-  DpLog (L"\r\n---- R429 DP Alt Mode stage 3 (DC-B -> SOR1, 1280x720@60 solid colour) ----\r\n");
+  DpLog (L"\r\n---- R429 DP Alt Mode stage 3 (DC-B -> SOR1) ----\r\n");
   mR429Step = L"TU-CALC";
+  // R443: 1920x1080@60 when the EDID lists it and it fits the trained link
+  mR443Mode = &mR443Modes[0];
+  if (mR426Has1080) {
+    mR443Mode = &mR443Modes[1];
+    if (!R429CalcTu (LinkRate, &Tu, &Act, &Frac, &Pol, &Wm, &Hb, &Vb)) {
+      DpLog (L"R443 1920x1080@60 does not fit the link (%u Mbit/s per lane): 1280x720@60\r\n",
+             LinkRate / 100000U);
+      mR443Mode = &mR443Modes[0];
+    }
+  }
+  DpLog (L"R443 TV mode %s (pixel clock %u kHz)\r\n", mR443Mode->Name, R429_PCLK / 1000U);
   if (!R429CalcTu (LinkRate, &Tu, &Act, &Frac, &Pol, &Wm, &Hb, &Vb)) {
     DpLog (L"R429 mode does not fit the link. Stopped.\r\n");
     return;
@@ -1071,7 +1106,7 @@ STATIC VOID R429DpVideoStage3 (VOID) {
   R429DcDump (L"attached");
   mR433Fps10 = R433MeasureFps ();
   DpLog (L"R433 DC-B measured about %u.%u frames/s (want 60.0; clock %s)\r\n", mR433Fps10 / 10, mR433Fps10 % 10,
-         mR433PllD2 ? L"PLLD2 74.25 MHz" : L"PLLP/5.5");
+         mR433PllD2 ? mR443Mode->Clock : L"PLLP/5.5");
   R429DcWr (R429_DC_INT_STATUS, 0xFFFFFFFFU);
   DpStall (100000);
   V = R429DcRd (R429_DC_INT_STATUS);
