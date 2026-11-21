@@ -82,6 +82,11 @@
  * calls (TvJackCalls/Gets/Last) and event subscriptions (TvEventAdds/Other),
  * and the jack event is sent again 5 s and 30 s after the start. TvTestTone is
  * now read by the jack thread (TvTone.cmd works without a device restart).
+ *
+ * 1.1.2: 1.1.1 showed the tone on the TV, and the endpoint "Digital Output"
+ * in MMDevices as not present, with no jack property call and no event
+ * subscription. The jack automation table moves from pin 1 to the topology
+ * filter (SYSVAD layout); the event is generated as a filter event.
  */
 
 #define INITGUID
@@ -1048,12 +1053,15 @@ static PCPIN_DESCRIPTOR g_TvTopoPins[] = {
     { 0, 0, 0, NULL,
       { 0, NULL, 0, NULL, ARRAYSIZE(g_BridgeRanges), g_BridgeRanges, KSPIN_DATAFLOW_IN, KSPIN_COMMUNICATION_NONE,
         &KSCATEGORY_AUDIO, NULL, { 0 } } },
-    { 0, 0, 0, &g_TvJackAutomation,
+    { 0, 0, 0, NULL,
       { 0, NULL, 0, NULL, ARRAYSIZE(g_BridgeRanges), g_BridgeRanges, KSPIN_DATAFLOW_OUT, KSPIN_COMMUNICATION_NONE,
         &KSNODETYPE_HDMI_INTERFACE, NULL, { 0 } } },
 };
+/* 1.1.2: the jack property and event on the FILTER (as SYSVAD), with KSP_PIN
+   naming pin 1. On the pin (1.1.0/1.1.1) Windows never reached the handler
+   and kept the endpoint "not present". */
 static PCFILTER_DESCRIPTOR g_TvTopoFilter = {
-    0, NULL, sizeof(PCPIN_DESCRIPTOR), ARRAYSIZE(g_TvTopoPins), g_TvTopoPins,
+    0, &g_TvJackAutomation, sizeof(PCPIN_DESCRIPTOR), ARRAYSIZE(g_TvTopoPins), g_TvTopoPins,
     sizeof(PCNODE_DESCRIPTOR), 0, NULL, ARRAYSIZE(g_TopoConnections), g_TopoConnections,
     ARRAYSIZE(g_TopoCategories), g_TopoCategories
 };
@@ -1750,7 +1758,7 @@ static VOID TvJackThread(PVOID Context)
         }
         if (Kick && g_Tv.PortEvents != NULL) {
             ((PPORTEVENTS)g_Tv.PortEvents)->GenerateEventList((GUID *)&KSEVENTSETID_PinCapsChange,
-                                                             KSEVENT_PINCAPS_JACKINFOCHANGE, TRUE, 1, FALSE, (ULONG)-1);
+                                                             KSEVENT_PINCAPS_JACKINFOCHANGE, FALSE, (ULONG)-1, FALSE, (ULONG)-1);
             SaTrace(L"TvKicks", Loops);
         }
         if (Now != g_Tv.Present) {
@@ -1759,7 +1767,7 @@ static VOID TvJackThread(PVOID Context)
             SaTrace(L"TvJackChanges", ++Changes);
             if (g_Tv.PortEvents != NULL) {
                 ((PPORTEVENTS)g_Tv.PortEvents)->GenerateEventList((GUID *)&KSEVENTSETID_PinCapsChange,
-                                                                 KSEVENT_PINCAPS_JACKINFOCHANGE, TRUE, 1, FALSE, (ULONG)-1);
+                                                                 KSEVENT_PINCAPS_JACKINFOCHANGE, FALSE, (ULONG)-1, FALSE, (ULONG)-1);
             }
         }
     }
