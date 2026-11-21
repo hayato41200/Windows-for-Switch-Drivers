@@ -76,6 +76,12 @@
  * TvStage 0x32 = endpoint registered. Parameters\TvTestTone = 1 plays one
  * second of 1 kHz to the TV at the next start; TvAudioOff = 1 leaves the HDA
  * alone (speaker only).
+ *
+ * 1.1.1: with 1.1.0 the TV endpoint was registered and the pin sense said
+ * connected, but Windows listed no TV. Traces now count the jack property
+ * calls (TvJackCalls/Gets/Last) and event subscriptions (TvEventAdds/Other),
+ * and the jack event is sent again 5 s and 30 s after the start. TvTestTone is
+ * now read by the jack thread (TvTone.cmd works without a device restart).
  */
 
 #define INITGUID
@@ -945,10 +951,15 @@ static PCFILTER_DESCRIPTOR g_TopoFilter = {
     ARRAYSIZE(g_TopoCategories), g_TopoCategories
 };
 
+/* 1.1.1: how Windows asks about the TV jack (Parameters TvJackGets etc.). */
+static LONG g_TvJackCalls, g_TvJackGets, g_TvJackLast, g_TvEventAdds, g_TvEventOther;
+
 /* 1.1.0, TV topology: pin 1 = HDMI out with a jack (presence from the codec pin sense). */
 static NTSTATUS TvJackProperty(PPCPROPERTY_REQUEST Req)
 {
     ULONG Need;
+    InterlockedIncrement(&g_TvJackCalls);
+    g_TvJackLast = (LONG)((Req->PropertyItem->Id << 8) | (Req->Verb & 0xFF) | (Req->InstanceSize << 16));
     if (Req->InstanceSize < sizeof(ULONG) || *(PULONG)Req->Instance != 1) {
         return STATUS_INVALID_PARAMETER;
     }
@@ -1002,6 +1013,7 @@ static NTSTATUS TvJackProperty(PPCPROPERTY_REQUEST Req)
             J->GenLocation = eGenLocPrimaryBox;
             J->PortConnection = ePortConnJack;
             J->IsConnected = g_Tv.Present != 0;
+            InterlockedIncrement(&g_TvJackGets);
         }
     }
     Req->ValueSize = Need;
@@ -1012,9 +1024,13 @@ static NTSTATUS TvJackEvent(PPCEVENT_REQUEST Req)
 {
     if (Req->Verb == PCEVENT_VERB_ADD) {
         if (g_Tv.PortEvents == NULL || Req->EventEntry == NULL) {
+            InterlockedIncrement(&g_TvEventOther);
             return STATUS_UNSUCCESSFUL;
         }
         ((PPORTEVENTS)g_Tv.PortEvents)->AddEventToEventList(Req->EventEntry);
+        InterlockedIncrement(&g_TvEventAdds);
+    } else {
+        InterlockedAdd(&g_TvEventOther, 0x10000);
     }
     return STATUS_SUCCESS;
 }
@@ -1707,11 +1723,36 @@ STDMETHODIMP_(NTSTATUS) CSaTopo::Init(PUNKNOWN UnknownAdapter, PRESOURCELIST Res
 static VOID TvJackThread(PVOID Context)
 {
     LARGE_INTEGER Period;
-    ULONG Changes = 0;
+    ULONG Changes = 0, Loops = 0, Shown = 0xFFFFFFFFu;
     UNREFERENCED_PARAMETER(Context);
     Period.QuadPart = -500LL * 10000;
     while (KeWaitForSingleObject(&g_Tv.Stop, Executive, KernelMode, FALSE, &Period) == STATUS_TIMEOUT) {
         LONG Now = TvSense() ? 1 : 0;
+        BOOLEAN Kick = FALSE;
+        ++Loops;
+        /* 1.1.1: TvTone.cmd sets TvTestTone = 1; play it here, no device restart needed. */
+        if ((Loops & 1) == 0 && SaReadParam(L"TvTestTone") != 0) {
+            TvTestTone();
+        }
+        /* 1.1.1: tell Windows again 5 s and 30 s after the start, in case it asked
+           before switchdisplay set the presence and missed the change. */
+        if (Loops == 10 || Loops == 60) Kick = TRUE;
+        {
+            ULONG Sum = (ULONG)g_TvJackCalls + ((ULONG)g_TvJackGets << 8) + ((ULONG)g_TvEventAdds << 16) + (ULONG)g_TvEventOther;
+            if (Sum != Shown) {
+                Shown = Sum;
+                SaTrace(L"TvJackCalls", (ULONG)g_TvJackCalls);
+                SaTrace(L"TvJackGets", (ULONG)g_TvJackGets);
+                SaTrace(L"TvJackLast", (ULONG)g_TvJackLast);
+                SaTrace(L"TvEventAdds", (ULONG)g_TvEventAdds);
+                SaTrace(L"TvEventOther", (ULONG)g_TvEventOther);
+            }
+        }
+        if (Kick && g_Tv.PortEvents != NULL) {
+            ((PPORTEVENTS)g_Tv.PortEvents)->GenerateEventList((GUID *)&KSEVENTSETID_PinCapsChange,
+                                                             KSEVENT_PINCAPS_JACKINFOCHANGE, TRUE, 1, FALSE, (ULONG)-1);
+            SaTrace(L"TvKicks", Loops);
+        }
         if (Now != g_Tv.Present) {
             InterlockedExchange(&g_Tv.Present, Now);
             SaTrace(L"TvPresent", (ULONG)Now);

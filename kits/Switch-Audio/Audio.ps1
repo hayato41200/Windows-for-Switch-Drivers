@@ -10,8 +10,8 @@
                   Windows audio engine (TestTone=1, then the device restarts), then report
   -Mode Check   : plays a Windows sound through the audio engine, lists audio errors from the
                   event logs (last hour), then report
-  -Mode TvTone  : (1.1.0+) the driver plays one second of 1 kHz to the TV from its own buffer
-                  (TvTestTone=1, then the device restarts), then report
+  -Mode TvTone  : (1.1.1+) the driver plays one second of 1 kHz to the TV from its own buffer
+                  (TvTestTone=1, picked up by the driver within a second), then report
   -Mode TvReset : (1.1.0+) clears TvPending (set when a start hung in the TV part), restarts the device
 
   Log: C:\SwitchWOA-Audio.txt
@@ -85,6 +85,18 @@ function Show-Status {
       }
     }
   } else { Log 'driver trace: (no Parameters key)' }
+  # 1.1.1: every render endpoint Windows knows, with its state (also unplugged/disabled ones).
+  $mm = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\MMDevices\Audio\Render'
+  $states = @{ 1 = 'active'; 2 = 'disabled'; 4 = 'not present'; 8 = 'unplugged' }
+  foreach ($k in @(Get-ChildItem $mm -ErrorAction SilentlyContinue)) {
+    $st = (Get-ItemProperty $k.PSPath -ErrorAction SilentlyContinue).DeviceState
+    $pp = Get-ItemProperty (Join-Path $k.PSPath 'Properties') -ErrorAction SilentlyContinue
+    $name = $pp.'{a45c254e-df1c-4efd-8020-67d146a850e0},2'
+    $dev = $pp.'{b3f8fa53-0004-438e-9003-51a46e139bfc},6'
+    $s2 = $states[[int]($st -band 0xF)]
+    if (-not $s2) { $s2 = 'state' }
+    Log ("render endpoint: '{0}' ({1})  {2} 0x{3:X}" -f $name, $dev, $s2, [uint32]$st)
+  }
   $ep = @(Get-CimInstance Win32_PnPEntity -ErrorAction SilentlyContinue | Where-Object { $_.PNPClass -eq 'AudioEndpoint' })
   foreach ($e in $ep) { Log ("endpoint: '{0}' status={1} problem={2}" -f $e.Name, $e.Status, $e.ConfigManagerErrorCode) }
   if ($ep.Count -eq 0) { Log 'endpoint: none' }
@@ -133,8 +145,7 @@ switch ($Mode) {
   'TvTone' {
     if (-not (Test-Path $Key)) { New-Item -Path $Key | Out-Null }
     Set-ItemProperty -Path $Key -Name TvTestTone -Value 1 -Type DWord
-    $dev = @(Get-CimInstance Win32_PnPEntity -ErrorAction SilentlyContinue | Where-Object { $_.PNPDeviceID -like 'ACPI\SWOA0C01*' })
-    foreach ($d in $dev) { Log (& $Pnputil /restart-device $d.PNPDeviceID | Out-String) }
+    # 1.1.1: the driver's jack thread picks it up within a second (no device restart).
     Log 'Listen: a one-second 1 kHz tone should play on the TV now.'
     Start-Sleep -Seconds 4
     Show-Status
