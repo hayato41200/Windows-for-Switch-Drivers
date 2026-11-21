@@ -43,6 +43,11 @@
  * kernel callback \Callback\SwitchWoaDpAlt (Argument1 = 1 up / 0 down,
  * Argument2 = DP_STATUS), on every change and every 5 s while up. Registry
  * DpAlt=0 turns it off.
+ *
+ * v8: DP Alt Mode also on the host path (the Switch powers VBUS), for
+ * USB-C -> HDMI adapters and hubs without their own power: 2 s after VBUS
+ * is on (and at start when UEFI left VBUS on), the same steps run once per
+ * plug-in. A partner without USB PD just fails Discover Identity (step 2).
  */
 #include <ntddk.h>
 #include <ntstrsafe.h>
@@ -116,6 +121,7 @@
 #define VDO_DP_PIN_C            (1u << 2)
 #define VDO_DP_PIN_D            (1u << 3)
 #define DPALT_NOTIFY_POLLS      10              /* re-notify every 5 s while up */
+#define DPALT_HOST_POLLS        4               /* v8: try DP 2 s after VBUS on */
 
 typedef enum _USBC_STATE { UsbcIdle = 0, UsbcHost = 1, UsbcSink = 2 } USBC_STATE;
 
@@ -141,6 +147,7 @@ typedef struct _SWBAT_DEVICE {
     BOOLEAN DpAllowed;
     BOOLEAN DpUp;
     ULONG DpTries, DpUps, DpNotifyPolls;
+    ULONG DpHostPolls;                          /* v8: polls since VBUS on */
     USHORT DpStatus;
     PCALLBACK_OBJECT DpCallback;
 } SWBAT_DEVICE, *PSWBAT_DEVICE;
@@ -731,6 +738,7 @@ static VOID SwBatUsbcPoll(PSWBAT_DEVICE Dev)
                 if (NT_SUCCESS(Status)) {
                     Dev->Usbc = UsbcHost;
                     Dev->BoostBad = Dev->BoostRestartsInRow = Dev->BoostWait = 0;
+                    Dev->DpHostPolls = 0;
                 }
             }
         }
@@ -747,12 +755,23 @@ static VOID SwBatUsbcPoll(PSWBAT_DEVICE Dev)
             }
             Dev->Usbc = UsbcIdle;
             Dev->HostStreak = Dev->SinkStreak = Dev->GoneStreak = Dev->StuckPolls = 0;
-        } else if (Dev->Usbc == UsbcHost && Inserted) {
-            SwBatCheckBoost(Dev, Sys);
-        } else if (Dev->DpUp && ++Dev->DpNotifyPolls >= DPALT_NOTIFY_POLLS) {
-            USHORT Dp = Dev->DpStatus;
-            (VOID)SwBatRead16(Dev->Pd, BM_DP_STATUS, &Dp);
-            SwBatDpSetUp(Dev, (Dp & BM_DP_EN) != 0, Dp);
+        } else {
+            if (Dev->Usbc == UsbcHost && Inserted) {
+                SwBatCheckBoost(Dev, Sys);
+                /* v8: unpowered DP adapters: try DP Alt once, 2 s after VBUS on */
+                if (!Dev->DpUp && Dev->DpHostPolls < DPALT_HOST_POLLS &&
+                    ++Dev->DpHostPolls == DPALT_HOST_POLLS) {
+                    SwBatDpAltCheck(Dev);
+                }
+            }
+            if (!(Dev->DpUp && ++Dev->DpNotifyPolls >= DPALT_NOTIFY_POLLS)) {
+                break;
+            }
+            {
+                USHORT Dp = Dev->DpStatus;
+                (VOID)SwBatRead16(Dev->Pd, BM_DP_STATUS, &Dp);
+                SwBatDpSetUp(Dev, (Dp & BM_DP_EN) != 0, Dp);
+            }
         }
         break;
     }
@@ -773,6 +792,7 @@ static VOID SwBatUsbcStart(PSWBAT_DEVICE Dev)
     Dev->Usbc = UsbcIdle;
     if (NT_SUCCESS(SwBatReadRegs(Dev->Charger, BQ_PWR_ON, &Pwr, 1)) && (Pwr & BQ_MODE_MASK) == BQ_MODE_OTG) {
         Dev->Usbc = UsbcHost;                       /* GoneStreak turns VBUS off if nothing is there */
+        Dev->DpHostPolls = 0;                       /* v8: UEFI R444 may have entered DP on this path */
     } else if (NT_SUCCESS(SwBatRead16(Dev->Pd, BM_STATUS1, &S1)) && (S1 & BM_INSERT) != 0 &&
                (S1 & BM_SRC_MODE) == 0 && (S1 & BM_VSAFE) != 0) {
         Dev->Usbc = UsbcSink;                       /* UEFI R363 already configured charging */
@@ -1205,7 +1225,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
         RtlCopyMemory(&SwBatParamsPath[RegistryPath->Length / sizeof(WCHAR)], L"\\Parameters", sizeof(L"\\Parameters"));
         (VOID)RtlCreateRegistryKey(RTL_REGISTRY_ABSOLUTE, SwBatParamsPath);
     }
-    SwBatTrace(L"DriverVersion", 7);
+    SwBatTrace(L"DriverVersion", 8);
 
     WDF_DRIVER_CONFIG_INIT(&Config, SwBatEvtDeviceAdd);
     return WdfDriverCreate(DriverObject, RegistryPath, WDF_NO_OBJECT_ATTRIBUTES, &Config, WDF_NO_HANDLE);

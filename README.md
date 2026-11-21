@@ -12,7 +12,7 @@ The UEFI and DSDT live in [Windows-for-Switch](https://github.com/hayato41200/Wi
 |---|---|---|---|
 | `tegra210gpio` | ACPI\SWOA0101 | R367 | GPIO controller (GpioClx) |
 | `tegra210i2c` | ACPI\SWOA0201 | R370 | I2C controller (SpbCx). I2C1 / I2C3 / I2C5 |
-| `switchbattery` | ACPI\SWOA0301 | R371 (USB-C: R378, TV: R440H) | Battery (battc); switches VBUS and charging when a USB-C device is plugged in or removed. Since 1.0.0.7 it enters DP Alt Mode when a DP Alt hub is plugged in and tells switchdisplay |
+| `switchbattery` | ACPI\SWOA0301 | R371 (USB-C: R378, TV: R440H, unpowered adapters: R444H) | Battery (battc); switches VBUS and charging when a USB-C device is plugged in or removed. Since 1.0.0.7 it enters DP Alt Mode when a DP Alt hub is plugged in and tells switchdisplay; since 1.0.0.8 also with unpowered adapters (the Switch powers VBUS) |
 | `switchfan` | ACPI\SWOA0401 | R372 (brightness: R376) | Fan control by temperature, screen brightness, backlight off when the screen turns off |
 | `switchtouch` | ACPI\SWOA0501 | R373 | Touch screen (VHF HID multi-touch) |
 | `switchpwrbtn` | ACPI\SWOA0601 | R374 | Power button (VHF HID). Since 1.0.2.0 a Windows restart returns to hekate (reboot-to-payload, Erista) and shut down powers the console off (MAX77620). Details: `drivers/SwitchPowerButton` ([English](drivers/SwitchPowerButton/README.md), [日本語](drivers/SwitchPowerButton/README-ja.md)) |
@@ -22,15 +22,15 @@ The UEFI and DSDT live in [Windows-for-Switch](https://github.com/hayato41200/Wi
 | `switchwlan` | `ACPI\SWOA0D01` | R405 | Wi-Fi. WPA2-Personal, DHCP, internet access. Wi-Fi 5 (802.11ac), 866/866 Mbit/s link. Tested on hardware on 2026-11-08: fast.com 55 Mbit/s down, 39 Mbit/s up. Bring your own firmware `brcmfmac4356(A3)-pcie.bin/.txt` (tested with 7.35.252.108). `switchwlan.sys` 0.6.13 |
 | `switchaudio` | ACPI\SWOA0C01 | R403 (R402: speaker only) | Audio playback to the speakers and headphones (PortCls WaveRT, 48 kHz, 16-bit, stereo). Switches automatically when headphones are plugged in or removed. Windows sees one output, "Speakers", with one volume. No microphone |
 | `switchsensor` | ACPI\SWOA0901 | R379 | Tilt sensor (automatic screen rotation). The light sensor was not found on this unit and is not used |
-| `switchdisplay` | ACPI\SWOA0E01 | R408 | Built-in panel (WDDM display-only driver, replaces Basic Display). Rotation (Settings and SwitchCenter auto-rotate). Puts the panel to sleep and stops the display controller when the screen turns off. Drawing is still done by the CPU (no GPU acceleration). Replaced at the next boot (`kits/Switch-Display`). 1.4.x: TV output over USB-C (mirrors the built-in screen, follows hot-plug and rotation). 1.4.2 fixes the stop right after start (error 43) that every version since 1.2.0 had |
+| `switchdisplay` | ACPI\SWOA0E01 | R408 | Built-in panel (WDDM display-only driver, replaces Basic Display). Rotation (Settings and SwitchCenter auto-rotate). Puts the panel to sleep and stops the display controller when the screen turns off. Drawing is still done by the CPU (no GPU acceleration). Replaced at the next boot (`kits/Switch-Display`). 1.4.x: TV output over USB-C (mirrors the built-in screen, follows hot-plug and rotation). 1.4.2 fixes the stop right after start (error 43) that every version since 1.2.0 had. 1.5.0: 1920x1080 when the TV takes it |
 | `swoadiag` | — (only while loaded) | — | Diagnostic: reads the USB (XUSB) registers |
 | `nvtsdhc` | ACPI\NVDA0101 | — (the SD loader adds the device) | SD host (sdport) for booting Windows 11 from SD. SwitchPatcher puts it on the SD (`kits/Switch-Sd`). If boot fails it shows a diagnostic code on a blue screen (see "Blue screen stop codes" below) |
 
 ## TV output (USB-C DisplayPort Alt Mode)
 
-- **Needs:** a USB-C hub with DP Alt and HDMI, with its own power; UEFI R440H or later (R441H for hekate); `switchbattery` 1.0.0.7; `switchdisplay` 1.4.4.
-- **What it does:** mirrors the built-in screen on the TV at 1280x720. Connected at boot, the TV shows the UEFI screen already; plugging the hub in after Windows has started works too. Landscape fills the TV; portrait is shrunk and centred.
-- **Planned:** the TV as a second (extended) display; modes other than 1280x720 (from the TV's EDID); HDMI audio; a check with the official Nintendo dock; unpowered hubs and adapters.
+- **Needs:** a USB-C hub with DP Alt or a USB-C to HDMI adapter, with or without its own power; UEFI R444H or later; `switchbattery` 1.0.0.8; `switchdisplay` 1.5.0.
+- **What it does:** mirrors the built-in screen on the TV, at 1920x1080 when the TV's EDID lists it, else 1280x720 (the 1280x720 picture is scaled up). Connected at boot, the TV shows the UEFI screen already; plugging the hub in after Windows has started works too. Landscape fills the TV; portrait is shrunk and centred.
+- **Planned:** the TV as a second (extended) display; HDMI audio; a check with the official Nintendo dock; modes above 1920x1080 (the current link, two lanes at 2.7 Gbps, cannot carry 4K).
 - **Turning it off:** DWORD `DpAlt` = 0 under `HKLM\SYSTEM\CurrentControlSet\Services\switchbattery\Parameters` (no DP Alt Mode), `TvHotplug` = 0 or `TvMirror` = 0 under `switchdisplay\Parameters`.
 
 ## Tested OS

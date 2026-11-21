@@ -39,6 +39,10 @@
  *     unplug the window goes back, DC-B stops and SOR1/DC-B are held in reset.
  *     The SOR1 pad rail (MAX77620 LDO8) is turned on by UEFI R440H at boot.
  *     The bring-up log is in the registry value TvLog (Status.cmd shows it).
+ *   - 1.5.0, TV mode from the EDID (UEFI R443): DC-B runs 1920x1080@60 when the
+ *     TV lists it and it fits the DP link, else 1280x720@60. The 1280x720 TV
+ *     buffer stays; DC-B window A scales it to the raster (DDA, point sampled;
+ *     registry TvFilter=1 also sets the window's H/V filters, untested).
  *
  * Trace: HKLM\SYSTEM\CurrentControlSet\Services\switchdisplay\Parameters
  */#define DXGKDDI_INTERFACE_VERSION 0x4002 /* DXGKDDI_INTERFACE_VERSION_WDDM1_3 */
@@ -47,7 +51,7 @@
 #include <ntstrsafe.h>
 #include <stdarg.h>
 
-#define SWD_VERSION        0x00010404u   /* 1.4.4 */
+#define SWD_VERSION        0x00010500u   /* 1.5.0 */
 #define SWD_TAG            'DwsS'
 
 /* Boot framebuffer (coreboot display.c / UEFI MemoryMap.h "Display Reserved") */
@@ -136,6 +140,10 @@
 #define TV_H               720u
 #define TV_PITCH           (TV_W * 4u)
 #define TV_REGS            17
+#define TV_ACT_720         ((720u << 16) | 1280u)
+#define TV_ACT_1080        ((1080u << 16) | 1920u)
+#define DC_WIN_H_FILTER    (1u << 8)
+#define DC_WIN_V_FILTER    (1u << 10)
 
 #define GUARD_SECONDS      60
 #define FLUSH_SECONDS      10
@@ -737,7 +745,8 @@ static VOID TvStartLocked(PSWD_CONTEXT Ctx)
     RegPutDword(L"TvDispCmd", cmd);
     RegPutDword(L"TvDispWinOpt", wopt);
     RegPutDword(L"TvActive", act);
-    if ((cmd & DISP_CTRL_MODE_C_DISPLAY) == 0 || (wopt & DC_SOR1_ENABLE) == 0 || act != ((TV_H << 16) | TV_W)) {
+    if ((cmd & DISP_CTRL_MODE_C_DISPLAY) == 0 || (wopt & DC_SOR1_ENABLE) == 0 ||
+        (act != TV_ACT_720 && act != TV_ACT_1080)) {
         MmUnmapIoSpace(Ctx->TvDc, DC_MAP_SIZE);
         Ctx->TvDc = NULL;
         RegPutDword(L"TvState", 4);
@@ -778,8 +787,13 @@ static VOID TvStartLocked(PSWD_CONTEXT Ctx)
     v[2] = 0;
     v[3] = 0;
     v[4] = (TV_H << 16) | TV_PITCH;         /* prescaled: H in bytes */
-    v[5] = (0x1000u << 16) | 0x1000u;       /* DDA 1.0, no scaling */
-    v[6] = (TV_H << 16) | TV_W;
+    /* 1.5.0: window = the DC-B raster; DDA as Linux tegra compute_dda_inc,
+     * (in - 1) / (out - 1) in 4.12 (1.0 when the raster is 1280x720) */
+    {
+        ULONG ow = act & 0xFFFFu, oh = act >> 16;
+        v[5] = ((((TV_H - 1u) * 0x1000u) / (oh - 1u)) << 16) | (((TV_W - 1u) * 0x1000u) / (ow - 1u));
+        v[6] = act;
+    }
     v[7] = TV_PITCH;
     v[8] = 0;
     v[9] = 0;
@@ -790,6 +804,7 @@ static VOID TvStartLocked(PSWD_CONTEXT Ctx)
     v[14] = 0;
     v[15] = (1u << 24) | 255u;              /* opaque */
     v[16] = DC_WIN_ENABLE;
+    if (act != TV_ACT_720 && RegGetDword(L"TvFilter", 0) != 0) v[16] |= DC_WIN_H_FILTER | DC_WIN_V_FILTER;
     TvWriteWindow(Ctx, v);
     RegPutDword(L"TvSavedStart", Ctx->TvSaved[11]);
     RegPutDword(L"TvBufLo", Ctx->TvPhys.LowPart);
@@ -939,7 +954,7 @@ static VOID DpBringUp(PSWD_CONTEXT Ctx)
     mR426Ok = FALSE; mR427Ok = FALSE; mR429Ok = FALSE;
     mR426Step = NULL; mR427Step = NULL; mR429Step = NULL;
     mR426Hpd = FALSE; mR426DpcdOk = FALSE; mR426EdidOk = FALSE;
-    DpLog(L"switchdisplay 1.4.4 DP Alt bring-up (attempt %u)\r\n", Ctx->DpFails + 1);
+    DpLog(L"switchdisplay 1.5.0 DP Alt bring-up (attempt %u)\r\n", Ctx->DpFails + 1);
     if (!DpMap()) {
         DpLog(L"register mapping failed\r\n");
     } else {
