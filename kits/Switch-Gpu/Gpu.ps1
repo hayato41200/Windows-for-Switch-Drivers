@@ -69,6 +69,33 @@ function Gpio($v) {
   '{0} {1} (0x{2:X2})' -f $(if ($g -band 8) { 'output high' } else { 'output low' }), $(if ($g -band 1) { 'push-pull' } else { 'open-drain' }), $g
 }
 function Bit($v, $b) { if ($null -eq $v) { 'n/a' } elseif (([uint32]$v -shr $b) -band 1) { '1' } else { '0' } }
+function RegPairs($v) {
+  if ($null -eq $v) { return 'n/a' }
+  $b = [byte[]]$v; if (($b.Length % 8) -ne 0) { return ('malformed bytes={0}' -f $b.Length) }
+  $out = @()
+  for ($i = 0; $i + 8 -le $b.Length; $i += 8) {
+    $a = [BitConverter]::ToUInt32($b, $i); $x = [BitConverter]::ToUInt32($b, $i + 4)
+    $out += ('{0:X8}={1:X8}' -f $a, $x)
+  }
+  return ($out -join ' ')
+}
+function RegTriples($v) {
+  if ($null -eq $v) { return 'n/a' }
+  $b = [byte[]]$v; if (($b.Length % 12) -ne 0) { return ('malformed bytes={0}' -f $b.Length) }
+  $out = @()
+  for ($i = 0; $i + 12 -le $b.Length; $i += 12) {
+    $a = [BitConverter]::ToUInt32($b, $i); $e = [BitConverter]::ToUInt32($b, $i + 4); $x = [BitConverter]::ToUInt32($b, $i + 8)
+    $out += ('{0:X8}:{1:X8}>{2:X8}' -f $a, $e, $x)
+  }
+  return ($out -join ' ')
+}
+function Words($v) {
+  if ($null -eq $v) { return 'n/a' }
+  $b = [byte[]]$v; if (($b.Length % 4) -ne 0) { return ('malformed bytes={0}' -f $b.Length) }
+  $out = @()
+  for ($i = 0; $i + 4 -le $b.Length; $i += 4) { $out += ('{0:X8}' -f [BitConverter]::ToUInt32($b, $i)) }
+  return ($out -join ' ')
+}
 
 function Show-Device {
   $found = $false
@@ -97,6 +124,31 @@ function Show-Trace {
     $steps[73] = 'B3c: prepare FECS DMA and validate GPCCS firmware'
     $steps[74] = 'B3c: PIO-load non-secure GPCCS IMEM and DMEM firmware'
     $steps[75] = 'B3c: ordered FECS mailbox setup, start GPCCS then FECS, wait ready'
+    $steps[76] = 'C1: query FECS golden, zcull, and PM image sizes'
+    $steps[77] = 'C2a: import and validate GR init lists'
+    $steps[78] = 'C2b: reset GR ctxsw state and apply bounded nonctx list'
+    $steps[79] = 'C2c: validate and apply bounded sw_ctx list'
+    $steps[80] = 'C2d: allocate and map isolated GR context backing'
+    $steps[81] = 'C2e: bind FECS, apply global buffers and bundle init, save golden image'
+    $steps[82] = 'C2e: FE power handshake, ctxsw reset, and SCC initialization'
+    $steps[83] = 'C2e: GM20B fixed-topology floorsweep and zcull setup'
+    $steps[84] = 'C2e: GR interrupts, FE HWW, and exception setup before FECS bind'
+    $steps[85] = 'C2e: finish bundle state, bounded idle waits, and pre-save L2 flush'
+    $steps[86] = 'C2e: replay sw_ctx after FECS channel bind in nvgpu order'
+    $steps[87] = 'C2e: bounded nouveau-predicate GR idle checks at bundle and save boundaries'
+    $steps[88] = 'C2e: GM20B nouveau generation order and true-idle checkpoints'
+    $steps[89] = 'C2b: configure GM20B GPC MMU after nonctx and idle'
+    $steps[90] = 'C2e: snapshot GPC/TPC PRI and stop on first FE exception change'
+    $steps[91] = 'C2e: capture GM20B GR hang status snapshots'
+    $steps[92] = 'C2e: initialize GM20B LTC active counts, slices, and interrupts'
+    $steps[93] = 'C2e: publish active LTC count to the GM20B FB hub'
+    $steps[94] = 'C2e: load GM20B default ZBC color and depth tables'
+    $steps[95] = 'C2e: select nvgpu-supported zero-comptag CBC mode'
+    $steps[96] = 'C2e: disable GM20B LG and SU read-coalesce before sw_ctx'
+    $steps[97] = 'C2e: apply and verify GM20B BE active-LTC ROP settings'
+    $steps[101] = 'C2e: set PE stream master and initialize fixed-topology zcull'
+    $steps[102] = 'C2e: set Nouveau BE active-FBP count from hardware'
+    $steps[103] = 'C2e: enable GR FIFO and semaphore access'
     Sum ('power test runs {0}: last step {1} ({2})  result {3}  took {4} us' -f $p.TestRuns, $p.Step, $steps[[int]$p.Step], (Hex $p.Result), $p.TestUs)
     if ($null -ne $p.McHotStatAfterReset) {
       $pts = @(@('GPU off', $p.McHotStatAtStart), @('after reset', $p.McHotStatAfterReset), @('after flush', $p.McHotStatAfterFlush), @('after BAR0 reads', $p.McHotStatAfterBar0), @('B2a start', $p.McHotStatB2aStart), @('before DMA', $p.McHotStatBeforeDma), @('after DMA', $p.McHotStatAfterDma))
@@ -271,7 +323,7 @@ function Show-Trace {
       }
     }
     if ($null -ne $p.B3aResult) {
-      $b3err = @{ '00000000' = 'OK'; 'E0000041' = 'firmware missing in the registry (run FwTest from the kit)'; 'E0000042' = 'bl.bin too short'; 'E0000043' = 'bl.bin header bad'; 'E0000044' = 'bl.bin descriptor bad'; 'E0000045' = 'ucode_load.bin too short'; 'E0000046' = 'ucode_load.bin header bad'; 'E0000047' = 'patch location outside the file'; 'E0000048' = 'load header outside the file'; 'E0000049' = 'app table bad'; 'E000004A' = 'signature/section offsets bad'; 'E000004B' = 'no memory'; 'E000004C' = 'bootloader does not fit IMEM'; 'E000004D' = 'no memory'; 'E0000061' = 'invalid WPR range'; 'E0000062' = 'built WPR is larger than the hardware protected region'; 'E0000063' = 'ACR descriptor is too short'; 'E0000064' = 'could not map WPR/VM memory'; 'E0000065' = 'PMU virtual-memory bind failed'; 'E0000066' = 'ACR DMA descriptor readback mismatch'; 'E0000067' = 'ACR boot timed out'; 'E0000068' = 'ACR boot mailbox indicated failure'; 'E0000069' = 'WPR CPU write/readback mismatch'; 'E000006A' = 'PMU PDB MMU invalidate failed'; 'E000006B' = 'all-PDB MMU invalidate could not observe FIFO empty'; 'E000006C' = 'MMU per-instance PDB page-size selection readback failed'; 'E000006D' = 'ACR did not leave PMU halted with empty mailboxes'; 'E000006E' = 'PMU DMEM size is outside the supported range'; 'E000006F' = 'PMU HS halt interrupt did not clear'; 'E0000070' = 'PMU LS INIT did not appear within 2000 polls (2 s)'; 'E0000071' = 'PMU INIT queue pointers stayed invalid for 2000 polls'; 'E0000072' = 'PMU INIT message header/type or PIO cursor mismatch'; 'E0000073' = 'PMU cmdline args DMEM readback/cursor mismatch'; 'E0000074' = 'WPR-advertised PMU argv does not match the runtime DMEM args location'; 'E0000075' = 'pre-ACR PFIFO MMU fault latches did not clear; ACR was skipped'; 'E0000076' = 'PMU DMACTL REQUIRE_CTX did not clear before LS start'; 'E0000077' = 'PMU loader WPR DMA address cannot be represented in the descriptor'; 'E0000078' = 'FECS bootstrap command, PMU reply, or LS-ready wait failed'; 'E0000079' = 'PMU INIT_WPR_REGION command, reply, or success status failed'; 'E000007A' = 'PMU did not dequeue the FECS bootstrap command before timeout'; 'E000007B' = 'PMU HALT observed before FECS bootstrap post'; 'E000007C' = 'PMU HALT observed immediately after FECS bootstrap post'; 'E000007D' = 'FECS CPUCTL HALT bit did not clear after CPUCTL_ALIAS start'; 'E000007E' = 'GPCCS inst/data firmware missing from registry'; 'E000007F' = 'GPCCS firmware is invalid or exceeds Falcon IMEM/DMEM capacity'; 'E0000080' = 'GPCCS CPUCTL HALT bit did not clear after start' }
+      $b3err = @{ '00000000' = 'OK'; 'E0000041' = 'firmware missing in the registry (run FwTest from the kit)'; 'E0000042' = 'bl.bin too short'; 'E0000043' = 'bl.bin header bad'; 'E0000044' = 'bl.bin descriptor bad'; 'E0000045' = 'ucode_load.bin too short'; 'E0000046' = 'ucode_load.bin header bad'; 'E0000047' = 'patch location outside the file'; 'E0000048' = 'load header outside the file'; 'E0000049' = 'app table bad'; 'E000004A' = 'signature/section offsets bad'; 'E000004B' = 'no memory'; 'E000004C' = 'bootloader does not fit IMEM'; 'E000004D' = 'no memory'; 'E0000061' = 'invalid WPR range'; 'E0000062' = 'built WPR is larger than the hardware protected region'; 'E0000063' = 'ACR descriptor is too short'; 'E0000064' = 'could not map WPR/VM memory'; 'E0000065' = 'PMU virtual-memory bind failed'; 'E0000066' = 'ACR DMA descriptor readback mismatch'; 'E0000067' = 'ACR boot timed out'; 'E0000068' = 'ACR boot mailbox indicated failure'; 'E0000069' = 'WPR CPU write/readback mismatch'; 'E000006A' = 'PMU PDB MMU invalidate failed'; 'E000006B' = 'all-PDB MMU invalidate could not observe FIFO empty'; 'E000006C' = 'MMU per-instance PDB page-size selection readback failed'; 'E000006D' = 'ACR did not leave PMU halted with empty mailboxes'; 'E000006E' = 'PMU DMEM size is outside the supported range'; 'E000006F' = 'PMU HS halt interrupt did not clear'; 'E0000070' = 'PMU LS INIT did not appear within 2000 polls (2 s)'; 'E0000071' = 'PMU INIT queue pointers stayed invalid for 2000 polls'; 'E0000072' = 'PMU INIT message header/type or PIO cursor mismatch'; 'E0000073' = 'PMU cmdline args DMEM readback/cursor mismatch'; 'E0000074' = 'WPR-advertised PMU argv does not match the runtime DMEM args location'; 'E0000075' = 'pre-ACR PFIFO MMU fault latches did not clear; ACR was skipped'; 'E0000076' = 'PMU DMACTL REQUIRE_CTX did not clear before LS start'; 'E0000077' = 'PMU loader WPR DMA address cannot be represented in the descriptor'; 'E0000078' = 'FECS bootstrap command, PMU reply, or LS-ready wait failed'; 'E0000079' = 'PMU INIT_WPR_REGION command, reply, or success status failed'; 'E000007A' = 'PMU did not dequeue the FECS bootstrap command before timeout'; 'E000007B' = 'PMU HALT observed before FECS bootstrap post'; 'E000007C' = 'PMU HALT observed immediately after FECS bootstrap post'; 'E000007D' = 'FECS CPUCTL HALT bit did not clear after CPUCTL_ALIAS start'; 'E000007E' = 'GPCCS inst/data firmware missing from registry'; 'E000007F' = 'GPCCS firmware is invalid or exceeds Falcon IMEM/DMEM capacity'; 'E0000080' = 'GPCCS CPUCTL HALT bit did not clear after start'; 'E0000081' = 'FECS size query mailbox stayed zero for 2000 polls'; 'E0000082' = 'FECS size query returned FAIL marker or invalid all-ones'; 'E0000083' = 'GR is disabled before C1 FECS method queries'; 'E0000084' = 'GR init-list blob missing or exceeds 128 KiB'; 'E0000085' = 'GR init-list blob is empty, malformed, or has an invalid register address'; 'E0000086' = 'GR is disabled before C2a list validation'; 'E0000087' = 'C2b GR reset, nonctx range/readback, scrub, or idle stage failed'; 'E0000088' = 'C2c sw_ctx validation, apply, or idle stage failed'; 'E0000089' = 'C2d GR arena allocation, bounds, topology, or PMC_ENABLE check failed'; 'E000008A' = 'C2d GR SMMU, GPU page-table, or instance-block readback failed'; 'E000008B' = 'C2e FECS method/bind or bounded GR idle wait timed out'; 'E000008C' = 'C2e FECS method failure, bundle validation, or golden image header mismatch'; 'E000008D' = 'C2e FE power/reset handshake or GR PDB invalidate failed'; 'E000008E' = 'C2e GR floorsweep/zcull or exception setup address validation/readback failed'; 'E000008F' = 'C2e FE HWW ESR is nonzero before setup or first bundle entry'; 'E0000090' = 'C2e bounded L2 flush or invalidate did not complete before golden header copy'; 'E0000091' = 'C2e GR engine remained busy through the bounded pre-save idle check'; 'E0000092' = 'C2e Nouveau GR idle predicate timed out at a generation checkpoint'; 'E0000093' = 'C2b GM20B GPC MMU register validation failed'; 'E0000094' = 'C2e FE/GR exception state changed during bundle replay'; 'E0000095' = 'priv-ring ACK_INTERRUPT command did not return to NO_CMD within 2000 polls'; 'E0000096' = 'C2e BE active-LTC ROP readback was invalid'; 'E0000097' = 'C2e active LTC count, CBC parameters, or LTC FS readback was invalid'; 'E0000098' = 'C2e FB active-LTC count readback was invalid'; 'E0000099' = 'C2e bounded ZBC idle, table validation, or ZBC readback failed'; 'E000009A' = 'C2e zero-comptag CBC base readback failed'; 'E000009B' = 'C2e bounded GM20B read-coalesce setup readback failed'; 'E000009C' = 'C2e early PE or zcull setup readback failed'; 'E000009D' = 'C2e Nouveau active-FBP ROP count setup failed'; 'E000009E' = 'C2e GR FIFO/semaphore access setup failed' }
       $why3 = $b3err[(Key32 $p.B3aResult)]; if (-not $why3) { $why3 = '?' }
       Sum ('B3c PMU app version {0}; argv in WPR {1}' -f (Hex $p.B3cPmuAppVersion), (Hex $p.B3bPmuArgv))
       Sum ('B3a firmware: bl.bin {0} bytes magic {1} (hdr {2} data {3}+{4})  start tag {5} dmem off {6} code {7}+{8}' -f $p.B3aBlLen, (Hex $p.B3aBlMagic), (Hex $p.B3aBlHdrOff), (Hex $p.B3aBlDataOff), (Hex $p.B3aBlDataSize), (Hex $p.B3aBlStartTag), (Hex $p.B3aBlDmemLoadOff), (Hex $p.B3aBlCodeOff), (Hex $p.B3aBlCodeSize))
@@ -411,6 +463,114 @@ function Show-Trace {
       if ($null -ne $p.B3cFecsResult) {
         $frWhy = $b3err[(Key32 $p.B3cFecsResult)]; if (-not $frWhy) { $frWhy = '?' }
         Sum ('B3c FECS WPR loader: DMA index {0}; code/data DMA base {1}/{2}; absolute WPR bases {3}' -f (Hex $p.B3cFecsDmaIdx), (Hex $p.B3cFecsCodeDmaBase), (Hex $p.B3cFecsDataDmaBase), $p.B3cFecsDmaBaseAbsolute)
+        if ($null -ne $p.B3cC1Result) {
+          $c1Why = @{ '00000000' = 'OK'; 'E0000081' = 'timeout'; 'E0000082' = 'FECS FAIL marker/register value'; 'E0000083' = 'GR disabled' }[(Key32 $p.B3cC1Result)]; if (-not $c1Why) { $c1Why = '?' }
+          Sum ('B3c C1 result {0} ({1}); PMC_ENABLE {2}; mailbox PASS/FAIL markers {3}/{4}; golden/zcull/PM image sizes {5}/{6}/{7}' -f (Hex $p.B3cC1Result), $c1Why, (Hex $p.B3cC1PmcEnable), (Hex $p.B3cC1MailboxPassValue), (Hex $p.B3cC1MailboxFailValue), (Hex $p.B3cC1GoldenImageSize), (Hex $p.B3cC1ZcullImageSize), (Hex $p.B3cC1PmImageSize))
+          Sum 'B3c C1 size queries: FECS mailbox 0 clear=0xFFFFFFFF, data=0, push method address; each bounded to 2000 polls'
+          Sum 'B3c C1 method addresses golden/zcull/PM = 0x10/0x16/0x25; data/push registers 0x409500/0x409504; result mailbox/clear 0x409800/0x409840'
+        }
+        if ($null -ne $p.B3cC2aResult) {
+          $c2aWhy = $b3err[(Key32 $p.B3cC2aResult)]; if (-not $c2aWhy) { $c2aWhy = '?' }
+          Sum ('B3c C2a result {0} ({1}); PMC_ENABLE {2}' -f (Hex $p.B3cC2aResult), $c2aWhy, (Hex $p.B3cC2aPmcEnable))
+          Sum 'B3c C2a validates formats; C2b applies sw_nonctx; C2c applies sw_ctx AIV address/value writes; bundle/method IDs are not BAR0 writes'
+          foreach ($w in @(@('sw_nonctx', 'B3cC2aSwNonctx'), @('sw_ctx', 'B3cC2aSwCtx'), @('sw_bundle_init', 'B3cC2aSwBundleInit'))) {
+            if ($null -ne $p.($w[1])) {
+              $nb = [byte[]]$p.($w[1]); $nv = @()
+              for ($i = 0; $i + 4 -le $nb.Length; $i += 4) { $nv += ('{0:X8}' -f [BitConverter]::ToUInt32($nb, $i)) }
+              Sum ('B3c C2a {0} trace words: {1}' -f $w[0], ($nv -join ' '))
+            }
+          }
+        }
+        if ($null -ne $p.B3cC2bResult) {
+          $c2bWhy = $b3err[(Key32 $p.B3cC2bResult)]; if (-not $c2bWhy) { $c2bWhy = '?' }
+          Sum ('B3c C2b result {0} ({1}); PMC_ENABLE {2}; sw_nonctx bytes/count/writes {3}/{4}/{5}; bad index/address {6}/{7}' -f (Hex $p.B3cC2bResult), $c2bWhy, (Hex $p.B3cC2bPmcEnable), (Hex $p.B3cC2bSwNonctxBytes), (Hex $p.B3cC2bSwNonctxCount), (Hex $p.B3cC2bSwNonctxWrites), (Hex $p.B3cC2bBadIndex), (Hex $p.B3cC2bBadAddress))
+          Sum ('B3c C2b rejected GR writes / dropped / ACK timeouts: {0}/{1}/{2}; records: {3}' -f (Hex $p.B3cC2bPrivWriteErrorCount), (Hex $p.B3cC2bPrivWriteErrorDropped), (Hex $p.B3cC2bPrivAckTimeouts), (Words $p.B3cC2bPrivWriteErrors))
+          Sum ('B3c C2b GPC MMU rejected writes / dropped / ACK timeouts: {0}/{1}/{2}; records: {3}' -f (Hex $p.B3cC2bGpcMmuPrivWriteErrorCount), (Hex $p.B3cC2bGpcMmuPrivWriteErrorDropped), (Hex $p.B3cC2bGpcMmuPrivAckTimeouts), (Words $p.B3cC2bGpcMmuPrivWriteErrors))
+          Sum ('B3c C2b MC_ENABLE before/during/after reset {0}/{1}/{2}; FECS ctxsw reset assert/release {3}/{4}; force clock polls/readback {5}/{6}; auto clock polls/readback {7}/{8}; SCC readback {9}; scrub polls/bits FECS/GPCCS {10}/{11}/{12}; GR idle polls/status {13}/{14}/{15}' -f (Hex $p.B3cC2bMcEnableBeforeReset), (Hex $p.B3cC2bMcEnableDuringReset), (Hex $p.B3cC2bMcEnableAfterReset), (Hex $p.B3cC2bFecsCtxswResetAssert), (Hex $p.B3cC2bFecsCtxswResetRelease), $p.B3cC2bForceClockPolls, (Hex $p.B3cC2bForceClockReadback), $p.B3cC2bAutoClockPolls, (Hex $p.B3cC2bAutoClockReadback), (Hex $p.B3cC2bSccInitReadback), $p.B3cC2bScrubPolls, (Hex $p.B3cC2bFecsScrubBits), (Hex $p.B3cC2bGpccsScrubBits), $p.B3cC2bIdlePolls, (Hex $p.B3cC2bEngineStatus), (Hex $p.B3cC2bGrStatus))
+          Sum ('B3c pre-C2b GPC/TPC/fuse/topology/ring snapshot: BADF registers {0}; address=value pairs {1}' -f (Hex $p.B3cC2bPreResetGpcPriBadfCount), (RegPairs $p.B3cC2bPreResetGpcPri))
+          Sum ('B3c GPC MMU setup result/count/mismatches {0}/{1}/{2}; writes/readbacks (address:expected>actual) {3}' -f (Hex $p.B3cC2bGpcMmuResult), (Hex $p.B3cC2bGpcMmuWriteCount), (Hex $p.B3cC2bGpcMmuMismatchCount), (RegTriples $p.B3cC2bGpcMmuReadback))
+          Sum 'B3c C2b applies only sw_nonctx AV records; allowed BAR0 windows are GR 0x400000-0x40FFFF, GPCS 0x418000-0x41FFFF, and two GPC PRI banks 0x500000-0x50FFFF'
+        }
+        if ($null -ne $p.B3cC2cResult) {
+          $c2cWhy = $b3err[(Key32 $p.B3cC2cResult)]; if (-not $c2cWhy) { $c2cWhy = '?' }
+          Sum ('B3c C2c result {0} ({1}); PMC_ENABLE {2}; sw_ctx bytes/count/writes {3}/{4}/{5}; bad index/address {6}/{7}; readback samples {8}; idle polls/status {9}/{10}/{11}' -f (Hex $p.B3cC2cResult), $c2cWhy, (Hex $p.B3cC2cPmcEnable), (Hex $p.B3cC2cSwCtxBytes), (Hex $p.B3cC2cSwCtxCount), (Hex $p.B3cC2cSwCtxWrites), (Hex $p.B3cC2cBadIndex), (Hex $p.B3cC2cBadAddress), (Hex $p.B3cC2cReadbackCount), $p.B3cC2cIdlePolls, (Hex $p.B3cC2cEngineStatus), (Hex $p.B3cC2cGrStatus))
+          Sum ('B3c C2c rejected writes / dropped / ACK timeouts: {0}/{1}/{2}; records: {3}' -f (Hex $p.B3cC2cPrivWriteErrorCount), (Hex $p.B3cC2cPrivWriteErrorDropped), (Hex $p.B3cC2cPrivAckTimeouts), (Words $p.B3cC2cPrivWriteErrors))
+          Sum 'B3c C2c follows FECS ready, C1 size queries, and C2a validation; nvgpu setup_hw writes sw_ctx addr/value directly and ignores AIV index'
+        }
+        if ($null -ne $p.B3cC2dResult) {
+          $c2dWhy = $b3err[(Key32 $p.B3cC2dResult)]; if (-not $c2dWhy) { $c2dWhy = '?' }
+          Sum ('B3c C2d result {0} ({1}); arena PA/bytes {2}/{3}; GPU VA/IOMMU-tagged IOVA {4}/{5}:{6}; outer SMMU mode/PDE before/expected/read/PTE expected/read {7}/{8}/{9}/{10}/{11}/{12}' -f (Hex $p.B3cC2dResult), $c2dWhy, (Hex $p.B3cC2dArenaPa), (Hex $p.B3cC2dArenaBytes), (Hex $p.B3cC2dGpuVa), (Hex $p.B3cC2dArenaIovaHi), (Hex $p.B3cC2dArenaIovaLo), (Hex $p.B3cC2dSmmuMode), (Hex $p.B3cC2dOuterPdeBefore), (Hex $p.B3cC2dOuterPdeExpected), (Hex $p.B3cC2dOuterPdeRead), (Hex $p.B3cC2dOuterPteExpected), (Hex $p.B3cC2dOuterPteRead))
+          Sum ('B3c C2d map checks: separate from ACR {0}; outer PTE verified/bad {1}/{2}; GPU PTE verified/bad {3}/{4}; GPU PDE expected/read low {5}/{6}, high {7}/{8}' -f (Hex $p.B3cC2dArenaDistinct), (Hex $p.B3cC2dOuterPteVerified), (Hex $p.B3cC2dOuterPteBadIndex), (Hex $p.B3cC2dGpuPteVerified), (Hex $p.B3cC2dGpuPteBadIndex), (Hex $p.B3cC2dGpuPdeExpectedLo), (Hex $p.B3cC2dGpuPdeReadLo), (Hex $p.B3cC2dGpuPdeExpectedHi), (Hex $p.B3cC2dGpuPdeReadHi))
+          Sum ('B3c C2d image/global bytes golden/zcull/PM/attrib/bundle/pagepool/priv {0}/{1}/{2}/{3}/{4}/{5}/{6}; VA golden/context/zcull/PM/attrib {7}/{8}/{9}/{10}/{11}' -f (Hex $p.B3cC2dGoldenBytes), (Hex $p.B3cC2dZcullBytes), (Hex $p.B3cC2dPmBytes), (Hex $p.B3cC2dAttribBytes), (Hex $p.B3cC2dBundleBytes), (Hex $p.B3cC2dPagepoolBytes), (Hex $p.B3cC2dPrivMapBytes), (Hex $p.B3cC2dGoldenVa), (Hex $p.B3cC2dChannelCtxVa), (Hex $p.B3cC2dZcullVa), (Hex $p.B3cC2dPmVa), (Hex $p.B3cC2dAttribVa))
+          Sum ('B3c C2d instance PDB/limit/WFI {0}:{1}/{2}:{3}/{4}:{5}; golden commit VA {6}; GPU PTE samples binary; attrib patch target/value {7}/{8}; outer map restored {9}' -f (Hex $p.B3cC2dInstPdbHi), (Hex $p.B3cC2dInstPdbLo), (Hex $p.B3cC2dInstLimitHi), (Hex $p.B3cC2dInstLimitLo), (Hex $p.B3cC2dInstWfiPtrHi), (Hex $p.B3cC2dInstWfiPtrLo), (Hex $p.B3cC2dGoldenCommitVa), (Hex $p.B3cC2dAttribBaseReg), (Hex $p.B3cC2dAttribBaseField), (Hex $p.B3cC2dOuterMapRestored))
+          Sum 'B3c C2d prepares bounded global/channel backing, a separate GPU PDB and RAMIN instance block; it does not bind FECS or save the golden image'
+          if ($null -ne $p.B3cC2dKeepOnReset) { Sum 'KeepOn was overridden for C2d so GPU reset and arena cleanup could complete' }
+        }
+        if ($null -ne $p.B3cC2eResult) {
+          $c2eWhy = $b3err[(Key32 $p.B3cC2eResult)]; if (-not $c2eWhy) { $c2eWhy = '?' }
+          Sum ('B3c C2e result {0} ({1}); bind method/data/mailbox/polls {2}/{3}/{4}/{5}; globals written {6}; bundle entries/last method {7}/{8}:{9}; save method/data/mailbox/polls {10}/{11}/{12}/{13}' -f (Hex $p.B3cC2eResult), $c2eWhy, (Hex $p.B3cC2eBindMethod), (Hex $p.B3cC2eBindData), (Hex $p.B3cC2eBindMailbox), $p.B3cC2eBindPolls, (Hex $p.B3cC2eGlobalWriteCount), (Hex $p.B3cC2eBundleEntries), (Hex $p.B3cC2eBundleLastAddress), (Hex $p.B3cC2eBundleLastValue), (Hex $p.B3cC2eSaveMethod), (Hex $p.B3cC2eSaveData), (Hex $p.B3cC2eSaveMailbox), $p.B3cC2eSavePolls)
+          Sum ('B3c C2e bundle baseline (ESR/info/intr/exception/GR status): {0}' -f (Words $p.B3cC2eBundleBaseline))
+          Sum ('B3c C2e entry 0 (index/method/data/ESR/info/intr/exception/GR status): {0}' -f (Words $p.B3cC2eBundleEntry0State))
+          Sum ('B3c C2e first changed entry found/index/method/data: {0}/{1}/{2}/{3}; state: {4}' -f (Hex $p.B3cC2eBundleFirstChangeFound), (Hex $p.B3cC2eBundleFirstChangeIndex), (Hex $p.B3cC2eBundleFirstChangeMethod), (Hex $p.B3cC2eBundleFirstChangeData), (Words $p.B3cC2eBundleFirstChangeState))
+          Sum ('B3c C2e rejected writes / dropped / ACK timeouts: {0}/{1}/{2}; records: {3}' -f (Hex $p.B3cC2ePrivWriteErrorCount), (Hex $p.B3cC2ePrivWriteErrorDropped), (Hex $p.B3cC2ePrivAckTimeouts), (Words $p.B3cC2ePrivWriteErrors))
+          Sum ('B3c C2e post-bind sw_ctx bytes/count/writes/readback/idle polls/result {0}/{1}/{2}/{3}/{4}/{5}; bad index/address {6}/{7}' -f (Hex $p.B3cC2ePostBindSwCtxBytes), (Hex $p.B3cC2ePostBindSwCtxCount), (Hex $p.B3cC2ePostBindSwCtxWrites), (Hex $p.B3cC2ePostBindSwCtxReadbackCount), (Hex $p.B3cC2ePostBindSwCtxIdlePolls), (Hex $p.B3cC2ePostBindSwCtxResult), (Hex $p.B3cC2ePostBindSwCtxBadIndex), (Hex $p.B3cC2ePostBindSwCtxBadAddress))
+          Sum ('B3c C2e true GR idle after GO_IDLE: polls/ok/GR status/engine/FIFO {0}/{1}/{2}/{3}/{4}; before save: polls/ok/GR status/engine/FIFO {5}/{6}/{7}/{8}/{9}' -f (Hex $p.B3cC2eTrueIdleGoBundlePolls), (Hex $p.B3cC2eTrueIdleGoBundleOk), (Hex $p.B3cC2eTrueIdleGoBundleGrStatus), (Hex $p.B3cC2eTrueIdleGoBundleEngineStatus), (Hex $p.B3cC2eTrueIdleGoBundleFifoStatus), (Hex $p.B3cC2eTrueIdlePreSavePolls), (Hex $p.B3cC2eTrueIdlePreSaveOk), (Hex $p.B3cC2eTrueIdlePreSaveGrStatus), (Hex $p.B3cC2eTrueIdlePreSaveEngineStatus), (Hex $p.B3cC2eTrueIdlePreSaveFifoStatus))          Sum ('B3c C2e Nouveau GR-enabled state at GO_IDLE/save {0}/{1}; read-only MC 0x260 entry/exit {2}/{3}; GR 0x5044B0 entry/exit {4}/{5} (bit27 {6}/{7})' -f (Hex $p.B3cC2eTrueIdleGoBundleMcEnable), (Hex $p.B3cC2eTrueIdlePreSaveMcEnable), (Hex $p.B3cC2eMcUnk260AtEntry), (Hex $p.B3cC2eMcUnk260AtExit), (Hex $p.B3cC2eGr5044B0AtEntry), (Hex $p.B3cC2eGr5044B0AtExit), (Hex $p.B3cC2eGr5044B0Bit27AtEntry), (Hex $p.B3cC2eGr5044B0Bit27AtExit))
+
+          Sum ('B3c C2e Nouveau idle checkpoints (poll/ok): sw_ctx {0}/{1}, setup {2}/{3}, timeout restore {4}/{5}, method-init {6}/{7}; pre-save MC enable {8}' -f (Hex $p.B3cC2eNouveauIdleAfterSwCtxPolls), (Hex $p.B3cC2eNouveauIdleAfterSwCtxOk), (Hex $p.B3cC2eNouveauIdleAfterSetupPolls), (Hex $p.B3cC2eNouveauIdleAfterSetupOk), (Hex $p.B3cC2eNouveauIdleAfterRestorePolls), (Hex $p.B3cC2eNouveauIdleAfterRestoreOk), (Hex $p.B3cC2eNouveauIdleAfterMethodPolls), (Hex $p.B3cC2eNouveauIdleAfterMethodOk), (Hex $p.B3cC2eTrueIdlePreSaveMcEnable))
+          Sum ('B3c C2e first busy bundle index/method/engine/GR/FIFO {0}/{1}/{2}/{3}/{4}; FE timeout saved/restored {5}/{6}; MC 0x260 entry/exit {7}/{8}' -f (Hex $p.B3cC2eFirstBusyBundleIndex), (Hex $p.B3cC2eFirstBusyBundleMethod), (Hex $p.B3cC2eFirstBusyEngineStatus), (Hex $p.B3cC2eFirstBusyGrStatus), (Hex $p.B3cC2eFirstBusyFifoStatus), (Hex $p.B3cC2eFeGoIdleTimeoutSaved), (Hex $p.B3cC2eFeGoIdleTimeoutRestoredBeforeBundle), (Hex $p.B3cC2eMcUnk260AtEntry), (Hex $p.B3cC2eMcUnk260AtExit))
+          Sum ('B3c C2e Nouveau idle raw GR/engine/FIFO: sw_ctx {0}/{1}/{2}, setup {3}/{4}/{5}, timeout restore {6}/{7}/{8}, method-init {9}/{10}/{11}; FE timeout {12}/{13}; channel header 1C/20/28/2C {14}/{15}/{16}/{17}' -f (Hex $p.B3cC2eNouveauIdleAfterSwCtxGrStatus), (Hex $p.B3cC2eNouveauIdleAfterSwCtxEngineStatus), (Hex $p.B3cC2eNouveauIdleAfterSwCtxFifoStatus), (Hex $p.B3cC2eNouveauIdleAfterSetupGrStatus), (Hex $p.B3cC2eNouveauIdleAfterSetupEngineStatus), (Hex $p.B3cC2eNouveauIdleAfterSetupFifoStatus), (Hex $p.B3cC2eNouveauIdleAfterRestoreGrStatus), (Hex $p.B3cC2eNouveauIdleAfterRestoreEngineStatus), (Hex $p.B3cC2eNouveauIdleAfterRestoreFifoStatus), (Hex $p.B3cC2eNouveauIdleAfterMethodGrStatus), (Hex $p.B3cC2eNouveauIdleAfterMethodEngineStatus), (Hex $p.B3cC2eNouveauIdleAfterMethodFifoStatus), (Hex $p.B3cC2eFeGoIdleTimeoutSaved), (Hex $p.B3cC2eFeGoIdleTimeoutRestoredBeforeBundle), (Hex $p.B3cC2eChannelHeader1C), (Hex $p.B3cC2eChannelHeader20), (Hex $p.B3cC2eChannelHeader28), (Hex $p.B3cC2eChannelHeader2C))
+          Sum ('B3c C2e wait stage/index/polls {0}/{1}/{2}; GR/engine/FIFO status {3}/{4}/{5}; FE wait/success {6}/{7}; idle branch/FIFO ctx/ctxsw/GR busy {8}/{9}/{10}/{11}' -f (Hex $p.B3cC2eWaitStage), (Hex $p.B3cC2eWaitBundleIndex), (Hex $p.B3cC2eWaitPolls), (Hex $p.B3cC2eWaitGrStatus), (Hex $p.B3cC2eWaitEngineStatus), (Hex $p.B3cC2eWaitFifoEngineStatus), (Hex $p.B3cC2eWaitIsFe), (Hex $p.B3cC2eWaitSucceeded), (Hex $p.B3cC2eWaitIdleBranch), (Hex $p.B3cC2eWaitFifoCtxStatus), (Hex $p.B3cC2eWaitCtxswActive), (Hex $p.B3cC2eWaitGrBusy))
+          Sum ('B3c C2e wait-history records/dropped/capacity {0}/{1}/{2}; each 10-word record is stage,index,polls,GR/engine/FIFO status,ctx,ctxsw,busy,branch flags' -f (Hex $p.B3cC2eWaitHistoryCount), (Hex $p.B3cC2eWaitHistoryDropped), (Hex $p.B3cC2eWaitHistoryCapacity))
+          Sum ('B3c C2e pre-save GR status/status1/status2 {0}/{1}/{2}; engine/FIFO {3}/{4}; bits 0/5/7/FE-GI {5}/{6}/{7}/{8}; activity 0/1/2/3-present/4 {9}/{10}/{11}/{12}/{13}' -f (Hex $p.B3cC2ePreSaveGrStatus), (Hex $p.B3cC2ePreSaveGrStatus1), (Hex $p.B3cC2ePreSaveGrStatus2), (Hex $p.B3cC2ePreSaveGrEngineStatus), (Hex $p.B3cC2ePreSaveFifoEngineStatus), (Hex $p.B3cC2ePreSaveGrStatusBit0), (Hex $p.B3cC2ePreSaveGrStatusBit5), (Hex $p.B3cC2ePreSaveGrStatusBit7), (Hex $p.B3cC2ePreSaveGrStatusFeGi), (Hex $p.B3cC2ePreSaveGrActivity0), (Hex $p.B3cC2ePreSaveGrActivity1), (Hex $p.B3cC2ePreSaveGrActivity2), (Hex $p.B3cC2ePreSaveGrActivity3Present), (Hex $p.B3cC2ePreSaveGrActivity4))
+          Sum ('B3c C2e exit GR status/status1/status2 {0}/{1}/{2}; activity 0/1/2/3-present/4 {3}/{4}/{5}/{6}/{7}; status bits 0/5/7/FE-GI {8}/{9}/{10}/{11}' -f (Hex $p.B3cC2ePostGrStatus), (Hex $p.B3cC2ePostGrStatus1), (Hex $p.B3cC2ePostGrStatus2), (Hex $p.B3cC2ePostGrActivity0), (Hex $p.B3cC2ePostGrActivity1), (Hex $p.B3cC2ePostGrActivity2), (Hex $p.B3cC2ePostGrActivity3Present), (Hex $p.B3cC2ePostGrActivity4), (Hex $p.B3cC2ePostGrStatusBit0), (Hex $p.B3cC2ePostGrStatusBit5), (Hex $p.B3cC2ePostGrStatusBit7), (Hex $p.B3cC2ePostGrStatusFeGi))
+          Sum ('B3c C2e bundle tail idle stage/index/polls {0}/{1}/{2}; FE timeout restored {3}; method-init entries {4}; L2 flush/invalidate polls/status {5}/{6}/{7}/{8}' -f (Hex $p.B3cC2eWaitStage), (Hex $p.B3cC2eWaitBundleIndex), (Hex $p.B3cC2eWaitPolls), (Hex $p.B3cC2eFeGoIdleTimeoutRestored), (Hex $p.B3cC2eMethodInitCount), (Hex $p.B3cC2eL2FlushPolls), (Hex $p.B3cC2eL2FlushStatus), (Hex $p.B3cC2eL2InvalidatePolls), (Hex $p.B3cC2eL2InvalidateStatus))
+          Sum ('B3c C2e FE power polls/status {0}/{1}; floorsweep writes/samples {2}/{3}; diagnostics PMC_ENABLE {4}' -f (Hex $p.B3cC2eForceOnPolls), (Hex $p.B3cC2eForceOnStatus), (Hex $p.B3cC2eFsWriteCount), (Hex $p.B3cC2eFsSampleCount), (Hex $p.B3cC2ePmcEnableAtDiagnostics))
+          Sum ('B3c C2e BE ROP setup: TOP_NUM_LTCS raw/count {0}/{1}; write count {2}; readback (address,before,expected,actual) {3}' -f (Hex $p.B3cC2eTopNumLtcsRaw), (Hex $p.B3cC2eLtcCount), (Hex $p.B3cC2eRopSetupWriteCount), (Words $p.B3cC2eRopSetupReadback))
+          Sum ('B3c C2e setup_hw additions: early PE/zcull writes {0} (addr,before,expected,actual) {1}; Nouveau FBP raw/count {2}/{3}, ROP writes {4}: {5}; FIFO access before/expected/read {6}' -f (Hex $p.B3cC2eEarlyZcullWriteCount), (Words $p.B3cC2eEarlyZcullReadback), (Hex $p.B3cC2eFbpCountRaw), (Hex $p.B3cC2eFbpCount), (Hex $p.B3cC2eNouveauRopWriteCount), (Words $p.B3cC2eNouveauRopReadback), (Words $p.B3cC2eFifoAccess))
+          Sum ('B3c C2e LTC active/max raw {0}/{1}; CBC params/slices/cache bytes/tags {2}/{3}/{4}/{5}; LTC FS writes {6}: {7}' -f (Hex $p.B3cC2eLtcActiveCountRaw), (Hex $p.B3cC2eLtcMaxCount), (Hex $p.B3cC2eLtcCbcParam), (Hex $p.B3cC2eLtcSlicesPerLtc), (Hex $p.B3cC2eLtcCacheLineBytes), (Hex $p.B3cC2eLtcComptagsPerCacheline), (Hex $p.B3cC2eLtcFsWriteCount), (Words $p.B3cC2eLtcFsReadback))
+          Sum ('B3c C2e FB active-LTC writes {0}: {1}; zero-comptag CBC configured/backing/write/readback {2}/{3}/{4}/{5}' -f (Hex $p.B3cC2eFbFsWriteCount), (Words $p.B3cC2eFbFsReadback), (Hex $p.B3cC2eCbcNoComptag), (Hex $p.B3cC2eCbcBackingBytes), (Hex $p.B3cC2eCbcWriteCount), (Words $p.B3cC2eCbcReadback))
+          Sum ('B3c C2e ZBC idle polls/ok/writes/records {0}/{1}/{2}/{3}; PMU ZBC sync skipped {4}' -f (Hex $p.B3cC2eZbcIdlePolls), (Hex $p.B3cC2eZbcIdleOk), (Hex $p.B3cC2eZbcWriteCount), (Words $p.B3cC2eZbcReadback), (Hex $p.B3cC2eZbcPmuSyncSkipped))
+          Sum ('B3c C2e read-coalesce before/mask/after {0}/{1}/{2}; LTC/FB/ZBC/CBC configured {3}/{4}/{5}/{6}; ZBC PMU sync skipped {7}; setup skipped flags LTC/CBC, ZBC, ROP {8}/{9}/{10}' -f (Hex $p.B3cC2eRdCoalesceBefore), (Hex $p.B3cC2eRdCoalesceMask), (Hex $p.B3cC2eRdCoalesceAfter), (Hex $p.B3cC2eLtcFsConfigured), (Hex $p.B3cC2eFbFsConfigured), (Hex $p.B3cC2eZbcConfigured), (Hex $p.B3cC2eCbcConfigured), (Hex $p.B3cC2eZbcPmuSyncSkipped), (Hex $p.B3cC2eLtcCbcSetupSkipped), (Hex $p.B3cC2eZbcSetupSkipped), (Hex $p.B3cC2eLtcBasedRopSetupSkipped))
+          Sum ('B3c C2e golden VA/save WFI/magic {0}/{1}/{2}; FE ESR/info {3}/{4}; FECS CPUCTL/SCTL/IRQ/host-int {5}/{6}/{7}/{8}; GPCCS CPUCTL/SCTL {9}/{10}; PFIFO intr/fault id {11}/{12}; MC int/error/address {13}/{14}/{15}' -f (Hex $p.B3cC2eGoldenCommitVa), (Hex $p.B3cC2eWfiPtrDuringSave), (Hex $p.B3cC2eGoldenMagicOnExit), (Hex $p.B3cC2eFeHwwEsr), (Hex $p.B3cC2eFeHwwEsrInfo), (Hex $p.B3cC2eFecsCpuctl), (Hex $p.B3cC2eFecsSctl), (Hex $p.B3cC2eFecsIrqstat), (Hex $p.B3cC2eFecsHostIntStatus), (Hex $p.B3cC2eGpccsCpuctl), (Hex $p.B3cC2eGpccsSctl), (Hex $p.B3cC2ePfifoIntr0), (Hex $p.B3cC2eFaultId), (Hex $p.B3cC2eMcInt), (Hex $p.B3cC2eMcErr), (Hex $p.B3cC2eMcErrAdr))
+          Sum ('B3c C2e save result/mailbox/polls {0}/{1}/{2}; FECS/GPCCS falcon mailboxes {3}/{4}' -f (Hex $p.B3cC2eResult), (Hex $p.B3cC2eSaveMailbox), $p.B3cC2eSavePolls, (Hex $p.B3cC2eFecsMailbox0), (Hex $p.B3cC2eGpccsMailbox0))
+          Sum ('B3c C2e post GR/engine/FE power {0}/{1}/{2}; HWW info {3}; FECS/GPCCS PC counts {4}/{5}' -f (Hex $p.B3cC2ePostGrStatus), (Hex $p.B3cC2ePostGrEngineStatus), (Hex $p.B3cC2ePostFePowerMode), (Hex $p.B3cC2ePostFeHwwEsrInfo), (Hex $p.B3cC2ePostFecsTraceCount), (Hex $p.B3cC2ePostGpccsTraceCount))
+          Sum ('B3c C2e pre-bundle ESR/info/raw404004 {0}/{1}/{2}; GR intr/exceptions/status1/status2 {3}/{4}/{5}/{6}/{7}/{8}; FECS host int status/clear/enable {9}/{10}/{11}; setup writes {12}' -f (Hex $p.B3cC2ePreBundleFeHwwEsr), (Hex $p.B3cC2ePreBundleFeHwwEsrInfo), (Hex $p.B3cC2ePreBundleFeInfoRaw404004), (Hex $p.B3cC2ePreBundleGrIntr), (Hex $p.B3cC2ePreBundleGrException), (Hex $p.B3cC2ePreBundleGrException1), (Hex $p.B3cC2ePreBundleGrException2), (Hex $p.B3cC2ePreBundleGrStatus1), (Hex $p.B3cC2ePreBundleGrStatus2), (Hex $p.B3cC2ePreBundleFecsHostIntStatus), (Hex $p.B3cC2ePreBundleFecsHostIntClear), (Hex $p.B3cC2ePreBundleFecsHostIntEnable), (Hex $p.B3cC2eExceptionSetupCount))
+          Sum ('B3c C2e FE ESR before setup {0}; GR interrupt/exception enable masks {1}/{2}/{3}/{4}' -f (Hex $p.B3cC2ePreSetupFeEsr), (Hex $p.B3cC2ePostGrIntrEnable), (Hex $p.B3cC2ePostGrExceptionEnable), (Hex $p.B3cC2ePostGrException1Enable), (Hex $p.B3cC2ePostGrException2Enable))
+          Sum ('B3c C2e GM20B GR status dumps: registers {0}; captured before/entry0/stop {1}/{2}/{3}' -f (Hex $p.B3cC2eGrStatusDumpRegisterCount), (Hex $p.B3cC2eGrStatusDumpBeforeCaptured), (Hex $p.B3cC2eGrStatusDumpEntry0Captured), (Hex $p.B3cC2eGrStatusDumpStopCaptured))
+          $grDumpNames = @('NV_PGRAPH_STATUS','NV_PGRAPH_STATUS1','NV_PGRAPH_STATUS2','NV_PGRAPH_ENGINE_STATUS','NV_PGRAPH_GRFIFO_STATUS','NV_PGRAPH_GRFIFO_CONTROL','NV_PGRAPH_PRI_FECS_HOST_INT_STATUS','NV_PGRAPH_EXCEPTION','NV_PGRAPH_FECS_INTR','NV_PFIFO_ENGINE_STATUS_GR','NV_PGRAPH_ACTIVITY0','NV_PGRAPH_ACTIVITY1','NV_PGRAPH_ACTIVITY2','NV_PGRAPH_ACTIVITY4','NV_PGRAPH_PRI_SKED_ACTIVITY','NV_PGRAPH_PRI_GPC0_GPCCS_GPC_ACTIVITY0','NV_PGRAPH_PRI_GPC0_GPCCS_GPC_ACTIVITY1','NV_PGRAPH_PRI_GPC0_GPCCS_GPC_ACTIVITY2','NV_PGRAPH_PRI_GPC0_GPCCS_GPC_ACTIVITY3','NV_PGRAPH_PRI_GPC0_TPC0_TPCCS_TPC_ACTIVITY0','NV_PGRAPH_PRI_GPC0_TPC1_TPCCS_TPC_ACTIVITY0','NV_PGRAPH_PRI_GPC0_TPCS_TPCCS_TPC_ACTIVITY0','NV_PGRAPH_PRI_GPCS_GPCCS_GPC_ACTIVITY0','NV_PGRAPH_PRI_GPCS_GPCCS_GPC_ACTIVITY1','NV_PGRAPH_PRI_GPCS_GPCCS_GPC_ACTIVITY2','NV_PGRAPH_PRI_GPCS_GPCCS_GPC_ACTIVITY3','NV_PGRAPH_PRI_GPCS_TPC0_TPCCS_TPC_ACTIVITY0','NV_PGRAPH_PRI_GPCS_TPC1_TPCCS_TPC_ACTIVITY0','NV_PGRAPH_PRI_GPCS_TPCS_TPCCS_TPC_ACTIVITY0','NV_PGRAPH_PRI_BE0_BECS_BE_ACTIVITY0','NV_PGRAPH_PRI_BE1_BECS_BE_ACTIVITY0','NV_PGRAPH_PRI_BES_BECS_BE_ACTIVITY0','NV_PGRAPH_PRI_DS_MPIPE_STATUS','NV_PGRAPH_PRI_FE_GO_IDLE_ON_STATUS','NV_PGRAPH_PRI_FE_GO_IDLE_TIMEOUT','NV_PGRAPH_PRI_FE_GO_IDLE_CHECK','NV_PGRAPH_PRI_FE_GO_IDLE_INFO','NV_PGRAPH_PRI_GPC0_TPC0_TEX_M_TEX_SUBUNITS_STATUS','NV_PGRAPH_PRI_CWD_FS','NV_PGRAPH_PRI_FE_TPC_FS','NV_PGRAPH_PRI_CWD_GPC_TPC_ID_0','NV_PGRAPH_PRI_CWD_SM_ID_0','NV_PGRAPH_PRI_FECS_CTXSW_STATUS_FE_0','NV_PGRAPH_PRI_FECS_CTXSW_STATUS_1','NV_PGRAPH_PRI_GPC0_GPCCS_CTXSW_STATUS_GPC_0','NV_PGRAPH_PRI_GPC0_GPCCS_CTXSW_STATUS_1','NV_PGRAPH_PRI_FECS_CTXSW_IDLESTATE','NV_PGRAPH_PRI_GPC0_GPCCS_CTXSW_IDLESTATE','NV_PGRAPH_PRI_FECS_CURRENT_CTX','NV_PGRAPH_PRI_FECS_NEW_CTX','NV_PGRAPH_PRI_BE0_CROP_STATUS1','NV_PGRAPH_PRI_BES_CROP_STATUS1','NV_PGRAPH_PRI_BE0_ZROP_STATUS','NV_PGRAPH_PRI_BE0_ZROP_STATUS2','NV_PGRAPH_PRI_BES_ZROP_STATUS','NV_PGRAPH_PRI_BES_ZROP_STATUS2','NV_PGRAPH_PRI_BE0_BECS_BE_EXCEPTION','NV_PGRAPH_PRI_BE0_BECS_BE_EXCEPTION_EN','NV_PGRAPH_PRI_GPC0_GPCCS_GPC_EXCEPTION','NV_PGRAPH_PRI_GPC0_GPCCS_GPC_EXCEPTION_EN','NV_PGRAPH_PRI_GPC0_TPC0_TPCCS_TPC_EXCEPTION','NV_PGRAPH_PRI_GPC0_TPC0_TPCCS_TPC_EXCEPTION_EN')
+          $grDumpSpecs = @(@('before bundle','B3cC2eGrStatusDumpBeforeBundle'), @('after entry 0','B3cC2eGrStatusDumpAfterEntry0'), @('stop point','B3cC2eGrStatusDumpAtStop'))
+          $grDumpData = @{}
+          foreach ($spec in $grDumpSpecs) {
+            $blob = $p.($spec[1])
+            if ($null -eq $blob) { continue }
+            $bytes = [byte[]]$blob
+            if ($bytes.Length -ne ($grDumpNames.Count * 8)) {
+              Add-Content -Path $Log -Value ('C2e GR status dump {0}: malformed bytes={1}, expected={2}' -f $spec[0], $bytes.Length, ($grDumpNames.Count * 8)) -Encoding UTF8
+              continue
+            }
+            $vals = @(); Add-Content -Path $Log -Value ('C2e GR status dump {0} (name=value):' -f $spec[0]) -Encoding UTF8
+            for ($di = 0; $di -lt $grDumpNames.Count; $di++) {
+              $addr = [BitConverter]::ToUInt32($bytes, $di * 8)
+              $val = [BitConverter]::ToUInt32($bytes, $di * 8 + 4)
+              $vals += [uint32]$val
+              Add-Content -Path $Log -Value ('  {0}=0x{1:X8} (0x{2:X8})' -f $grDumpNames[$di], $val, $addr) -Encoding UTF8
+            }
+            $grDumpData[$spec[1]] = $vals
+          }
+          if ($grDumpData.ContainsKey('B3cC2eGrStatusDumpBeforeBundle') -and $grDumpData.ContainsKey('B3cC2eGrStatusDumpAfterEntry0')) {
+            $delta = @(); $beforeVals = $grDumpData['B3cC2eGrStatusDumpBeforeBundle']; $entryVals = $grDumpData['B3cC2eGrStatusDumpAfterEntry0']
+            for ($di = 0; $di -lt $grDumpNames.Count; $di++) {
+              if ($beforeVals[$di] -ne $entryVals[$di]) { $delta += ('{0}=0x{1:X8}->0x{2:X8}' -f $grDumpNames[$di], $beforeVals[$di], $entryVals[$di]) }
+            }
+            if ($delta.Count -eq 0) { Sum 'B3c C2e GR status dump delta before/after entry 0: none' }
+            else { Sum ('B3c C2e GR status dump delta before/after entry 0: {0}' -f ($delta -join '; ')) }
+          } else { Sum 'B3c C2e GR status dump delta before/after entry 0: unavailable' }
+          Sum 'B3c C2e activity registers are raw; referenced GM20B nvgpu headers do not define per-unit 3-bit state names'
+          Sum 'C2e bind/save mailbox values follow gr_gk20a_fecs_ctx_bind_channel() and gr_gk20a_fecs_ctx_image_save(); bundle_init records use the GR pipe bundle ports'
+          if ($null -ne $p.B3cC2ePreBundleGpcPri) {
+            Sum ('B3c immediately before bundle: GPC/TPC/fuse/topology/ring BADF registers {0}; address=value pairs {1}' -f (Hex $p.B3cC2ePreBundleGpcPriBadfCount), (RegPairs $p.B3cC2ePreBundleGpcPri))
+          }
+        }
         Sum ('B3c FECS bootstrap result {0} ({1}); INIT queue HPQ base/size/index {2}/{3}/{4}; MSGQ base/size {5}/{6}' -f (Hex $p.B3cFecsResult), $frWhy, (Hex $p.B3cFecsHpqBase), (Hex $p.B3cFecsHpqSize), (Hex $p.B3cFecsHpqIndex), (Hex $p.B3cFecsMsgqBase), (Hex $p.B3cFecsMsgqSize))
         Sum ('B3c FECS WPR init reply header/control/code {0}/{1}/{2}; polls {3}; bootstrap reply header/control/payload {4}/{5}/{6}; polls {7}' -f (Hex $p.B3cFecsWprReplyHeader), (Hex $p.B3cFecsWprReplyCtrl), (Hex $p.B3cFecsWprReplyCode), $p.B3cFecsWprReplyPolls, (Hex $p.B3cFecsReplyHeader), (Hex $p.B3cFecsReplyCtrl), (Hex $p.B3cFecsReplyPayload), $p.B3cFecsReplyPolls)
         Sum ('B3c FECS HPQ head/tail after WPR init {0}/{1}; after bootstrap wait {2}/{3}; MSGQ head/tail after wait {4}/{5}' -f (Hex $p.B3cFecsHpqHeadAfterWprInit), (Hex $p.B3cFecsHpqTailAfterWprInit), (Hex $p.B3cFecsHpqHeadAfterWait), (Hex $p.B3cFecsHpqTailAfterWait), (Hex $p.B3cFecsMsgHeadAfterWait), (Hex $p.B3cFecsMsgTailAfterWait))
@@ -422,7 +582,22 @@ function Show-Trace {
         Sum ('B3c FECS ctxsw ready at 0x409800: nvgpu expects exact 0x10, Nouveau waits for bit0; accept exact 0x10 or bit0 and track any nonzero/change; observed {0} after {1} polls; legacy 0x419A00 before/after {2}/{3}; FECS CPUCTL/SCTL/mailbox0/1 {4}/{5}/{6}/{7}; PC trace idx/count {8}/{9}; IRQSTAT/MASK {10}/{11}; PFIFO intr0/fault id {12}/{13}' -f (Hex $p.B3cFecsReadyMailbox), $p.B3cFecsReadyPolls, (Hex $p.B3cFecsLegacyMailbox419A00BeforeStartSeq), (Hex $p.B3cFecsLegacyMailbox419A00AfterWait), (Hex $p.B3cFecsCpuctl), (Hex $p.B3cFecsSctl), (Hex $p.B3cFecsMailbox0), (Hex $p.B3cFecsMailbox1), (Hex $p.B3cFecsTraceIdx), $p.B3cFecsTraceCount, (Hex $p.B3cFecsIrqStat), (Hex $p.B3cFecsIrqMask), (Hex $p.B3cFecsPfifoIntr0), (Hex $p.B3cFecsFaultId))
         Sum ('B3c GPCCS after wait: CPUCTL/SCTL {0}/{1}; Falcon mailbox0/1 {2}/{3}; BOOTVEC {4}; PC trace idx/count {5}/{6}; IRQSTAT/MASK {7}/{8}; ctxsw mailbox base 0x41A800' -f (Hex $p.B3cGpccsCpuctl), (Hex $p.B3cGpccsSctl), (Hex $p.B3cGpccsFalconMailbox0), (Hex $p.B3cGpccsFalconMailbox1), (Hex $p.B3cGpccsBootvecFinal), (Hex $p.B3cGpccsTraceIdx), $p.B3cGpccsTraceCount, (Hex $p.B3cGpccsIrqStat), (Hex $p.B3cGpccsIrqMask))
         Sum 'B3c Step 73 FECS DMA snapshot/GPCCS firmware validation; Step 74 GPCCS IMEM/DMEM PIO with 256-byte IMEM padding; Step 75 ordered mailbox setup, GPCCS then FECS start and ready wait'
-        foreach ($w in @(@('PMU checkpoint after WPR ACK', 'B3cPmuCheckpointAfterWprAck'), @('PMU checkpoint after GR enable', 'B3cPmuCheckpointAfterGrEnable'), @('PMU checkpoint before FECS secure-start mailbox sequence', 'B3cPmuCheckpointBeforeFecsStartMailboxSeq'), @('PMU checkpoint before bootstrap', 'B3cPmuCheckpointBeforeBootstrap'), @('WPR init command', 'B3cFecsWprInitCommand'), @('bootstrap command', 'B3cFecsBootstrapCommand'), @('PMU PC trace after post', 'B3cFecsPmuTraceAfterPost'), @('PMU PC trace after wait', 'B3cFecsPmuTraceAfterWait'), @('HPQ tail sample polls', 'B3cFecsHpqSamplePolls'), @('HPQ tail samples', 'B3cFecsHpqTailSamples'), @('PMU IRQSTAT samples', 'B3cFecsPmuIrqSamples'), @('FECS PC trace', 'B3cFecsTracePc'), @('FECS ctxsw mailboxes 0..7', 'B3cFecsCtxswMailboxWords'), @('GPCCS PC trace', 'B3cGpccsTracePc'), @('GPCCS ctxsw mailboxes 0..7', 'B3cGpccsCtxswMailboxWords'), @('FECS MMU fault records', 'B3cFecsFaultRecs'), @('FECS WPR BLD words', 'B3cFecsBldWords'))) {
+        # Claude: the wait history can hold up to 2048 x 10 words. Show only a compact summary on screen;
+        # the full table goes to the log file only, so the console stays readable in a photo.
+        if ($null -ne $p.B3cC2eWaitHistory) {
+          $hb = [byte[]]$p.B3cC2eWaitHistory; $hn = [int]($hb.Length / 40); $hBusy = 0; $hCtxsw = 0; $hRows = @()
+          for ($r = 0; $r -lt $hn; $r++) {
+            $rw = @(); for ($k = 0; $k -lt 10; $k++) { $rw += [BitConverter]::ToUInt32($hb, $r * 40 + $k * 4) }
+            if ($rw[8] -ne 0) { $hBusy++ }; if ($rw[7] -ne 0) { $hCtxsw++ }
+            $hRows += (($rw | ForEach-Object { '{0:X8}' -f $_ }) -join ' ')
+          }
+          Add-Content -Path $Log -Value ('C2e per-wait GR/FIFO snapshots (stage,index,polls,GRstatus,GRengine,FIFOengine,ctx,ctxsw,busy,branch):') -Encoding UTF8
+          foreach ($hr in $hRows) { Add-Content -Path $Log -Value ('  ' + $hr) -Encoding UTF8 }
+          Sum ('C2e wait history: records {0}, GR busy at idle-declare {1}, ctxsw active {2} (full table in the txt log)' -f $hn, $hBusy, $hCtxsw)
+          $hFirst = [Math]::Max(0, $hn - 3)
+          for ($r = $hFirst; $r -lt $hn; $r++) { Sum ('C2e wait history last [{0}]: {1}' -f $r, $hRows[$r]) }
+        }
+        foreach ($w in @(@('C2e post-bind sw_ctx readback (addr/index/expected/actual)', 'B3cC2ePostBindSwCtxReadback'), @('C2e global writes (addr/value)', 'B3cC2eGlobalWrites'), @('C2e timeslice writes (addr/before/mask/after)', 'B3cC2eTimesliceWrites'), @('C2e global commit readback (addr/expected/actual)', 'B3cC2eGlobalReadback'), @('C2e floorsweep readback (addr/expected/actual)', 'B3cC2eFsReadback'), @('C2e exception/interrupt setup writes (addr/value)', 'B3cC2eExceptionSetupWrites'), @('C2e FECS PC trace', 'B3cC2eFecsTracePc'), @('C2e post FECS PC trace', 'B3cC2ePostFecsTracePc'), @('C2e post GPCCS PC trace', 'B3cC2ePostGpccsTracePc'), @('C2e post MMU fault records', 'B3cC2ePostFaultRecords'), @('C2e golden image header samples (offset/value)', 'B3cC2eGoldenSamples'), @('C2e golden buffer first 16 words on exit', 'B3cC2eGoldenRawOnExit'), @('C2e FECS ctxsw mailboxes 0..7 on exit', 'B3cC2eFecsCtxswMailboxes'), @('C2e GPCCS ctxsw mailboxes 0..7 on exit', 'B3cC2eGpccsCtxswMailboxes'), @('C2e MMU fault records', 'B3cC2eFaultRecords'), @('PMU checkpoint after WPR ACK', 'B3cPmuCheckpointAfterWprAck'), @('PMU checkpoint after GR enable', 'B3cPmuCheckpointAfterGrEnable'), @('PMU checkpoint before FECS secure-start mailbox sequence', 'B3cPmuCheckpointBeforeFecsStartMailboxSeq'), @('PMU checkpoint before bootstrap', 'B3cPmuCheckpointBeforeBootstrap'), @('C2b nonctx readback sample (addr/expected/actual)', 'B3cC2bReadback'), @('C2c sw_ctx readback sample (addr/index/expected/actual)', 'B3cC2cReadback'), @('C2d GPU PTE samples (index/expected/actual)', 'B3cC2dGpuPteSamples'), @('C2d backing samples (offset/expected/actual)', 'B3cC2dBackingSamples'), @('C2d outer SMMU PTE samples (index/before/after)', 'B3cC2dOuterPteBeforeAfter'), @('WPR init command', 'B3cFecsWprInitCommand'), @('bootstrap command', 'B3cFecsBootstrapCommand'), @('PMU PC trace after post', 'B3cFecsPmuTraceAfterPost'), @('PMU PC trace after wait', 'B3cFecsPmuTraceAfterWait'), @('HPQ tail sample polls', 'B3cFecsHpqSamplePolls'), @('HPQ tail samples', 'B3cFecsHpqTailSamples'), @('PMU IRQSTAT samples', 'B3cFecsPmuIrqSamples'), @('FECS PC trace', 'B3cFecsTracePc'), @('FECS ctxsw mailboxes 0..7', 'B3cFecsCtxswMailboxWords'), @('GPCCS PC trace', 'B3cGpccsTracePc'), @('GPCCS ctxsw mailboxes 0..7', 'B3cGpccsCtxswMailboxWords'), @('C1 golden query trace', 'B3cC1GoldenQueryWords'), @('C1 zcull query trace', 'B3cC1ZcullQueryWords'), @('C1 PM query trace', 'B3cC1PmQueryWords'), @('FECS MMU fault records', 'B3cFecsFaultRecs'), @('FECS WPR BLD words', 'B3cFecsBldWords'))) {
           if ($null -ne $p.($w[1])) {
             $wb = [byte[]]$p.($w[1]); $wl = @()
             for ($i = 0; $i + 4 -le $wb.Length; $i += 4) { $wl += ('{0:X8}' -f [BitConverter]::ToUInt32($wb, $i)) }
@@ -496,7 +671,8 @@ switch ($Mode) {
       $fwList = @(@('acr\bl.bin', 'FwAcrBl', 832), @('acr\ucode_load.bin', 'FwAcrUcodeLoad', 18592),
                        @('pmu\desc.bin', 'FwPmuDesc', 652), @('pmu\image.bin', 'FwPmuImage', 47872), @('pmu\sig.bin', 'FwPmuSig', 76),
                        @('gr\fecs_bl.bin', 'FwFecsBl', 576), @('gr\fecs_inst.bin', 'FwFecsInst', 17021), @('gr\fecs_data.bin', 'FwFecsData', 1964), @('gr\fecs_sig.bin', 'FwFecsSig', 76),
-                       @('gr\gpccs_inst.bin', 'FwGpccsInst', 0), @('gr\gpccs_data.bin', 'FwGpccsData', 0))
+                       @('gr\gpccs_inst.bin', 'FwGpccsInst', 0), @('gr\gpccs_data.bin', 'FwGpccsData', 0),
+                       @('gr\sw_ctx.bin', 'FwGrSwCtx', 0), @('gr\sw_nonctx.bin', 'FwGrSwNonctx', 0), @('gr\sw_bundle_init.bin', 'FwGrSwBundleInit', 0))
       $fwOk = $true
       if (-not $fwDir) {
         $have = Get-ItemProperty $Key -ErrorAction SilentlyContinue
@@ -513,6 +689,9 @@ switch ($Mode) {
         }
       }
       else { Sum "firmware folder: $fwDir" }
+      if ($fwDir) {
+        Remove-ItemProperty -Path $Key -Name FwGrSwCtx, FwGrSwNonctx, FwGrSwBundleInit -ErrorAction SilentlyContinue
+      }
       foreach ($f in $fwList) {
         if (-not $fwDir) { break }
         $fp = Join-Path $fwDir $f[0]
@@ -544,7 +723,7 @@ switch ($Mode) {
       Log "pnputil /delete-driver $name /uninstall /force"
       (& $Pnputil /delete-driver $name /uninstall /force 2>&1) | ForEach-Object { Log "  $_" }
     }
-    Remove-ItemProperty -Path $Key -Name FwAcrBl, FwAcrUcodeLoad, FwPmuDesc, FwPmuImage, FwPmuSig, FwFecsBl, FwFecsInst, FwFecsData, FwFecsSig, FwGpccsInst, FwGpccsData -ErrorAction SilentlyContinue
+    Remove-ItemProperty -Path $Key -Name FwAcrBl, FwAcrUcodeLoad, FwPmuDesc, FwPmuImage, FwPmuSig, FwFecsBl, FwFecsInst, FwFecsData, FwFecsSig, FwGpccsInst, FwGpccsData, FwGrSwCtx, FwGrSwNonctx, FwGrSwBundleInit -ErrorAction SilentlyContinue
     Show-Device
   }
 }

@@ -39,7 +39,7 @@
 #include <wdf.h>
 #include <spb.h>
 
-#define SWGPU_VERSION      0x00000424u   /* 0.4.36 */
+#define SWGPU_VERSION      0x00000438u   /* 0.4.56 */
 
 #define CAR_PHYS           0x60006000ull
 #define CAR_LEN            0x1000u
@@ -1078,6 +1078,25 @@ static VOID ProbeB2a(PSWGPU_DEVICE Dev)
 #define ACR_WPR_BYTES      0x00040000u
 #define ACR_GM20B_IOMMU_TAG (1ull << 34) /* nouveau_platform.c: gm20b iommu_bit */
 
+/* C2d owns a separate 2 MiB contiguous arena and GPU instance. The outer
+ * SMMU directory may reference this arena, but the ACR arena and instance
+ * block remain dedicated to the ACR/PMU path. */
+#define GR_VM_ARENA_SIZE   0x200000u
+#define GR_VM_CTX_OFF      0x000000u
+#define GR_VM_GLOBAL_OFF   0x020000u /* golden context image */
+#define GR_VM_BUNDLE_OFF   0x040000u
+#define GR_VM_PAGEPOOL_OFF 0x042000u
+#define GR_VM_ATTRIB_OFF   0x050000u
+#define GR_VM_ZCULL_OFF    0x098000u
+#define GR_VM_PM_OFF       0x0A9000u
+#define GR_VM_PRIV_OFF     0x100000u
+#define GR_VM_GPU_PGD_OFF  0x180000u
+#define GR_VM_GPU_PGT_OFF  0x190000u
+#define GR_VM_INST_OFF     0x1D0000u
+#define GR_VM_SMMU_PGT_OFF 0x1D1000u
+#define GR_VM_GPU_VA       0x18000000u
+#define GR_VM_PAGE_COUNT   (GR_VM_ARENA_SIZE >> 12)
+
 typedef struct _ACR_VM_STATE {
     PVOID Arena;
     PVOID WprBuffer;
@@ -1090,6 +1109,32 @@ typedef struct _ACR_VM_STATE {
 } ACR_VM_STATE;
 
 static ACR_VM_STATE g_AcrVm;
+
+typedef struct _GR_VM_STATE {
+    PVOID Arena;
+    PHYSICAL_ADDRESS Pa;
+    ULONGLONG Iova;
+    ULONG SmmuWin;
+    ULONG SmmuPteFirst;
+    ULONG SmmuPdeIndex;
+    ULONG OldSmmuPde;
+    ULONG OldSmmuPtes[GR_VM_PAGE_COUNT];
+    BOOLEAN PtbChanged;
+    BOOLEAN SharedSmmuPt;
+    BOOLEAN Attempted;
+    BOOLEAN Active;
+} GR_VM_STATE;
+
+static GR_VM_STATE g_GrVm;
+
+#define B3C_PRIV_RING_LOG_CAPACITY 64u
+#define B3C_PRIV_RING_LOG_WORDS 16u
+static ULONG g_B3cPrivRingWriteLog[B3C_PRIV_RING_LOG_CAPACITY][B3C_PRIV_RING_LOG_WORDS];
+static ULONG g_B3cPrivRingWriteLogCount;
+static ULONG g_B3cPrivRingWriteLogDropped;
+static ULONG g_B3cPrivRingAckTimeouts;
+static ULONG g_B3cPrivRingLastAckPolls;
+static ULONG g_B3cPrivRingLastCommand;
 
 /* Read back one identity-mapped Tegra-SMMU page. This is diagnostic only:
  * a mismatch is recorded but does not change the ACR experiment flow. */
@@ -2092,6 +2137,2376 @@ static VOID TraceB3cPmuCheckpoint(volatile UCHAR *B, PCWSTR Name)
     TraceBin(Name, snap, sizeof(snap));
 }
 
+/* nvgpu gr_gk20a_init_ctx_state() uses mailbox 0 as a nonzero-return
+ * handshake for size discovery (ok=0, NOT_EQUAL; fail condition skipped).
+ * gr_gk20a_submit_fecs_method_op() clears mailbox 0, writes method data,
+ * then pushes the method address. Keep each query bounded and record all
+ * inputs, mailbox state and poll count for C1 diagnosis. */
+static ULONG B3cFecsQuerySize(volatile UCHAR *B, ULONG methodAddr,
+    PCWSTR traceName, PULONG imageSize)
+{
+    ULONG query[11];
+    ULONG polls;
+
+    query[0] = methodAddr;
+    query[1] = 0u;          /* method data */
+    query[2] = 0u;          /* mailbox ID */
+    query[3] = 0xFFFFFFFFu; /* mailbox clear value */
+    query[4] = 0u;          /* nvgpu mailbox.ok for NOT_EQUAL */
+    query[5] = 0u;          /* nvgpu mailbox.fail; fail condition is SKIP */
+    query[6] = Rd(B, 0x409800u);
+
+    Wr(B, 0x409840u, 0xFFFFFFFFu);
+    query[7] = Rd(B, 0x409800u);
+    Wr(B, 0x409500u, 0u);
+    Wr(B, 0x409504u, methodAddr & 0xFFFu);
+    KeMemoryBarrier();
+
+    query[8] = 0u;
+    for (polls = 0; polls < 2000u; ++polls) {
+        query[8] = Rd(B, 0x409800u);
+        if (query[8] == 0xFFFFFFFFu) {
+            query[9] = polls;
+            query[10] = 0xE0000082u;
+            TraceBin(traceName, query, sizeof(query));
+            return 0xE0000082u;
+        }
+        if (query[8] != 0u) break;
+        Ms(1);
+    }
+    query[9] = polls;
+    if (polls == 2000u) {
+        query[10] = 0xE0000081u;
+        TraceBin(traceName, query, sizeof(query));
+        return 0xE0000081u;
+    }
+    if (query[8] == 2u) {
+        query[10] = 0xE0000082u; /* hw_gr_gm20b.h FAIL marker */
+        TraceBin(traceName, query, sizeof(query));
+        return 0xE0000082u;
+    }
+    query[10] = 0u;
+    TraceBin(traceName, query, sizeof(query));
+    *imageSize = query[8];
+    return 0u;
+}
+
+/* Stage C1 only queries FECS sizes after successful FECS ctxsw readiness.
+ * It does not allocate, bind, or write a GR context. */
+static ULONG B3cQueryFecsImageSizes(PSWGPU_DEVICE Dev, PULONG goldenOut,
+                                    PULONG zcullOut, PULONG pmOut)
+{
+    volatile UCHAR *B = Dev->Bar0;
+    ULONG pmcEnable, result = 0;
+    ULONG goldenImageSize = 0, zcullImageSize = 0, pmImageSize = 0;
+
+    Step(76);
+    pmcEnable = Rd(B, NV_PMC_ENABLE);
+    Trace(L"B3cC1PmcEnable", pmcEnable);
+    Trace(L"B3cC1MailboxPassValue", 1u); /* gr_fecs_ctxsw_mailbox_value_pass_v() */
+    Trace(L"B3cC1MailboxFailValue", 2u); /* gr_fecs_ctxsw_mailbox_value_fail_v() */
+    if (!(pmcEnable & (1u << 12))) {
+        result = 0xE0000083u;
+        goto done;
+    }
+
+    /* hw_gr_gm20b.h: gr_fecs_method_push_adr_discover_image_size_v(). */
+    result = B3cFecsQuerySize(B, 0x10u, L"B3cC1GoldenQueryWords", &goldenImageSize);
+    Trace(L"B3cC1GoldenImageSize", goldenImageSize);
+    if (result != 0u) goto done;
+
+    /* hw_gr_gm20b.h: gr_fecs_method_push_adr_discover_zcull_image_size_v(). */
+    result = B3cFecsQuerySize(B, 0x16u, L"B3cC1ZcullQueryWords", &zcullImageSize);
+    Trace(L"B3cC1ZcullImageSize", zcullImageSize);
+    if (result != 0u) goto done;
+
+    /* hw_gr_gm20b.h: gr_fecs_method_push_adr_discover_pm_image_size_v(). */
+    result = B3cFecsQuerySize(B, 0x25u, L"B3cC1PmQueryWords", &pmImageSize);
+    Trace(L"B3cC1PmImageSize", pmImageSize);
+
+done:
+    if (result == 0u) {
+        *goldenOut = goldenImageSize;
+        *zcullOut = zcullImageSize;
+        *pmOut = pmImageSize;
+    }
+    TraceDurable(L"B3cC1Result", result);
+    return result;
+}
+
+/* C2a: validate the raw GM20B init-list records without touching GR registers.
+ * nvgpu gr_gk20a_init_ctx_vars() stores sw_non_ctx_load and sw_bundle_init as
+ * addr/value records and sw_ctx_load as addr/index/value records. The files
+ * are bounded individually, parsed one at a time, and always freed here.
+ * C2b applies only nonctx during gk20a_init_gr_reset_enable_hw(); sw_ctx is
+ * deferred to setup_hw, while bundle init belongs to
+ * gr_gk20a_init_golden_ctx_image() after FECS context binding. */
+static ULONG B3cValidateOneGrInitList(PCWSTR valueName, PCWSTR traceName,
+                                      ULONG recordBytes, BOOLEAN registerList)
+{
+    PUCHAR data;
+    ULONG length, count, result = 0, trace[8] = { 0 }, entryIndex;
+    ULONG firstOffset, lastOffset;
+
+    data = ReadBinParam(valueName, 0x20000u, &length);
+    if (data == NULL) {
+        trace[0] = 0;
+        trace[1] = recordBytes;
+        trace[7] = 0xE0000084u;
+        TraceBin(traceName, trace, sizeof(trace));
+        return 0xE0000084u;
+    }
+    if (recordBytes == 0 || length == 0 || (length % recordBytes) != 0) {
+        trace[0] = length;
+        trace[1] = recordBytes;
+        trace[7] = 0xE0000085u;
+        TraceBin(traceName, trace, sizeof(trace));
+        ExFreePoolWithTag(data, SWGPU_TAG);
+        return 0xE0000085u;
+    }
+
+    count = length / recordBytes;
+    for (entryIndex = 0; entryIndex < count; ++entryIndex) {
+        ULONG entryOffset = entryIndex * recordBytes;
+        ULONG registerAddress = Le32(data + entryOffset);
+        /* Claude: sw_bundle_init holds bundle/method addresses (0x38..0x1E100
+         * in linux-firmware gm20b, 704 of 952 not dword aligned), not BAR0
+         * register offsets, so only register lists get the alignment check. */
+        if ((registerList && (registerAddress & 3u) != 0) || registerAddress > 0x00FFFFFCu) {
+            trace[0] = length;
+            trace[1] = recordBytes;
+            trace[2] = count;
+            trace[3] = entryIndex;
+            trace[4] = registerAddress;
+            trace[7] = 0xE0000085u;
+            TraceBin(traceName, trace, sizeof(trace));
+            ExFreePoolWithTag(data, SWGPU_TAG);
+            return 0xE0000085u;
+        }
+    }
+    firstOffset = 0;
+    lastOffset = length - recordBytes;
+    trace[0] = length;
+    trace[1] = recordBytes;
+    trace[2] = count;
+    trace[3] = Le32(data + firstOffset); /* first register address */
+    if (recordBytes == 12u) {
+        trace[4] = Le32(data + firstOffset + 4u); /* AIV index */
+        trace[5] = Le32(data + firstOffset + 8u); /* AIV value */
+    } else {
+        trace[5] = Le32(data + firstOffset + 4u); /* AV value */
+    }
+    trace[6] = Le32(data + lastOffset); /* last register address */
+    TraceBin(traceName, trace, sizeof(trace));
+    ExFreePoolWithTag(data, SWGPU_TAG);
+    return result;
+}
+
+static ULONG B3cValidateGrInitLists(PSWGPU_DEVICE Dev)
+{
+    ULONG result;
+    ULONG pmcEnable;
+
+    Step(77);
+    pmcEnable = Rd(Dev->Bar0, NV_PMC_ENABLE);
+    Trace(L"B3cC2aPmcEnable", pmcEnable);
+    if (!(pmcEnable & (1u << 12))) {
+        TraceDurable(L"B3cC2aResult", 0xE0000086u);
+        return 0xE0000086u;
+    }
+
+    /* sw_nonctx and sw_bundle_init use 8-byte AV records; sw_ctx uses
+     * 12-byte AIV records. These are read-only format checks at this stage. */
+    result = B3cValidateOneGrInitList(L"FwGrSwNonctx", L"B3cC2aSwNonctx", 8u, TRUE);
+    if (result == 0)
+        result = B3cValidateOneGrInitList(L"FwGrSwCtx", L"B3cC2aSwCtx", 12u, TRUE);
+    if (result == 0)
+        result = B3cValidateOneGrInitList(L"FwGrSwBundleInit", L"B3cC2aSwBundleInit", 8u, FALSE);
+    TraceDurable(L"B3cC2aResult", result);
+    return result;
+}
+
+/* C2c: nvgpu gk20a_init_gr_setup_hw() applies sw_ctx AIV entries as direct
+ * address/value writes (the entry index is not used by that loop). Validate
+ * every address before the first write and keep the same bounded GM20B PRI
+ * windows used by C2b. */
+static BOOLEAN B3cIsGrPriAddress(ULONG address);
+
+/* Switchroot nvgpu common/priv_ring/priv_ring_gm20b.c:
+ * gm20b_priv_ring_isr() snapshots ringmaster and station error registers,
+ * issues ACK_INTERRUPT, and waits for the command field to return to NO_CMD.
+ * The headers name the registers and command encodings, but do not describe
+ * priv_error_info/code subfields; retain those fields raw. */
+static VOID B3cPrivRingResetWriteLog(VOID)
+{
+    RtlZeroMemory(g_B3cPrivRingWriteLog, sizeof(g_B3cPrivRingWriteLog));
+    g_B3cPrivRingWriteLogCount = 0u;
+    g_B3cPrivRingWriteLogDropped = 0u;
+    g_B3cPrivRingAckTimeouts = 0u;
+    g_B3cPrivRingLastAckPolls = 0u;
+    g_B3cPrivRingLastCommand = 0u;
+}
+
+static BOOLEAN B3cPrivRingAfterGrWrite(volatile UCHAR *B,
+                                        ULONG writeAddress,
+                                        ULONG writeValue)
+{
+    ULONG intr0, intr1;
+    ULONG sysAdr, sysWrdat, sysInfo, sysCode;
+    ULONG gpcAdr, gpcWrdat, gpcInfo, gpcCode;
+    ULONG ackNeeded, ackPolls = 0xFFFFFFFFu, commandAfter = 0u;
+    ULONG *entry;
+
+    intr0 = Rd(B, 0x00120058u);
+    intr1 = Rd(B, 0x0012005Cu);
+    sysAdr = Rd(B, 0x00122120u);
+    sysWrdat = Rd(B, 0x00122124u);
+    sysInfo = Rd(B, 0x00122128u);
+    sysCode = Rd(B, 0x0012212Cu);
+    gpcAdr = Rd(B, 0x00128120u);
+    gpcWrdat = Rd(B, 0x00128124u);
+    gpcInfo = Rd(B, 0x00128128u);
+    gpcCode = Rd(B, 0x0012812Cu);
+    /* The interrupt status is the event qualifier. Station error registers
+     * may retain the previous payload after ACK, so do not attribute a stale
+     * payload to every subsequent write when both status words are clear. */
+    ackNeeded = (intr0 | intr1) != 0u;
+
+    if (ackNeeded) {
+        Wr(B, 0x0012004Cu, 0x2u); /* ACK_INTERRUPT (GM20B header value). */
+        KeMemoryBarrier();
+        for (ackPolls = 0; ackPolls < 2000u; ++ackPolls) {
+            commandAfter = Rd(B, 0x0012004Cu) & 0x3Fu;
+            if (commandAfter == 0u) break; /* NO_CMD */
+            Ms(1);
+        }
+        g_B3cPrivRingLastAckPolls = ackPolls;
+        g_B3cPrivRingLastCommand = commandAfter;
+        if (ackPolls == 2000u) ++g_B3cPrivRingAckTimeouts;
+    }
+
+    if (ackNeeded) {
+        if (g_B3cPrivRingWriteLogCount < B3C_PRIV_RING_LOG_CAPACITY) {
+            entry = g_B3cPrivRingWriteLog[g_B3cPrivRingWriteLogCount++];
+            entry[0] = writeAddress;
+            entry[1] = writeValue;
+            entry[2] = intr0;
+            entry[3] = intr1;
+            entry[4] = sysAdr;
+            entry[5] = sysWrdat;
+            entry[6] = sysInfo;
+            entry[7] = sysCode;
+            entry[8] = gpcAdr;
+            entry[9] = gpcWrdat;
+            entry[10] = gpcInfo;
+            entry[11] = gpcCode;
+            entry[12] = ackPolls;
+            entry[13] = commandAfter;
+            entry[14] = 1u;
+            entry[15] = (ackPolls == 2000u) ? 1u : 0u;
+        } else {
+            ++g_B3cPrivRingWriteLogDropped;
+        }
+    }
+    return ackPolls != 2000u;
+}
+
+static VOID B3cPrivRingTraceWriteLog(PCWSTR countName,
+                                     PCWSTR droppedName,
+                                     PCWSTR timeoutName,
+                                     PCWSTR recordsName)
+{
+    Trace(countName, g_B3cPrivRingWriteLogCount);
+    Trace(droppedName, g_B3cPrivRingWriteLogDropped);
+    Trace(timeoutName, g_B3cPrivRingAckTimeouts);
+    Trace(L"B3cPrivRingLastAckPolls", g_B3cPrivRingLastAckPolls);
+    Trace(L"B3cPrivRingLastCommand", g_B3cPrivRingLastCommand);
+    if (g_B3cPrivRingWriteLogCount != 0u)
+        TraceBin(recordsName, g_B3cPrivRingWriteLog,
+            g_B3cPrivRingWriteLogCount * B3C_PRIV_RING_LOG_WORDS * sizeof(ULONG));
+}
+
+static BOOLEAN B3cPrivRingDrainBeforeWrites(volatile UCHAR *B)
+{
+    /* Sentinel origin distinguishes a pre-existing latched error from a
+     * rejection caused by the first list register write. */
+    return B3cPrivRingAfterGrWrite(B, 0xFFFFFFFFu, 0xFFFFFFFFu);
+}
+
+static ULONG B3cApplyGrCtxList(PSWGPU_DEVICE Dev, BOOLEAN postBind)
+{
+    volatile UCHAR *B = Dev->Bar0;
+    PUCHAR data = NULL;
+    ULONG length = 0, count = 0, result = 0, entryIndex;
+    ULONG grAddr, grIndex, grValue, badAddr = 0, badIndex = 0xFFFFFFFFu;
+    ULONG pmcEnable, writeCount = 0, sampleCount = 0, sample[8][4] = { 0 };
+    ULONG waitPoll = 0, engineStatus = 0, grStatus = 0;
+    ULONG c2cEngineStatusOff = 0x0040060Cu;
+    ULONG c2cGrStatusOff = 0x00400700u;
+
+    Step(postBind ? 86u : 79u);
+    if (!postBind) B3cPrivRingResetWriteLog();
+    if (!B3cPrivRingDrainBeforeWrites(B)) {
+        result = 0xE0000095u; goto done;
+    }
+    pmcEnable = Rd(B, NV_PMC_ENABLE);
+    Trace(postBind ? L"B3cC2ePostBindSwCtxPmcEnable" : L"B3cC2cPmcEnable", pmcEnable);
+    if (!(pmcEnable & (1u << 12))) { result = 0xE0000088u; goto done; }
+
+    data = ReadBinParam(L"FwGrSwCtx", 0x20000u, &length);
+    Trace(postBind ? L"B3cC2ePostBindSwCtxBytes" : L"B3cC2cSwCtxBytes", length);
+    if (data == NULL || length == 0u || (length % 12u) != 0u) {
+        result = 0xE0000088u; goto done;
+    }
+    count = length / 12u;
+    Trace(postBind ? L"B3cC2ePostBindSwCtxCount" : L"B3cC2cSwCtxCount", count);
+    /* Validate the entire list before touching any GR register. */
+    for (entryIndex = 0; entryIndex < count; ++entryIndex) {
+        grAddr = Le32(data + entryIndex * 12u);
+        grIndex = Le32(data + entryIndex * 12u + 4u);
+        if ((grAddr & 3u) != 0u || !B3cIsGrPriAddress(grAddr)) {
+            badAddr = grAddr; badIndex = entryIndex;
+            Trace(postBind ? L"B3cC2ePostBindSwCtxBadEntryIndexValue" : L"B3cC2cBadEntryIndexValue", grIndex);
+            result = 0xE0000088u; goto done;
+        }
+    }
+
+    for (entryIndex = 0; entryIndex < count; ++entryIndex) {
+        grAddr = Le32(data + entryIndex * 12u);
+        grIndex = Le32(data + entryIndex * 12u + 4u);
+        grValue = Le32(data + entryIndex * 12u + 8u);
+        /* gk20a_init_gr_setup_hw() writes l[i].addr = l[i].value; it does
+         * not use AIV index. Record the index for comparison/diagnostics. */
+        Wr(B, grAddr, grValue);
+        if (!B3cPrivRingAfterGrWrite(B, grAddr, grValue)) {
+            badAddr = grAddr; badIndex = entryIndex;
+            result = 0xE0000095u; goto done;
+        }
+        ++writeCount;
+        if (entryIndex < RTL_NUMBER_OF(sample)) {
+            sample[entryIndex][0] = grAddr;
+            sample[entryIndex][1] = grIndex;
+            sample[entryIndex][2] = grValue;
+            sample[entryIndex][3] = 0;
+            sampleCount = entryIndex + 1u;
+        }
+    }
+    KeMemoryBarrier();
+    for (entryIndex = 0; entryIndex < sampleCount; ++entryIndex)
+        sample[entryIndex][3] = Rd(B, sample[entryIndex][0]);
+    Trace(postBind ? L"B3cC2ePostBindSwCtxWrites" : L"B3cC2cSwCtxWrites", writeCount);
+    Trace(postBind ? L"B3cC2ePostBindSwCtxReadbackCount" : L"B3cC2cReadbackCount", sampleCount);
+    if (sampleCount) TraceBin(postBind ? L"B3cC2ePostBindSwCtxReadback" : L"B3cC2cReadback", sample, sampleCount * sizeof(sample[0]));
+
+    /* Observe the setup_hw idle boundary with a finite ceiling. */
+    for (waitPoll = 0; waitPoll < 2000u; ++waitPoll) {
+        engineStatus = Rd(B, c2cEngineStatusOff);
+        grStatus = Rd(B, c2cGrStatusOff);
+        if (!(engineStatus & 1u) && !(grStatus & 0x6u)) break;
+        Ms(1);
+    }
+    Trace(postBind ? L"B3cC2ePostBindSwCtxIdlePolls" : L"B3cC2cIdlePolls", waitPoll);
+    Trace(postBind ? L"B3cC2ePostBindSwCtxEngineStatus" : L"B3cC2cEngineStatus", engineStatus);
+    Trace(postBind ? L"B3cC2ePostBindSwCtxGrStatus" : L"B3cC2cGrStatus", grStatus);
+    if (waitPoll == 2000u) result = 0xE0000088u;
+
+done:
+    Trace(postBind ? L"B3cC2ePostBindSwCtxBadIndex" : L"B3cC2cBadIndex", badIndex);
+    Trace(postBind ? L"B3cC2ePostBindSwCtxBadAddress" : L"B3cC2cBadAddress", badAddr);
+    B3cPrivRingTraceWriteLog(
+        postBind ? L"B3cC2ePrivWriteErrorCount" : L"B3cC2cPrivWriteErrorCount",
+        postBind ? L"B3cC2ePrivWriteErrorDropped" : L"B3cC2cPrivWriteErrorDropped",
+        postBind ? L"B3cC2ePrivAckTimeouts" : L"B3cC2cPrivAckTimeouts",
+        postBind ? L"B3cC2ePrivWriteErrors" : L"B3cC2cPrivWriteErrors");
+    if (data != NULL) ExFreePoolWithTag(data, SWGPU_TAG);
+    TraceDurable(postBind ? L"B3cC2ePostBindSwCtxResult" : L"B3cC2cResult", result);
+    return result;
+}
+
+/* The nvgpu golden path binds the channel FECS context before replaying
+ * sw_ctx_load; this helper is called a second time there for that ordering. */
+static ULONG B3cC2eWaitNouveauGrIdle(volatile UCHAR *B, ULONG waitStage,
+                                     ULONG bundleIndex, PULONG state)
+{
+    ULONG polls, grStatus = 0, engineStatus = 0, fifoStatus = 0;
+    ULONG mcEnable = 0, ctxswActive = 0, grBusy = 0;
+    for (polls = 0; polls < 2000u; ++polls) {
+        grStatus = Rd(B, 0x00400700u);
+        fifoStatus = Rd(B, 0x00002640u);
+        ctxswActive = (fifoStatus & 0x00008000u) != 0u;
+        engineStatus = Rd(B, 0x0040060Cu);
+        grBusy = engineStatus & 1u;
+        mcEnable = Rd(B, NV_PMC_ENABLE);
+        /* nouveau gf100_gr_wait_idle(): GR disabled in MC, or both GR idle
+         * and no ctxsw. FIFO ctx_status INVALID is deliberately not a bypass. */
+        if (!(mcEnable & 0x1000u) || (!grBusy && !ctxswActive)) break;
+        Ms(1);
+    }
+    state[0] = waitStage; state[1] = bundleIndex; state[2] = polls;
+    state[3] = grStatus; state[4] = engineStatus; state[5] = fifoStatus;
+    state[6] = mcEnable;
+    return (polls < 2000u) ? 1u : 0u;
+}
+
+/* Read-only C2b/C2e topology snapshot. Addresses come from the unmodified MIT
+ * nvgpu GM20B headers hw_gr_gm20b.h, hw_fuse_gm20b.h, hw_top_gm20b.h, and
+ * hw_pri_ringmaster/ringstation headers. The 0x5044b0 read is retained because
+ * the hardware log returned BADF5040 there; it is not used as a write target. */
+static VOID B3cCaptureGpcPriDiag(volatile UCHAR *B, PCWSTR traceName,
+                                 PCWSTR badCountName, PULONG badfCountOut)
+{
+    static const ULONG offsets[] = {
+        0x00022430u, 0x00022434u, 0x00022438u, 0x0002243Cu, 0x00022440u,
+        0x00022444u, 0x00022448u, 0x0002244Cu, 0x00022450u, 0x00022454u,
+        0x00022458u, 0x0002245Cu, 0x00021C1Cu, 0x00021C38u, 0x00021C3Cu,
+        0x00021838u, 0x0002183Cu, 0x00409604u,
+        0x0012004Cu, 0x00120050u, 0x00120058u, 0x0012005Cu, 0x00120060u,
+        0x00120078u, 0x00128120u, 0x00128124u, 0x00128128u, 0x0012812Cu,
+        0x00122120u, 0x00122124u, 0x00122128u, 0x0012212Cu,
+        0x00502C80u, 0x00502C90u, 0x00504500u, 0x00504508u, 0x00504238u,
+        0x00504088u, 0x00504698u, 0x0050469Cu, 0x005046A4u, 0x00504D00u,
+        0x00419D00u, 0x0041AC80u, 0x00419EA4u, 0x005044B0u
+    };
+    ULONG pairs[RTL_NUMBER_OF(offsets)][2];
+    ULONG i, badfCount = 0;
+
+    for (i = 0; i < RTL_NUMBER_OF(offsets); ++i) {
+        ULONG value = Rd(B, offsets[i]);
+        pairs[i][0] = offsets[i];
+        pairs[i][1] = value;
+        if ((value & 0xFFFF0000u) == 0xBADF0000u) ++badfCount;
+    }
+    Trace(badCountName, badfCount);
+    TraceBin(traceName, pairs, sizeof(pairs));
+    if (badfCountOut != NULL) *badfCountOut = badfCount;
+}
+
+/* GM20B gm20b_gr_init_gpc_mmu(), called by gk20a_gr_init() after the validated
+ * sw_nonctx writes, memory scrub and GR idle boundary. Secure ACR is active,
+ * so Nouveau's non-secure-only 0x100ce4 bypass is intentionally omitted. */
+static ULONG B3cInitGpcMmu(PSWGPU_DEVICE Dev)
+{
+    volatile UCHAR *B = Dev->Bar0;
+    ULONG values[7][3] = { 0 };
+    ULONG i, mismatchCount = 0, result = 0;
+
+    Step(89);
+    values[0][0] = 0x00418880u;
+    values[0][1] = Rd(B, 0x00100C80u) & 0xF000187Fu;
+    values[1][0] = 0x00418890u; values[1][1] = 0u;
+    values[2][0] = 0x00418894u; values[2][1] = 0u;
+    values[3][0] = 0x004188B0u; values[3][1] = Rd(B, 0x00100CC4u);
+    values[4][0] = 0x004188B4u; values[4][1] = Rd(B, 0x00100CC8u);
+    values[5][0] = 0x004188B8u; values[5][1] = Rd(B, 0x00100CCCu);
+    values[6][0] = 0x004188ACu; values[6][1] = Rd(B, 0x00100800u);
+
+    Trace(L"B3cC2bGpcMmuSourceMmuCtrl", Rd(B, 0x00100C80u));
+    Trace(L"B3cC2bGpcMmuSourceDebugCtl", Rd(B, 0x00100CC4u));
+    Trace(L"B3cC2bGpcMmuSourceDebugWr", Rd(B, 0x00100CC8u));
+    Trace(L"B3cC2bGpcMmuSourceDebugRd", Rd(B, 0x00100CCCu));
+    Trace(L"B3cC2bGpcMmuSourceFbConfig", Rd(B, 0x00100800u));
+    B3cPrivRingResetWriteLog();
+    if (!B3cPrivRingDrainBeforeWrites(B)) { result = 0xE0000095u; goto done; }
+
+    for (i = 0; i < RTL_NUMBER_OF(values); ++i) {
+        if (!B3cIsGrPriAddress(values[i][0])) {
+            result = 0xE0000093u;
+            goto done;
+        }
+    }
+    for (i = 0; i < RTL_NUMBER_OF(values); ++i) {
+        Wr(B, values[i][0], values[i][1]);
+        if (!B3cPrivRingAfterGrWrite(B, values[i][0], values[i][1])) {
+            result = 0xE0000095u;
+            goto done;
+        }
+        values[i][2] = Rd(B, values[i][0]);
+        if (values[i][2] != values[i][1]) ++mismatchCount;
+    }
+    KeMemoryBarrier();
+    Trace(L"B3cC2bGpcMmuWriteCount", RTL_NUMBER_OF(values));
+    Trace(L"B3cC2bGpcMmuMismatchCount", mismatchCount);
+    TraceBin(L"B3cC2bGpcMmuReadback", values, sizeof(values));
+    if (mismatchCount != 0u) result = 0xE0000093u;
+
+done:
+    B3cPrivRingTraceWriteLog(L"B3cC2bGpcMmuPrivWriteErrorCount",
+        L"B3cC2bGpcMmuPrivWriteErrorDropped", L"B3cC2bGpcMmuPrivAckTimeouts",
+        L"B3cC2bGpcMmuPrivWriteErrors");
+    TraceDurable(L"B3cC2bGpcMmuResult", result);
+    return result;
+}
+
+/* C2d allocates a bounded, independent GR address space and the backing that
+ * nvgpu alloc_global_ctx_buffers()/alloc_gr_ctx() prepare before the golden
+ * image. It writes only the new outer/GR page tables and RAMIN instance block;
+ * FECS bind_pointer and golden-save methods remain deferred to C2e. */
+static ULONG B3cPrepareGrContext(PSWGPU_DEVICE Dev, ULONG goldenBytes,
+                                 ULONG zcullBytes, ULONG pmBytes)
+{
+    PHYSICAL_ADDRESS low, high, boundary, acrArenaPa, smmuPtPa;
+    volatile UCHAR *B = Dev->Bar0;
+    volatile ULONG *smmuPd = NULL, *smmuPt = NULL;
+    ULONGLONG *gpuPgd, *gpuPgt, *inst;
+    ULONG pmcEnable, result = 0, i, pageCount = GR_VM_PAGE_COUNT;
+    ULONG grWindowBase, grPageFirst, grPteExpected, grPteRead;
+    ULONG outerPdeExpected, outerPdeRead, gpuPteIndex, gpuPdeIndex, outerBadIndex = 0xFFFFFFFFu;
+    ULONG gpuBadIndex = 0xFFFFFFFFu;
+    ULONG goldenAligned, zcullAligned, pmAligned, privBytes = 0x80000u;
+    ULONG betaDefault = 0x400u, betaGranularity = 0x20u;
+    ULONG alphaDefault = 0x800u, alphaGranularity = 0x20u;
+    ULONG maxTpcCount = 2u, attribBytes, bundleBytes = 0x18u * 0x100u;
+    ULONG pagepoolBytes = 0x80u * 0x100u;
+    ULONG sample[8][3] = { 0 }, sampleCount = 0;
+    ULONG backingSample[16][3] = { 0 };
+    ULONG instPdbLo, instPdbHi, instLimitLo, instLimitHi;
+    ULONGLONG gpuPdb, gpuPdeExpected, wfiGpuVa;
+    ULONG *instWords;
+    BOOLEAN smmuEnabled;
+
+    Step(80);
+    RtlZeroMemory(&g_GrVm, sizeof(g_GrVm));
+    g_GrVm.Attempted = TRUE;
+    pmcEnable = Rd(B, NV_PMC_ENABLE);
+    Trace(L"B3cC2dPmcEnable", pmcEnable);
+    if (!(pmcEnable & (1u << 12))) { result = 0xE0000089u; goto done; }
+    if (!g_AcrVm.Active || goldenBytes == 0 || zcullBytes == 0 || pmBytes == 0 ||
+        goldenBytes > 0x20000u || zcullBytes > 0x20000u || pmBytes > 0x10000u) {
+        result = 0xE0000089u; goto done;
+    }
+
+    /* GM20B gr_gm20b_calc_global_ctx_buffer_size(): beta is 0x400 + half,
+     * alpha is 0x800 + half; each size is multiplied by its 0x20 granularity
+     * and the 2-TPC topology. Header defaults/granularities are from the
+     * user's unmodified MIT hw_gr_gm20b.h. */
+    attribBytes = (betaDefault + (betaDefault >> 1)) * betaGranularity * maxTpcCount +
+                  (alphaDefault + (alphaDefault >> 1)) * alphaGranularity * maxTpcCount;
+    goldenAligned = (goldenBytes + 0xFFFu) & ~0xFFFu;
+    zcullAligned = (zcullBytes + 0xFFFu) & ~0xFFFu;
+    pmAligned = (pmBytes + 0xFFFu) & ~0xFFFu;
+    Trace(L"B3cC2dGoldenBytes", goldenBytes);
+    Trace(L"B3cC2dZcullBytes", zcullBytes);
+    Trace(L"B3cC2dPmBytes", pmBytes);
+    Trace(L"B3cC2dAttribBytes", attribBytes);
+    Trace(L"B3cC2dBundleBytes", bundleBytes);
+    Trace(L"B3cC2dPagepoolBytes", pagepoolBytes);
+    Trace(L"B3cC2dPrivMapBytes", privBytes);
+    Trace(L"B3cC2dTopologyTpcs", maxTpcCount);
+    Trace(L"B3cC2dChannelCtxBytes", goldenAligned);
+    Trace(L"B3cC2dZcullAligned", zcullAligned);
+    Trace(L"B3cC2dPmAligned", pmAligned);
+    if (attribBytes != 0x48000u || bundleBytes != 0x1800u || pagepoolBytes != 0x8000u ||
+        GR_VM_PM_OFF + pmAligned > GR_VM_ARENA_SIZE) {
+        result = 0xE0000089u; goto done;
+    }
+
+    low.QuadPart = 0;
+    high.QuadPart = 0xFFFFFFFFll;
+    boundary.QuadPart = ACR_SMMU_WINDOW;
+    g_GrVm.Arena = MmAllocateContiguousMemorySpecifyCache(
+        GR_VM_ARENA_SIZE, low, high, boundary, MmNonCached);
+    if (g_GrVm.Arena == NULL) { result = 0xE0000089u; goto done; }
+    RtlZeroMemory(g_GrVm.Arena, GR_VM_ARENA_SIZE);
+    g_GrVm.Pa = MmGetPhysicalAddress(g_GrVm.Arena);
+    if (g_GrVm.Pa.HighPart != 0 || (g_GrVm.Pa.LowPart & 0xFFFu) != 0 ||
+        g_GrVm.Pa.LowPart > 0xFFFFFFFFu - GR_VM_ARENA_SIZE) {
+        result = 0xE0000089u; goto done;
+    }
+    {
+        PHYSICAL_ADDRESS acrPa = MmGetPhysicalAddress(g_AcrVm.Arena);
+        ULONG acrEnd = acrPa.LowPart + ACR_VM_ARENA_SIZE;
+        ULONG grEnd = g_GrVm.Pa.LowPart + GR_VM_ARENA_SIZE;
+        if (g_GrVm.Pa.LowPart < acrEnd && acrPa.LowPart < grEnd) {
+            result = 0xE0000089u; goto done;
+        }
+        Trace(L"B3cC2dArenaDistinct", 1u);
+    }
+    g_GrVm.SmmuWin = g_GrVm.Pa.LowPart & ~(ACR_SMMU_WINDOW - 1u);
+    g_GrVm.SmmuPteFirst = (g_GrVm.Pa.LowPart - g_GrVm.SmmuWin) >> 12;
+    pageCount = GR_VM_ARENA_SIZE >> 12;
+    if (g_GrVm.SmmuPteFirst + pageCount > (ACR_SMMU_WINDOW >> 12)) {
+        result = 0xE0000089u; goto done;
+    }
+    smmuEnabled = g_AcrVm.PtbChanged ? TRUE : FALSE;
+    if (smmuEnabled) {
+        smmuPd = (volatile ULONG *)((PUCHAR)g_AcrVm.Arena);
+        g_GrVm.SmmuPdeIndex = g_GrVm.SmmuWin >> 22;
+        g_GrVm.OldSmmuPde = smmuPd[g_GrVm.SmmuPdeIndex];
+        acrArenaPa = MmGetPhysicalAddress(g_AcrVm.Arena);
+        grWindowBase = acrArenaPa.LowPart & ~(ACR_SMMU_WINDOW - 1u);
+        if (g_GrVm.SmmuWin == grWindowBase) {
+            smmuPt = (volatile ULONG *)((PUCHAR)g_AcrVm.Arena + PAGE_SIZE);
+            g_GrVm.SharedSmmuPt = TRUE;
+        } else {
+            smmuPt = (volatile ULONG *)((PUCHAR)g_GrVm.Arena + GR_VM_SMMU_PGT_OFF);
+        }
+        for (i = 0; i < pageCount; ++i) {
+            g_GrVm.OldSmmuPtes[i] = smmuPt[g_GrVm.SmmuPteFirst + i];
+            smmuPt[g_GrVm.SmmuPteFirst + i] = ((g_GrVm.Pa.LowPart >> 12) + i) | SMMU_ATTR_RWNS;
+        }
+        if (!g_GrVm.SharedSmmuPt) {
+            ULONGLONG grSmmuPtPa = (ULONGLONG)g_GrVm.Pa.LowPart + GR_VM_SMMU_PGT_OFF;
+            smmuPd[g_GrVm.SmmuPdeIndex] = (ULONG)(grSmmuPtPa >> 12) |
+                                            SMMU_ATTR_RWNS | SMMU_PDE_NEXT;
+            g_GrVm.PtbChanged = TRUE;
+        }
+        KeMemoryBarrier();
+        Wr(Dev->Mc, MC_SMMU_PTC_FLUSH, 0);
+        (VOID)Rd(Dev->Mc, MC_SMMU_PTB_ASID);
+        Wr(Dev->Mc, MC_SMMU_TLB_FLUSH, 0);
+        (VOID)Rd(Dev->Mc, MC_SMMU_PTB_ASID);
+        g_GrVm.PtbChanged = TRUE;
+        smmuPtPa = MmGetPhysicalAddress((PVOID)smmuPt);
+        outerPdeExpected = (smmuPtPa.LowPart >> 12) | SMMU_ATTR_RWNS | SMMU_PDE_NEXT;
+        outerPdeRead = smmuPd[g_GrVm.SmmuPdeIndex];
+        Trace(L"B3cC2dOuterPdeIndex", g_GrVm.SmmuPdeIndex);
+        Trace(L"B3cC2dOuterPdeBefore", g_GrVm.OldSmmuPde);
+        Trace(L"B3cC2dOuterPdeExpected", outerPdeExpected);
+        Trace(L"B3cC2dOuterPdeRead", outerPdeRead);
+        if (outerPdeRead != outerPdeExpected) { result = 0xE000008Au; goto done; }
+        for (i = 0; i < pageCount; ++i) {
+            ULONG outerExpected = ((g_GrVm.Pa.LowPart >> 12) + i) | SMMU_ATTR_RWNS;
+            if (smmuPt[g_GrVm.SmmuPteFirst + i] != outerExpected) {
+                outerBadIndex = g_GrVm.SmmuPteFirst + i;
+                break;
+            }
+        }
+        Trace(L"B3cC2dOuterPteVerified", i);
+        Trace(L"B3cC2dOuterPteBadIndex", outerBadIndex);
+        if (i != pageCount) { result = 0xE000008Au; goto done; }
+        {
+            ULONG oldPteSample[3][3];
+            oldPteSample[0][0] = g_GrVm.SmmuPteFirst;
+            oldPteSample[1][0] = g_GrVm.SmmuPteFirst + (pageCount >> 1);
+            oldPteSample[2][0] = g_GrVm.SmmuPteFirst + pageCount - 1u;
+            for (i = 0; i < 3; ++i) {
+                oldPteSample[i][1] = g_GrVm.OldSmmuPtes[i == 0 ? 0 : (i == 1 ? pageCount >> 1 : pageCount - 1u)];
+                oldPteSample[i][2] = smmuPt[oldPteSample[i][0]];
+            }
+            TraceBin(L"B3cC2dOuterPteBeforeAfter", oldPteSample, sizeof(oldPteSample));
+        }
+    } else {
+        g_GrVm.Iova = g_GrVm.Pa.LowPart;
+    }
+    if (smmuEnabled) g_GrVm.Iova = (ULONGLONG)g_GrVm.Pa.LowPart | ACR_GM20B_IOMMU_TAG;
+
+    /* Fill the isolated GPU 4 KiB page table, PDB and RAMIN context pointer.
+     * Layout follows nvgpu global buffers and W4T's MIT cross-check layout. */
+    gpuPgd = (ULONGLONG *)((PUCHAR)g_GrVm.Arena + GR_VM_GPU_PGD_OFF);
+    gpuPgt = (ULONGLONG *)((PUCHAR)g_GrVm.Arena + GR_VM_GPU_PGT_OFF);
+    inst = (ULONGLONG *)((PUCHAR)g_GrVm.Arena + GR_VM_INST_OFF);
+    instWords = (ULONG *)((PUCHAR)g_GrVm.Arena + GR_VM_INST_OFF);
+    for (i = 0; i < (0x10000u / sizeof(ULONGLONG)); ++i) gpuPgd[i] = 0;
+    for (i = 0; i < (0x40000u / sizeof(ULONGLONG)); ++i) gpuPgt[i] = 0;
+    gpuPdeIndex = GR_VM_GPU_VA >> 27;
+    gpuPdeExpected = (((ULONGLONG)g_GrVm.Iova + GR_VM_GPU_PGT_OFF) << 24) | (5ull << 32);
+    gpuPgd[gpuPdeIndex] = gpuPdeExpected;
+    gpuPteIndex = (GR_VM_GPU_VA >> 12) & 0x7FFFu;
+    for (i = 0; i < pageCount; ++i)
+        gpuPgt[gpuPteIndex + i] = ((g_GrVm.Iova + ((ULONGLONG)i << 12)) >> 8) | 1ull;
+    gpuPdb = ((g_GrVm.Iova + GR_VM_GPU_PGD_OFF) & ~0xFFFULL) | 4u;
+    inst[0x200 / sizeof(ULONGLONG)] = gpuPdb;
+    inst[0x208 / sizeof(ULONGLONG)] = 0xFFFFFFFFFFULL;
+    wfiGpuVa = (ULONGLONG)GR_VM_GPU_VA + GR_VM_CTX_OFF;
+    /* nvgpu gr_gk20a_commit_inst() first commits the channel context VA before
+     * gr_gk20a_init_golden_ctx_image() temporarily commits GOLDEN_CTX_VA.
+     * Word 132 carries target/mode + VA[31:12]; word 133 carries VA[39:32]. */
+    instWords[132] = (ULONG)((wfiGpuVa & 0xFFFFF000ULL) | 4u);
+    instWords[133] = (ULONG)((wfiGpuVa >> 32) & 0xFFu);
+    KeMemoryBarrier();
+    if (gpuPgd[gpuPdeIndex] != gpuPdeExpected) { result = 0xE000008Au; goto done; }
+    for (i = 0; i < pageCount; ++i) {
+        ULONGLONG gpuPteExpected = ((g_GrVm.Iova + ((ULONGLONG)i << 12)) >> 8) | 1ull;
+        if (gpuPgt[gpuPteIndex + i] != gpuPteExpected) {
+            gpuBadIndex = gpuPteIndex + i;
+            break;
+        }
+    }
+    Trace(L"B3cC2dGpuPteVerified", i);
+    Trace(L"B3cC2dGpuPteBadIndex", gpuBadIndex);
+    if (i != pageCount) { result = 0xE000008Au; goto done; }
+
+    instPdbLo = (ULONG)inst[0x200 / sizeof(ULONGLONG)];
+    instPdbHi = (ULONG)(inst[0x200 / sizeof(ULONGLONG)] >> 32);
+    instLimitLo = (ULONG)inst[0x208 / sizeof(ULONGLONG)];
+    instLimitHi = (ULONG)(inst[0x208 / sizeof(ULONGLONG)] >> 32);
+    Trace(L"B3cC2dArenaPa", g_GrVm.Pa.LowPart);
+    Trace(L"B3cC2dArenaBytes", GR_VM_ARENA_SIZE);
+    Trace(L"B3cC2dArenaIovaLo", (ULONG)g_GrVm.Iova);
+    Trace(L"B3cC2dArenaIovaHi", (ULONG)(g_GrVm.Iova >> 32));
+    Trace(L"B3cC2dGpuVa", GR_VM_GPU_VA);
+    Trace(L"B3cC2dGpuPdeIndex", gpuPdeIndex);
+    Trace(L"B3cC2dGpuPdeExpectedLo", (ULONG)gpuPdeExpected);
+    Trace(L"B3cC2dGpuPdeExpectedHi", (ULONG)(gpuPdeExpected >> 32));
+    Trace(L"B3cC2dGpuPdeReadLo", (ULONG)gpuPgd[gpuPdeIndex]);
+    Trace(L"B3cC2dGpuPdeReadHi", (ULONG)(gpuPgd[gpuPdeIndex] >> 32));
+    Trace(L"B3cC2dGpuPdeLo", (ULONG)gpuPgd[gpuPdeIndex]);
+    Trace(L"B3cC2dGpuPdeHi", (ULONG)(gpuPgd[gpuPdeIndex] >> 32));
+    Trace(L"B3cC2dInstPdbLo", instPdbLo);
+    Trace(L"B3cC2dInstPdbHi", instPdbHi);
+    Trace(L"B3cC2dInstLimitLo", instLimitLo);
+    Trace(L"B3cC2dInstLimitHi", instLimitHi);
+    Trace(L"B3cC2dInstWfiPtrLo", instWords[132]);
+    Trace(L"B3cC2dInstWfiPtrHi", instWords[133]);
+    Trace(L"B3cC2dGoldenCommitVa", GR_VM_GPU_VA + GR_VM_GLOBAL_OFF);
+    Trace(L"B3cC2dGoldenVa", GR_VM_GPU_VA + GR_VM_GLOBAL_OFF);
+    Trace(L"B3cC2dBundleVa", GR_VM_GPU_VA + GR_VM_BUNDLE_OFF);
+    Trace(L"B3cC2dPagepoolVa", GR_VM_GPU_VA + GR_VM_PAGEPOOL_OFF);
+    Trace(L"B3cC2dAttribVa", GR_VM_GPU_VA + GR_VM_ATTRIB_OFF);
+    Trace(L"B3cC2dAttribBaseReg", 0x00418810u);
+    Trace(L"B3cC2dAttribBaseField",
+          (((GR_VM_GPU_VA + GR_VM_ATTRIB_OFF) >> 12) & 0x0FFFFFFFu) | 0x80000000u);
+    Trace(L"B3cC2dPrivMapVa", GR_VM_GPU_VA + GR_VM_PRIV_OFF);
+    Trace(L"B3cC2dChannelCtxVa", GR_VM_GPU_VA + GR_VM_CTX_OFF);
+    Trace(L"B3cC2dZcullVa", GR_VM_GPU_VA + GR_VM_ZCULL_OFF);
+    Trace(L"B3cC2dPmVa", GR_VM_GPU_VA + GR_VM_PM_OFF);
+
+    /* The whole arena was zeroed. Read both edges of each backing allocation
+     * so the next run distinguishes a valid mapped allocation from only a
+     * plausible virtual-address calculation. */
+    backingSample[0][0] = GR_VM_CTX_OFF;       backingSample[0][1] = 0;
+    backingSample[1][0] = GR_VM_CTX_OFF + goldenAligned - 4u; backingSample[1][1] = 0;
+    backingSample[2][0] = GR_VM_GLOBAL_OFF;    backingSample[2][1] = 0;
+    backingSample[3][0] = GR_VM_GLOBAL_OFF + goldenAligned - 4u; backingSample[3][1] = 0;
+    backingSample[4][0] = GR_VM_ATTRIB_OFF;    backingSample[4][1] = 0;
+    backingSample[5][0] = GR_VM_ATTRIB_OFF + attribBytes - 4u; backingSample[5][1] = 0;
+    backingSample[6][0] = GR_VM_PRIV_OFF;      backingSample[6][1] = 0;
+    backingSample[7][0] = GR_VM_PRIV_OFF + privBytes - 4u; backingSample[7][1] = 0;
+    backingSample[8][0] = GR_VM_BUNDLE_OFF;    backingSample[8][1] = 0;
+    backingSample[9][0] = GR_VM_BUNDLE_OFF + bundleBytes - 4u; backingSample[9][1] = 0;
+    backingSample[10][0] = GR_VM_PAGEPOOL_OFF; backingSample[10][1] = 0;
+    backingSample[11][0] = GR_VM_PAGEPOOL_OFF + pagepoolBytes - 4u; backingSample[11][1] = 0;
+    backingSample[12][0] = GR_VM_ZCULL_OFF;    backingSample[12][1] = 0;
+    backingSample[13][0] = GR_VM_ZCULL_OFF + zcullAligned - 4u; backingSample[13][1] = 0;
+    backingSample[14][0] = GR_VM_PM_OFF;      backingSample[14][1] = 0;
+    backingSample[15][0] = GR_VM_PM_OFF + pmAligned - 4u; backingSample[15][1] = 0;
+    for (i = 0; i < RTL_NUMBER_OF(backingSample); ++i) {
+        backingSample[i][2] = *(volatile ULONG *)((PUCHAR)g_GrVm.Arena + backingSample[i][0]);
+        if (backingSample[i][2] != backingSample[i][1]) result = 0xE000008Au;
+    }
+    TraceBin(L"B3cC2dBackingSamples", backingSample, sizeof(backingSample));
+
+    /* Verify the first, middle and final PTE plus RAMIN fields and outer map. */
+    sampleCount = 3;
+    sample[0][0] = gpuPteIndex;
+    sample[0][1] = (ULONG)((g_GrVm.Iova >> 8) | 1ull);
+    sample[0][2] = (ULONG)gpuPgt[gpuPteIndex];
+    sample[1][0] = gpuPteIndex + (pageCount >> 1);
+    sample[1][1] = (ULONG)((g_GrVm.Iova + ((ULONGLONG)(pageCount >> 1) << 12)) >> 8) | 1u;
+    sample[1][2] = (ULONG)gpuPgt[gpuPteIndex + (pageCount >> 1)];
+    sample[2][0] = gpuPteIndex + pageCount - 1u;
+    sample[2][1] = (ULONG)(((g_GrVm.Iova + ((ULONGLONG)(pageCount - 1u) << 12)) >> 8) | 1ull);
+    sample[2][2] = (ULONG)gpuPgt[gpuPteIndex + pageCount - 1u];
+    TraceBin(L"B3cC2dGpuPteSamples", sample, sampleCount * sizeof(sample[0]));
+    TraceDurable(L"B3cC2dSmmuMode", smmuEnabled ? 1u : 0u);
+    if (smmuEnabled) {
+        grPageFirst = g_GrVm.SmmuPteFirst;
+        grPteExpected = ((g_GrVm.Pa.LowPart >> 12) + (pageCount >> 1)) | SMMU_ATTR_RWNS;
+        grPteRead = smmuPt[grPageFirst + (pageCount >> 1)];
+        Trace(L"B3cC2dOuterPteIndex", grPageFirst + (pageCount >> 1));
+        Trace(L"B3cC2dOuterPteExpected", grPteExpected);
+        Trace(L"B3cC2dOuterPteRead", grPteRead);
+        if (grPteRead != grPteExpected) { result = 0xE000008Au; goto done; }
+    }
+    if (instPdbLo != (ULONG)gpuPdb || instPdbHi != (ULONG)(gpuPdb >> 32) ||
+        instLimitLo != 0xFFFFFFFFu || instLimitHi != 0xFFu ||
+        instWords[132] != (ULONG)((wfiGpuVa & 0xFFFFF000ULL) | 4u) ||
+        instWords[133] != (ULONG)((wfiGpuVa >> 32) & 0xFFu) ||
+        sample[0][1] != sample[0][2] || sample[1][1] != sample[1][2] ||
+        sample[2][1] != sample[2][2]) {
+        result = 0xE000008Au; goto done;
+    }
+    if (result != 0u) goto done;
+    g_GrVm.Active = TRUE;
+
+done:
+    TraceDurable(L"B3cC2dResult", result);
+    return result;
+}
+
+/* Match nvgpu gr_gk20a_wait_idle() and gr_gk20a_wait_fe_idle(): GR is idle
+ * for INVALID FIFO context or (!GR busy && !ctxsw); FE is idle when only the
+ * FE method-lower field is zero. The current GM20B path uses GR engine slot 0. */
+static ULONG B3cC2eWait(volatile UCHAR *B, ULONG waitStage, ULONG bundleIndex,
+                        BOOLEAN waitFe, PULONG state, PULONG history,
+                        PULONG historyCount, PULONG historyDropped,
+                        ULONG historyCapacity)
+{
+    ULONG polls, grStatus = 0, grEngineStatus = 0, fifoEngineStatus = 0;
+    ULONG ctxStatus = 0, ctxswActive = 0, grBusy = 0, idle, idleBranch = 0;
+    for (polls = 0; polls < 2000u; ++polls) {
+        grStatus = Rd(B, 0x00400700u);
+        /* Snapshot FIFO/engine even on FE waits so each wait event records
+         * whether GR was truly idle, not just whether the FE method cleared. */
+        fifoEngineStatus = Rd(B, 0x00002640u); /* FIFO GR engine slot 0 */
+        ctxStatus = (fifoEngineStatus >> 13) & 7u;
+        ctxswActive = (fifoEngineStatus & 0x8000u) != 0u;
+        grEngineStatus = Rd(B, 0x0040060Cu);
+        grBusy = grEngineStatus & 1u;
+        if (waitFe) {
+            if (((grStatus >> 2) & 1u) == 0u) { idleBranch = 3u; break; }
+        } else {
+            if (ctxStatus == 0u) { idleBranch = 1u; break; }
+            if (!grBusy && !ctxswActive) { idleBranch = 2u; break; }
+        }
+        Ms(1);
+    }
+    idle = (polls < 2000u) ? 1u : 0u;
+    state[0] = waitStage; state[1] = bundleIndex; state[2] = polls;
+    state[3] = grStatus; state[4] = grEngineStatus;
+    state[5] = fifoEngineStatus; state[6] = waitFe ? 1u : 0u;
+    state[7] = idle; state[8] = idleBranch; state[9] = ctxStatus;
+    state[10] = ctxswActive; state[11] = grBusy;
+    if (history != NULL && historyCount != NULL && historyDropped != NULL) {
+        if (*historyCount < historyCapacity) {
+            PULONG record = history + (*historyCount * 10u);
+            record[0] = waitStage; record[1] = bundleIndex; record[2] = polls;
+            record[3] = grStatus; record[4] = grEngineStatus;
+            record[5] = fifoEngineStatus; record[6] = ctxStatus;
+            record[7] = ctxswActive; record[8] = grBusy;
+            record[9] = idleBranch | (waitFe ? 0x100u : 0u);
+            ++(*historyCount);
+        } else {
+            ++(*historyDropped);
+        }
+    }
+    return idle;
+}
+
+/* Captured on every C2e exit, before the normal GPU reset path. */
+static VOID B3cC2eCaptureDiagnostics(PSWGPU_DEVICE Dev)
+{
+    volatile UCHAR *B = Dev->Bar0;
+    ULONG i, id, count = 0, idx, nr, pc[8] = { 0 }, rec[6][5] = { 0 };
+    ULONG fecsCtxsw[8] = { 0 }, gpccsCtxsw[8] = { 0 };
+    ULONG goldenHead[16] = { 0 };
+    ULONG value;
+    value = Rd(B, 0x00404000u);
+    Trace(L"B3cC2ePostFeHwwEsr", value); Trace(L"B3cC2eFeHwwEsr", value);
+    value = Rd(B, 0x004041B0u);
+    Trace(L"B3cC2ePostFeHwwEsrInfo", value); Trace(L"B3cC2eFeHwwEsrInfo", value);
+    Trace(L"B3cC2ePostFeInfoRaw404004", Rd(B, 0x00404004u));
+    Trace(L"B3cC2ePostGrIntr", Rd(B, 0x00400100u));
+    Trace(L"B3cC2ePostGrIntrEnable", Rd(B, 0x0040013Cu));
+    Trace(L"B3cC2ePostGrException", Rd(B, 0x00400108u));
+    Trace(L"B3cC2ePostGrExceptionEnable", Rd(B, 0x00400138u));
+    Trace(L"B3cC2ePostGrException1", Rd(B, 0x00400118u));
+    Trace(L"B3cC2ePostGrException1Enable", Rd(B, 0x00400130u));
+    Trace(L"B3cC2ePostGrException2", Rd(B, 0x0040011Cu));
+    Trace(L"B3cC2ePostGrException2Enable", Rd(B, 0x00400134u));
+    Trace(L"B3cC2ePostGrStatus1", Rd(B, 0x00400604u));
+    Trace(L"B3cC2ePostGrStatus2", Rd(B, 0x00400608u));
+    Trace(L"B3cC2eGrStatus1", Rd(B, 0x00400604u));
+    Trace(L"B3cC2eGrStatus2", Rd(B, 0x00400608u));
+    value = Rd(B, 0x00409C18u);
+    Trace(L"B3cC2ePostFecsHostIntStatus", value); Trace(L"B3cC2eFecsHostIntStatus", value);
+    Trace(L"B3cC2ePostFecsHostIntClear", Rd(B, 0x00409C20u));
+    Trace(L"B3cC2ePostFecsHostIntEnable", Rd(B, 0x00409C24u));
+    Trace(L"B3cC2ePostMemfmtHwwEsr", Rd(B, 0x00404600u));
+    Trace(L"B3cC2ePostSccHwwEsr", Rd(B, 0x00408030u));
+    Trace(L"B3cC2ePostMmeHwwEsr", Rd(B, 0x00404490u));
+    Trace(L"B3cC2ePostPdHwwEsr", Rd(B, 0x00406018u));
+    Trace(L"B3cC2ePostSkedHwwEsr", Rd(B, 0x00407020u));
+    Trace(L"B3cC2ePostDsHwwEsr", Rd(B, 0x00405840u));
+    value = Rd(B, 0x00400700u);
+    Trace(L"B3cC2ePostGrStatus", value); Trace(L"B3cC2eGrStatus", value);
+    Trace(L"B3cC2ePostGrStatusBit0", value & 1u);
+    Trace(L"B3cC2ePostGrStatusBit5", (value >> 5) & 1u);
+    Trace(L"B3cC2ePostGrStatusBit7", (value >> 7) & 1u);
+    Trace(L"B3cC2ePostGrStatusFeGi", (value >> 21) & 1u);
+    value = Rd(B, 0x0040060Cu);
+    Trace(L"B3cC2ePostGrEngineStatus", value); Trace(L"B3cC2eGrEngineStatus", value);
+    Trace(L"B3cC2ePostFifoEngineStatus", Rd(B, 0x00002640u));
+    Trace(L"B3cC2ePostGrActivity0", Rd(B, 0x00400380u));
+    Trace(L"B3cC2ePostGrActivity1", Rd(B, 0x00400384u));
+    Trace(L"B3cC2ePostGrActivity2", Rd(B, 0x00400388u));
+    Trace(L"B3cC2ePostGrActivity3Present", 0u); /* no gr_activity_3_r() in GM20B header */
+    Trace(L"B3cC2ePostGrActivity4", Rd(B, 0x00400390u));
+    Trace(L"B3cC2ePostFeGoIdle", Rd(B, 0x00404154u));
+    Trace(L"B3cC2ePostFeGoIdleOnStatus", Rd(B, 0x00404150u));
+    Trace(L"B3cC2ePostFePowerMode", Rd(B, 0x00404170u));
+    Trace(L"B3cC2ePostFeGoIdleCheck", Rd(B, 0x00404158u));
+    Trace(L"B3cC2ePostFeGoIdleInfo", Rd(B, 0x00404194u));
+    value = Rd(B, 0x00409100u);
+    Trace(L"B3cC2ePostFecsCpuctl", value); Trace(L"B3cC2eFecsCpuctl", value);
+    value = Rd(B, 0x00409040u);
+    Trace(L"B3cC2ePostFecsMailbox0", value); Trace(L"B3cC2eFecsMailbox0", value);
+    value = Rd(B, 0x00409044u);
+    Trace(L"B3cC2ePostFecsMailbox1", value); Trace(L"B3cC2eFecsMailbox1", value);
+    value = Rd(B, 0x00409008u);
+    Trace(L"B3cC2ePostFecsIrqstat", value); Trace(L"B3cC2eFecsIrqstat", value);
+    Trace(L"B3cC2ePostFecsIrqmask", Rd(B, 0x0040900Cu));
+    value = Rd(B, 0x00409240u);
+    Trace(L"B3cC2ePostFecsSctl", value); Trace(L"B3cC2eFecsSctl", value);
+    for (i = 0; i < RTL_NUMBER_OF(fecsCtxsw); ++i) {
+        fecsCtxsw[i] = Rd(B, 0x00409800u + i * 4u);
+        gpccsCtxsw[i] = Rd(B, 0x0041A800u + i * 4u);
+    }
+    TraceBin(L"B3cC2eFecsCtxswMailboxes", fecsCtxsw, sizeof(fecsCtxsw));
+    TraceBin(L"B3cC2eGpccsCtxswMailboxes", gpccsCtxsw, sizeof(gpccsCtxsw));
+    idx = Rd(B, 0x00409148u); nr = (idx >> 16) & 0xFFu;
+    if (nr > RTL_NUMBER_OF(pc)) nr = RTL_NUMBER_OF(pc);
+    Trace(L"B3cC2ePostFecsTraceIdx", idx); Trace(L"B3cC2ePostFecsTraceCount", nr);
+    for (i = 0; i < nr; ++i) { Wr(B, 0x00409148u, i); pc[i] = Rd(B, 0x0040914Cu); }
+    if (nr) TraceBin(L"B3cC2ePostFecsTracePc", pc, nr * sizeof(ULONG));
+    value = Rd(B, 0x0041A100u);
+    Trace(L"B3cC2ePostGpccsCpuctl", value); Trace(L"B3cC2eGpccsCpuctl", value);
+    value = Rd(B, 0x0041A240u);
+    Trace(L"B3cC2ePostGpccsSctl", value); Trace(L"B3cC2eGpccsSctl", value);
+    value = Rd(B, 0x0041A040u);
+    Trace(L"B3cC2ePostGpccsMailbox0", value); Trace(L"B3cC2eGpccsMailbox0", value);
+    value = Rd(B, 0x0041A044u);
+    Trace(L"B3cC2ePostGpccsMailbox1", value); Trace(L"B3cC2eGpccsMailbox1", value);
+    Trace(L"B3cC2ePostGpccsIrqstat", Rd(B, 0x0041A008u));
+    Trace(L"B3cC2ePostGpccsIrqmask", Rd(B, 0x0041A00Cu));
+    idx = Rd(B, 0x0041A148u); nr = (idx >> 16) & 0xFFu;
+    if (nr > RTL_NUMBER_OF(pc)) nr = RTL_NUMBER_OF(pc);
+    Trace(L"B3cC2ePostGpccsTraceIdx", idx); Trace(L"B3cC2ePostGpccsTraceCount", nr);
+    for (i = 0; i < nr; ++i) { Wr(B, 0x0041A148u, i); pc[i] = Rd(B, 0x0041A14Cu); }
+    if (nr) TraceBin(L"B3cC2ePostGpccsTracePc", pc, nr * sizeof(ULONG));
+    value = Rd(B, 0x2100u);
+    Trace(L"B3cC2ePostPfifoIntr0", value); Trace(L"B3cC2ePfifoIntr0", value);
+    id = Rd(B, 0x259Cu); Trace(L"B3cC2ePostFaultId", id); Trace(L"B3cC2eFaultId", id);
+    for (i = 0; i < 32u && count < RTL_NUMBER_OF(rec); ++i) {
+        if (!(id & (1u << i))) continue;
+        rec[count][0] = i; rec[count][1] = Rd(B, 0x2800u + i * 0x10u);
+        rec[count][2] = Rd(B, 0x2804u + i * 0x10u);
+        rec[count][3] = Rd(B, 0x2808u + i * 0x10u);
+        rec[count][4] = Rd(B, 0x280Cu + i * 0x10u); ++count;
+    }
+    Trace(L"B3cC2ePostFaultCount", count); Trace(L"B3cC2eFaultCount", count);
+    if (count) {
+        TraceBin(L"B3cC2ePostFaultRecords", rec, count * sizeof(rec[0]));
+        TraceBin(L"B3cC2eFaultRecords", rec, count * sizeof(rec[0]));
+    }
+    value = Rd(Dev->Mc, MC_INTSTATUS);
+    Trace(L"B3cC2ePostMcInt", value); Trace(L"B3cC2eMcInt", value);
+    value = Rd(Dev->Mc, MC_ERR_STATUS);
+    Trace(L"B3cC2ePostMcErr", value); Trace(L"B3cC2eMcErr", value);
+    value = Rd(Dev->Mc, MC_ERR_ADR);
+    Trace(L"B3cC2ePostMcErrAdr", value); Trace(L"B3cC2eMcErrAdr", value);
+    if (g_GrVm.Active && g_GrVm.Arena != NULL) {
+        for (i = 0; i < RTL_NUMBER_OF(goldenHead); ++i)
+            goldenHead[i] = *(volatile ULONG *)((PUCHAR)g_GrVm.Arena + GR_VM_GLOBAL_OFF + i * sizeof(ULONG));
+        TraceBin(L"B3cC2eGoldenRawOnExit", goldenHead, sizeof(goldenHead));
+        /* Claude: goldenHead holds only the first 16 words; read the 0xFC magic directly. */
+        Trace(L"B3cC2eGoldenMagicOnExit",
+              *(volatile ULONG *)((PUCHAR)g_GrVm.Arena + GR_VM_GLOBAL_OFF + 0xFCu));
+    }
+}
+
+static VOID B3cC2eCapturePreBundle(volatile UCHAR *B)
+{
+    Trace(L"B3cC2ePreBundleFeHwwEsr", Rd(B, 0x00404000u));
+    Trace(L"B3cC2ePreBundleFeHwwEsrInfo", Rd(B, 0x004041B0u));
+    Trace(L"B3cC2ePreBundleFeInfoRaw404004", Rd(B, 0x00404004u));
+    Trace(L"B3cC2ePreBundleGrIntr", Rd(B, 0x00400100u));
+    Trace(L"B3cC2ePreBundleGrIntrEnable", Rd(B, 0x0040013Cu));
+    Trace(L"B3cC2ePreBundleGrException", Rd(B, 0x00400108u));
+    Trace(L"B3cC2ePreBundleGrExceptionEnable", Rd(B, 0x00400138u));
+    Trace(L"B3cC2ePreBundleGrException1", Rd(B, 0x00400118u));
+    Trace(L"B3cC2ePreBundleGrException1Enable", Rd(B, 0x00400130u));
+    Trace(L"B3cC2ePreBundleGrException2", Rd(B, 0x0040011Cu));
+    Trace(L"B3cC2ePreBundleGrException2Enable", Rd(B, 0x00400134u));
+    Trace(L"B3cC2ePreBundleGrStatus1", Rd(B, 0x00400604u));
+    Trace(L"B3cC2ePreBundleGrStatus2", Rd(B, 0x00400608u));
+    Trace(L"B3cC2ePreBundleFecsHostIntStatus", Rd(B, 0x00409C18u));
+    Trace(L"B3cC2ePreBundleFecsHostIntClear", Rd(B, 0x00409C20u));
+    Trace(L"B3cC2ePreBundleFecsHostIntEnable", Rd(B, 0x00409C24u));
+}
+
+static VOID B3cC2eCaptureBeforeExceptionSetup(volatile UCHAR *B)
+{
+    Trace(L"B3cC2eBeforeSetupFeHwwEsr", Rd(B, 0x00404000u));
+    Trace(L"B3cC2eBeforeSetupFeHwwEsrInfo", Rd(B, 0x004041B0u));
+    Trace(L"B3cC2eBeforeSetupFeInfoRaw404004", Rd(B, 0x00404004u));
+    Trace(L"B3cC2eBeforeSetupGrIntr", Rd(B, 0x00400100u));
+    Trace(L"B3cC2eBeforeSetupGrIntrEnable", Rd(B, 0x0040013Cu));
+    Trace(L"B3cC2eBeforeSetupGrException", Rd(B, 0x00400108u));
+    Trace(L"B3cC2eBeforeSetupGrExceptionEnable", Rd(B, 0x00400138u));
+    Trace(L"B3cC2eBeforeSetupGrException1", Rd(B, 0x00400118u));
+    Trace(L"B3cC2eBeforeSetupGrException1Enable", Rd(B, 0x00400130u));
+    Trace(L"B3cC2eBeforeSetupGrException2", Rd(B, 0x0040011Cu));
+    Trace(L"B3cC2eBeforeSetupGrException2Enable", Rd(B, 0x00400134u));
+    Trace(L"B3cC2eBeforeSetupGrStatus1", Rd(B, 0x00400604u));
+    Trace(L"B3cC2eBeforeSetupGrStatus2", Rd(B, 0x00400608u));
+    Trace(L"B3cC2eBeforeSetupFecsHostIntStatus", Rd(B, 0x00409C18u));
+    Trace(L"B3cC2eBeforeSetupFecsHostIntClear", Rd(B, 0x00409C20u));
+    Trace(L"B3cC2eBeforeSetupFecsHostIntEnable", Rd(B, 0x00409C24u));
+}
+
+/* Mirror gk20a_mm_l2_flush(g, true): flush dirty L2 lines, then invalidate.
+ * Both operations use the GM20B hw_flush registers and a finite poll bound. */
+static BOOLEAN B3cC2eL2Flush(volatile UCHAR *B, PULONG state)
+{
+    ULONG polls, status = 0;
+    Wr(B, 0x00070010u, 1u); /* flush_l2_flush_dirty_pending_busy_f() */
+    for (polls = 0; polls < 2000u; ++polls) {
+        status = Rd(B, 0x00070010u);
+        if ((status & 3u) == 0u) break;
+        Us(5);
+    }
+    state[0] = polls; state[1] = status;
+    if (polls == 2000u) { state[2] = 0u; state[3] = 0u; return FALSE; }
+
+    Wr(B, 0x00070004u, 1u); /* flush_l2_system_invalidate_pending_busy_f() */
+    for (polls = 0; polls < 2000u; ++polls) {
+        status = Rd(B, 0x00070004u);
+        if ((status & 3u) == 0u) break;
+        Us(5);
+    }
+    state[2] = polls; state[3] = status;
+    return (polls < 2000u) ? TRUE : FALSE;
+}
+
+/* Exact register set emitted by MIT nvgpu gr_gm20b_dump_gr_status_regs().
+ * The target has one GPC and two TPCs, so both conditional TPC1 reads are
+ * included. Each trace is address/value DWORD pairs in this source order. */
+#define B3C_GR_STATUS_DUMP_REGS 62u
+static VOID B3cCaptureGrStatusDump(volatile UCHAR *B, PCWSTR Name, PULONG Pairs)
+{
+    static const ULONG offsets[B3C_GR_STATUS_DUMP_REGS] = {
+        0x00400700u, 0x00400604u, 0x00400608u, 0x0040060Cu,
+        0x00400504u, 0x00400500u, 0x00409C18u, 0x00400108u,
+        0x00400144u, 0x00002640u, 0x00400380u, 0x00400384u,
+        0x00400388u, 0x00400390u, 0x00407054u, 0x00502C80u,
+        0x00502C84u, 0x00502C88u, 0x00502C8Cu, 0x00504500u,
+        0x00504D00u, 0x00501D00u, 0x0041AC80u, 0x0041AC84u,
+        0x0041AC88u, 0x0041AC8Cu, 0x0041C500u, 0x0041CD00u,
+        0x00419D00u, 0x00410200u, 0x00410600u, 0x00408A00u,
+        0x00405858u, 0x00404150u, 0x00404154u, 0x00404158u,
+        0x00404194u, 0x00504238u, 0x00405B00u, 0x004041C4u,
+        0x00405B60u, 0x00405BA0u, 0x00409C00u, 0x00409400u,
+        0x00502C04u, 0x00502400u, 0x00409420u, 0x00502420u,
+        0x00409B00u, 0x00409B04u, 0x00410134u, 0x00408934u,
+        0x00410048u, 0x0041004Cu, 0x00408848u, 0x0040884Cu,
+        0x00410204u, 0x00410208u, 0x00502C90u, 0x00502C94u,
+        0x00504508u, 0x0050450Cu
+    };
+    ULONG i;
+    for (i = 0; i < B3C_GR_STATUS_DUMP_REGS; ++i) {
+        Pairs[i * 2u] = offsets[i];
+        Pairs[i * 2u + 1u] = Rd(B, offsets[i]);
+    }
+    TraceBin(Name, Pairs, B3C_GR_STATUS_DUMP_REGS * 2u * sizeof(ULONG));
+}
+
+/* C2e: follow nvgpu gr_gk20a_init_golden_ctx_image() and Nouveau
+ * gm20b_grctx_generate_main() after FECS is ready.
+ * GM20B registers/method encodings were checked against the unmodified MIT
+ * hw_gr_gm20b.h and hw_ctxsw_prog_gm20b.h. sw_bundle_init entries go through
+ * PIPE_BUNDLE_DATA/ADDRESS (gk20a_init_sw_bundle), never as BAR0 offsets.
+ * The address/value table mirrors the GM20B global-buffer commits in
+ * gr_gm20b.c; only fixed GR PRI addresses are written here. */
+static ULONG B3cCreateGoldenContext(PSWGPU_DEVICE Dev)
+{
+    volatile UCHAR *B = Dev->Bar0;
+    PUCHAR bundle = NULL;
+    ULONG bundleBytes = 0, result = 0, pmcEnable, polls, i, lastData = 0;
+    ULONG *instWords, instBlockPa, bindData, saveData, mailbox, bundleMethodId, value;
+    ULONG written = 0, sample[8][3] = { 0 }, sampleCount = 0;
+    ULONG timesliceTrace[6][4] = { 0 };
+    ULONG waitState[12] = { 0 };
+    PULONG waitHistory = NULL;
+    ULONG waitHistoryCount = 0, waitHistoryDropped = 0, waitHistoryCapacity = 2048u;
+    ULONG trueIdleAfterSwCtx[7] = { 0 }, trueIdleAfterSetup[7] = { 0 };
+    ULONG trueIdleAfterRestore[7] = { 0 }, trueIdleAfterMethodInit[7] = { 0 };
+    ULONG trueIdleGoBundle[7] = { 0 }, trueIdlePreSave[7] = { 0 };
+    ULONG trueIdleGoBundleOk = 0, trueIdlePreSaveOk = 0;
+    ULONG trueIdleAfterSwCtxOk = 0, trueIdleAfterSetupOk = 0;
+    ULONG trueIdleAfterRestoreOk = 0, trueIdleAfterMethodInitOk = 0;
+    ULONG firstBusyIndex = 0xFFFFFFFFu, firstBusyMethod = 0;
+    ULONG firstBusyEngineStatus = 0, firstBusyGrStatus = 0, firstBusyFifoStatus = 0;
+    ULONG feGoIdleTimeoutSaved = 0, feGoIdleTimeoutSavedValid = 0;
+    ULONG mcUnk260AtEntry = 0;
+    ULONG gr5044b0AtEntry = 0, gr5044b0AtExit = 0;
+    ULONG l2FlushState[4] = { 0 };
+    ULONG fePowerStatus = 0, resetAssertRead = 0, resetReleaseRead = 0;
+    ULONG preBundleFeEsr = 0;
+    ULONG bundleBaseline[5] = { 0 }, bundleEntry0[8] = { 0 };
+    ULONG grDumpBefore[B3C_GR_STATUS_DUMP_REGS * 2u] = { 0 };
+    ULONG grDumpEntry0[B3C_GR_STATUS_DUMP_REGS * 2u] = { 0 };
+    ULONG grDumpStop[B3C_GR_STATUS_DUMP_REGS * 2u] = { 0 };
+    ULONG grDumpBeforeCaptured = 0, grDumpEntry0Captured = 0, grDumpStopCaptured = 0;
+    ULONG bundleFirstChange[8] = { 0 }, bundleFirstChangeIndex = 0xFFFFFFFFu;
+    ULONG bundleFirstChangeFound = 0;
+    ULONG bundleFeEsr, bundleFeInfo, bundleGrIntr, bundleGrException, bundleGrStatus;
+    ULONG preSaveGrStatus, preSaveGrStatus1, preSaveGrStatus2;
+    ULONG preSaveGrEngineStatus, preSaveFifoEngineStatus;
+    ULONG goldenHdr[64], goldenSamples[8][2] = { 0 };
+    ULONG fecsTraceIdx, fecsTraceCount, fecsPc[8] = { 0 };
+    ULONG faultId, faultCount = 0, unit, faultRecs[6][5] = { 0 };
+    ULONG fsSample[12][3] = { 0 }, fsSampleCount = 0, fsWrites = 0;
+    ULONG ropWrites[3][4] = { 0 }, ropWriteCount = 0;
+    ULONG earlyZcullWrites[6][4] = { 0 }, earlyZcullWriteCount = 0;
+    ULONG nouveauRopWrites[2][4] = { 0 }, nouveauRopWriteCount = 0;
+    ULONG fifoCtlTrace[3] = { 0 }, fbpCountRaw = 0, fbpCount = 0;
+    ULONG ltcCountRaw = 0, ltcCountDetected = 0;
+    ULONG ltcMaxCount = 0, ltcActiveCountRaw = 0, ltcParamRaw = 0;
+    ULONG ltcSlicesPerLtc = 0, ltcCacheLineBytes = 0, ltcTagsPerCacheLine = 0;
+    ULONG ltcFsWrites[4][4] = { 0 }, ltcFsWriteCount = 0;
+    ULONG fbFsWrites[1][4] = { 0 }, fbFsWriteCount = 0;
+    ULONG cbcWrites[1][4] = { 0 }, cbcWriteCount = 0;
+    ULONG zbcWrites[48][4] = { 0 }, zbcWriteCount = 0;
+    ULONG zbcColorDs[3][4] = { {0u,0u,0u,0x3F800000u}, {0u,0u,0u,0u},
+                                {0x3F800000u,0x3F800000u,0x3F800000u,0x3F800000u} };
+    ULONG zbcColorL2[3][4] = { {0xFF000000u,0u,0u,0u}, {0u,0u,0u,0u},
+                                {0xFFFFFFFFu,0xFFFFFFFFu,0xFFFFFFFFu,0xFFFFFFFFu} };
+    ULONG zbcColorFmt[3] = { 0x28u, 1u, 2u };
+    ULONG zbcDepth[2] = { 0x3F800000u, 0u };
+    ULONG zbcColorIndex, zbcChanIndex, zbcLtcIndex, zbcAddress, zbcValue;
+    ULONG zbcIdleState[7] = { 0 }, zbcIdleOk = 0;
+    ULONG cbcNoComptag = 1u;
+    ULONG ltcFsConfigured = 0, fbFsConfigured = 0;
+    ULONG zbcConfigured = 0, cbcConfigured = 0, beRopConfigured = 0;
+    ULONG rdCoalesceBefore = 0, rdCoalesceAfter = 0, rdCoalesceMask = 0x14u;
+    ULONG bundleBase, pagepoolBase, attribBase, bundleCount = 0;
+    ULONG preBundleGpcPriBadfCount = 0;
+    struct { ULONG Address; ULONG Value; } globalWrites[] = {
+        {0x0040800Cu, 0x00000800u}, {0x00408010u, 0x80000080u},
+        {0x00419004u, 0x00000420u}, {0x00419008u, 0x00000080u},
+        {0x004064CCu, 0x80000080u}, {0x00418E30u, 0x80000080u},
+        {0x00408004u, 0x00000400u}, {0x00408008u, 0x80000018u},
+        {0x00418E24u, 0x00000400u}, {0x00418E28u, 0x80000018u},
+        {0x004064C8u, 0x00C001C0u},
+        {0x00418810u, 0x80018050u}, {0x00419848u, 0x10018050u},
+        {0x00419C2Cu, 0x10018050u}, {0x00405830u, 0x04000800u},
+        {0x004064C4u, 0x0200FFFFu}, {0x005030C0u, 0x00000800u},
+        {0x005030F4u, 0x00000000u}, {0x005030E4u, 0x00001000u},
+        {0x005030F8u, 0x00000C00u}, {0x00418EA0u, 0x02AA0800u}
+    };
+
+    Step(81);
+    B3cPrivRingResetWriteLog();
+    mcUnk260AtEntry = Rd(B, 0x00000260u);
+    Trace(L"B3cC2eMcUnk260AtEntry", mcUnk260AtEntry);
+    pmcEnable = Rd(B, NV_PMC_ENABLE);
+    Trace(L"B3cC2ePmcEnable", pmcEnable);
+    if (!(pmcEnable & (1u << 12)) || !g_GrVm.Active || g_GrVm.Arena == NULL) {
+        result = 0xE000008Bu; goto done;
+    }
+    gr5044b0AtEntry = Rd(B, 0x005044B0u);
+    Trace(L"B3cC2eGr5044B0AtEntry", gr5044b0AtEntry);
+    Trace(L"B3cC2eGr5044B0Bit27AtEntry", (gr5044b0AtEntry >> 27) & 1u);
+    waitHistory = (PULONG)ExAllocatePool2(POOL_FLAG_NON_PAGED,
+        waitHistoryCapacity * 10u * sizeof(ULONG), SWGPU_TAG);
+    if (waitHistory != NULL) RtlZeroMemory(waitHistory,
+        waitHistoryCapacity * 10u * sizeof(ULONG));
+    Trace(L"B3cC2eWaitHistoryCapacity", waitHistory != NULL ? waitHistoryCapacity : 0u);
+
+    /* Step 82: nvgpu's FE-on, ctxsw reset pulse, FE-auto, then SCC clear. */
+    Step(82);
+    Wr(B, 0x00404170u, 0x12u); /* REQ_SEND | MODE_FORCE_ON */
+    for (polls = 0; polls < 200u; ++polls) {
+        fePowerStatus = Rd(B, 0x00404170u);
+        if (((fePowerStatus >> 4) & 1u) == 0u) break;
+        Us(10);
+    }
+    waitState[0] = 10u; waitState[1] = 0xFFFFFFFFu; waitState[2] = polls;
+    waitState[3] = fePowerStatus; waitState[6] = 0u; waitState[7] = (polls < 200u);
+    Trace(L"B3cC2eForceOnPolls", polls); Trace(L"B3cC2eForceOnStatus", fePowerStatus);
+    if (polls == 200u) { result = 0xE000008Du; goto done; }
+    Wr(B, 0x00409614u, 0x70u);
+    resetAssertRead = Rd(B, 0x00409614u);
+    Us(10);
+    Wr(B, 0x00409614u, 0x770u);
+    resetReleaseRead = Rd(B, 0x00409614u);
+    Us(10);
+    Trace(L"B3cC2eCtxswResetAssert", resetAssertRead);
+    Trace(L"B3cC2eCtxswResetRelease", resetReleaseRead);
+    if (resetAssertRead != 0x70u || resetReleaseRead != 0x770u) {
+        result = 0xE000008Du; goto done;
+    }
+    Wr(B, 0x00404170u, 0x10u); /* REQ_SEND | MODE_AUTO */
+    for (polls = 0; polls < 200u; ++polls) {
+        fePowerStatus = Rd(B, 0x00404170u);
+        if (((fePowerStatus >> 4) & 1u) == 0u) break;
+        Us(10);
+    }
+    waitState[0] = 11u; waitState[1] = 0xFFFFFFFFu; waitState[2] = polls;
+    waitState[3] = fePowerStatus; waitState[6] = 0u; waitState[7] = (polls < 200u);
+    Trace(L"B3cC2eAutoPolls", polls); Trace(L"B3cC2eAutoStatus", fePowerStatus);
+    if (polls == 200u) { result = 0xE000008Du; goto done; }
+    Wr(B, 0x0040802Cu, 1u); /* SCC RAM clear */
+    Trace(L"B3cC2eSccInit", Rd(B, 0x0040802Cu));
+    bundleBase = (GR_VM_GPU_VA + GR_VM_BUNDLE_OFF) >> 8;
+    pagepoolBase = (GR_VM_GPU_VA + GR_VM_PAGEPOOL_OFF) >> 8;
+    attribBase = (GR_VM_GPU_VA + GR_VM_ATTRIB_OFF) >> 12;
+    globalWrites[0].Value = pagepoolBase;
+    globalWrites[1].Value = 0x80000080u;
+    globalWrites[2].Value = pagepoolBase;
+    globalWrites[3].Value = 0x00000080u;
+    globalWrites[4].Value = 0x80000080u;
+    globalWrites[5].Value = 0x80000080u;
+    globalWrites[6].Value = bundleBase;
+    globalWrites[7].Value = 0x80000018u;
+    globalWrites[8].Value = bundleBase;
+    globalWrites[9].Value = 0x80000018u;
+    globalWrites[11].Value = attribBase | 0x80000000u;
+    globalWrites[12].Value = attribBase | 0x10000000u;
+    globalWrites[13].Value = attribBase | 0x10000000u;
+    for (i = 0; i < RTL_NUMBER_OF(globalWrites); ++i) {
+        if ((globalWrites[i].Address & 3u) != 0u ||
+            !B3cIsGrPriAddress(globalWrites[i].Address)) {
+            result = 0xE000008Cu; goto done;
+        }
+    }
+    instWords = (ULONG *)((PUCHAR)g_GrVm.Arena + GR_VM_INST_OFF);
+    /* Claude: FECS must see the instance block through the same GPU-visible
+     * address as the C2d PDB (IOMMU-tagged IOVA when the SMMU is active),
+     * like the ACR PMU bind (inst 0x704FDC68 carries the tag bit 22). An
+     * untagged physical address is the PRIV_VIOLATION path from B2a. */
+    instBlockPa = (ULONG)(((g_GrVm.Iova + GR_VM_INST_OFF) >> 12) & 0x0FFFFFFFu);
+    bindData = instBlockPa | 0xB0000000u;
+    Trace(L"B3cC2eInstIovaPage", instBlockPa);
+    saveData = bindData;
+    /* Claude: invalidate the GPU MMU for the new GR PDB before FECS first
+     * walks it, using the same bounded helper as the ACR path. */
+    if (!AcrMmuInvalidatePdb(B, g_GrVm.Iova + GR_VM_GPU_PGD_OFF)) {
+        Trace(L"B3cC2eGrPdbInvalidate", 0u);
+        result = 0xE000008Du; goto done;
+    }
+    Trace(L"B3cC2eGrPdbInvalidate", 1u);
+    /* Steps 98-100 follow the front of nvgpu gk20a_init_gr_setup_hw():
+     * PE stream-master + zcull setup, Nouveau's GM20B ROP active-FBP count,
+     * then GPFIFO/semaphore access.  The fixed 1-GPC/2-TPC values reuse the
+     * previously validated zcull map; no unbounded topology is accepted. */
+    Step(101);
+    earlyZcullWrites[0][0] = 0x00503018u;
+    earlyZcullWrites[0][1] = Rd(B, earlyZcullWrites[0][0]);
+    earlyZcullWrites[0][2] = earlyZcullWrites[0][1] | 1u;
+    earlyZcullWrites[1][0] = 0x00418980u;
+    earlyZcullWrites[1][1] = Rd(B, earlyZcullWrites[1][0]);
+    earlyZcullWrites[1][2] = 0x10u;
+    earlyZcullWrites[2][0] = 0x00500914u;
+    earlyZcullWrites[2][1] = Rd(B, earlyZcullWrites[2][0]);
+    earlyZcullWrites[2][2] = 0x00000201u;
+    earlyZcullWrites[3][0] = 0x00500910u;
+    earlyZcullWrites[3][1] = Rd(B, earlyZcullWrites[3][0]);
+    earlyZcullWrites[3][2] = 0x00040002u;
+    earlyZcullWrites[4][0] = 0x00500918u;
+    earlyZcullWrites[4][1] = Rd(B, earlyZcullWrites[4][0]);
+    earlyZcullWrites[4][2] = 0x00400000u; /* ceil(0x800000 / 2 TPCs) */
+    earlyZcullWrites[5][0] = 0x0041BFD4u;
+    earlyZcullWrites[5][1] = Rd(B, earlyZcullWrites[5][0]);
+    earlyZcullWrites[5][2] = 0x00400000u;
+    for (i = 0; i < RTL_NUMBER_OF(earlyZcullWrites); ++i) {
+        if ((earlyZcullWrites[i][0] & 3u) ||
+            !B3cIsGrPriAddress(earlyZcullWrites[i][0])) {
+            result = 0xE000009Cu; goto done;
+        }
+    }
+    if (!B3cPrivRingDrainBeforeWrites(B)) { result = 0xE0000095u; goto done; }
+    for (i = 0; i < RTL_NUMBER_OF(earlyZcullWrites); ++i) {
+        Wr(B, earlyZcullWrites[i][0], earlyZcullWrites[i][2]);
+        if (!B3cPrivRingAfterGrWrite(B, earlyZcullWrites[i][0], earlyZcullWrites[i][2])) {
+            result = 0xE0000095u; goto done;
+        }
+        earlyZcullWrites[i][3] = Rd(B, earlyZcullWrites[i][0]);
+        ++earlyZcullWriteCount;
+        /* Claude: 0.4.55 HW showed zcull registers that do not read back the
+         * written value (0x500910 adds bit 30, 0x500918 and broadcast 0x41BFD4
+         * read 0). The same values were written by the old Step 83 without
+         * stopping, and the priv ring reported no rejection, so a readback
+         * difference here is recorded (earlyZcullWrites) but not fatal. */
+    }
+    Step(102);
+    fbpCountRaw = Rd(B, 0x00120074u);
+    fbpCount = fbpCountRaw & 0xFu;
+    nouveauRopWrites[0][0] = 0x00408850u;
+    nouveauRopWrites[1][0] = 0x00408958u;
+    for (i = 0; i < RTL_NUMBER_OF(nouveauRopWrites); ++i) {
+        nouveauRopWrites[i][1] = Rd(B, nouveauRopWrites[i][0]);
+        nouveauRopWrites[i][2] = (nouveauRopWrites[i][1] & ~0xFu) | fbpCount;
+        if ((nouveauRopWrites[i][0] & 3u) ||
+            !B3cIsGrPriAddress(nouveauRopWrites[i][0])) {
+            result = 0xE000009Du; goto done;
+        }
+    }
+    /* Claude: 0.4.55 HW read 0x120074 = 0. Do not program 0 active units;
+     * skip Nouveau's FBP-count variant and let Step 92 (nvgpu, LTC count 2,
+     * verified on 0.4.54) set ZROP/CROP. */
+    Trace(L"B3cC2eNouveauRopSkippedZeroFbp", fbpCount == 0u ? 1u : 0u);
+    if (fbpCount != 0u && !B3cPrivRingDrainBeforeWrites(B)) { result = 0xE0000095u; goto done; }
+    for (i = 0; fbpCount != 0u && i < RTL_NUMBER_OF(nouveauRopWrites); ++i) {
+        Wr(B, nouveauRopWrites[i][0], nouveauRopWrites[i][2]);
+        if (!B3cPrivRingAfterGrWrite(B, nouveauRopWrites[i][0], nouveauRopWrites[i][2])) {
+            result = 0xE0000095u; goto done;
+        }
+        nouveauRopWrites[i][3] = Rd(B, nouveauRopWrites[i][0]);
+        ++nouveauRopWriteCount;
+        if (nouveauRopWrites[i][3] != nouveauRopWrites[i][2]) {
+            result = 0xE000009Du; goto done;
+        }
+    }
+    Step(103);
+    fifoCtlTrace[0] = Rd(B, 0x00400500u);
+    fifoCtlTrace[1] = 0x00010001u;
+    if (!B3cIsGrPriAddress(0x00400500u)) { result = 0xE000009Eu; goto done; }
+    if (!B3cPrivRingDrainBeforeWrites(B)) { result = 0xE0000095u; goto done; }
+    Wr(B, 0x00400500u, fifoCtlTrace[1]);
+    if (!B3cPrivRingAfterGrWrite(B, 0x00400500u, fifoCtlTrace[1])) {
+        result = 0xE0000095u; goto done;
+    }
+    fifoCtlTrace[2] = Rd(B, 0x00400500u);
+    if (fifoCtlTrace[2] != fifoCtlTrace[1]) { result = 0xE000009Eu; goto done; }
+    /* nvgpu gk20a_init_gr_setup_hw() exception/interrupt section. Keep it
+     * before the FECS bind/golden-generation sequence, as setup_hw precedes
+     * gr_gk20a_init_golden_ctx_image(). MC/CPU interrupt outputs stay off. */
+    Step(84);
+    B3cC2eCaptureBeforeExceptionSetup(B);
+    preBundleFeEsr = Rd(B, 0x00404000u);
+    Trace(L"B3cC2ePreSetupFeEsr", preBundleFeEsr);
+    if (preBundleFeEsr & 0x3FFFFFFFu) {
+        result = 0xE000008Fu; goto done;
+    }
+    {
+        ULONG setupAddr[20], setupValue[20], setupTrace[20][2];
+        ULONG setupCount = 0, setupIndex;
+        setupAddr[setupCount] = 0x00400100u; setupValue[setupCount++] = 0xFFFFFFFFu;
+        setupAddr[setupCount] = 0x0040013Cu; setupValue[setupCount++] = 0xFFFFFFFFu;
+        setupAddr[setupCount] = 0x00409C24u; setupValue[setupCount++] = 0x000F0002u;
+        setupAddr[setupCount] = 0x00404000u; setupValue[setupCount++] = 0xC0000000u;
+        setupAddr[setupCount] = 0x00404600u; setupValue[setupCount++] = 0xC0000000u;
+        setupAddr[setupCount] = 0x00408030u; setupValue[setupCount++] = 0xC0000000u;
+        setupAddr[setupCount] = 0x00404490u; setupValue[setupCount++] = 0xC0000000u;
+        setupAddr[setupCount] = 0x00406018u; setupValue[setupCount++] = 0xC0000000u;
+        setupAddr[setupCount] = 0x00407020u; setupValue[setupCount++] = 0x40000000u;
+        setupAddr[setupCount] = 0x00405840u; setupValue[setupCount++] = 0xC0000000u;
+        setupAddr[setupCount] = 0x00419E44u; setupValue[setupCount++] = 0x00DFFFFEu;
+        setupAddr[setupCount] = 0x00419E4Cu; setupValue[setupCount++] = 0x00000005u;
+        setupAddr[setupCount] = 0x00419D0Cu; setupValue[setupCount++] = 0x00000003u;
+        setupAddr[setupCount] = 0x0041AC94u; setupValue[setupCount++] = 0x00020000u;
+        setupAddr[setupCount] = 0x00400108u; setupValue[setupCount++] = 0xFFFFFFFFu;
+        setupAddr[setupCount] = 0x00400138u; setupValue[setupCount++] = 0xFFFFFFFFu;
+        setupAddr[setupCount] = 0x00400118u; setupValue[setupCount++] = 0xFFFFFFFFu;
+        setupAddr[setupCount] = 0x00400130u; setupValue[setupCount++] = 0xFFFFFFFFu;
+        setupAddr[setupCount] = 0x0040011Cu; setupValue[setupCount++] = 0xFFFFFFFFu;
+        setupAddr[setupCount] = 0x00400134u; setupValue[setupCount++] = 0xFFFFFFFFu;
+        for (setupIndex = 0; setupIndex < setupCount; ++setupIndex) {
+            if ((setupAddr[setupIndex] & 3u) ||
+                !B3cIsGrPriAddress(setupAddr[setupIndex])) {
+                result = 0xE000008Eu; goto done;
+            }
+        }
+        Trace(L"B3cC2eExceptionSetupCount", setupCount);
+        for (setupIndex = 0; setupIndex < setupCount; ++setupIndex) {
+            setupTrace[setupIndex][0] = setupAddr[setupIndex];
+            setupTrace[setupIndex][1] = setupValue[setupIndex];
+        }
+        TraceBin(L"B3cC2eExceptionSetupWrites", setupTrace,
+                 setupCount * sizeof(setupTrace[0]));
+        if (!B3cPrivRingDrainBeforeWrites(B)) {
+            result = 0xE0000095u; goto done;
+        }
+        for (setupIndex = 0; setupIndex < setupCount; ++setupIndex) {
+            Wr(B, setupAddr[setupIndex], setupValue[setupIndex]);
+            if (!B3cPrivRingAfterGrWrite(B, setupAddr[setupIndex], setupValue[setupIndex])) {
+                result = 0xE0000095u; goto done;
+            }
+        }
+        Trace(L"B3cC2eGrIntrAfterEnable", Rd(B, 0x00400100u));
+        Trace(L"B3cC2eGrIntrEnableReadback", Rd(B, 0x0040013Cu));
+        Trace(L"B3cC2eFecsHostIntStatusAfterEnable", Rd(B, 0x00409C18u));
+        Trace(L"B3cC2eFecsHostIntClearAfterEnable", Rd(B, 0x00409C20u));
+        Trace(L"B3cC2eFecsHostIntEnableReadback", Rd(B, 0x00409C24u));
+        Trace(L"B3cC2eExceptionAfterEnable", Rd(B, 0x00400108u));
+        Trace(L"B3cC2eException1AfterEnable", Rd(B, 0x00400118u));
+        Trace(L"B3cC2eException2AfterEnable", Rd(B, 0x0040011Cu));
+        Trace(L"B3cC2eFeHwwEsrAfterEnable", Rd(B, 0x00404000u));
+        Trace(L"B3cC2eMemfmtHwwEsrAfterEnable", Rd(B, 0x00404600u));
+        Trace(L"B3cC2eSccHwwEsrAfterEnable", Rd(B, 0x00408030u));
+        Trace(L"B3cC2eMmeHwwEsrAfterEnable", Rd(B, 0x00404490u));
+        Trace(L"B3cC2ePdHwwEsrAfterEnable", Rd(B, 0x00406018u));
+        Trace(L"B3cC2eSkedHwwEsrAfterEnable", Rd(B, 0x00407020u));
+        Trace(L"B3cC2eDsHwwEsrAfterEnable", Rd(B, 0x00405840u));
+        Trace(L"B3cC2eFeHwwInfoDecodeAvailable", 0u);
+    }
+    Trace(L"B3cC2eBindMethod", 3u); Trace(L"B3cC2eBindData", bindData);
+    Trace(L"B3cC2eBindMailboxClear", 0x30u);
+    Wr(B, 0x00409840u, 0x30u);
+    Wr(B, 0x00409500u, bindData);
+    Wr(B, 0x00409504u, 3u);
+    KeMemoryBarrier();
+    for (polls = 0; polls < 2000u; ++polls) {
+        mailbox = Rd(B, 0x00409800u);
+        if (mailbox & 0x30u) break;
+        Ms(1);
+    }
+    Trace(L"B3cC2eBindMailbox", mailbox); Trace(L"B3cC2eBindPolls", polls);
+    waitState[0] = 20u; waitState[1] = 0xFFFFFFFFu; waitState[2] = polls;
+    waitState[3] = mailbox; waitState[7] = (polls < 2000u);
+    if (polls == 2000u) { result = 0xE000008Bu; goto done; }
+    if (mailbox & 0x20u) { result = 0xE000008Cu; goto done; }
+    if (!(mailbox & 0x10u)) { result = 0xE000008Cu; goto done; }
+    if (!B3cC2eWait(B, 30u, 0xFFFFFFFFu, FALSE, waitState, waitHistory, &waitHistoryCount, &waitHistoryDropped, waitHistoryCapacity)) {
+        result = 0xE000008Bu; goto done;
+    }
+
+    /* nouveau ctxgf100.c gf100_grctx_generate() initializes the channel
+     * image header before invoking gm20b_grctx_generate_main(). */
+    *(ULONG *)((PUCHAR)g_GrVm.Arena + GR_VM_CTX_OFF + 0x1Cu) = 1u;
+    *(ULONG *)((PUCHAR)g_GrVm.Arena + GR_VM_CTX_OFF + 0x20u) = 0u;
+    *(ULONG *)((PUCHAR)g_GrVm.Arena + GR_VM_CTX_OFF + 0x28u) = 0u;
+    *(ULONG *)((PUCHAR)g_GrVm.Arena + GR_VM_CTX_OFF + 0x2Cu) = 0u;
+    Trace(L"B3cC2eChannelHeader1C", *(ULONG *)((PUCHAR)g_GrVm.Arena + GR_VM_CTX_OFF + 0x1Cu));
+    Trace(L"B3cC2eChannelHeader20", *(ULONG *)((PUCHAR)g_GrVm.Arena + GR_VM_CTX_OFF + 0x20u));
+    Trace(L"B3cC2eChannelHeader28", *(ULONG *)((PUCHAR)g_GrVm.Arena + GR_VM_CTX_OFF + 0x28u));
+    Trace(L"B3cC2eChannelHeader2C", *(ULONG *)((PUCHAR)g_GrVm.Arena + GR_VM_CTX_OFF + 0x2Cu));
+    KeMemoryBarrier();
+
+    /* Step 92: gm20b_ltc_init_fs_state() establishes active LTC/slice state
+     * before ZBC and CBC setup. TOP_NUM_LTCS is the max count; the ringmaster
+     * register's count field is the actual active LTC count. */
+    Step(92);
+    ltcCountRaw = Rd(B, 0x00022454u);
+    ltcActiveCountRaw = Rd(B, 0x0012006Cu);
+    ltcMaxCount = ltcCountRaw;
+    ltcCountDetected = ltcActiveCountRaw & 0x1Fu;
+    ltcParamRaw = Rd(B, 0x0017E280u);
+    ltcSlicesPerLtc = (ltcParamRaw >> 28) & 0xFu;
+    ltcCacheLineBytes = 512u << ((ltcParamRaw >> 24) & 0xFu);
+    ltcTagsPerCacheLine = ltcParamRaw & 0xFFFFu;
+    Trace(L"B3cC2eTopNumLtcsRaw", ltcCountRaw);
+    Trace(L"B3cC2eLtcActiveCountRaw", ltcActiveCountRaw);
+    Trace(L"B3cC2eLtcMaxCount", ltcMaxCount);
+    Trace(L"B3cC2eLtcCount", ltcCountDetected);
+    Trace(L"B3cC2eLtcCbcParam", ltcParamRaw);
+    Trace(L"B3cC2eLtcSlicesPerLtc", ltcSlicesPerLtc);
+    Trace(L"B3cC2eLtcCacheLineBytes", ltcCacheLineBytes);
+    Trace(L"B3cC2eLtcComptagsPerCacheline", ltcTagsPerCacheLine);
+    if (ltcCountDetected == 0u || ltcCountDetected > ltcMaxCount ||
+        ltcSlicesPerLtc == 0u || ltcTagsPerCacheLine == 0u) {
+        result = 0xE0000097u; goto done;
+    }
+    ltcFsWrites[0][0] = 0x0017E27Cu;
+    ltcFsWrites[0][1] = Rd(B, ltcFsWrites[0][0]);
+    ltcFsWrites[0][2] = ltcCountDetected;
+    ltcFsWrites[1][0] = 0x0017E000u;
+    ltcFsWrites[1][1] = Rd(B, ltcFsWrites[1][0]);
+    ltcFsWrites[1][2] = ltcCountDetected;
+    ltcFsWrites[2][0] = 0x0017E318u;
+    ltcFsWrites[2][1] = Rd(B, 0x00140518u);
+    ltcFsWrites[2][2] = ltcFsWrites[2][1] | (1u << 15);
+    ltcFsWrites[3][0] = 0x0017E20Cu;
+    ltcFsWrites[3][1] = Rd(B, ltcFsWrites[3][0]);
+    ltcFsWrites[3][2] = ltcFsWrites[3][1] & ~((1u << 20) | (1u << 21) | (1u << 30));
+    for (i = 0; i < RTL_NUMBER_OF(ltcFsWrites); ++i) {
+        if ((ltcFsWrites[i][0] & 3u) || ltcFsWrites[i][0] < 0x00140000u ||
+            ltcFsWrites[i][0] >= 0x00180000u) {
+            result = 0xE0000097u; goto done;
+        }
+    }
+    for (i = 0; i < RTL_NUMBER_OF(ltcFsWrites); ++i) {
+        Wr(B, ltcFsWrites[i][0], ltcFsWrites[i][2]);
+        ltcFsWrites[i][3] = Rd(B, ltcFsWrites[i][0]);
+        ++ltcFsWriteCount;
+        if (ltcFsWrites[i][3] != ltcFsWrites[i][2]) {
+            result = 0xE0000097u; goto done;
+        }
+    }
+    TraceBin(L"B3cC2eLtcFsReadback", ltcFsWrites, sizeof(ltcFsWrites));
+    Trace(L"B3cC2eLtcFsWriteCount", ltcFsWriteCount);
+    ltcFsConfigured = 1u;
+
+    /* Step 93: fb_gm20b_init_fs_state() publishes the active LTC count to
+     * the FB hub. The physical-secure bypass is non-secure-boot only. */
+    Step(93);
+    fbFsWrites[0][0] = 0x00100800u;
+    fbFsWrites[0][1] = Rd(B, fbFsWrites[0][0]);
+    fbFsWrites[0][2] = ltcCountDetected;
+    Wr(B, fbFsWrites[0][0], fbFsWrites[0][2]);
+    fbFsWrites[0][3] = Rd(B, fbFsWrites[0][0]);
+    ++fbFsWriteCount;
+    TraceBin(L"B3cC2eFbFsReadback", fbFsWrites, sizeof(fbFsWrites));
+    Trace(L"B3cC2eFbFsWriteCount", fbFsWriteCount);
+    if (fbFsWrites[0][3] != fbFsWrites[0][2]) {
+        result = 0xE0000098u; goto done;
+    }
+    fbFsConfigured = 1u;
+
+    /* Step 94: nvgpu setup_hw loads the ZBC tables before CBC and sw_ctx.
+     * Recreate the GM20B default color/depth entries using its exact L2 DSTG
+     * and GR DS register sequence. Entry zero is reserved by GK20A. */
+    Step(94);
+    zbcIdleOk = B3cC2eWaitNouveauGrIdle(B, 0x5A424349u, 0xFFFFFFFFu, zbcIdleState);
+    Trace(L"B3cC2eZbcIdlePolls", zbcIdleState[2]);
+    Trace(L"B3cC2eZbcIdleOk", zbcIdleOk);
+    if (!zbcIdleOk) { result = 0xE0000099u; goto done; }
+    zbcWriteCount = 0u;
+#define B3C_C2E_ZBC_ADD(a, v) do { \
+        if (zbcWriteCount >= RTL_NUMBER_OF(zbcWrites)) { result = 0xE0000099u; goto done; } \
+        zbcWrites[zbcWriteCount][0] = (a); \
+        zbcWrites[zbcWriteCount][1] = (v); \
+        zbcWrites[zbcWriteCount][2] = Rd(B, (a)); \
+        ++zbcWriteCount; \
+    } while (0)
+    for (zbcColorIndex = 0; zbcColorIndex < 3u; ++zbcColorIndex) {
+        zbcLtcIndex = zbcColorIndex + 1u; /* GK20A_STARTOF_ZBC_TABLE */
+        B3C_C2E_ZBC_ADD(0x0017E338u, zbcLtcIndex);
+        for (zbcChanIndex = 0; zbcChanIndex < 4u; ++zbcChanIndex)
+            B3C_C2E_ZBC_ADD(0x0017E33Cu + zbcChanIndex * 4u,
+                            zbcColorL2[zbcColorIndex][zbcChanIndex]);
+        B3C_C2E_ZBC_ADD(0x00405804u, zbcColorDs[zbcColorIndex][0]);
+        B3C_C2E_ZBC_ADD(0x00405808u, zbcColorDs[zbcColorIndex][1]);
+        B3C_C2E_ZBC_ADD(0x0040580Cu, zbcColorDs[zbcColorIndex][2]);
+        B3C_C2E_ZBC_ADD(0x00405810u, zbcColorDs[zbcColorIndex][3]);
+        B3C_C2E_ZBC_ADD(0x00405814u, zbcColorFmt[zbcColorIndex]);
+        B3C_C2E_ZBC_ADD(0x00405820u, zbcLtcIndex);
+        B3C_C2E_ZBC_ADD(0x00405824u, 0x4u); /* C select | write | trigger */
+    }
+    for (zbcColorIndex = 0; zbcColorIndex < 2u; ++zbcColorIndex) {
+        zbcLtcIndex = zbcColorIndex + 1u; /* independent depth table index */
+        B3C_C2E_ZBC_ADD(0x0017E338u, zbcLtcIndex);
+        B3C_C2E_ZBC_ADD(0x0017E34Cu, zbcDepth[zbcColorIndex]);
+        B3C_C2E_ZBC_ADD(0x00405818u, zbcDepth[zbcColorIndex]);
+        B3C_C2E_ZBC_ADD(0x0040581Cu, 1u); /* FP32 depth format */
+        B3C_C2E_ZBC_ADD(0x00405820u, zbcLtcIndex);
+        B3C_C2E_ZBC_ADD(0x00405824u, 0x5u); /* Z select | write | trigger */
+    }
+#undef B3C_C2E_ZBC_ADD
+    if (zbcWriteCount != RTL_NUMBER_OF(zbcWrites)) {
+        result = 0xE0000099u; goto done;
+    }
+    for (i = 0; i < zbcWriteCount; ++i) {
+        zbcAddress = zbcWrites[i][0];
+        if ((zbcAddress & 3u) ||
+            !((zbcAddress >= 0x00140000u && zbcAddress < 0x00180000u) ||
+              B3cIsGrPriAddress(zbcAddress))) {
+            result = 0xE0000099u; goto done;
+        }
+    }
+    if (!B3cPrivRingDrainBeforeWrites(B)) { result = 0xE0000095u; goto done; }
+    for (i = 0; i < zbcWriteCount; ++i) {
+        zbcAddress = zbcWrites[i][0];
+        zbcValue = zbcWrites[i][1];
+        Wr(B, zbcAddress, zbcValue);
+        if (B3cIsGrPriAddress(zbcAddress) &&
+            !B3cPrivRingAfterGrWrite(B, zbcAddress, zbcValue)) {
+            result = 0xE0000095u; goto done;
+        }
+        zbcWrites[i][3] = Rd(B, zbcAddress);
+        if (zbcAddress != 0x00405824u && zbcWrites[i][3] != zbcValue) {
+            result = 0xE0000099u; goto done;
+        }
+    }
+    TraceBin(L"B3cC2eZbcReadback", zbcWrites, sizeof(zbcWrites));
+    Trace(L"B3cC2eZbcWriteCount", zbcWriteCount);
+    Trace(L"B3cC2eZbcPmuSyncSkipped", 1u); /* ELPG ZBC-save path is not enabled here. */
+    zbcConfigured = 1u;
+
+    /* Step 95: nvgpu's comptag path accepts max_comptag_mem == 0: init_comptags
+     * returns without allocation and cbc_ctrl is a no-op for zero backing.
+     * Select this bounded no-comptag mode; do not invent a CBC buffer size. */
+    Step(95);
+    cbcNoComptag = 1u;
+    cbcWrites[0][0] = 0x0017E278u;
+    cbcWrites[0][1] = Rd(B, cbcWrites[0][0]);
+    cbcWrites[0][2] = 0u; /* gm20b_ltc_init_cbc() base for zero-sized store */
+    Wr(B, cbcWrites[0][0], cbcWrites[0][2]);
+    cbcWrites[0][3] = Rd(B, cbcWrites[0][0]);
+    ++cbcWriteCount;
+    TraceBin(L"B3cC2eCbcReadback", cbcWrites, sizeof(cbcWrites));
+    Trace(L"B3cC2eCbcWriteCount", cbcWriteCount);
+    Trace(L"B3cC2eCbcNoComptag", cbcNoComptag);
+    Trace(L"B3cC2eCbcBackingBytes", 0u);
+    if (cbcWrites[0][3] != cbcWrites[0][2]) { result = 0xE000009Au; goto done; }
+    cbcConfigured = 1u;
+
+    /* Step 96: gm20a_gr_disable_rd_coalesce(), called by setup_hw before
+     * sw_ctx_load, clears LG and SU read-coalesce bits in TEX_M_DBG2. */
+    Step(96);
+    rdCoalesceBefore = Rd(B, 0x00419A3Cu);
+    Wr(B, 0x00419A3Cu, rdCoalesceBefore & ~rdCoalesceMask);
+    if (!B3cPrivRingAfterGrWrite(B, 0x00419A3Cu,
+                                 rdCoalesceBefore & ~rdCoalesceMask)) {
+        result = 0xE0000095u; goto done;
+    }
+    rdCoalesceAfter = Rd(B, 0x00419A3Cu);
+    Trace(L"B3cC2eRdCoalesceBefore", rdCoalesceBefore);
+    Trace(L"B3cC2eRdCoalesceMask", rdCoalesceMask);
+    Trace(L"B3cC2eRdCoalesceAfter", rdCoalesceAfter);
+    if (rdCoalesceAfter & rdCoalesceMask) { result = 0xE000009Bu; goto done; }
+
+    /* nvgpu gr_gk20a_init_golden_ctx_image() binds FECS, waits idle, then
+     * writes sw_ctx_load before committing global buffers and bundle init. */
+    result = B3cApplyGrCtxList(Dev, TRUE);
+    if (result != 0u) goto done;
+    /* Nouveau waits idle after sw_ctx while the production FE timeout is
+     * still active; only then does gm20b_grctx_generate_main() save/disable it. */
+    Step(88);
+    trueIdleAfterSwCtxOk = B3cC2eWaitNouveauGrIdle(B, 0x53574358u, 0xFFFFFFFFu, trueIdleAfterSwCtx);
+    if (!trueIdleAfterSwCtxOk) { result = 0xE0000092u; goto done; }
+    feGoIdleTimeoutSaved = Rd(B, 0x00404154u);
+    feGoIdleTimeoutSavedValid = 1u;
+    Trace(L"B3cC2eFeGoIdleTimeoutSaved", feGoIdleTimeoutSaved);
+    Wr(B, 0x00404154u, 0u);
+    Trace(L"B3cC2eFeGoIdleTimeoutDisabled", Rd(B, 0x00404154u));
+
+    /* GM20B global backing commits and enabled timeslice state. */
+    TraceBin(L"B3cC2eGlobalWrites", globalWrites, sizeof(globalWrites));
+    if (!B3cPrivRingDrainBeforeWrites(B)) { result = 0xE0000095u; goto done; }
+    for (i = 0; i < RTL_NUMBER_OF(globalWrites); ++i) {
+        Wr(B, globalWrites[i].Address, globalWrites[i].Value);
+        if (!B3cPrivRingAfterGrWrite(B, globalWrites[i].Address, globalWrites[i].Value)) {
+            result = 0xE0000095u; goto done;
+        }
+        ++written;
+        if (i < RTL_NUMBER_OF(sample)) {
+            sample[i][0] = globalWrites[i].Address;
+            sample[i][1] = globalWrites[i].Value;
+            sample[i][2] = 0;
+            sampleCount = i + 1u;
+        }
+    }
+    timesliceTrace[0][0] = 0x00418C6Cu; timesliceTrace[0][2] = 0x1u;
+    timesliceTrace[1][0] = 0x0041980Cu; timesliceTrace[1][2] = 0x10u;
+    timesliceTrace[2][0] = 0x0041BE08u; timesliceTrace[2][2] = 0x4u;
+    timesliceTrace[3][0] = 0x004064C0u; timesliceTrace[3][2] = 0x80000000u;
+    timesliceTrace[4][0] = 0x00405800u; timesliceTrace[4][2] = 0x08000000u;
+    timesliceTrace[5][0] = 0x00419C00u; timesliceTrace[5][2] = 0x8u;
+    for (i = 0; i < RTL_NUMBER_OF(timesliceTrace); ++i) {
+        timesliceTrace[i][1] = Rd(B, timesliceTrace[i][0]);
+        timesliceTrace[i][3] = timesliceTrace[i][1] | timesliceTrace[i][2];
+        Wr(B, timesliceTrace[i][0], timesliceTrace[i][3]);
+        if (!B3cPrivRingAfterGrWrite(B, timesliceTrace[i][0], timesliceTrace[i][3])) {
+            result = 0xE0000095u; goto done;
+        }
+    }
+    TraceBin(L"B3cC2eTimesliceWrites", timesliceTrace, sizeof(timesliceTrace));
+    Trace(L"B3cC2eGlobalWriteCount", written);
+    for (i = 0; i < sampleCount; ++i) sample[i][2] = Rd(B, sample[i][0]);
+    TraceBin(L"B3cC2eGlobalReadback", sample, sampleCount * sizeof(sample[0]));
+    for (i = 0; i < sampleCount; ++i) {
+        if (sample[i][1] != sample[i][2]) { result = 0xE000008Cu; goto done; }
+    }
+
+    /* Step 83: single-GPC/two-TPC GM20B SM/TPC and ZCULL state. Along with
+     * the existing floorsweep writes, ctxgm20b.c's gm20b_grctx_generate_main()
+     * uses 4064d0..4ec, 405b00, 408908 and 4041c4 before its idle boundary. */
+    Step(83);
+    {
+        ULONG fsAddr[64], fsValue[64], fsCount = 0;
+        fsAddr[fsCount] = 0x00406028u; fsValue[fsCount++] = 2u;
+        fsAddr[fsCount] = 0x00405870u; fsValue[fsCount++] = 2u;
+        fsAddr[fsCount] = 0x004041C4u; fsValue[fsCount++] = 3u;
+        fsAddr[fsCount] = 0x00405B00u; fsValue[fsCount++] = 0x0201u;
+        fsAddr[fsCount] = 0x00405B60u; fsValue[fsCount++] = 0x00000100u;
+        /* Single-GPC/two-TPC mapping setup from the nvgpu GM20B/GK20A
+         * floorsweep path: row offset 1, two entries, all map to GPC0. */
+        fsAddr[fsCount] = 0x00418BB8u; fsValue[fsCount++] = 0x00000201u;
+        fsAddr[fsCount] = 0x0041BFD0u; fsValue[fsCount++] = 0x00700201u;
+        fsAddr[fsCount] = 0x0041BFE4u; fsValue[fsCount++] = 0u;
+        fsAddr[fsCount] = 0x004078BCu; fsValue[fsCount++] = 0x00000201u;
+        for (i = 0; i < 6u; ++i) {
+            fsAddr[fsCount] = 0x00418B08u + i * 4u; fsValue[fsCount++] = 0u;
+            fsAddr[fsCount] = 0x0041BF00u + i * 4u; fsValue[fsCount++] = 0u;
+            fsAddr[fsCount] = 0x0040780Cu + i * 4u; fsValue[fsCount++] = 0u;
+        }
+        for (i = 0; i < 8u; ++i) {
+            fsAddr[fsCount] = 0x004064D0u + i * 4u; fsValue[fsCount++] = 0u;
+        }
+        for (i = 0; i < 2u; ++i) {
+            fsAddr[fsCount] = 0x00504698u + i * 0x800u; fsValue[fsCount++] = i;
+            fsAddr[fsCount] = 0x00500C10u + i * 4u; fsValue[fsCount++] = i;
+            fsAddr[fsCount] = 0x00504088u + i * 0x800u; fsValue[fsCount++] = i;
+        }
+        for (i = 0; i < 6u; ++i) {
+            fsAddr[fsCount] = 0x00405BA0u + i * 4u;
+            fsValue[fsCount++] = (i == 0u) ? 0x100u : 0u;
+        }
+        /* Nvgpu uses TOP_NUM_LTCS as max_ltc_count and the priv-ring
+         * enumeration result as active ltc_count; the latter is 0x12006C. */
+        ltcCountRaw = Rd(B, 0x00022454u);
+        ltcActiveCountRaw = Rd(B, 0x0012006Cu);
+        ltcMaxCount = ltcCountRaw;
+        ltcCountDetected = ltcActiveCountRaw & 0x1Fu;
+        Trace(L"B3cC2eTopNumLtcsRaw", ltcCountRaw);
+        Trace(L"B3cC2eLtcActiveCountRaw", ltcActiveCountRaw);
+        Trace(L"B3cC2eLtcMaxCount", ltcMaxCount);
+        Trace(L"B3cC2eLtcCount", ltcCountDetected);
+        for (i = 0; i < fsCount; ++i) {
+            if ((fsAddr[i] & 3u) || !B3cIsGrPriAddress(fsAddr[i])) {
+                result = 0xE000008Eu; goto done;
+            }
+        }
+        for (i = 0; i < fsCount; ++i) {
+            Wr(B, fsAddr[i], fsValue[i]); ++fsWrites;
+            if (!B3cPrivRingAfterGrWrite(B, fsAddr[i], fsValue[i])) {
+                result = 0xE0000095u; goto done;
+            }
+            if (i < RTL_NUMBER_OF(fsSample)) {
+                fsSample[i][0] = fsAddr[i]; fsSample[i][1] = fsValue[i];
+                fsSample[i][2] = Rd(B, fsAddr[i]); fsSampleCount = i + 1u;
+            }
+        }
+        Trace(L"B3cC2eFsWriteCount", fsWrites);
+        Trace(L"B3cC2eFsSampleCount", fsSampleCount);
+        TraceBin(L"B3cC2eFsReadback", fsSample, fsSampleCount * sizeof(fsSample[0]));
+        for (i = 0; i < fsSampleCount; ++i) {
+            if (fsSample[i][1] != fsSample[i][2]) { result = 0xE000008Eu; goto done; }
+        }
+        Trace(L"B3cC2ePreemptionInitPresent", 0u); /* GM20B ops have no init_preemption_state hook here. */
+    }
+    /* Step 97: GM20B gr_gm20b_init_fs_state() BE tail. The source writes
+     * zrop/crop active-LTC counts, then ORs comp_vdc_4to2_disable into the
+     * current BE0 crop debug value. Keep this as its own bounded/readback
+     * checked point. */
+    Step(97);
+    if (ltcCountDetected == 0u || ltcCountDetected > 0xFu) {
+        result = 0xE0000096u; goto done;
+    }
+    ropWrites[0][0] = 0x00408850u;
+    ropWrites[0][1] = Rd(B, ropWrites[0][0]);
+    ropWrites[0][2] = ltcCountDetected;
+    ropWrites[1][0] = 0x00408958u;
+    ropWrites[1][1] = Rd(B, ropWrites[1][0]);
+    ropWrites[1][2] = ltcCountDetected;
+    ropWrites[2][0] = 0x00408908u;
+    ropWrites[2][1] = Rd(B, 0x00410108u);
+    ropWrites[2][2] = ropWrites[2][1] | 0x80000000u;
+    for (i = 0; i < RTL_NUMBER_OF(ropWrites); ++i) {
+        if ((ropWrites[i][0] & 3u) || !B3cIsGrPriAddress(ropWrites[i][0])) {
+            result = 0xE0000096u; goto done;
+        }
+    }
+    if (!B3cPrivRingDrainBeforeWrites(B)) { result = 0xE0000095u; goto done; }
+    for (i = 0; i < RTL_NUMBER_OF(ropWrites); ++i) {
+        Wr(B, ropWrites[i][0], ropWrites[i][2]);
+        if (!B3cPrivRingAfterGrWrite(B, ropWrites[i][0], ropWrites[i][2])) {
+            result = 0xE0000095u; goto done;
+        }
+        ropWrites[i][3] = Rd(B, ropWrites[i][0]);
+        ++ropWriteCount;
+        if (ropWrites[i][3] != ropWrites[i][2]) {
+            result = 0xE0000096u; goto done;
+        }
+    }
+    TraceBin(L"B3cC2eRopSetupReadback", ropWrites, sizeof(ropWrites));
+    Trace(L"B3cC2eRopSetupWriteCount", ropWriteCount);
+    /* Nouveau gk104 uses FBP count (0x120074) in the low nibble; GM20B
+     * nvgpu gr_gm20b_init_fs_state() separately writes active LTC count. */
+    beRopConfigured = 1u;
+    Trace(L"B3cC2eLtcCbcSetupSkipped", cbcConfigured ? 0u : 1u);
+    Trace(L"B3cC2eZbcSetupSkipped", zbcConfigured ? 0u : 1u);
+    Trace(L"B3cC2eLtcBasedRopSetupSkipped", (ltcFsConfigured && fbFsConfigured && beRopConfigured) ? 0u : 1u);
+    if (!B3cC2eWait(B, 35u, 0xFFFFFFFFu, FALSE, waitState, waitHistory, &waitHistoryCount, &waitHistoryDropped, waitHistoryCapacity)) {
+        result = 0xE000008Bu; goto done;
+    }
+    trueIdleAfterSetupOk = B3cC2eWaitNouveauGrIdle(B, 0x53455455u, 0xFFFFFFFFu, trueIdleAfterSetup);
+    Trace(L"B3cC2eNouveauIdleAfterSetupOk", trueIdleAfterSetupOk);
+    if (!trueIdleAfterSetupOk) { result = 0xE0000092u; goto done; }
+
+    bundle = ReadBinParam(L"FwGrSwBundleInit", 0x20000u, &bundleBytes);
+    Trace(L"B3cC2eBundleBytes", bundleBytes);
+    if (bundle == NULL || bundleBytes == 0u || (bundleBytes % 8u) != 0u) {
+        result = 0xE000008Cu; goto done;
+    }
+    bundleCount = bundleBytes / 8u;
+    /* GM20B gm20b_grctx_generate_main() restores the saved FE_GO_IDLE
+     * timeout before method-init and bundle-init replay. */
+    if (feGoIdleTimeoutSavedValid) {
+        Wr(B, 0x00404154u, feGoIdleTimeoutSaved);
+        KeMemoryBarrier();
+    }
+    Trace(L"B3cC2eFeGoIdleTimeoutRestoredBeforeBundle", Rd(B, 0x00404154u));
+    trueIdleAfterRestoreOk = B3cC2eWaitNouveauGrIdle(B, 0x52535452u, 0xFFFFFFFFu, trueIdleAfterRestore);
+    Trace(L"B3cC2eNouveauIdleAfterTimeoutRestoreOk", trueIdleAfterRestoreOk);
+    if (!trueIdleAfterRestoreOk) { result = 0xE0000092u; goto done; }
+    /* GM20B has no sw_method_init.bin; Nouveau's method-init pack is empty.
+     * Preserve its following idle boundary before gf100_gr_icmd(). */
+    Trace(L"B3cC2eMethodInitCount", 0u);
+    trueIdleAfterMethodInitOk = B3cC2eWaitNouveauGrIdle(B, 0x4D544844u, 0xFFFFFFFFu, trueIdleAfterMethodInit);
+    Trace(L"B3cC2eNouveauIdleAfterMethodInitOk", trueIdleAfterMethodInitOk);
+    if (!trueIdleAfterMethodInitOk) { result = 0xE0000092u; goto done; }
+    Wr(B, 0x00400208u, 0x80000000u); /* pipe mode override */
+    B3cC2eCapturePreBundle(B);
+    preBundleFeEsr = Rd(B, 0x00404000u);
+    Trace(L"B3cC2ePreBundleFeEsr", preBundleFeEsr);
+    if (preBundleFeEsr & 0x3FFFFFFFu) {
+        result = 0xE000008Fu; goto done;
+    }
+    Step(90);
+    B3cCaptureGpcPriDiag(B, L"B3cC2ePreBundleGpcPri", L"B3cC2ePreBundleGpcPriBadfCount",
+                         &preBundleGpcPriBadfCount);
+    Step(91);
+    B3cCaptureGrStatusDump(B, L"B3cC2eGrStatusDumpBeforeBundle", grDumpBefore);
+    grDumpBeforeCaptured = 1u;
+    bundleBaseline[0] = Rd(B, 0x00404000u);
+    bundleBaseline[1] = Rd(B, 0x004041B0u);
+    bundleBaseline[2] = Rd(B, 0x00400100u);
+    bundleBaseline[3] = Rd(B, 0x00400108u);
+    bundleBaseline[4] = Rd(B, 0x00400700u);
+    TraceBin(L"B3cC2eBundleBaseline", bundleBaseline, sizeof(bundleBaseline));
+    for (i = 0; i < bundleBytes / 8u; ++i) {
+        bundleMethodId = Le32(bundle + i * 8u);
+        value = Le32(bundle + i * 8u + 4u);
+        if (i == 0u || value != lastData) {
+            Wr(B, 0x00400204u, value);
+            lastData = value;
+        }
+        Wr(B, 0x00400200u, bundleMethodId);
+        /* Snapshot the FE/GR exception state immediately after each posted
+         * method, before any bounded idle wait can obscure the first fault. */
+        bundleFeEsr = Rd(B, 0x00404000u);
+        bundleFeInfo = Rd(B, 0x004041B0u);
+        bundleGrIntr = Rd(B, 0x00400100u);
+        bundleGrException = Rd(B, 0x00400108u);
+        bundleGrStatus = Rd(B, 0x00400700u);
+        if (i == 0u) {
+            bundleEntry0[0] = i;
+            bundleEntry0[1] = bundleMethodId;
+            bundleEntry0[2] = value;
+            bundleEntry0[3] = bundleFeEsr;
+            bundleEntry0[4] = bundleFeInfo;
+            bundleEntry0[5] = bundleGrIntr;
+            bundleEntry0[6] = bundleGrException;
+            bundleEntry0[7] = bundleGrStatus;
+            TraceBin(L"B3cC2eBundleEntry0State", bundleEntry0, sizeof(bundleEntry0));
+            B3cCaptureGrStatusDump(B, L"B3cC2eGrStatusDumpAfterEntry0", grDumpEntry0);
+            grDumpEntry0Captured = 1u;
+        }
+        if (bundleFirstChangeFound == 0u &&
+            (bundleFeEsr != bundleBaseline[0] ||
+             bundleFeInfo != bundleBaseline[1] ||
+             bundleGrIntr != bundleBaseline[2] ||
+             bundleGrException != bundleBaseline[3]))  /* Claude: GR status is recorded but not a stop condition; GR is always busy after entry 0, so including it stopped at entry 0 every time. */ {
+            bundleFirstChangeFound = 1u;
+            bundleFirstChangeIndex = i;
+            bundleFirstChange[0] = i;
+            bundleFirstChange[1] = bundleMethodId;
+            bundleFirstChange[2] = value;
+            bundleFirstChange[3] = bundleFeEsr;
+            bundleFirstChange[4] = bundleFeInfo;
+            bundleFirstChange[5] = bundleGrIntr;
+            bundleFirstChange[6] = bundleGrException;
+            bundleFirstChange[7] = bundleGrStatus;
+            TraceBin(L"B3cC2eBundleFirstChangeState", bundleFirstChange,
+                     sizeof(bundleFirstChange));
+            Trace(L"B3cC2eBundleFirstChangeIndex", bundleFirstChangeIndex);
+            Trace(L"B3cC2eBundleFirstChangeMethod", bundleMethodId);
+            Trace(L"B3cC2eBundleFirstChangeData", value);
+            Trace(L"B3cC2eBundleFirstChangeFeEsr", bundleFeEsr);
+            Trace(L"B3cC2eBundleFirstChangeFeInfo", bundleFeInfo);
+            Trace(L"B3cC2eBundleFirstChangeGrIntr", bundleGrIntr);
+            Trace(L"B3cC2eBundleFirstChangeGrException", bundleGrException);
+            Trace(L"B3cC2eBundleFirstChangeGrStatus", bundleGrStatus);
+            B3cCaptureGrStatusDump(B, L"B3cC2eGrStatusDumpAtStop", grDumpStop);
+            grDumpStopCaptured = 1u;
+            result = 0xE0000094u;
+            goto done;
+        }
+        if (firstBusyIndex == 0xFFFFFFFFu) {
+            firstBusyEngineStatus = Rd(B, 0x0040060Cu);
+            if (firstBusyEngineStatus & 1u) {
+                firstBusyIndex = i;
+                firstBusyMethod = bundleMethodId;
+                firstBusyGrStatus = Rd(B, 0x00400700u);
+                firstBusyFifoStatus = Rd(B, 0x00002640u);
+            }
+        }
+        if ((bundleMethodId & 0xFFFFu) == 0xE100u) {
+            Step(87);
+            trueIdleGoBundleOk = B3cC2eWaitNouveauGrIdle(B, 0xE100u, i, trueIdleGoBundle);
+        }
+        /* Nouveau gf100_gr_icmd() submits the method first, waits for GR
+         * after GO_IDLE, then waits for FE method-lower to clear. */
+        if (!B3cC2eWait(B, 50u, i, TRUE, waitState, waitHistory, &waitHistoryCount, &waitHistoryDropped, waitHistoryCapacity)) {
+            result = 0xE000008Bu; goto done;
+        }
+    }
+    Step(85);
+    Wr(B, 0x00400208u, 0u); /* nvgpu disables pipe mode override first */
+    Trace(L"B3cC2ePipeOverrideAfterBundle", Rd(B, 0x00400208u));
+    if (!B3cC2eWait(B, 60u, bundleCount, FALSE, waitState, waitHistory, &waitHistoryCount, &waitHistoryDropped, waitHistoryCapacity)) {
+        if (feGoIdleTimeoutSavedValid) Wr(B, 0x00404154u, feGoIdleTimeoutSaved);
+        result = 0xE000008Bu; goto done;
+    }
+    if (feGoIdleTimeoutSavedValid) Wr(B, 0x00404154u, feGoIdleTimeoutSaved);
+    Trace(L"B3cC2eFeGoIdleTimeoutRestored", Rd(B, 0x00404154u));
+    Trace(L"B3cC2eFinalIdlePolls", waitState[2]);
+    Trace(L"B3cC2eFinalGrStatus", waitState[3]);
+    Trace(L"B3cC2eFinalEngineStatus", waitState[4]);
+    Trace(L"B3cC2eBundleEntries", bundleBytes / 8u);
+    Trace(L"B3cC2eBundleLastAddress", bundleMethodId);
+    Trace(L"B3cC2eBundleLastValue", value);
+    Trace(L"B3cC2eBundleFirstChangeFound", bundleFirstChangeFound);
+    Trace(L"B3cC2eBundleFirstChangeIndex", bundleFirstChangeIndex);
+    TraceBin(L"B3cC2eBundleEntry0State", bundleEntry0, sizeof(bundleEntry0));
+    Trace(L"B3cC2eMethodInitCount", 0u); /* GM20B linux-firmware has no sw_method_init.bin */
+    if (!B3cC2eWait(B, 61u, bundleCount, FALSE, waitState, waitHistory, &waitHistoryCount, &waitHistoryDropped, waitHistoryCapacity)) {
+        result = 0xE000008Bu; goto done;
+    }
+    if (!B3cC2eL2Flush(B, l2FlushState)) {
+        Trace(L"B3cC2eL2FlushPolls", l2FlushState[0]);
+        Trace(L"B3cC2eL2FlushStatus", l2FlushState[1]);
+        Trace(L"B3cC2eL2InvalidatePolls", l2FlushState[2]);
+        Trace(L"B3cC2eL2InvalidateStatus", l2FlushState[3]);
+        result = 0xE0000090u; goto done;
+    }
+    Trace(L"B3cC2eL2FlushPolls", l2FlushState[0]);
+    Trace(L"B3cC2eL2FlushStatus", l2FlushState[1]);
+    Trace(L"B3cC2eL2InvalidatePolls", l2FlushState[2]);
+    Trace(L"B3cC2eL2InvalidateStatus", l2FlushState[3]);
+
+    /* nvgpu flushes/invalidates L2, copies the FECS header from the channel
+     * context, sets zcull no-ctxsw and ptr=0, then commits GOLDEN_CTX_VA. */
+    RtlCopyMemory(goldenHdr,
+        (PUCHAR)g_GrVm.Arena + GR_VM_CTX_OFF, sizeof(goldenHdr));
+    RtlCopyMemory((PUCHAR)g_GrVm.Arena + GR_VM_GLOBAL_OFF,
+        goldenHdr, sizeof(goldenHdr));
+    *(ULONG *)((PUCHAR)g_GrVm.Arena + GR_VM_GLOBAL_OFF + 0x1Cu) = 1u;
+    *(ULONG *)((PUCHAR)g_GrVm.Arena + GR_VM_GLOBAL_OFF + 0x20u) = 0u;
+    instWords[132] = (GR_VM_GPU_VA + GR_VM_GLOBAL_OFF) | 4u;
+    instWords[133] = 0u;
+    KeMemoryBarrier();
+    Trace(L"B3cC2eGoldenCommitVa", GR_VM_GPU_VA + GR_VM_GLOBAL_OFF);
+    Trace(L"B3cC2eWfiPtrDuringSave", instWords[132]);
+    /* Snapshot immediately before submitting FECS golden-save method 9. */
+    preSaveGrStatus = Rd(B, 0x00400700u);
+    preSaveGrStatus1 = Rd(B, 0x00400604u);
+    preSaveGrStatus2 = Rd(B, 0x00400608u);
+    preSaveGrEngineStatus = Rd(B, 0x0040060Cu);
+    preSaveFifoEngineStatus = Rd(B, 0x00002640u);
+    Trace(L"B3cC2ePreSaveGrStatus", preSaveGrStatus);
+    Trace(L"B3cC2ePreSaveGrStatus1", preSaveGrStatus1);
+    Trace(L"B3cC2ePreSaveGrStatus2", preSaveGrStatus2);
+    Trace(L"B3cC2ePreSaveGrEngineStatus", preSaveGrEngineStatus);
+    Trace(L"B3cC2ePreSaveFifoEngineStatus", preSaveFifoEngineStatus);
+    Trace(L"B3cC2ePreSaveGrBusyBit", preSaveGrEngineStatus & 1u);
+    Trace(L"B3cC2ePreSaveGrStatusBit0", preSaveGrStatus & 1u);
+    Trace(L"B3cC2ePreSaveGrStatusBit5", (preSaveGrStatus >> 5) & 1u);
+    Trace(L"B3cC2ePreSaveGrStatusBit7", (preSaveGrStatus >> 7) & 1u);
+    Trace(L"B3cC2ePreSaveGrStatusFeGi", (preSaveGrStatus >> 21) & 1u);
+    Trace(L"B3cC2ePreSaveGrActivity0", Rd(B, 0x00400380u));
+    Trace(L"B3cC2ePreSaveGrActivity1", Rd(B, 0x00400384u));
+    Trace(L"B3cC2ePreSaveGrActivity2", Rd(B, 0x00400388u));
+    Trace(L"B3cC2ePreSaveGrActivity3Present", 0u);
+    Trace(L"B3cC2ePreSaveGrActivity4", Rd(B, 0x00400390u));
+    Step(87);
+    trueIdlePreSaveOk = B3cC2eWaitNouveauGrIdle(B, 0x53415645u, bundleCount, trueIdlePreSave); /* 'SAVE' */
+    if (!trueIdlePreSaveOk) { result = 0xE0000091u; goto done; }
+    Trace(L"B3cC2eSaveMethod", 9u); Trace(L"B3cC2eSaveData", saveData);
+    Trace(L"B3cC2eSaveMailboxClear", 3u);
+    Wr(B, 0x00409840u, 3u);
+    Wr(B, 0x00409500u, saveData);
+    Wr(B, 0x00409504u, 9u);
+    KeMemoryBarrier();
+    for (polls = 0; polls < 2000u; ++polls) {
+        mailbox = Rd(B, 0x00409800u);
+        if (mailbox & 3u) break;
+        Ms(1);
+    }
+    Trace(L"B3cC2eSaveMailbox", mailbox); Trace(L"B3cC2eSavePolls", polls);
+    waitState[0] = 70u; waitState[1] = bundleCount; waitState[2] = polls;
+    waitState[3] = mailbox; waitState[7] = (polls < 2000u);
+    if (polls == 2000u) { result = 0xE000008Bu; goto done; }
+    if (mailbox & 2u) { result = 0xE000008Cu; goto done; }
+    if (!(mailbox & 1u)) { result = 0xE000008Cu; goto done; }
+
+    goldenSamples[0][0] = 0x00u;
+    goldenSamples[0][1] = *(ULONG *)((PUCHAR)g_GrVm.Arena + GR_VM_GLOBAL_OFF + 0x00u);
+    goldenSamples[1][0] = 0x1Cu; goldenSamples[1][1] = *(ULONG *)((PUCHAR)g_GrVm.Arena + GR_VM_GLOBAL_OFF + 0x1Cu);
+    goldenSamples[2][0] = 0x20u; goldenSamples[2][1] = *(ULONG *)((PUCHAR)g_GrVm.Arena + GR_VM_GLOBAL_OFF + 0x20u);
+    goldenSamples[3][0] = 0xFCu; goldenSamples[3][1] = *(ULONG *)((PUCHAR)g_GrVm.Arena + GR_VM_GLOBAL_OFF + 0xFCu);
+    goldenSamples[4][0] = 0x100u; goldenSamples[4][1] = *(ULONG *)((PUCHAR)g_GrVm.Arena + GR_VM_GLOBAL_OFF + 0x100u);
+    Trace(L"B3cC2eGoldenMagic", goldenSamples[3][1]);
+    TraceBin(L"B3cC2eGoldenSamples", goldenSamples, sizeof(goldenSamples));
+    if (goldenSamples[3][1] != 0x600DC0DEu) { result = 0xE000008Cu; goto done; }
+
+    instWords[132] = 0u;
+    instWords[133] = 0u;
+    KeMemoryBarrier();
+    Trace(L"B3cC2eWfiPtrAfterSaveLo", instWords[132]);
+    Trace(L"B3cC2eWfiPtrAfterSaveHi", instWords[133]);
+    mailbox = Rd(B, 0x00409B00u) & ~0x80000000u;
+    Wr(B, 0x00409B00u, mailbox); /* Nouveau clears FECS current-context valid */
+    KeMemoryBarrier();
+    Trace(L"B3cC2eFecsCurrentCtxAfterUnbind", Rd(B, 0x00409B00u));
+    Trace(L"B3cC2eFeHwwEsr", Rd(B, 0x00404000u));
+    Trace(L"B3cC2eFecsCpuctl", Rd(B, 0x00409100u));
+    Trace(L"B3cC2eFecsSctl", Rd(B, 0x00409240u));
+    Trace(L"B3cC2eFecsMailbox0", Rd(B, 0x00409040u));
+    Trace(L"B3cC2eFecsMailbox1", Rd(B, 0x00409044u));
+    Trace(L"B3cC2eFecsIrqstat", Rd(B, 0x00409008u));
+    Trace(L"B3cC2eFecsIrqmask", Rd(B, 0x0040900Cu));
+    fecsTraceIdx = Rd(B, 0x00409148u);
+    fecsTraceCount = (fecsTraceIdx >> 16) & 0xFFu;
+    if (fecsTraceCount > RTL_NUMBER_OF(fecsPc)) fecsTraceCount = RTL_NUMBER_OF(fecsPc);
+    Trace(L"B3cC2eFecsTraceIdx", fecsTraceIdx);
+    Trace(L"B3cC2eFecsTraceCount", fecsTraceCount);
+    for (i = 0; i < fecsTraceCount; ++i) {
+        Wr(B, 0x00409148u, i);
+        fecsPc[i] = Rd(B, 0x0040914Cu);
+    }
+    if (fecsTraceCount) TraceBin(L"B3cC2eFecsTracePc", fecsPc, fecsTraceCount * sizeof(ULONG));
+    Trace(L"B3cC2eGpccsCpuctl", Rd(B, 0x0041A100u));
+    Trace(L"B3cC2eGpccsSctl", Rd(B, 0x0041A240u));
+    Trace(L"B3cC2eGpccsMailbox0", Rd(B, 0x0041A040u));
+    Trace(L"B3cC2eGpccsMailbox1", Rd(B, 0x0041A044u));
+    Trace(L"B3cC2ePfifoIntr0", Rd(B, 0x2100u));
+    faultId = Rd(B, 0x259Cu);
+    Trace(L"B3cC2eFaultId", faultId);
+    for (unit = 0; unit < 32u && faultCount < RTL_NUMBER_OF(faultRecs); ++unit) {
+        if (!(faultId & (1u << unit))) continue;
+        faultRecs[faultCount][0] = unit;
+        faultRecs[faultCount][1] = Rd(B, 0x2800u + unit * 0x10u);
+        faultRecs[faultCount][2] = Rd(B, 0x2804u + unit * 0x10u);
+        faultRecs[faultCount][3] = Rd(B, 0x2808u + unit * 0x10u);
+        faultRecs[faultCount][4] = Rd(B, 0x280Cu + unit * 0x10u);
+        ++faultCount;
+    }
+    Trace(L"B3cC2eFaultCount", faultCount);
+    if (faultCount) TraceBin(L"B3cC2eFaultRecords", faultRecs, faultCount * sizeof(faultRecs[0]));
+    Trace(L"B3cC2eMcInt", Rd(Dev->Mc, MC_INTSTATUS));
+    Trace(L"B3cC2eMcErr", Rd(Dev->Mc, MC_ERR_STATUS));
+    Trace(L"B3cC2eMcErrAdr", Rd(Dev->Mc, MC_ERR_ADR));
+
+done:
+    pmcEnable = Rd(B, NV_PMC_ENABLE);
+    if (!grDumpStopCaptured && (pmcEnable & (1u << 12))) {
+        B3cCaptureGrStatusDump(B, L"B3cC2eGrStatusDumpAtStop", grDumpStop);
+        grDumpStopCaptured = 1u;
+    }
+    Trace(L"B3cC2eGrStatusDumpRegisterCount", B3C_GR_STATUS_DUMP_REGS);
+    Trace(L"B3cC2eGrStatusDumpBeforeCaptured", grDumpBeforeCaptured);
+    Trace(L"B3cC2eGrStatusDumpEntry0Captured", grDumpEntry0Captured);
+    Trace(L"B3cC2eGrStatusDumpStopCaptured", grDumpStopCaptured);
+    Trace(L"B3cC2eNouveauIdleAfterSwCtxPolls", trueIdleAfterSwCtx[2]);
+    Trace(L"B3cC2eNouveauIdleAfterSwCtxGrStatus", trueIdleAfterSwCtx[3]);
+    Trace(L"B3cC2eNouveauIdleAfterSwCtxEngineStatus", trueIdleAfterSwCtx[4]);
+    Trace(L"B3cC2eNouveauIdleAfterSwCtxFifoStatus", trueIdleAfterSwCtx[5]);
+    Trace(L"B3cC2eNouveauIdleAfterSwCtxMcEnable", trueIdleAfterSwCtx[6]);
+    Trace(L"B3cC2eNouveauIdleAfterSwCtxOk", trueIdleAfterSwCtxOk);
+    Trace(L"B3cC2eNouveauIdleAfterSetupPolls", trueIdleAfterSetup[2]);
+    Trace(L"B3cC2eNouveauIdleAfterSetupGrStatus", trueIdleAfterSetup[3]);
+    Trace(L"B3cC2eNouveauIdleAfterSetupEngineStatus", trueIdleAfterSetup[4]);
+    Trace(L"B3cC2eNouveauIdleAfterSetupFifoStatus", trueIdleAfterSetup[5]);
+    Trace(L"B3cC2eNouveauIdleAfterSetupMcEnable", trueIdleAfterSetup[6]);
+    Trace(L"B3cC2eNouveauIdleAfterSetupOk", trueIdleAfterSetupOk);
+    Trace(L"B3cC2eNouveauIdleAfterRestorePolls", trueIdleAfterRestore[2]);
+    Trace(L"B3cC2eNouveauIdleAfterRestoreGrStatus", trueIdleAfterRestore[3]);
+    Trace(L"B3cC2eNouveauIdleAfterRestoreEngineStatus", trueIdleAfterRestore[4]);
+    Trace(L"B3cC2eNouveauIdleAfterRestoreFifoStatus", trueIdleAfterRestore[5]);
+    Trace(L"B3cC2eNouveauIdleAfterRestoreMcEnable", trueIdleAfterRestore[6]);
+    Trace(L"B3cC2eNouveauIdleAfterRestoreOk", trueIdleAfterRestoreOk);
+    Trace(L"B3cC2eNouveauIdleAfterMethodPolls", trueIdleAfterMethodInit[2]);
+    Trace(L"B3cC2eNouveauIdleAfterMethodGrStatus", trueIdleAfterMethodInit[3]);
+    Trace(L"B3cC2eNouveauIdleAfterMethodEngineStatus", trueIdleAfterMethodInit[4]);
+    Trace(L"B3cC2eNouveauIdleAfterMethodFifoStatus", trueIdleAfterMethodInit[5]);
+    Trace(L"B3cC2eNouveauIdleAfterMethodMcEnable", trueIdleAfterMethodInit[6]);
+    Trace(L"B3cC2eNouveauIdleAfterMethodOk", trueIdleAfterMethodInitOk);
+    Trace(L"B3cC2eFirstBusyBundleIndex", firstBusyIndex);
+    Trace(L"B3cC2eFirstBusyBundleMethod", firstBusyMethod);
+    Trace(L"B3cC2eFirstBusyEngineStatus", firstBusyEngineStatus);
+    Trace(L"B3cC2eFirstBusyGrStatus", firstBusyGrStatus);
+    Trace(L"B3cC2eFirstBusyFifoStatus", firstBusyFifoStatus);
+    Trace(L"B3cC2eTrueIdleGoBundleStage", trueIdleGoBundle[0]);
+    Trace(L"B3cC2eTrueIdleGoBundleIndex", trueIdleGoBundle[1]);
+    Trace(L"B3cC2eTrueIdleGoBundlePolls", trueIdleGoBundle[2]);
+    Trace(L"B3cC2eTrueIdleGoBundleGrStatus", trueIdleGoBundle[3]);
+    Trace(L"B3cC2eTrueIdleGoBundleEngineStatus", trueIdleGoBundle[4]);
+    Trace(L"B3cC2eTrueIdleGoBundleFifoStatus", trueIdleGoBundle[5]);
+    Trace(L"B3cC2eTrueIdleGoBundleMcEnable", trueIdleGoBundle[6]);
+    Trace(L"B3cC2eTrueIdleGoBundleOk", trueIdleGoBundleOk);
+    Trace(L"B3cC2eTrueIdlePreSaveStage", trueIdlePreSave[0]);
+    Trace(L"B3cC2eTrueIdlePreSaveBundleIndex", trueIdlePreSave[1]);
+    Trace(L"B3cC2eTrueIdlePreSavePolls", trueIdlePreSave[2]);
+    Trace(L"B3cC2eTrueIdlePreSaveGrStatus", trueIdlePreSave[3]);
+    Trace(L"B3cC2eTrueIdlePreSaveEngineStatus", trueIdlePreSave[4]);
+    Trace(L"B3cC2eTrueIdlePreSaveFifoStatus", trueIdlePreSave[5]);
+    Trace(L"B3cC2eTrueIdlePreSaveMcEnable", trueIdlePreSave[6]);
+    Trace(L"B3cC2eTrueIdlePreSaveOk", trueIdlePreSaveOk);
+    Trace(L"B3cC2eWaitHistoryCount", waitHistoryCount);
+    Trace(L"B3cC2eWaitHistoryDropped", waitHistoryDropped);
+    Trace(L"B3cC2eWaitHistoryCapacity", waitHistory != NULL ? waitHistoryCapacity : 0u);
+    if (waitHistory != NULL && waitHistoryCount != 0u)
+        TraceBin(L"B3cC2eWaitHistory", waitHistory,
+            waitHistoryCount * 10u * sizeof(ULONG));
+    Trace(L"B3cC2eWaitStage", waitState[0]);
+    Trace(L"B3cC2eWaitBundleIndex", waitState[1]);
+    Trace(L"B3cC2eWaitPolls", waitState[2]);
+    Trace(L"B3cC2eWaitGrStatus", waitState[3]);
+    Trace(L"B3cC2eWaitEngineStatus", waitState[4]);
+    Trace(L"B3cC2eWaitFifoEngineStatus", waitState[5]);
+    Trace(L"B3cC2eWaitIsFe", waitState[6]);
+    Trace(L"B3cC2eWaitSucceeded", waitState[7]);
+    Trace(L"B3cC2eWaitIdleBranch", waitState[8]);
+    Trace(L"B3cC2eWaitFifoCtxStatus", waitState[9]);
+    Trace(L"B3cC2eWaitCtxswActive", waitState[10]);
+    Trace(L"B3cC2eWaitGrBusy", waitState[11]);
+    Trace(L"B3cC2eTopNumLtcsRaw", ltcCountRaw);
+    Trace(L"B3cC2eLtcActiveCountRaw", ltcActiveCountRaw);
+    Trace(L"B3cC2eLtcMaxCount", ltcMaxCount);
+    Trace(L"B3cC2eLtcCount", ltcCountDetected);
+    Trace(L"B3cC2eLtcCbcParam", ltcParamRaw);
+    Trace(L"B3cC2eLtcSlicesPerLtc", ltcSlicesPerLtc);
+    Trace(L"B3cC2eLtcCacheLineBytes", ltcCacheLineBytes);
+    Trace(L"B3cC2eLtcComptagsPerCacheline", ltcTagsPerCacheLine);
+    Trace(L"B3cC2eLtcFsConfigured", ltcFsConfigured);
+    Trace(L"B3cC2eLtcFsWriteCount", ltcFsWriteCount);
+    TraceBin(L"B3cC2eLtcFsReadback", ltcFsWrites, sizeof(ltcFsWrites));
+    Trace(L"B3cC2eFbFsConfigured", fbFsConfigured);
+    Trace(L"B3cC2eFbFsWriteCount", fbFsWriteCount);
+    TraceBin(L"B3cC2eFbFsReadback", fbFsWrites, sizeof(fbFsWrites));
+    Trace(L"B3cC2eZbcConfigured", zbcConfigured);
+    Trace(L"B3cC2eZbcWriteCount", zbcWriteCount);
+    TraceBin(L"B3cC2eZbcReadback", zbcWrites, sizeof(zbcWrites));
+    Trace(L"B3cC2eZbcPmuSyncSkipped", 1u);
+    Trace(L"B3cC2eCbcConfigured", cbcConfigured);
+    Trace(L"B3cC2eCbcNoComptag", cbcNoComptag);
+    Trace(L"B3cC2eCbcBackingBytes", 0u);
+    Trace(L"B3cC2eCbcWriteCount", cbcWriteCount);
+    TraceBin(L"B3cC2eCbcReadback", cbcWrites, sizeof(cbcWrites));
+    Trace(L"B3cC2eRopSetupWriteCount", ropWriteCount);
+    TraceBin(L"B3cC2eRopSetupReadback", ropWrites, sizeof(ropWrites));
+    Trace(L"B3cC2eEarlyZcullWriteCount", earlyZcullWriteCount);
+    TraceBin(L"B3cC2eEarlyZcullReadback", earlyZcullWrites, sizeof(earlyZcullWrites));
+    Trace(L"B3cC2eFbpCountRaw", fbpCountRaw);
+    Trace(L"B3cC2eFbpCount", fbpCount);
+    Trace(L"B3cC2eNouveauRopWriteCount", nouveauRopWriteCount);
+    TraceBin(L"B3cC2eNouveauRopReadback", nouveauRopWrites, sizeof(nouveauRopWrites));
+    TraceBin(L"B3cC2eFifoAccess", fifoCtlTrace, sizeof(fifoCtlTrace));
+    Trace(L"B3cC2eLtcCbcSetupSkipped", cbcConfigured ? 0u : 1u);
+    Trace(L"B3cC2eZbcSetupSkipped", zbcConfigured ? 0u : 1u);
+    Trace(L"B3cC2eLtcBasedRopSetupSkipped", (ltcFsConfigured && fbFsConfigured && beRopConfigured) ? 0u : 1u);
+    TraceBin(L"B3cC2eBundleBaseline", bundleBaseline, sizeof(bundleBaseline));
+    Trace(L"B3cC2eBundleFirstChangeFound", bundleFirstChangeFound);
+    Trace(L"B3cC2eBundleFirstChangeIndex", bundleFirstChangeIndex);
+    TraceBin(L"B3cC2eBundleEntry0State", bundleEntry0, sizeof(bundleEntry0));
+    if (bundleFirstChangeFound)
+        TraceBin(L"B3cC2eBundleFirstChangeState", bundleFirstChange,
+                 sizeof(bundleFirstChange));
+    B3cPrivRingTraceWriteLog(L"B3cC2ePrivWriteErrorCount",
+        L"B3cC2ePrivWriteErrorDropped", L"B3cC2ePrivAckTimeouts",
+        L"B3cC2ePrivWriteErrors");
+    pmcEnable = Rd(B, NV_PMC_ENABLE);
+    Trace(L"B3cC2ePmcEnableAtDiagnostics", pmcEnable);
+    if (pmcEnable & (1u << 12)) {
+        B3cC2eCaptureDiagnostics(Dev);
+        gr5044b0AtExit = Rd(B, 0x005044B0u);
+        Trace(L"B3cC2eGr5044B0AtExit", gr5044b0AtExit);
+        Trace(L"B3cC2eGr5044B0Bit27AtExit", (gr5044b0AtExit >> 27) & 1u);
+    }
+    Trace(L"B3cC2eMcUnk260AtExit", Rd(B, 0x00000260u));
+    if (bundle != NULL) ExFreePoolWithTag(bundle, SWGPU_TAG);
+    if (waitHistory != NULL) ExFreePoolWithTag(waitHistory, SWGPU_TAG);
+    Wr(B, 0x00400208u, 0u);
+    if (feGoIdleTimeoutSavedValid) Wr(B, 0x00404154u, feGoIdleTimeoutSaved);
+    TraceDurable(L"B3cC2eResult", result);
+    return result;
+}
+
+/* Only called after the existing GPU block reset; restore exactly the outer
+ * mapping entries C2d changed before releasing its separate arena. */
+static VOID GrVmCleanupAfterGpuReset(PSWGPU_DEVICE Dev)
+{
+    volatile ULONG *smmuPd, *smmuPt;
+    ULONG i, readback = 1;
+    if (g_GrVm.PtbChanged && g_GrVm.Arena != NULL && g_AcrVm.Arena != NULL) {
+        smmuPd = (volatile ULONG *)g_AcrVm.Arena;
+        if (g_GrVm.SharedSmmuPt) smmuPt = (volatile ULONG *)((PUCHAR)g_AcrVm.Arena + PAGE_SIZE);
+        else smmuPt = (volatile ULONG *)((PUCHAR)g_GrVm.Arena + GR_VM_SMMU_PGT_OFF);
+        for (i = 0; i < GR_VM_PAGE_COUNT; ++i) {
+            smmuPt[g_GrVm.SmmuPteFirst + i] = g_GrVm.OldSmmuPtes[i];
+            if (smmuPt[g_GrVm.SmmuPteFirst + i] != g_GrVm.OldSmmuPtes[i]) readback = 0;
+        }
+        if (!g_GrVm.SharedSmmuPt) smmuPd[g_GrVm.SmmuPdeIndex] = g_GrVm.OldSmmuPde;
+        KeMemoryBarrier();
+        Wr(Dev->Mc, MC_SMMU_PTC_FLUSH, 0);
+        (VOID)Rd(Dev->Mc, MC_SMMU_PTB_ASID);
+        Wr(Dev->Mc, MC_SMMU_TLB_FLUSH, 0);
+        (VOID)Rd(Dev->Mc, MC_SMMU_PTB_ASID);
+        if (smmuPd[g_GrVm.SmmuPdeIndex] != g_GrVm.OldSmmuPde)
+            readback = 0;
+        TraceDurable(L"B3cC2dOuterMapRestored", readback);
+    } else {
+        TraceDurable(L"B3cC2dOuterMapRestored", 1u);
+    }
+    if (g_GrVm.Arena != NULL)
+        MmFreeContiguousMemorySpecifyCache(g_GrVm.Arena, GR_VM_ARENA_SIZE, MmNonCached);
+    RtlZeroMemory(&g_GrVm, sizeof(g_GrVm));
+}
+
+/* C2b: mirror the reset-enable portion of nvgpu gk20a_init_gr_reset_enable_hw()
+ * before FECS/GPCCS ctxsw ucode startup. Only the GM20B GR global/GPCS PRI
+ * windows and its two GPC PRI windows are accepted for the firmware list;
+ * this deliberately excludes all other BAR0 blocks. Register offsets below
+ * are kept separate from values read from BAR0. */
+static BOOLEAN B3cIsGrPriAddress(ULONG address)
+{
+    if ((address >= 0x00400000u && address < 0x00410000u) ||
+        (address >= 0x00418000u && address < 0x00420000u) ||
+        (address >= 0x00500000u && address < 0x00510000u))
+        return TRUE;
+    return FALSE;
+}
+
+static ULONG B3cRunC2b(PSWGPU_DEVICE Dev)
+{
+    volatile UCHAR *B = Dev->Bar0;
+    PUCHAR data = NULL;
+    ULONG length = 0, count, result = 0, entryIndex, waitPoll;
+    ULONG grAddr, grValue, badAddr = 0, badIndex = 0xFFFFFFFFu;
+    ULONG pmcEnable, grPowerRead = 0, grResetAssertRead, grResetReleaseRead;
+    ULONG gpcPriBadfCount = 0;
+    ULONG mcValue, mcDisabled, mcEnabled, sccInitRead;
+    ULONG scrubFecs = 0, scrubGpccs = 0, engineStatus = 0, grStatus = 0;
+    ULONG writes = 0, sampleCount = 0, sample[8][3] = { 0 };
+    ULONG c2bSwNonctxResetCtlOff = 0x00409614u;
+    ULONG c2bGrPowerModeOff = 0x00404170u;
+    ULONG c2bSccInitOff = 0x0040802Cu;
+    ULONG c2bFecsDmaCtlOff = 0x0040910Cu;
+    ULONG c2bGpccsDmaCtlOff = 0x0041A10Cu;
+    ULONG c2bGrEngineStatusOff = 0x0040060Cu;
+    ULONG c2bGrStatusOff = 0x00400700u;
+    ULONG c2bMcEnableOff = 0x00000200u;
+    ULONG c2bEngineResetMask = 0x18001000u;
+
+    Step(78);
+    B3cPrivRingResetWriteLog();
+    B3cCaptureGpcPriDiag(B, L"B3cC2bPreResetGpcPri", L"B3cC2bPreResetGpcPriBadfCount",
+                         &gpcPriBadfCount);
+    pmcEnable = Rd(B, NV_PMC_ENABLE);
+    Trace(L"B3cC2bPmcEnable", pmcEnable);
+    if (!(pmcEnable & (1u << 12))) { result = 0xE0000087u; goto done; }
+
+    data = ReadBinParam(L"FwGrSwNonctx", 0x20000u, &length);
+    Trace(L"B3cC2bSwNonctxBytes", length);
+    if (data == NULL || length == 0 || (length % 8u) != 0) {
+        result = 0xE0000087u; goto done;
+    }
+    count = length / 8u;
+    /* Validate the entire user-provided list before the first MMIO write. */
+    for (entryIndex = 0; entryIndex < count; ++entryIndex) {
+        grAddr = Le32(data + entryIndex * 8u);
+        if ((grAddr & 3u) != 0 || !B3cIsGrPriAddress(grAddr)) {
+            badAddr = grAddr; badIndex = entryIndex;
+            result = 0xE0000087u; goto done;
+        }
+    }
+    Trace(L"B3cC2bSwNonctxCount", count);
+    Trace(L"B3cC2bSwNonctxFirstAddr", Le32(data));
+
+    /* nvgpu gk20a_init_gr_prepare() -> gk20a_reset(): reset PGRAPH, BLG,
+     * and PERFMON, keeping all unrelated PMC_ENABLE bits (including PMU).
+     * hw_mc_gm20b.h confirms MC_ENABLE=0x200 and masks 0x1000/0x08000000/
+     * 0x10000000. This reset is bounded by fixed delays and readback checks. */
+    mcValue = Rd(B, c2bMcEnableOff);
+    Trace(L"B3cC2bMcEnableBeforeReset", mcValue);
+    Wr(B, c2bMcEnableOff, mcValue & ~c2bEngineResetMask);
+    mcDisabled = Rd(B, c2bMcEnableOff);
+    Trace(L"B3cC2bMcEnableDuringReset", mcDisabled);
+    if (mcDisabled & c2bEngineResetMask) { result = 0xE0000087u; goto done; }
+    Us(20);
+    mcValue = Rd(B, c2bMcEnableOff);
+    Wr(B, c2bMcEnableOff, mcValue | c2bEngineResetMask);
+    mcEnabled = Rd(B, c2bMcEnableOff);
+    Trace(L"B3cC2bMcEnableAfterReset", mcEnabled);
+    Us(20);
+    if ((mcEnabled & c2bEngineResetMask) != c2bEngineResetMask || !(mcEnabled & (1u << 12))) {
+        result = 0xE0000087u; goto done;
+    }
+
+    /* nvgpu gr_gk20a_ctx_reset(g, 0): request forced-on FE clocks, then
+     * assert context reset (0x70), wait 20 us, and release it (0x770).
+     * Addresses/values are verified in hw_gr_gm20b.h (gr_fe_pwr_mode_* and
+     * gr_fecs_ctxsw_reset_ctl_*). */
+    Wr(B, c2bGrPowerModeOff, 0x12u);
+    for (waitPoll = 0; waitPoll < 2000u; ++waitPoll) {
+        grPowerRead = Rd(B, c2bGrPowerModeOff);
+        if (((grPowerRead >> 4) & 1u) == 0u) break;
+        Us(10);
+    }
+    Trace(L"B3cC2bForceClockPolls", waitPoll);
+    Trace(L"B3cC2bForceClockReadback", grPowerRead);
+    if (waitPoll == 2000u) { result = 0xE0000087u; goto done; }
+
+    Wr(B, c2bSwNonctxResetCtlOff, 0x70u);
+    grResetAssertRead = Rd(B, c2bSwNonctxResetCtlOff);
+    Us(20);
+    Wr(B, c2bSwNonctxResetCtlOff, 0x770u);
+    grResetReleaseRead = Rd(B, c2bSwNonctxResetCtlOff);
+    Us(20);
+    Trace(L"B3cC2bFecsCtxswResetAssert", grResetAssertRead);
+    Trace(L"B3cC2bFecsCtxswResetRelease", grResetReleaseRead);
+
+    /* Return FE clocks to automatic mode and wait for the request to finish. */
+    Wr(B, c2bGrPowerModeOff, 0x10u);
+    for (waitPoll = 0; waitPoll < 2000u; ++waitPoll) {
+        grPowerRead = Rd(B, c2bGrPowerModeOff);
+        if (((grPowerRead >> 4) & 1u) == 0u) break;
+        Us(10);
+    }
+    Trace(L"B3cC2bAutoClockPolls", waitPoll);
+    Trace(L"B3cC2bAutoClockReadback", grPowerRead);
+    if (waitPoll == 2000u) { result = 0xE0000087u; goto done; }
+
+    /* nvgpu gk20a_init_gr_reset_enable_hw() clears SCC RAM after ctxsw reset,
+     * then writes each validated non-context AV record. */
+    Wr(B, c2bSccInitOff, 1u);
+    sccInitRead = Rd(B, c2bSccInitOff);
+    Trace(L"B3cC2bSccInitReadback", sccInitRead);
+    if (!B3cPrivRingDrainBeforeWrites(B)) { result = 0xE0000095u; goto done; }
+    for (entryIndex = 0; entryIndex < count; ++entryIndex) {
+        grAddr = Le32(data + entryIndex * 8u);
+        grValue = Le32(data + entryIndex * 8u + 4u);
+        Wr(B, grAddr, grValue);
+        if (!B3cPrivRingAfterGrWrite(B, grAddr, grValue)) {
+            badAddr = grAddr; badIndex = entryIndex;
+            result = 0xE0000095u; goto done;
+        }
+        ++writes;
+        if (entryIndex < RTL_NUMBER_OF(sample)) {
+            sample[entryIndex][0] = grAddr;
+            sample[entryIndex][1] = grValue;
+            sample[entryIndex][2] = 0;
+            sampleCount = entryIndex + 1u;
+        }
+    }
+    KeMemoryBarrier();
+    for (entryIndex = 0; entryIndex < sampleCount; ++entryIndex)
+        sample[entryIndex][2] = Rd(B, sample[entryIndex][0]);
+    Trace(L"B3cC2bSwNonctxWrites", writes);
+    Trace(L"B3cC2bReadbackCount", sampleCount);
+    if (sampleCount) TraceBin(L"B3cC2bReadback", sample, sampleCount * sizeof(sample[0]));
+
+    /* Match nvgpu gr_gk20a_wait_mem_scrubbing() with a finite 2 s ceiling. */
+    for (waitPoll = 0; waitPoll < 2000u; ++waitPoll) {
+        scrubFecs = Rd(B, c2bFecsDmaCtlOff) & 0x6u;
+        scrubGpccs = Rd(B, c2bGpccsDmaCtlOff) & 0x6u;
+        if (scrubFecs == 0u && scrubGpccs == 0u) break;
+        Ms(1);
+    }
+    Trace(L"B3cC2bScrubPolls", waitPoll);
+    Trace(L"B3cC2bFecsScrubBits", scrubFecs);
+    Trace(L"B3cC2bGpccsScrubBits", scrubGpccs);
+    if (waitPoll == 2000u) { result = 0xE0000087u; goto done; }
+
+    /* This probe has no GPFIFO channel yet; use the GR engine-busy and FE
+     * method busy bits nvgpu checks in its idle helpers, with a hard limit. */
+    for (waitPoll = 0; waitPoll < 2000u; ++waitPoll) {
+        engineStatus = Rd(B, c2bGrEngineStatusOff);
+        grStatus = Rd(B, c2bGrStatusOff);
+        if (!(engineStatus & 1u) && !(grStatus & 0x6u)) break;
+        Ms(1);
+    }
+    Trace(L"B3cC2bIdlePolls", waitPoll);
+    Trace(L"B3cC2bEngineStatus", engineStatus);
+    Trace(L"B3cC2bGrStatus", grStatus);
+    if (waitPoll == 2000u) { result = 0xE0000087u; goto done; }
+
+done:
+    B3cPrivRingTraceWriteLog(L"B3cC2bPrivWriteErrorCount",
+        L"B3cC2bPrivWriteErrorDropped", L"B3cC2bPrivAckTimeouts",
+        L"B3cC2bPrivWriteErrors");
+    Trace(L"B3cC2bBadIndex", badIndex);
+    Trace(L"B3cC2bBadAddress", badAddr);
+    if (data != NULL) ExFreePoolWithTag(data, SWGPU_TAG);
+    TraceDurable(L"B3cC2bResult", result);
+    return result;
+}
+
 static ULONG B3cStartFecsLs(PSWGPU_DEVICE Dev)
 {
     volatile UCHAR *B = Dev->Bar0;
@@ -2210,6 +4625,10 @@ static ULONG B3cStartFecsLs(PSWGPU_DEVICE Dev)
     Trace(L"B3cFecsPmcEnableAfter", Rd(B, NV_PMC_ENABLE));
     if (!(Rd(B, NV_PMC_ENABLE) & (1u << 12))) { result = 0xE0000078u; goto done; }
     TraceB3cPmuCheckpoint(B, L"B3cPmuCheckpointAfterGrEnable");
+    result = B3cRunC2b(Dev);
+    if (result != 0u) goto done;
+    result = B3cInitGpcMmu(Dev);
+    if (result != 0u) goto done;
     /* Retain 0x419A00 only as a legacy comparison. The GM20B FECS ctxsw
      * mailbox sequence is written immediately before the FECS start below. */
     Trace(L"B3cFecsLegacyMailbox419A00BeforeStartSeq", Rd(B, 0x419A00u));
@@ -2438,7 +4857,7 @@ done:
      * Step 67 leaves PMC_ENABLE bit 12 clear). */
     Trace(L"B3cFecsGrEnabledAtRead", (Rd(B, NV_PMC_ENABLE) >> 12) & 1u);
     if (Rd(B, NV_PMC_ENABLE) & (1u << 12)) {
-    Trace(L"B3cFecsCpuctl", Rd(B, 0x409100u)); Trace(L"B3cFecsSctl", Rd(B, 0x409200u));
+    Trace(L"B3cFecsCpuctl", Rd(B, 0x409100u)); Trace(L"B3cFecsSctl", Rd(B, 0x409240u));
     Trace(L"B3cFecsMailbox0", Rd(B, 0x409040u)); Trace(L"B3cFecsMailbox1", Rd(B, 0x409044u));
     Trace(L"B3cFecsLegacyMailbox419A00Final", Rd(B, 0x419A00u));
     fecsTraceIdx = Rd(B, 0x409148u); fecsTraceNr = (fecsTraceIdx >> 16) & 0xFFu;
@@ -2484,7 +4903,8 @@ static VOID ProbeB3a(PSWGPU_DEVICE Dev, BOOLEAN RunAcr)
     ULONG nsOff, nsSize, dataBase, dataSize, numApps, app0Off, app0Size, sigSrc;
     ULONG hwcfg, imemSize, dmemSize, imemBase, dbgFused;
     ULONG wprRawStart, wprRawLimit, wprAllocLen = 0, wprUsed = 0;
-    ULONG bootPolls, pmuArgv = 0, fecsErr = 0;
+    ULONG bootPolls, pmuArgv = 0, fecsErr = 0, c1Err = 0, c2aErr = 0, c2cErr = 0, c2dErr = 0, c2eErr = 0;
+    ULONG c1GoldenBytes = 0, c1ZcullBytes = 0, c1PmBytes = 0;
     BOOLEAN acrAttempted = FALSE;
     ULONGLONG arenaIova = 0, instIova = 0;
     ULONGLONG wprStart, wprEnd;
@@ -2915,6 +5335,28 @@ static VOID ProbeB3a(PSWGPU_DEVICE Dev, BOOLEAN RunAcr)
             if (err == 0) {
                 fecsErr = B3cStartFecsLs(Dev);
                 if (fecsErr != 0) err = fecsErr;
+                else {
+                    c1Err = B3cQueryFecsImageSizes(Dev, &c1GoldenBytes,
+                                                   &c1ZcullBytes, &c1PmBytes);
+                    if (c1Err != 0) err = c1Err;
+                    else {
+                        c2aErr = B3cValidateGrInitLists(Dev);
+                        if (c2aErr != 0) err = c2aErr;
+                        else {
+                            c2cErr = B3cApplyGrCtxList(Dev, FALSE);
+                            if (c2cErr != 0) err = c2cErr;
+                            else {
+                                c2dErr = B3cPrepareGrContext(Dev, c1GoldenBytes,
+                                                             c1ZcullBytes, c1PmBytes);
+                                if (c2dErr != 0) err = c2dErr;
+                                else {
+                                    c2eErr = B3cCreateGoldenContext(Dev);
+                                    if (c2eErr != 0) err = c2eErr;
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
     } else {
@@ -3058,7 +5500,9 @@ static NTSTATUS PowerTest(PSWGPU_DEVICE Dev, BOOLEAN KeepOn, ULONG Mode)
     if (NT_SUCCESS(st) && Mode == 3) ProbeB2a(Dev);
     if (NT_SUCCESS(st) && Mode == 4) ProbeB3a(Dev, FALSE);
     if (NT_SUCCESS(st) && Mode == 5) ProbeB3a(Dev, TRUE);
-    if (KeepOn) { Step(100); return st; }
+    if (KeepOn && !g_GrVm.Attempted) { Step(100); return st; }
+    if (KeepOn && g_GrVm.Attempted)
+        TraceDurable(L"B3cC2dKeepOnReset", 1u); /* C2d backing must be released after reset. */
 
 down:
     Step(10);   /* power down, put everything back */
@@ -3072,6 +5516,7 @@ down:
         Wr(Dev->Car, CAR_RST_DEV_X_SET, CLK_X_GPU);
         Us(10);
         FreeB2aPagesAfterGpuReset();
+        GrVmCleanupAfterGpuReset(Dev);
         AcrVmCleanupAfterGpuReset(Dev);
         Wr(Dev->Car, CAR_CLK_ENB_X_CLR, (CLK_X_GPU | CLK_X_PLLG_REF) & ~clkx0);
         Wr(Dev->Mc, MC_HOTRESET_CTRL_1, Rd(Dev->Mc, MC_HOTRESET_CTRL_1) & ~MC_HOTRESET_GPU);

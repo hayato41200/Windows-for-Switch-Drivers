@@ -1,4 +1,4 @@
-The 4K small-page PDE encoding in switchgpu.c is adapted from
+﻿The 4K small-page PDE encoding in switchgpu.c is adapted from
 Linux nouveau v6.12, nvkm/subdev/mmu/vmmgf100.c, gf100_vmm_pgd_pde.
 https://github.com/torvalds/linux/blob/v6.12/drivers/gpu/drm/nouveau/nvkm/subdev/mmu/vmmgf100.c
 
@@ -204,3 +204,199 @@ https://github.com/NVIDIA/nvgpu/blob/1ae0167d360287ca78f5a2572f0de42594140312/dr
 https://github.com/NVIDIA/nvgpu/blob/1ae0167d360287ca78f5a2572f0de42594140312/drivers/gpu/nvgpu/gm20b/gr_gm20b.c
 https://github.com/torvalds/linux/blob/v6.12/drivers/gpu/drm/nouveau/nvkm/engine/gr/gf100.c
 https://github.com/torvalds/linux/blob/v6.12/drivers/gpu/drm/nouveau/nvkm/falcon/v1.c
+
+0.4.37 Stage C1 FECS size-query comparison (MIT references; no upstream code
+copied): Switchroot nvgpu 1ae0167d, gk20a/gr_gk20a.c:
+gr_gk20a_init_ctx_state(), gr_gk20a_submit_fecs_method_op(),
+gr_gk20a_ctx_wait_ucode(); GM20B definitions in
+include/nvgpu/hw/gm20b/hw_gr_gm20b.h: gr_fecs_method_data_r(),
+gr_fecs_method_push_r(), gr_fecs_method_push_adr_discover_image_size_v(),
+gr_fecs_method_push_adr_discover_zcull_image_size_v(),
+gr_fecs_method_push_adr_discover_pm_image_size_v(),
+gr_fecs_ctxsw_mailbox_r(), gr_fecs_ctxsw_mailbox_clear_r(),
+gr_fecs_ctxsw_mailbox_value_pass_v(), and
+gr_fecs_ctxsw_mailbox_value_fail_v(). The read-only W4T Erista driver was
+used only as a cross-check: MIT platform/t210_gr_context.c, fecs() and
+tg_gpu_gr_context_init(). No GPL-2.0-only files were used or adapted.
+
+https://github.com/CTCaer/switch-l4t-kernel-nvgpu/blob/1ae0167d360287ca78f5a2572f0de42594140312/drivers/gpu/nvgpu/gk20a/gr_gk20a.c
+https://github.com/CTCaer/switch-l4t-kernel-nvgpu/blob/1ae0167d360287ca78f5a2572f0de42594140312/drivers/gpu/nvgpu/gk20a/gk20a.c
+https://github.com/CTCaer/switch-l4t-kernel-nvgpu/blob/1ae0167d360287ca78f5a2572f0de42594140312/drivers/gpu/nvgpu/include/nvgpu/hw/gm20b/hw_gr_gm20b.h
+
+0.4.40 Stage C2c sw_ctx application reference (MIT; sequence adapted, no
+source implementation copied): Switchroot nvgpu 1ae0167d,
+gk20a/gr_gk20a.c: gk20a_init_gr_setup_hw() and gr_gk20a_wait_idle(). The
+sw_ctx AIV list is applied through its addr/value fields; the index is not
+used by that setup_hw loop. Address validation is limited to GM20B GR/GPCS
+and GPC PRI ranges before any MMIO write. No firmware is included.
+Copyright (c) 2014-2023 NVIDIA Corporation; licensed under the MIT License.
+Full license text is available in the referenced upstream source.
+
+https://github.com/CTCaer/switch-l4t-kernel-nvgpu/blob/1ae0167d360287ca78f5a2572f0de42594140312/drivers/gpu/nvgpu/gk20a/gr_gk20a.c
+https://github.com/CTCaer/switch-l4t-kernel-nvgpu/blob/1ae0167d360287ca78f5a2572f0de42594140312/drivers/gpu/nvgpu/include/nvgpu/hw/gm20b/hw_mc_gm20b.h
+
+0.4.38 Stage C2a GR init-list format reference (MIT; no source code copied):
+Switchroot nvgpu 1ae0167d, gk20a/gr_gk20a.c:
+gr_gk20a_init_ctx_vars(), gk20a_init_gr_reset_enable_hw(),
+gk20a_init_gr_setup_hw(), gk20a_init_sw_bundle(), and
+gr_gk20a_init_golden_ctx_image(). Stage C2a uses only the record formats and
+initialization ordering represented by those MIT nvgpu interfaces; no
+upstream implementation code was copied. The user-provided W4T MIT source was
+also consulted as a cross-check only: core/gr_firmware.c,
+tg_gpu_gr_netlist_parse(), and platform/t210_gr_context.c,
+tg_gpu_gr_context_init(). Stage C2a only validates the user-supplied blobs
+and does not write their register lists.
+
+0.4.39 Stage C2b GR reset and non-context initialization sequence (MIT nvgpu;
+sequence adapted, no source file copied): Switchroot nvgpu 1ae0167d,
+gk20a/gr_gk20a.c: gk20a_init_gr_prepare(), gr_gk20a_ctx_reset(),
+gk20a_init_gr_reset_enable_hw(), gr_gk20a_wait_mem_scrubbing(), and
+gr_gk20a_wait_idle(); gk20a/gk20a.c: gk20a_reset(); register definitions verified against
+include/nvgpu/hw/gm20b/hw_gr_gm20b.h:
+gr_fecs_ctxsw_reset_ctl_*, gr_fe_pwr_mode_*, gr_scc_init_*,
+gr_fecs_dmactl_*, gr_gpccs_dmactl_*, gr_engine_status_*, and gr_status_*.
+include/nvgpu/hw/gm20b/hw_mc_gm20b.h: mc_enable_r(),
+mc_enable_pgraph_enabled_f(), mc_enable_blg_enabled_f(), and
+mc_enable_perfmon_enabled_f().
+The driver validates the whole user-provided sw_nonctx list against bounded
+GM20B GR/GPCS and two-GPC PRI windows before any list writes. No firmware is
+included. Copyright (c) 2014-2023 NVIDIA Corporation; licensed under the MIT
+License. Full license text is available in the referenced upstream source.
+
+https://github.com/CTCaer/switch-l4t-kernel-nvgpu/blob/1ae0167d360287ca78f5a2572f0de42594140312/drivers/gpu/nvgpu/gk20a/gr_gk20a.c
+https://github.com/CTCaer/switch-l4t-kernel-nvgpu/blob/1ae0167d360287ca78f5a2572f0de42594140312/drivers/gpu/nvgpu/include/nvgpu/hw/gm20b/hw_gr_gm20b.h
+
+
+0.4.41 Stage C2d GR context backing and VM layout references (MIT; no
+upstream implementation code copied): Switchroot nvgpu 1ae0167d,
+gm20b/gr_gm20b.c: gr_gm20b_calc_global_ctx_buffer_size() and
+gr_gm20b_commit_global_attrib_cb(); gk20a/gr_gk20a.c:
+gr_gk20a_alloc_global_ctx_buffers(), gr_gk20a_map_global_ctx_buffers(),
+gr_gk20a_alloc_gr_ctx(), and gr_gk20a_commit_inst();
+include/nvgpu/hw/gm20b/hw_gr_gm20b.h: GM20B buffer defaults, granularity,
+pagepool limits, and gr_gpcs_setup_attrib_cb_base_r(). The independent work
+arena placement was cross-checked against the MIT W4T reference:
+platform/t210_gr_context.h (TG_GPU_GR_* offsets) and
+platform/t210_gr_context.c: tg_gpu_gr_context_init(). Copyright (c)
+2014-2023 NVIDIA Corporation; licensed under the MIT License. Full license
+text is available in the referenced upstream sources.
+
+0.4.42 Stage C2e golden-context bring-up: reference functions checked in the
+MIT Switchroot nvgpu source include gk20a/gr_gk20a.c:
+gr_gk20a_fecs_ctx_bind_channel(), gr_gk20a_submit_fecs_method_op(),
+gk20a_init_sw_bundle(), gr_gk20a_fecs_ctx_image_save(), and
+gr_gk20a_init_golden_ctx_image(); gm20b/gr_gm20b.c global-context commit
+operations; include/nvgpu/hw/gm20b/hw_gr_gm20b.h and
+hw_ctxsw_prog_gm20b.h provide register/method/header values. The GR global
+buffer address/value grouping was cross-checked and adapted from MIT W4T
+platform/t210_gr_context.c functions tg_gpu_gr_context_global_patches() and
+tg_gpu_gr_context_init(). Copyright (c) 2014-2018 NVIDIA Corporation;
+licensed under the MIT License. Full license text is
+available in the referenced upstream source files.
+
+https://github.com/CTCaer/switch-l4t-kernel-nvgpu/blob/1ae0167d360287ca78f5a2572f0de42594140312/drivers/gpu/nvgpu/gk20a/gr_gk20a.c
+https://github.com/CTCaer/switch-l4t-kernel-nvgpu/blob/1ae0167d360287ca78f5a2572f0de42594140312/drivers/gpu/nvgpu/gm20b/gr_gm20b.c
+https://github.com/CTCaer/switch-l4t-kernel-nvgpu/blob/1ae0167d360287ca78f5a2572f0de42594140312/drivers/gpu/nvgpu/include/nvgpu/hw/gm20b/hw_gr_gm20b.h
+https://github.com/CTCaer/switch-l4t-kernel-nvgpu/blob/1ae0167d360287ca78f5a2572f0de42594140312/drivers/gpu/nvgpu/include/nvgpu/hw/gm20b/hw_ctxsw_prog_gm20b.h
+
+https://github.com/ruje0504-2/W4T-Windows-Drivers/blob/main/drivers/t210-icosa/drivers/TegraGpu/platform/t210_gr_context.c
+
+0.4.43 Stage C2e precondition and wait diagnostics: compared against MIT
+Switchroot nvgpu gk20a/gr_gk20a.c functions gr_gk20a_wait_idle(),
+gr_gk20a_wait_fe_idle(), gr_gk20a_init_golden_ctx_image(),
+gk20a_init_sw_bundle(), and gm20b/gr_gm20b.c gr_gm20b_init_fs_state().
+The adapted portions are the FE force-on/auto and ctxsw-reset sequencing,
+GR-idle/FE-idle predicates, and the bounded fixed-topology GR initialization
+subset. The full upstream MIT license and copyright notices are retained at
+the referenced source files.
+0.4.44 Stage C2e exception and interrupt setup: adapted in GR PRI scope from
+MIT Switchroot nvgpu gk20a/gr_gk20a.c functions
+`gk20a_init_gr_setup_hw()`, `gr_gk20a_enable_hww_exceptions()`,
+`gk20a_gr_enable_exceptions()`, `gk20a_gr_enable_gpc_exceptions()`, and
+`gr_gk20a_fecs_host_int_enable()`, plus gm20b/gr_gm20b.c function
+`gr_gm20b_set_hww_esr_report_mask()`. The register encodings were checked
+against include/nvgpu/hw/gm20b/hw_gr_gm20b.h. Copyright and MIT license
+notices are retained in the referenced upstream source files.
+
+0.4.46 Stage C2e golden-save ordering and bounded cache flush: compared and
+adapted from MIT Switchroot nvgpu 1ae0167d, gk20a/gr_gk20a.c functions
+gk20a_init_sw_bundle(), gr_gk20a_init_golden_ctx_image(), and
+gr_gk20a_fecs_ctx_image_save(), plus gk20a/mm_gk20a.c function
+gk20a_mm_l2_flush(). Register encodings are from
+include/nvgpu/hw/gm20b/hw_flush_gm20b.h and
+include/nvgpu/hw/gm20b/hw_ctxsw_prog_gm20b.h. No source files are copied;
+the original copyright and MIT license text remain in the cited upstream
+files.
+
+0.4.48 C2e ordering and diagnostics were compared with MIT Switchroot nvgpu 1ae0167d, gk20a/gr_gk20a.c functions gr_gk20a_init_golden_ctx_image(), gk20a_init_sw_bundle(), gr_gk20a_wait_idle(), and gr_gk20a_wait_fe_idle(). The post-bind sw_ctx replay and bundle wait ordering follow those functions. No source code was copied; upstream copyright and MIT license notices remain in the referenced source files.
+0.4.49 Nouveau comparison: Linux v6.12 nvkm/engine/gr/ctxgm20b.c, function gm20b_grctx_generate_main() (Copyright 2015 NVIDIA Corporation, MIT); ctxgf100.c, functions gf100_grctx_generate() and gf100_grctx_generate_main() (Copyright 2010 Red Hat Inc., MIT); and gf100.c, functions gf100_gr_wait_idle(), gf100_gr_icmd(), and gf100_gr_mthd() (Copyright 2012 Red Hat Inc., MIT). The GR setup order, FE go-idle timeout restore placement, idle predicates, and secure firmware save/unload distinction were compared/adapted. No source code was copied. The upstream MIT notices are retained at the referenced Linux source files.
+
+MIT notice for the referenced Nouveau sources:
+Copyright (c) 2015 NVIDIA CORPORATION. All rights reserved.
+Copyright 2010 Red Hat Inc.
+Copyright 2012 Red Hat Inc.
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the "Software"), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
+The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE COPYRIGHT HOLDER(S) OR AUTHOR(S) BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+0.4.50 GM20B GPC MMU initialization order and writes were compared/adapted
+from Linux Nouveau v6.12, nvkm/engine/gr/gm20b.c function
+gm20b_gr_init_gpc_mmu() (Copyright 2015 NVIDIA Corporation, MIT) and
+nvkm/engine/gr/gk20a.c function gk20a_gr_init() (Copyright 2014-2015 NVIDIA
+Corporation, MIT). Register addresses for diagnostics were checked against
+unmodified MIT nvgpu L4T r32.7.6 headers hw_gr_gm20b.h, hw_fuse_gm20b.h,
+hw_top_gm20b.h, hw_pri_ringmaster_gm20b.h,
+hw_pri_ringstation_gpc_gm20b.h, and hw_pri_ringstation_sys_gm20b.h.
+No source code was copied. Copyright and MIT license text for Nouveau is
+included above; nvgpu header notices remain with the referenced header files.
+
+0.4.51 bundle-replay diagnostics: FE/GR register names and offsets were
+checked against MIT nvgpu L4T r32.7.6 hw_gr_gm20b.h and
+hw_pri_ringstation_gpc_gm20b.h. The non-context register-list application
+was compared with Switchroot nvgpu 1ae0167d gk20a/gr_gk20a.c function
+gk20a_init_gr_reset_enable_hw(). No source code was copied. nvgpu source
+license notices remain in the referenced upstream files.
+
+0.4.52 priv-ring diagnostics and ACK ordering were compared with MIT
+Switchroot nvgpu 1ae0167d common/priv_ring/priv_ring_gm20b.c function
+gm20b_priv_ring_isr(). Register and command encodings were checked against
+unmodified MIT nvgpu L4T r32.7.6 headers hw_pri_ringmaster_gm20b.h,
+hw_pri_ringstation_gpc_gm20b.h, and hw_pri_ringstation_sys_gm20b.h. The
+non-context list order was checked against gk20a/gr_gk20a.c function
+gk20a_init_gr_reset_enable_hw(). No source code was copied; the original
+copyright and MIT license notices remain in the referenced upstream files.
+
+0.4.53 read-only GR hang snapshots follow the exact register sequence in
+MIT Switchroot nvgpu 1ae0167d gm20b/gr_gm20b.c function
+gr_gm20b_dump_gr_status_regs(), cross-checked against the MIT GM20B register
+headers hw_gr_gm20b.h and hw_fifo_gm20b.h. The two TPC1 activity reads are
+included for the observed two-TPC topology. No source code was copied; the
+upstream copyright and MIT license notices remain in the referenced files.
+
+0.4.54 LTC/FB/ZBC/CBC/BE setup ordering and register writes were compared
+with MIT Switchroot nvgpu 1ae0167d: common/ltc/ltc_gm20b.c functions
+gm20b_ltc_init_fs_state(), gm20b_ltc_init_comptags(), gm20b_ltc_init_cbc(),
+gm20b_ltc_cbc_ctrl(), gm20b_ltc_set_zbc_color_entry(), and
+gm20b_ltc_set_zbc_depth_entry(), gm20b_ltc_set_enabled(),
+gm20b_flush_ltc(), and gm20b_determine_L2_size_bytes(); gk20a/gr_gk20a.c functions
+gk20a_init_gr_setup_hw(), gr_gk20a_load_zbc_default_table(),
+gr_gk20a_add_zbc_color(), gr_gk20a_add_zbc_depth(), and gr_gk20a_add_zbc();
+gm20b/gr_gm20b.c functions gr_gm20b_init_fs_state() and
+gm20a_gr_disable_rd_coalesce(); common/fb/fb_gm20b.c function
+fb_gm20b_init_fs_state(). Register maps and bit fields were checked against
+MIT nvgpu L4T r32.7.6 headers hw_ltc_gm20b.h, hw_gr_gm20b.h,
+hw_top_gm20b.h, hw_pri_ringmaster_gm20b.h, and hw_fb_gm20b.h. No source
+code was copied. The adapted register sequence and zero-comptag experiment
+follow the referenced MIT implementation; upstream copyright and license
+notices remain in the referenced files.
+
+0.4.55 GR setup_hw comparison and register sequence were checked against MIT-licensed
+Switchroot nvgpu 1ae0167d: gk20a/gr_gk20a.c (gk20a_init_gr_setup_hw,
+gr_gk20a_zcull_init_hw), gm20b/gr_gm20b.c (gr_gm20b_init_fs_state), and
+Linux Nouveau: nvkm/engine/gr/gk20a.c (gk20a_gr_init), gf117.c
+(gf117_gr_init_zcull), and gk104.c (gk104_gr_init_rop_active_fbps).
+Addresses and field values were verified against MIT nvgpu
+hw_gr_gm20b.h and hw_top_gm20b.h. No source code was copied. The fixed
+one-GPC/two-TPC zcull mapping follows the existing driver setup; the added
+FIFO access value is access_enabled | semaphore_access_enabled (0x00010001).

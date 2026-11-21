@@ -1,4 +1,4 @@
-# GPU 段階 A / B1 / B2a: switchgpu(試験)
+﻿# GPU 段階 A / B1 / B2a: switchgpu(試験)
 
 GM20B の GPU に Windows から電源とクロックを入れ、GPU が応答するか(ID レジスター `NV_PMC_BOOT_0` が読めるか)を確かめるテスト用ドライバーです。GPU で描くための最初の一歩で、画面の表示には関係しません。
 
@@ -279,3 +279,192 @@ ready 条件は nvgpu `gr_gk20a_wait_ctxsw_ready()` が期待する ucode INIT c
 GPCCS は引き続きユーザー提供の `gpccs_inst.bin` / `gpccs_data.bin` を IMEM/DMEM offset 0 へ PIO します。Nouveau `gf100_gr_init_fw()` / `nvkm_falcon_v1_load_imem()` に合わせ、IMEM は 256-byte block (64 dword) 単位でタグを進め、末尾をゼロ padding します。Nouveau の直接 PIO 起動経路に BOOTVEC 書き込みはないため変更せず、前後値を記録します。Step 70 は GPCCS CPUCTL/SCTL、Falcon mailbox、PC trace、IRQ、ctxsw mailbox 0..7 を追加記録します。既存の `E0000078` ready timeout を使います。
 
 確認する SUMMARY 行は FECS pre-start mailbox sequence、FECS ctxsw ready value/first-nonzero/change-count/polls、FECS ctxsw mailbox 0..7、GPCCS firmware source/padded IMEM words、BOOTVEC、GPCCS PC/IRQ/ctxsw mailboxes です。ビルドと実機結果は未確認です。
+
+## 0.4.37: Stage C1 FECS image size の照会
+
+0.4.37 では Stage C の最初の限定手順を追加します。`B3cFecsResult == 0` の場合だけ Step 76 を実行し、nvgpu `gr_gk20a_init_ctx_state()` と同じ順で FECS に3つの method を送ります。golden image size は `0x10`、zcull image size は `0x16`、PM image size は `0x25` です。`gr_gk20a_submit_fecs_method_op()` に合わせ、mailbox ID 0 を `0xFFFFFFFF` で clear し、method data に 0、method push に method address を書いて、mailbox 0 が 0 以外になるまで待ちます。各待ちは最大2000回、1 msごとです。method、mailbox clear前後、返信値、poll数と戻り値を各バイナリ trace に記録します。
+
+指定の `hw_gr_gm20b.h` では FECS method data/push が `0x409500` / `0x409504`、ctxsw mailbox 0 / clear 0 が `0x409800` / `0x409840`、3つの method address が上記の値であることを確認しました。汎用 mailbox PASS/FAIL 値は `1` / `2` です。size query の nvgpu 条件は mailbox 0 が 0 以外になること（NOT_EQUAL、FAIL 条件は SKIP）なので、C1 では2も失敗 sentinel として扱います。`E0000081` は mailbox timeout、`E0000082` は FAIL marker または all-ones read、`E0000083` は C1 前に GR が無効の場合です。context の確保、bind、書き込みは行いません。FECS SCTL の診断アドレスも `0x409240`（Falcon base + `0x240`）へ修正しました。`0x409200` は SCTL ではありません。
+
+SUMMARY では `B3c C1 result`、`B3cC1GoldenQueryWords`、`B3cC1ZcullQueryWords`、`B3cC1PmQueryWords`、3つの image size と `B3cFecsSctl` を確認してください。C1 は未ビルド・実機未確認です。
+
+## Stage C2 の小段階計画
+
+各段階は独立したバージョンで実機確認し、成功・失敗のどちらでも既存の GPU reset 経路で終了します。後段の初期化を先取りせず、段階ごとのトレースで確認して進めます。
+
+| 段階 | 版 / Step | 作業 | 新しい失敗コード |
+| --- | --- | --- | --- |
+| C2a | 0.4.38 / 77 | `sw_nonctx`、`sw_ctx`、`sw_bundle_init` をレジストリから読み、サイズ・レコード境界・レジスタアドレスを検査して件数と先頭/末尾を記録する。レジスタ書き込みはしない。 | `E0000084` firmware 欠落/128 KiB 超、`E0000085` 形式/範囲不正、`E0000086` GR 無効 |
+| C2b | 0.4.39 / 78 | nvgpu `gk20a_init_gr_prepare()` / `gk20a_init_gr_reset_enable_hw()` の順序に合わせて GR reset と nonctx 初期化を FECS ctxsw ucode 初期化より前に配置し、実行前後を記録する。 | `E0000087` reset/idle または nonctx 段階失敗 |
+| C2c | 0.4.40 / 79 | FECS ready、C1 size query、C2a 検査後に `sw_ctx` の AIV 項目を適用し、GR idle を上限付きで待つ。 | `E0000088` context list/idle 失敗 |
+| C2d | 0.4.41 / 80 | C1 の画像サイズに基づく最小 GR context と必要な backing を上限付きで確保し、仮想アドレス/instance 情報を組み立てて readback する。 | `E0000089` 確保/境界、`E000008A` bind 準備失敗 |
+| C2e | 0.4.42 / 81 | FECS context bind の後に bundle init と golden save を参照順で実行し、golden image のサイズと readback を検証する。 | `E000008B` FECS method/idle timeout、`E000008C` golden readback 不一致 |
+
+0.4.38 は C2a、0.4.39 は C2b を実装しました。nvgpu `gr_gk20a_init_ctx_vars()` と `gk20a_init_gr_reset_enable_hw()` では nonctx list は reset-enable 中、ctx list は後続の `gk20a_init_gr_setup_hw()` 中、bundle init は `gr_gk20a_init_golden_ctx_image()` から context bind 後に実行されます。C2c はこのうち `sw_ctx` の適用だけを切り出します。
+
+## 0.4.38: Stage C2a GR init-list の取込みと検査
+
+`FwTest` / `AcrTest` は、ユーザー提供の `gr/sw_ctx.bin`、`gr/sw_nonctx.bin`、`gr/sw_bundle_init.bin` を `FwGrSwCtx`、`FwGrSwNonctx`、`FwGrSwBundleInit` としてレジストリへ取り込みます。ドライバーは C1 が成功し、`PMC_ENABLE` bit 12 が立っている場合だけ Step 77 を行います。各 blob は最大 128 KiB、同時に一つだけ読み込み、検査後に必ず解放します。`sw_nonctx` と `sw_bundle_init` は 8-byte AV (`addr,value`)、`sw_ctx` は 12-byte AIV (`addr,index,value`) の整数レコードとして、空/端数サイズと 16 MiB BAR0 外または非 DWORD 境界のアドレスを検出します。各トレースにはバイト数、レコード長、件数、先頭アドレス/値、末尾アドレスを残します。これは読み取りだけで、GR レジスタには書きません。
+
+不足または128 KiBを超える blob は `E0000084`、不正なサイズ/アドレスは `E0000085`、Step 前に GR が無効なら `E0000086` です。`Gpu.ps1` の SUMMARY では Step 77 と `B3cC2aSwNonctx` / `B3cC2aSwCtx` / `B3cC2aSwBundleInit` の各バイナリ統計を確認します。ファームウェアはキットへ含めません。ビルドと実機結果は未確認です。
+
+sw_bundle_init の先頭の値はレジスターの番地ではなく bundle/method の番号(linux-firmware の gm20b では 0x38〜0x1E100、952 件中 704 件が 4 の倍数でない)なので、4 の倍数確認は sw_nonctx と sw_ctx にだけ適用します。GM20B の `sw_method_init.bin` は配布物に存在せず、nvgpu は method-init 件数がある場合のみ処理します。詳細は 0.4.40 節を参照してください。
+
+## 0.4.39: Stage C2b GR reset と sw_nonctx 適用
+
+Step 78 は FECS bootstrap command より前、PMU の INIT_WPR_REGION 成功後に実行します。PMC_ENABLE bit 12 が立っていることを確認し、GM20B の FECS ctxsw reset (`0x409614`: reset assert `0x70`、release `0x770`) と FE clock force-on/auto 要求を実行します。続いて SCC RAM (`0x40802C`) を初期化し、レジストリの `FwGrSwNonctx` を AV 形式で再生します。レコード全件を先に検査し、DWORD 境界と GR PRI (`0x400000-0x40FFFF`)、GPCS PRI (`0x418000-0x41FFFF`) または 2 GPC PRI (`0x500000-0x50FFFF`) に入るアドレスだけを書きます。リストの書込み数と先頭 8 件の addr/expected/actual readback を記録します。
+
+nvgpu `gk20a_init_gr_reset_enable_hw()` の順序に合わせ、再生後に FECS/GPCCS の IMEM/DMEM scrub と GR idle をそれぞれ最大 2000 回待ちます。いずれかの値が不正、reset request / scrub / idle が時間内に終わらない場合は `E0000087` とし、既存の GPU reset 経路に進みます。bundle/method ID の `sw_bundle_init` は BAR0 レジスタとして書きません。C2b では `sw_ctx`、bundle init、context の確保/bind、golden save は行いません。
+
+参照: MIT nvgpu `gk20a/gr_gk20a.c` の `gk20a_init_gr_prepare()`, `gr_gk20a_ctx_reset()`, `gk20a_init_gr_reset_enable_hw()`, `gr_gk20a_wait_mem_scrubbing()`, `gr_gk20a_wait_idle()` と `include/nvgpu/hw/gm20b/hw_gr_gm20b.h` の `gr_fecs_ctxsw_reset_ctl_*`, `gr_fe_pwr_mode_*`, `gr_scc_init_*`, `gr_fecs_dmactl_*`, `gr_gpccs_dmactl_*` を照合しました。Step 78 は `gk20a_init_gr_prepare()` の PGRAPH/BLG/PERFMON reset と、続く `gk20a_init_gr_reset_enable_hw()` の FECS ctxsw reset → SCC RAM 初期化 → nonctx 再生の順を実装します。MC_ENABLE (`0x200`) の reset mask は PGRAPH/BLG/PERFMON の `0x1000|0x08000000|0x10000000` で、他の bit (PMU を含む) を保持して前後を trace します。GPFIFO access setup と GR 割り込み有効化はこの段階では含めません。
+
+`sw_method_init.bin` は GM20B の配布物にありません。ユーザー確認の upstream linux-firmware `nvidia/gm20b/gr` には9ファイルがあり、`sw_method_init.bin` は含まれません。nvgpu は method-init の件数が非0の場合だけ処理するため、空リストを許容し、本キットでも取り込みや欠落エラーを追加しません。
+
+## 0.4.40: Stage C2c sw_ctx 適用
+
+Step 79 は FECS/GPCCS の起動と FECS ready、C1 の golden/zcull/PM size query、C2a の全リスト検査が成功した後に実行します。これは nvgpu `gk20a_init_gr_setup_hw()` 内で `sw_ctx_load` を走査する位置に対応します。レジストリから `FwGrSwCtx` を最大128 KiBで読み、全454件相当のレコード境界と全アドレスを最初の書き込み前に検証します。許可するアドレスは C2b と同じ GR (`0x400000-0x40FFFF`)、GPCS (`0x418000-0x41FFFF`)、GPC PRI (`0x500000-0x50FFFF`) の範囲です。
+
+nvgpu の setup_hw ループは各 AIV の `addr` に `value` を直接書き、`index` はそのループでは使いません。このため本実装も `index` を記録しつつ `addr/value` を書きます。適用件数と先頭8件の addr/index/expected/actual を記録し、エンジン/GR idle を最大2000回、各1 msで待ちます。PMC_ENABLE bit 12 が無効、リスト異常、idle timeout は `E0000088` で終了し既存の GPU reset 経路に入ります。
+
+この小段階では setup_hw にある他の処理(SLCG/FB MMU debug 設定、floorsweeping、zcull、clock gating、IRQ/exceptions、ZBC/CBC、timeslice、context manager 等)は実装しません。これらは追加の設定値、割り込み状態、または GR context/backing が必要です。bundle init、context allocate/bind、golden save も未実施です。
+
+参照: MIT nvgpu `gk20a/gr_gk20a.c` の `gk20a_init_gr_setup_hw()` と `gr_gk20a_wait_idle()`。本段階では setup_hw の sw_ctx ループの順序と addr/value 書き込みを照合し、実装コードは複製していません。ビルドと実機結果は未確認です。
+
+## 0.4.41: Stage C2d GR context backing と独立 VM
+
+Step 80 は FECS ready、C1 の golden/zcull/PM サイズ照会、C2a のリスト検証、C2b reset/nonctx、C2c sw_ctx 適用がすべて成功した場合だけ実行します。2 MiB の物理連続 GR arena を別に確保し、ACR arena と ACR instance block は変更しません。arena 内に別の GPU page directory/table と RAMIN instance block を作り、C1 のサイズに基づく channel context、golden image、zcull、PM の各 backing と global bundle/pagepool/attribute/private-access-map buffer を配置して GPU VA に写します。
+
+GM20B nvgpu gr_gm20b_calc_global_ctx_buffer_size() の式と hw_gr_gm20b.h の値から、1 GPC・2 TPC の attribute buffer は 0x48000 bytes、bundle buffer は 0x1800 bytes、pagepool は 0x8000 bytes、private access map は 0x80000 bytes です。W4T の MIT t210_gr_context.h の CTX/GOLD/BUNDLE/PAGEPOOL/ATTRIB/ACCESS_MAP offsets を配置の照合に使います。各 backing の先頭/末尾、GPU PTE、outer SMMU PTE/PDE、instance PDB/limit/WFI pointer を記録します。SMMU mapping は別の outer window なら GR arena 内の専用 table と ACR outer directory の追加 PDE を使い、同じ window なら ACR の既存 table に GR pages のみを追加します。GPU reset 後に変更した outer entries を戻して arena を解放します。
+
+この段階では FECS bind_pointer、bundle init、golden image save は送りません。0x418810 の attribute-base register と期待 field は patch 用の診断値として記録するだけです。E0000089 は PMC_ENABLE/サイズ/arena 条件、E000008A は SMMU/GPU page table/instance/backing の readback 不一致です。失敗時も既存の GPU reset cleanup を通します。 Step 80 を試した実行では KeepOn=1 でも GPU reset と arena cleanup を行います。実機で B3cC2dResult が 0 になり、arena/PDE/PTE/PDB/WFI と backing samples が期待値に一致することを確認してください。
+
+## 0.4.42: Stage C2e golden context image
+
+Step 81 は C2d が成功し、PMC_ENABLE bit 12 が有効なときだけ実行します。FECS bind_pointer method 3 を data=`instance block PA >> 12 | 0xB0000000` で送り、mailbox 0 の clear/pass/fail は `0x30/0x10/0x20` です。GR global backing の pagepool/bundle/attribute 設定と timeslice を反映し、`FwGrSwBundleInit` は bundle data/address port に流します。bundle file の値は method ID なので BAR0 register address として書きません。続いて `0x100` byte FECS header を golden buffer に複製し、zcull mode/pointer を設定、instance block の WFI pointer を golden VA に向け、WFI_GOLDEN_SAVE method 9 を送ります。mailbox clear/pass/fail は `3/1/2` です。成功時は header magic `0x600DC0DE`、header sample、FECS/GPCCS、FE HWW ESR、PFIFO fault id、MC error を記録し、instance pointer を channel context に戻して FECS current context を無効化します。終了時は既存 reset と C2d outer-map/arena cleanup を通します。
+
+実装で参照した nvgpu の関数は `gr_gk20a_fecs_ctx_bind_channel()`、`gr_gk20a_submit_fecs_method_op()`、`gk20a_init_sw_bundle()`、`gr_gk20a_fecs_ctx_image_save()`、`gr_gk20a_init_golden_ctx_image()` です。register/method 値は `hw_gr_gm20b.h` と header layout/magic は `hw_ctxsw_prog_gm20b.h` で確認しました。W4T の `tg_gpu_gr_context_global_patches()` と `tg_gpu_gr_context_init()` は global backing の register grouping の MIT cross-check です。E000008B は method/idle timeout、E000008C は method failure、bundle validation、または header magic mismatch です。実機では bind/save mailbox、bundle entry count、golden magic/samples、FE HWW ESR、PFIFO fault id を確認してください。
+
+この実装は段階的な試行用です。`gr_gk20a_init_golden_ctx_image()` の FE power/reset handshakes、`init_preemption_state()`、GM20B `init_fs_state()` の floorsweep 全体、global zcull/context-buffer patch の全項目はまだ含めていません。したがって mailbox/save が通っても nvgpu と同等の完成した golden context とは見なさず、これらの初期化を含める次段階が必要です。
+
+C2c の過去の sample では sw_ctx が 0 を書いた 0x404004 の readback が 0x70000 でした。GM20B header にこの番地の register name はなく、nvgpu setup_hw の list loop も readback を検査しません。この値だけでは read-only/sticky bit と異常状態のどちらかは断定できません。
+
+(Claude 追記、0.4.42) FECS の bind/save に渡す instance block の番地を、物理番地から C2d の PDB と同じ IOMMU タグ付き IOVA に直した(ACR の PMU bind 0x704FDC68 と同じ扱い。タグなしは B2a の PRIV_VIOLATION の経路)。また bind の前に、ACR と同じ AcrMmuInvalidatePdb() で新しい GR の PDB を invalidate する(結果は B3cC2eGrPdbInvalidate)。
+
+## 0.4.43: Stage C2e wait diagnostics and GR setup
+
+Step 81 now records the last C2e wait stage, bundle index, poll count and the GR, engine and FIFO status values on every exit. The bounded waits use the nvgpu predicates: `gr_gk20a_wait_idle()` treats an invalid FIFO context as idle, or requires both GR not busy and no context switch active; `gr_gk20a_wait_fe_idle()` waits until FE method upper/lower and FE-GI bits are all zero. Stage IDs 10/11 are FE force-on/auto handshakes, 20 FECS bind mailbox, 30/35/40/60 GR idle, 50 FE method idle, and 70 golden-save mailbox. All time limits remain bounded.
+
+Before the golden sequence, Step 82 performs the FE power force-on/auto requests, FECS context-switch reset pulse and SCC clear. Step 83 applies a bounded, fixed 1-GPC/2-TPC GR/zcull setup subset through validated GR PRI ranges, then captures readback samples. These are diagnostic bring-up stages. Step 83 includes the fixed one-GPC/two-TPC mapping tables, SM numbering, skip table, ZROP/CROP active-LTC count, and zcull inputs; per-fuse topology discovery and broader setup_hw state remain outside this bounded step. GM20B has no `init_preemption_state` hook on this path; the driver records that no preemption hook ran. `E000008D` identifies FE power/reset or PDB-invalidate failure; `E000008E` identifies the fixed-topology write validation/readback failure.
+
+Every C2e exit now captures FE HWW ESR/info, GR/engine/FIFO status, FE go-idle/power registers, FECS and GPCCS state/PC traces, PFIFO fault records and MC status while GR remains enabled. SUMMARY prints the last wait checkpoint and the post-run diagnostics. This remains unbuilt and requires hardware review; it does not establish successful golden-image creation.
+## 0.4.44: C2e GR interrupt and HWW exception setup
+
+Step 84 follows the exception/interrupt portion of nvgpu `gk20a_init_gr_setup_hw()`: clear and enable GR interrupts; enable FECS host error interrupts; reset/enable FE, MEMFMT, SCC, MME, PD, SKED and DS HWW ESRs; program the GM20B HWW report masks; enable TPC/GPC exception forwarding; then clear and enable GR exception registers. All writes are prevalidated against GR/GPC PRI ranges. MC and CPU interrupt output routing is not enabled; the test continues to poll registers.
+
+The driver captures FE HWW ESR at `0x404000`, the header-defined info register `0x4041B0`, and the separately requested raw `0x404004` value, along with GR interrupt/exception registers, GR status 1/2 and FECS host-interrupt status/clear/enable before setup, before the first bundle entry, and on every C2e exit. If FE HWW ESR status bits are nonzero before setup or immediately before the first bundle entry, C2e stops with `E000008F` and enters the existing GPU reset path. The nvgpu FE handler only reads/clears the ESR and requests recovery; its code and the GM20B register header do not define a decoding layout for the reported `0x7FFD6` info value, so it is kept raw.
+
+This adds the interrupt/exception subsection only. Other `gk20a_init_gr_setup_hw()` items not added here include GPC MMU init, private-ring timeout setup, FIFO access enable, ECC scrub, ZBC/CBC init, read-coalesce control and clock-gating setup. The fixed topology/zcull setup is isolated in Step 83; context list replay is already in C2c. No MC/CPU interrupt output is enabled.
+
+## 0.4.45: C2e nvgpu idle predicates
+
+The C2e waits now match `gr_gk20a_wait_fe_idle()` and `gr_gk20a_wait_idle()` in the pinned nvgpu `gk20a/gr_gk20a.c`. FE idle tests only `gr_status_fe_method_lower_v(val) == 0U`; it does not wait for FE-method-upper or FE-GI to clear. GR idle is true when FIFO context status is INVALID, or when GR engine busy is false and FIFO context-switch-in-progress is false. The current Switch has one GR engine at FIFO slot 0. In the bundle replay, nvgpu calls GR `wait_idle()` for the `GR_GO_IDLE_BUNDLE` entry and calls `wait_fe_idle()` after each entry. Every wait remains bounded to 2000 polls.
+
+The wait trace retains the raw GR, GR-engine and FIFO-engine status and now adds the selected idle branch, FIFO context-status field, ctxsw-active and GR-busy values. Idle branch is 1 for invalid FIFO context, 2 for the no-busy/no-ctxsw predicate, and 0 for timeout (FE wait uses 1 when the FE lower-method field is idle). This is a predicate correction; no new hardware validation has been performed.
+
+## 0.4.46: C2e golden-save order and failure diagnostics
+
+失敗時に `Gpu.ps1` の SUMMARY が `n/a` だった原因は、診断関数が `B3cC2ePost...` の名前で記録する一方、SUMMARY は `B3cC2eFecsCpuctl` など `Post` なしの名前を参照していたためです。診断はその両方の名前で記録し、全ての C2e 終了経路から、PMC_ENABLE bit 12 が有効な間に読みます。失敗時も FECS/GPCCS の状態、FECS host interrupt、ctxsw mailbox 0..7、PFIFO fault ID と有効な per-unit fault records、MC 状態、golden buffer の先頭16ワードを確認できます。`B3cC2eGoldenRawOnExit` は保存が完了しない場合も含むバイナリ記録です。
+
+Step 85 は `gk20a_init_sw_bundle()` の終了順に合わせます。pipe override を解除し、FE go-idle timeout が無効な間に GR idle を待ち、timeout を production 値へ戻します。GM20B の `sw_method_init` は0件として記録し、`gr_gk20a_init_golden_ctx_image()` の次の GR idle wait を実行します。その後、nvgpu `gk20a_mm_l2_flush(g, true)` と同じ dirty L2 flush → L2 invalidate を `0x70010` / `0x70004` で実行し、各々最大2000 pollで完了を待ってから channel context の0x100-byte FECS headerを golden buffer にコピーします。timeout は `E0000090` です。
+
+保存 method は nvgpu `gr_gk20a_fecs_ctx_image_save()` と同じ clear=`3`、成功条件 mailbox0 bit0、失敗条件 bit1 を維持しました。bind の mailbox bit4 が残っても、wait は bit0/bit1 だけを見るため、clear を `0xFFFFFFFF` に変更していません。確認した `gr_gk20a_init_golden_ctx_image()` は header copy 前の L2 flush/invalidate を行いますが、golden save の後に追加の L2/MM flush は行わず、続けて golden buffer を読みます。このため post-save flush は追加せず、timeout時は reset 前の golden buffer と FECS 状態を記録します。save 実行中の WFI pointer と golden VA も記録します。
+
+参照は MIT nvgpu `gk20a/gr_gk20a.c` の `gk20a_init_sw_bundle()`、`gr_gk20a_init_golden_ctx_image()`、`gr_gk20a_fecs_ctx_image_save()` と `gk20a/mm_gk20a.c` の `gk20a_mm_l2_flush()`、および GM20B `hw_flush_gm20b.h` / `hw_ctxsw_prog_gm20b.h` です。ビルドと実機確認は未実施です。
+
+## 0.4.47: C2e golden save の停止診断
+
+C2e は nvgpu `gr_gk20a_wait_idle()` の判定を変えず、FIFO context status が INVALID なら idle、それ以外は GR busy と ctxsw active の両方が解除された場合に idle とします。各 bounded wait の終了時に、GR status、GR engine status、FIFO engine status、context/ctxsw/busy の各フィールド、stage、bundle index、poll 数、選択された分岐を `B3cC2eWaitHistory` に記録します。各レコードは32ビット値10個で、最大2048件です。実際の件数と未記録件数も記録します。
+
+FECS save method 9 の直前と C2e の終了時に、`gr_status`、`gr_status_1`、`gr_status_2`、GR engine/FIFO status、GR activity 0、1、2、4 を読みます。GM20B の `hw_gr_gm20b.h` では activity 0/1/2/4 は `0x400380`、`0x400384`、`0x400388`、`0x400390` です。同ヘッダーに activity 3 の accessor はありません。status bit 21 は FE-GI と定義されていますが、bit 5 と 7 に名前付き decoder はないため、raw bit のまま記録します。wait 条件やハードウェア書き込みは変更していません。診断のみの変更で、未ビルド・未実機確認です。
+
+FECS ctxsw mailbox 2=`0x41009`、mailbox 3=`0x20`、GPCCS mailbox 4=`0x10137` は raw 値で記録します。確認した nvgpu の wait/dump 処理と GM20B register header は、これらの mailbox slot/value の意味を定義していないため、意味を推定しません。
+
+## 0.4.48: C2e bundle idle diagnostics and post-bind sw_ctx order
+
+0.4.47 のログでは、960 wait のうち958回で FIFO ctx_status INVALID の分岐が idle と判定しました。その全てで GR engine busy bit 0 は立っており、最初の bundle entry 以降は `gr_status` と `gr_activity_1` が動作中の値を示したまま、GO_IDLE後も save 直前も engine busy が解除されませんでした。PFIFO/MMU fault と FE HWW exception はありませんでした。これは bundle replay の後も GR engine が停止しないことを示します。
+
+nvgpu 1ae0167d の `gr_gk20a_init_golden_ctx_image()` は FECS channel bind と wait の後に `sw_ctx_load` を書き、その後に global buffers/timeslice/floorsweep と bundle init を行います。Step 86 で同じリストを bind 後にも適用して、従来の C2c pre-bind 適用と比較できるようにしました。`gk20a_init_sw_bundle()` は各 bundle entry の前に FE idle を待ち、`GR_GO_IDLE_BUNDLE` の後に GR idle を待つため、entry 前の待ち順もこの順に合わせています。
+
+既存の nvgpu idle predicate は維持します。別に Step 87 で GO_IDLE の後と golden save 直前に、GR engine status bit 0 が 0 になるまで各最大2000回、1ms間隔で待ちます。GO_IDLE後の timeout は記録して継続し、save直前も busy なら `E0000091` で保存を止めて既存のGPU resetへ進みます。両 checkpoint の GR status、engine/FIFO status、poll 数を記録します。
+
+GM20B `hw_gr_gm20b.h` は `gr_status` の FE-GI bit 21 と FE method bits 1/2 を定義しますが、観測された bit 0/5/7/11/14/24 の名称や `gr_activity_1` の内部 unit/state field は同ヘッダーに定義されていません。activity_1 は `0x400384` の raw 値として記録し、`0x200` を特定 unit/state と断定しません。nvgpu `gk20a_gr_debug_dump()` の調査でも当該 bit/field の decoder は確認できませんでした。
+
+参照: MIT Switchroot nvgpu `gk20a/gr_gk20a.c` の `gr_gk20a_wait_idle()`、`gr_gk20a_wait_fe_idle()`、`gr_gk20a_init_golden_ctx_image()`、`gk20a_init_sw_bundle()`。参照元に沿った順序と register names の比較で、ソースコードはコピーしていません。
+補足: sw_ctx の再適用は `gr_gk20a_init_golden_ctx_image()` の FECS channel bind 後、global buffer commit と bundle replay の前です。`gk20a_init_sw_bundle()` は各 bundle entry の前に FE idle を待ち、GO_IDLE entry の後に GR idle を待ちます。実装はこの順序に合わせました。
+
+診断の解釈: `0x400700` の観測値 `0x01200821 / 0x00204001 / 0x00200021 / 0x002000A1` は、それぞれ bit 24,21,11,5,0 / bit 21,14,0 / bit 21,5,0 / bit 21,7,5,0 です。GM20B header で名前を確認できたのは bit 21 の FE-GI で、FE method upper/lower は bit 1/2 です。残りの set bit と `gr_activity_1=0x200` の unit/state 解釈は、照合した header/debug path から確定できません。FIFO context status が INVALID でも engine busy bit 0 が立つ状態を別の bounded check で捕捉します。
+
+この試験は host FIFO runlist/channel をロードしていません。nvgpu の golden path は FECS channel bind 後に進みますが、現状の FECS bind だけで FIFO engine の実 context が VALID になるかは未確認です。Step 87 の二つの raw status を次の実機結果で確認してください。
+## 0.4.49: Nouveau GM20B golden generation order
+
+0.4.48 の E0000091 では、GO_IDLE 後も GR status 0x00200021、GR engine busy=1、FIFO context status=INVALID のままでした。FECS save は送っていません。以前のログにあった golden magic は bind 時点で既に書かれていたため、save 完了の証拠として扱いません。
+
+Nouveau v6.12 の gm20b_grctx_generate_main() は sw_ctx と idle wait の後に FE_GO_IDLE timeout を保存して一時無効化し、attrib/floorsweep と topology 設定を行います。そこから idle を待って timeout を元の値へ戻し、再度 idle を待って method-init、idle wait、bundle replay の順です。gf100_gr_icmd() は pipe override を有効にして各 method を投稿し、GO_IDLE の後に GR idle、各 entry 後に FE method-lower idle を待ち、最後に override を解除します。今回 timeout は bundle replay の前に保存値へ戻し、FE idle wait を method 投稿後に置きました。
+
+sw_ctx の後の idle wait は FE timeout を変更する前に置きました。Step 84 の例外/割り込み setup_hw 部分も FECS bind より前に置き、FECS bind から sw_ctx、timeout/floorsweep、method-init、bundle replay までの Nouveau の並びに割り込まないようにしました。
+
+GM20B 関数にある 0x4064D0..0x4064EC のゼロ設定、0x405B00 の topology、0x408908 の read/OR/write、0x4041C4 の TPC mask は既存 Step 83 にあり、設定後の idle wait を追加しました。追加チェックは gf100_gr_wait_idle() と同じく GR が MC で無効、または GR busy と ctxsw active の両方が 0 のときだけ成功とします。FIFO context INVALID は成功条件にしません。Step 88 の各 wait は最大2000回です。GO_IDLE 後の timeout は記録して bundle replay を続け、save 直前も idle でなければ E0000091 で save を送りません。セットアップ境界で idle にならない場合は E0000092 で中断します。
+
+ctxgf100.c の WFI firmware path は FECS save 後に 0x409B00 の current-context valid bit を消します。legacy unload の 0x409B04 / 0x409000 経路は non-firmware path のため適用しません。0x5044B0 bit 27 は照合した GM20B/Nouveau context-generation 関数で確認できなかったため書きません。GM20B 専用 main override は nvkm_mc_unk260() を呼ばないため、0x260 は前後を読むだけにしています。GR 外への書き込みは追加していません。
+
+参照: Linux Nouveau v6.12 MIT ctxgm20b.c:gm20b_grctx_generate_main()、ctxgf100.c:gf100_grctx_generate()、gf100.c:gf100_gr_wait_idle() / gf100_gr_icmd() / gf100_gr_mthd()。FECS firmware save の条件は ctxgf100.c:gf100_grctx_generate() の firmware 分岐と照合しました。参照ソースのコードはコピーしていません。
+
+## 0.4.50: GPC/TPC PRI と GM20B GPC MMU の切り分け
+
+0.4.49 の実機では Step 90 の前に bundle method `0x1000` で GR が busy になり、`0x5044B0` は `0xBADF5040` を返しました。これは TPC 側の読み出しが応答していない兆候ですが、それだけで clock gating、priv ring、floorsweep のどれが原因かは確定できません。FE HWW ESR `0x80000001` の bit 0 と info `0x73258` は、照合した `hw_gr_gm20b.h` と Nouveau/nvgpu の FE handler にフィールド定義が見当たらないため raw 値で記録します。
+
+C2b の Step 78 開始時と、Step 90 の最初の bundle method 直前に、GPC0/TPC0・TPC1・broadcast の activity/status、SM/PE 設定、FECS floorsweep、TOP の GPC/TPC 数、fuse の GPC/TPC opt 値、PRI ringmaster と ringstation の状態・priv error address/data/info/code を読みます。レジスタ offset/value の組を `B3cC2bPreResetGpcPri` と `B3cC2ePreBundleGpcPri` に記録し、BADFxxxx の件数を別記録します。診断の読み出しは GPU 状態を変更しません。
+
+新しく有効化する確定手順は Step 89 の GM20B `gm20b_gr_init_gpc_mmu()` です。Nouveau `gk20a_gr_init()` の順序は、sw_nonctx、Falcon scrub、GR idle の後に GPC MMU、続いて zcull/ROP/FIFO/interrupt setup です。既存 C2b が nonctx・scrub・idle を終えた直後に、この GPC MMU 部分を行います。`0x100C80 & 0xF000187F` を `0x418880` に設定し、`0x418890/0x418894` を 0、`0x100CC4/CC8/CCC` と `0x100800` をそれぞれ `0x4188B0/B4/B8/AC` に反映します。書き込み先は GR/GPC PRI のみで、expected/readback を記録します。secure ACR boot 中のため Nouveau の non-secure 専用 bypass `0x100CE4=0xFFFFFFFF` は実施しません。readback 不一致は `E0000093` です。
+
+Priv ring は既に ACR 前の Step 53 で初期化しており、今回は再列挙しません。nvgpu `gk20a_init_gr_setup_hw()` は SLCG GR/PERF と、その後の BLGC/PG/ELCG prod 設定を呼びます。今回確認できた範囲では、それらの GM20B 製品値テーブルと有効化条件を特定できなかったため追加していません。したがって clock/power gating は未完了の確認項目です。0x260 と `0x5044B0` は読み取り専用です。実機では二つの `GpcPri` バイナリ記録における BADF 値、Step 89 の `B3cC2bGpcMmuReadback`、Step 90 の FE HWW ESR/INFO と最初の bundle index を確認してください。
+
+## 0.4.51: bundle replay の最初の FE/GR 状態変化を特定
+
+0.4.50 の実機では `sw_nonctx` entry 79 の `0x419DF4 <- 0` が GPC priv-ring error (`adr=0x00419DF4`, `wrdat=0`, `info=0x1C40820C`, `code=0xBADF510C`) として記録されました。照合した nvgpu `gk20a_init_gr_reset_enable_hw()` は `sw_non_ctx_load` の各 address/value を通常の GR MMIO write で順に適用します。個別 entry の priv-level 判定や再試行は同関数に見当たらず、拒否時の設定変更は追加していません。
+
+Step 90 では bundle の各 method/data 投稿直後に FE ESR `0x404000`、FE HWW info `0x4041B0`、GR intr `0x400100`、GR exception `0x400108`、GR status `0x400700` を読みます。baseline から FE ESR/info、GR intr/exception のいずれかが最初に変化した entry で `E0000094` として replay を止めます。GR status は記録しますが、entry 0 から busy になるため停止条件には使いません。`B3cC2eBundleBaseline` と `B3cC2eBundleEntry0State` は 5/8 DWORD、`B3cC2eBundleFirstChangeState` は index/method/data/ESR/info/intr/exception/GR status の 8 DWORD です。変更がなければ index は `0xFFFFFFFF`、found は 0 です。全 exit path でこれらの trace を出し、既存の reset/cleanup へ進みます。
+
+`hw_pri_ringstation_gpc_gm20b.h` は priv-error ADR/WRDAT/INFO/CODE の register address を定義しますが、`0x1C40820C` や `0xBADF510C` の subfield decoder はありません。確認した nvgpu FE exception handler と GM20B register header も `0x53242`、`0x73258`、`0x7FFD6`、`0x5FFD6` の FE HWW info field layout を定義していないため raw 値のまま扱います。priv-ring error の clear/ack 方法も参照コードで同じ GM20B register に対する安全な clear write を確認できなかったので、記録後の書き込みはしていません。
+
+## 0.4.52: GR PRI write ごとの priv-ring error 記録
+
+Step 78 の `sw_nonctx`、Step 79/86 の `sw_ctx`、Step 89 の GPC MMU、C2e の exception setup・global/timeslice・floorsweep writes の直後に、ringmaster status0/1 と SYS/GPC priv-error ADR/WRDAT/INFO/CODE を読みます。ringmaster interrupt status が非0なら、直前の write address/value と station の生値を最大64件記録し、`ACK_INTERRUPT` を発行して command が `NO_CMD` に戻るまで最大2000 poll 待ちます。未完了は `E0000095` で中断し、GPU reset に進みます。各記録は16 DWORDで、write address/value、status0/1、SYS 4語、GPC 4語、ACK poll数、command readback、ACK実施/timeoutを含みます。64件超は dropped count に記録します。
+
+nvgpu `gm20b_priv_ring_isr()` の診断順と ACK 手順、および `hw_pri_ringmaster_gm20b.h` の `ACK_INTERRUPT=2` / `NO_CMD=0` を参照しました。`hw_pri_ringstation_gpc_gm20b.h` と `hw_pri_ringstation_sys_gm20b.h` は各 station のエラー register address を定義しますが、照合した版に priv-error INFO/CODE の field decoder はなく、数値は raw のまま表示します。確認した `hw_gr_gm20b.h` に FECS/GPCCS の priv-level mask 設定は見つかりませんでした。`gk20a_init_gr_reset_enable_hw()` は FECS 起動より前に `sw_non_ctx_load` を直接適用します。今回、priv-level mask の推測書き込みは加えていません。
+
+## 0.4.53: GM20B GR hang status snapshots
+
+Step 91 adds read-only snapshots from nvgpu `gr_gm20b_dump_gr_status_regs()` at three points: immediately before the first bundle method, immediately after entry 0, and at the stop/exit point. Each snapshot contains the exact name and offset list from that function, including both TPC1 activity registers for this 1-GPC/2-TPC GPU. The binary records are `B3cC2eGrStatusDumpBeforeBundle`, `B3cC2eGrStatusDumpAfterEntry0`, and `B3cC2eGrStatusDumpAtStop`; the log prints every register as `name=value`. The on-screen SUMMARY shows only before/after-entry-0 differences. Activity values remain raw because the referenced GM20B headers and dump helper do not define per-unit 3-bit state names. This is a diagnostics-only change; it adds no register writes or waits. Reference: MIT nvgpu `gm20b/gr_gm20b.c`, `gr_gm20b_dump_gr_status_regs()`, with offsets cross-checked against `hw_gr_gm20b.h` and `hw_fifo_gm20b.h`.
+
+## 0.4.54: GM20B LTC/FB/ZBC/CBC and BE setup
+
+Steps 92-97 extend C2e with the newly available nvgpu function bodies. Step 92 follows `gm20b_ltc_init_fs_state()`: it reads the full `TOP_NUM_LTCS` maximum, extracts the active count from `pri_ringmaster_enum_ltc_count_v()`, records slice/cache-line/comptag parameters, writes active LTC counts to `0x17E27C` and `0x17E000`, copies the LTS0 DSTG config to `0x17E318` with VDC 4-to-2 disabled, and clears the three LTC interrupt-enable bits in `0x17E20C`. Step 93 follows `fb_gm20b_init_fs_state()` and writes the active LTC count to `0x100800`. The physical-secure bypass at `0x100CE4` is omitted: nvgpu only writes it when secure privilege is disabled, while this path has completed ACR secure boot.
+
+Step 94 loads the three default ZBC color entries and two FP32 depth entries in the `gr_gk20a_load_zbc_default_table()` order, using the LTC DSTG index/value ports and GR DS table ports. Step 95 follows the zero-size comptag path: nvgpu `gm20b_ltc_init_comptags()` returns without allocating when max comptag lines are zero, `gm20b_ltc_init_cbc()` writes a zero CBC base for a zero-sized store, and `gm20b_ltc_cbc_ctrl()` returns when the backing store has size zero. This probe therefore chooses zero comptag backing; it does not claim that every compressed rendering workload can run without comptags. Step 96 clears the LG/SU read-coalesce bits as `gm20a_gr_disable_rd_coalesce()` does before `sw_ctx_load`. Step 97 applies the BE active-LTC ZROP/CROP settings and CROP debug3 bit from `gr_gm20b_init_fs_state()` after the remaining GR floorsweep/timeslice setup.
+
+New write locations outside GR PRI are: LTC `0x17E27C`, `0x17E000`, `0x17E318`, `0x17E20C`, ZBC ports `0x17E338`, `0x17E33C..0x17E348`, `0x17E34C`, and CBC base `0x17E278`, all from `common_ltc_ltc_gm20b.c` (`gm20b_ltc_init_fs_state`, `gm20b_ltc_init_cbc`, `gm20b_ltc_set_zbc_color_entry`, `gm20b_ltc_set_zbc_depth_entry`); FB `0x100800` from `common_fb_fb_gm20b.c` (`fb_gm20b_init_fs_state`). ZBC's GR DS registers, read-coalesce `0x419A3C`, and BE ZROP/CROP registers remain GR PRI writes. The conditional `fb_priv_mmu_phy_secure` write, FB `init_cbc` callback (not assigned for GM20B), PMU ZBC-save synchronization (ELPG path is not active here), `gm20b_ltc_set_enabled()`, `gm20b_flush_ltc()`, and `gm20b_determine_L2_size_bytes()` are omitted; ordinary compression remains unverified for this no-comptag probe. ECC scrub and unrelated SLCG/BLCG/ELCG setup are also omitted. The existing three GR status dumps and reset/cleanup flow remain in place; each new step has a bounded wait where applicable and readback traces. CROP_STATUS1 and FE_GO_IDLE_INFO remain raw because the checked headers do not provide decoders for those observed fields.
+
+References: MIT Switchroot nvgpu 1ae0167d `common/ltc/ltc_gm20b.c` (`gm20b_ltc_init_fs_state`, `gm20b_ltc_init_comptags`, `gm20b_ltc_init_cbc`, `gm20b_ltc_cbc_ctrl`, `gm20b_ltc_set_zbc_color_entry`, `gm20b_ltc_set_zbc_depth_entry`), `gk20a/gr_gk20a.c` (`gk20a_init_gr_setup_hw`, `gr_gk20a_load_zbc_default_table`, `gr_gk20a_add_zbc`), `gm20b/gr_gm20b.c` (`gr_gm20b_init_fs_state`), and `common/fb/fb_gm20b.c` (`fb_gm20b_init_fs_state`). Addresses were checked against MIT `hw_ltc_gm20b.h`, `hw_gr_gm20b.h`, `hw_top_gm20b.h`, `hw_pri_ringmaster_gm20b.h`, and `hw_fb_gm20b.h`.
+
+## 0.4.55: GR setup_hw の PE/zCull/FIFO/ROP 前処理
+
+0.4.55 は実機 0.4.54 で確認した `GRFIFO_CONTROL (0x400500)=0` を受け、C2e の FECS bind 前に不足していた setup_hw 項目を追加します。Step 101 は PE stream-master と既存の固定 1-GPC/2-TPC zCull 設定を早め、Step 102 は Nouveau の active-FBP ROP 設定を、Step 103 は FIFO access と semaphore access を `0x00010001` にします。各 GR write は範囲検証、priv-ring ACK、readback を行い、失敗は既存の GPU reset/cleanup に進みます。新しいエラーは `E000009C` (PE/zCull)、`E000009D` (FBP ROP)、`E000009E` (FIFO access) です。
+
+参照順序は nvgpu `gk20a_init_gr_setup_hw()` の PE master → `gr_gk20a_zcull_init_hw()` → FIFO access → interrupts です。Nouveau `gk20a_gr_init()` は `gf117_gr_init_zcull()`、`gk104_gr_init_rop_active_fbps()` を用い、FIFO access も有効化します。GM20B nvgpu の `gr_gm20b_init_fs_state()` は ZROP/CROP に active LTC count を使います。一方 Nouveau の ROP helper は `0x120074` の active FBP count を ZROP/CROP の low nibble に反映します。SUMMARY には両方のカウント、書き込み前後の値と FIFO control の前/期待/実測値を出します。
+
+Step 83 にあった PE stream-master と zCull の 6 write は Step 101 へ移したため、bundle 直前に遅れて上書きしません。既存の fixed topology floorsweep/SM setup は Step 83 に残します。今回の zCull は既存の fixed mapping を使う限定実装で、nvgpu がソフトウェアで構成する一般 topology の tile/bank map 生成は追加していません。ECC scrub、clock-gating prod、private-ring timeout、full FIFO channel/runlist setup も対象外です。新しい hardware result では Step 101/102/103 の readback と、bundle entry 0 後の GR dumps (特に FIFO control、CROP status/activity、FE exception) を確認してください。
+
+## 0.4.56 (Claude): 0.4.55 の止まり方の修正
+
+0.4.55 の実機では、Step 101 の zcull の設定で、書いた値と読み返しが違うレジスターがあり(0x500910 は bit30 が足される、0x500918 と放送用の 0x41BFD4 は 0 と読める)、E000009C で止まった。priv ring の拒否はなく、同じ値は以前の Step 83 でも止めずに書いていたので、読み返しの違いは記録だけにした。また 0x120074(FBP の数)が 0 と読めたので、0 のときは nouveau 流の ROP 設定を飛ばし、Step 92 の nvgpu 流(LTC の数 2)に任せる(B3cC2eNouveauRopSkippedZeroFbp)。
