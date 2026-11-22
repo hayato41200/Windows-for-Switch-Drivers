@@ -56,6 +56,14 @@
  *   - 1.6.2: the boot-loop guard refuses one start and then lets the next
  *     one try (it latched for good before: after quick restarts the TV kept
  *     UEFI's portrait picture and got no audio set-up).
+ *   - 1.7.0, extended display: the TV is a second monitor (child 1, target 1,
+ *     source 1), reported connected while the TV picture is on, with one
+ *     mode, the DC-B raster (1920x1080 or 1280x720; the TV buffer now has the
+ *     raster's size, DDA 1.0). Windows then offers Extend / Duplicate / second
+ *     screen only. Duplicate is source 0 -> targets 0 and 1: the TV gets the
+ *     panel's picture upright and fitted, as the 1.3.0 mirror did. Either
+ *     source can drive either target. Registry TvExtend=0 gives the 1.6.2
+ *     behaviour (one display, the TV always mirrors it).
  *
  * Trace: HKLM\SYSTEM\CurrentControlSet\Services\switchdisplay\Parameters
  */#define DXGKDDI_INTERFACE_VERSION 0x4002 /* DXGKDDI_INTERFACE_VERSION_WDDM1_3 */
@@ -64,7 +72,8 @@
 #include <ntstrsafe.h>
 #include <stdarg.h>
 
-#define SWD_VERSION        0x00010602u   /* 1.6.2 */
+#define SWD_VERSION        0x00010700u   /* 1.7.0 */
+#define SWD_NOSRC          0xFFu         /* target not in the topology */
 #define SWD_TAG            'DwsS'
 
 /* Boot framebuffer (coreboot display.c / UEFI MemoryMap.h "Display Reserved") */
@@ -183,13 +192,17 @@ typedef struct _SWD_CONTEXT {
     BOOLEAN              VsyncWant;     /* argument of SyncVsync */
     D3DDDIFORMAT         FbFormat;
 
-    /* current mode */
-    BOOLEAN              Active;        /* a source mode is committed */
-    BOOLEAN              Visible;
+    /* current mode. 1.7.0: two sources; PanelSrc / TvSrc say which source
+     * drives target 0 (panel) / target 1 (TV), SWD_NOSRC when none. */
+    BOOLEAN              Extend;        /* registry TvExtend, default 1 */
+    BOOLEAN              Active;        /* the panel shows a source */
+    BOOLEAN              Visible[2];
     BOOLEAN              MonitorOff;
-    D3DKMDT_VIDPN_PRESENT_PATH_ROTATION Rotation;
-    ULONG                SrcWidth;
-    ULONG                SrcHeight;
+    D3DKMDT_VIDPN_PRESENT_PATH_ROTATION Rotation;   /* of the panel path */
+    ULONG                SrcW[2];
+    ULONG                SrcH[2];
+    ULONG                PanelSrc;
+    ULONG                TvSrc;
 
     /* system display (bugcheck screen) */
     BOOLEAN              SystemDisplay;
@@ -216,8 +229,13 @@ typedef struct _SWD_CONTEXT {
 
     /* 1.3.0 TV mirror (DC-B) */
     PUCHAR               TvDc;          /* DC-B registers */
-    PUCHAR               TvVa;          /* 1280x720 buffer, write-combined */
+    PUCHAR               TvVa;          /* raster-size buffer (1.7.0), write-combined */
     PHYSICAL_ADDRESS     TvPhys;
+    ULONG                TvW, TvH, TvPitch;   /* buffer size, kept after unplug for the modes */
+    SIZE_T               TvSize;
+    volatile LONG        TvConnected;   /* child 1 status */
+    volatile LONG        TvIndicates, TvSrcPresents;
+    volatile LONG        TvIndicateSt;
     ULONG                TvSaved[TV_REGS];
     LONG                 TvLastW, TvLastH;
     volatile LONG        TvPresents;
@@ -304,6 +322,10 @@ static VOID FlushCounters(PSWD_CONTEXT Ctx)
     RegPutDword(L"VsyncDisables", (ULONG)Ctx->VsyncDisables);
     RegPutDword(L"TvPresents", (ULONG)Ctx->TvPresents);
     RegPutDword(L"DpNotes", (ULONG)Ctx->DpNotes);
+    RegPutDword(L"TvConnected", (ULONG)Ctx->TvConnected);
+    RegPutDword(L"TvIndicates", (ULONG)Ctx->TvIndicates);
+    RegPutDword(L"TvIndicateSt", (ULONG)Ctx->TvIndicateSt);
+    RegPutDword(L"TvSrcPresents", (ULONG)Ctx->TvSrcPresents);
     {
         int i;
         for (i = 0; i < D_COUNT; i++) {
@@ -470,26 +492,19 @@ static BOOLEAN RotationPinned(D3DKMDT_VIDPN_PRESENT_PATH_ROTATION r)
            r == D3DKMDT_VPPR_ROTATE180 || r == D3DKMDT_VPPR_ROTATE270;
 }
 
-/* 1.0.9: like the Basic Display sample, the source mode is always the panel's
- * own size (720x1280), also for 90/270. The DWM then presents a 1280x720
- * surface with Flags.Rotate set and the driver rotates it. 1.0.7/1.0.8 offered
- * 1280x720 for 90/270 and refused Windows' 720x1280 + 270 ("could not be saved"). */
-static VOID SourceSizeFor(PSWD_CONTEXT Ctx, D3DKMDT_VIDPN_PRESENT_PATH_ROTATION r, ULONG *W, ULONG *H)
-{
-    UNREFERENCED_PARAMETER(r);
-    *W = Ctx->FbWidth; *H = Ctx->FbHeight;
-}
+/* 1.0.7/1.0.8 offered 1280x720 for 90/270 and refused Windows' 720x1280 + 270
+ * ("could not be saved"); see SourceSizeFor. */
 
 /* Target and monitor signal: active = total = 720x1280, frequencies not
  * specified (as the KMDOD sample). 1.0.3-1.0.10 tried real timings
  * (78 MHz, 1000x1300, 60 Hz) in several forms; Windows refused all of them for
  * the target, and a real monitor mode emptied the GDI mode list. */
-static VOID FillSignalInfo(D3DKMDT_VIDEO_SIGNAL_INFO *s)
+static VOID FillSignalInfo(D3DKMDT_VIDEO_SIGNAL_INFO *s, ULONG W, ULONG H)
 {
     RtlZeroMemory(s, sizeof(*s));
     s->VideoStandard = D3DKMDT_VSS_OTHER;
-    s->ActiveSize.cx = SWD_NATIVE_W;
-    s->ActiveSize.cy = SWD_NATIVE_H;
+    s->ActiveSize.cx = W;
+    s->ActiveSize.cy = H;
     s->TotalSize = s->ActiveSize;
     s->VSyncFreq.Numerator = D3DKMDT_FREQUENCY_NOTSPECIFIED;
     s->VSyncFreq.Denominator = D3DKMDT_FREQUENCY_NOTSPECIFIED;
@@ -498,6 +513,21 @@ static VOID FillSignalInfo(D3DKMDT_VIDEO_SIGNAL_INFO *s)
     s->PixelRate = D3DKMDT_FREQUENCY_NOTSPECIFIED;
     s->ScanLineOrdering = D3DDDI_VSSLO_PROGRESSIVE;   /* VSyncFreqDivider stays 0 (not Miracast) */
 }
+/* 1.7.0: target 0 is the panel, target 1 the TV (its buffer size; 1280x720
+ * before the first plug-in). */
+static VOID TargetSize(PSWD_CONTEXT Ctx, ULONG Target, ULONG *W, ULONG *H)
+{
+    if (Target == 0) { *W = SWD_NATIVE_W; *H = SWD_NATIVE_H; return; }
+    *W = Ctx->TvW ? Ctx->TvW : TV_W;
+    *H = Ctx->TvH ? Ctx->TvH : TV_H;
+}
+
+static BOOLEAN TvScalingOk(D3DKMDT_VIDPN_PRESENT_PATH_SCALING s)
+{
+    return ScalingOk(s) || s == D3DKMDT_VPPS_CENTERED || s == D3DKMDT_VPPS_ASPECTRATIOCENTEREDMAX ||
+           s == D3DKMDT_VPPS_STRETCHED;
+}
+
 static VOID FillSourceMode(D3DKMDT_VIDPN_SOURCE_MODE *m, ULONG W, ULONG H)
 {
     m->Type = D3DKMDT_RMT_GRAPHICS;
@@ -644,7 +674,7 @@ static VOID TvBlt(PSWD_CONTEXT Ctx, PUCHAR SrcBase, LONG SrcTop, LONG Pitch, REC
     LONG uw, uh, outW, outH, x0, y0, dy, dx, dys, dye, dxs, dxe;
     RECT u;
 #define TSRC(x, y) (((const ULONG *)(SrcBase + (SIZE_T)((y) - SrcTop) * (SIZE_T)Pitch))[(x)])
-#define TDST(y)    ((ULONG *)(Ctx->TvVa + (SIZE_T)(y) * TV_PITCH))
+#define TDST(y)    ((ULONG *)(Ctx->TvVa + (SIZE_T)(y) * Ctx->TvPitch))
 
     if (Rc.left < 0) Rc.left = 0;
     if (Rc.top < 0) Rc.top = 0;
@@ -679,7 +709,7 @@ static VOID TvBlt(PSWD_CONTEXT Ctx, PUCHAR SrcBase, LONG SrcTop, LONG Pitch, REC
                     Baked == D3DKMDT_VPPR_ROTATE270 ? TSRC((b), uw - 1 - (a)) : \
                     Baked == D3DKMDT_VPPR_ROTATE180 ? TSRC(Ws - 1 - (a), Hs - 1 - (b)) : TSRC((a), (b)))
 
-    if (uw == (LONG)TV_W && uh == (LONG)TV_H) {
+    if (uw == (LONG)Ctx->TvW && uh == (LONG)Ctx->TvH) {
         for (dy = u.top; dy < u.bottom; dy++) {
             ULONG *d = TDST(dy);
             if (Baked == D3DKMDT_VPPR_IDENTITY) {
@@ -690,12 +720,12 @@ static VOID TvBlt(PSWD_CONTEXT Ctx, PUCHAR SrcBase, LONG SrcTop, LONG Pitch, REC
         }
         return;
     }
-    outH = (LONG)TV_H;
-    outW = uw * (LONG)TV_H / uh;
-    if (outW > (LONG)TV_W) { outW = (LONG)TV_W; outH = uh * (LONG)TV_W / uw; }
+    outH = (LONG)Ctx->TvH;
+    outW = uw * (LONG)Ctx->TvH / uh;
+    if (outW > (LONG)Ctx->TvW) { outW = (LONG)Ctx->TvW; outH = uh * (LONG)Ctx->TvW / uw; }
     if (outW <= 0 || outH <= 0) return;
-    x0 = ((LONG)TV_W - outW) / 2;
-    y0 = ((LONG)TV_H - outH) / 2;
+    x0 = ((LONG)Ctx->TvW - outW) / 2;
+    y0 = ((LONG)Ctx->TvH - outH) / 2;
     /* destination pixels whose sample falls inside u */
     dys = y0 + (u.top * outH + uh - 1) / uh;
     dye = y0 + (u.bottom * outH + uh - 1) / uh;
@@ -716,7 +746,7 @@ static VOID TvBlt(PSWD_CONTEXT Ctx, PUCHAR SrcBase, LONG SrcTop, LONG Pitch, REC
 static VOID TvClear(PSWD_CONTEXT Ctx)
 {
     ULONG y;
-    for (y = 0; y < TV_H; y++) RtlZeroMemory(Ctx->TvVa + (SIZE_T)y * TV_PITCH, TV_PITCH);
+    for (y = 0; y < Ctx->TvH; y++) RtlZeroMemory(Ctx->TvVa + (SIZE_T)y * Ctx->TvPitch, Ctx->TvPitch);
 }
 
 /* StartDevice: take DC-B over if UEFI left it running for a TV. */
@@ -770,7 +800,19 @@ static VOID TvStartLocked(PSWD_CONTEXT Ctx)
     lo.QuadPart = 0;
     hi.QuadPart = 0xFFFFFFFFll;     /* START_HI stays 0 */
     skip.QuadPart = 0;
-    Ctx->TvVa = (PUCHAR)MmAllocateContiguousMemorySpecifyCache((SIZE_T)TV_PITCH * TV_H, lo, hi, skip, MmWriteCombined);
+    /* 1.7.0: the buffer has the raster's size (the TV is a monitor of its
+     * own now); 1280x720 scaled by the window if that much is not free. */
+    Ctx->TvW = act & 0xFFFFu;
+    Ctx->TvH = act >> 16;
+    if (RegGetDword(L"TvNative", 1) == 0) { Ctx->TvW = TV_W; Ctx->TvH = TV_H; }
+    Ctx->TvPitch = Ctx->TvW * 4u;
+    Ctx->TvSize = (SIZE_T)Ctx->TvPitch * Ctx->TvH;
+    Ctx->TvVa = (PUCHAR)MmAllocateContiguousMemorySpecifyCache(Ctx->TvSize, lo, hi, skip, MmWriteCombined);
+    if (!Ctx->TvVa && Ctx->TvW != TV_W) {
+        Ctx->TvW = TV_W; Ctx->TvH = TV_H; Ctx->TvPitch = TV_PITCH;
+        Ctx->TvSize = (SIZE_T)TV_PITCH * TV_H;
+        Ctx->TvVa = (PUCHAR)MmAllocateContiguousMemorySpecifyCache(Ctx->TvSize, lo, hi, skip, MmWriteCombined);
+    }
     if (!Ctx->TvVa) {
         MmUnmapIoSpace(Ctx->TvDc, DC_MAP_SIZE);
         Ctx->TvDc = NULL;
@@ -800,15 +842,15 @@ static VOID TvStartLocked(PSWD_CONTEXT Ctx)
     v[1] = 0;                               /* position 0,0 */
     v[2] = 0;
     v[3] = 0;
-    v[4] = (TV_H << 16) | TV_PITCH;         /* prescaled: H in bytes */
+    v[4] = (Ctx->TvH << 16) | Ctx->TvPitch; /* prescaled: H in bytes */
     /* 1.5.0: window = the DC-B raster; DDA as Linux tegra compute_dda_inc,
      * (in - 1) / (out - 1) in 4.12 (1.0 when the raster is 1280x720) */
     {
         ULONG ow = act & 0xFFFFu, oh = act >> 16;
-        v[5] = ((((TV_H - 1u) * 0x1000u) / (oh - 1u)) << 16) | (((TV_W - 1u) * 0x1000u) / (ow - 1u));
+        v[5] = ((((Ctx->TvH - 1u) * 0x1000u) / (oh - 1u)) << 16) | (((Ctx->TvW - 1u) * 0x1000u) / (ow - 1u));
         v[6] = act;
     }
-    v[7] = TV_PITCH;
+    v[7] = Ctx->TvPitch;
     v[8] = 0;
     v[9] = 0;
     v[10] = 0;                              /* pitch linear */
@@ -818,12 +860,15 @@ static VOID TvStartLocked(PSWD_CONTEXT Ctx)
     v[14] = 0;
     v[15] = (1u << 24) | 255u;              /* opaque */
     v[16] = DC_WIN_ENABLE;
-    if (act != TV_ACT_720 && RegGetDword(L"TvFilter", 0) != 0) v[16] |= DC_WIN_H_FILTER | DC_WIN_V_FILTER;
+    if (Ctx->TvW != (act & 0xFFFFu) && RegGetDword(L"TvFilter", 0) != 0) v[16] |= DC_WIN_H_FILTER | DC_WIN_V_FILTER;
     TvWriteWindow(Ctx, v);
     RegPutDword(L"TvSavedStart", Ctx->TvSaved[11]);
     RegPutDword(L"TvBufLo", Ctx->TvPhys.LowPart);
     RegPutDword(L"TvBufHi", (ULONG)Ctx->TvPhys.HighPart);
+    RegPutDword(L"TvBufW", Ctx->TvW);
+    RegPutDword(L"TvBufH", Ctx->TvH);
     RegPutDword(L"TvState", 6);
+    InterlockedExchange(&Ctx->TvConnected, 1);
     TvAudioUp(act);
 }
 
@@ -836,6 +881,7 @@ static VOID TvStop(PSWD_CONTEXT Ctx)
     TvLock(Ctx);                            /* Present no longer copies to the TV after this */
     va = Ctx->TvVa;
     Ctx->TvVa = NULL;
+    InterlockedExchange(&Ctx->TvConnected, 0);
     TvUnlock(Ctx);
     if (Ctx->TvDc && va) {
         TvWriteWindow(Ctx, Ctx->TvSaved);
@@ -843,7 +889,7 @@ static VOID TvStop(PSWD_CONTEXT Ctx)
         KeDelayExecutionThread(KernelMode, FALSE, &t);
     }
     if (va) {
-        MmFreeContiguousMemorySpecifyCache(va, (SIZE_T)TV_PITCH * TV_H, MmWriteCombined);
+        MmFreeContiguousMemorySpecifyCache(va, Ctx->TvSize, MmWriteCombined);
     }
     if (Ctx->TvDc) {
         MmUnmapIoSpace(Ctx->TvDc, DC_MAP_SIZE);
@@ -1057,13 +1103,30 @@ static VOID TvAudioDown(VOID)
     RegPutDword(L"TvAudioState", 7);
 }
 
+/* 1.7.0: tell Windows the TV monitor (child 1) came or went. */
+static VOID TvIndicate(PSWD_CONTEXT Ctx, BOOLEAN Connected)
+{
+    DXGK_CHILD_STATUS cs;
+    NTSTATUS st;
+    if (!Ctx->Extend || !Ctx->Started || !Ctx->Dxgk.DxgkCbIndicateChildStatus) return;
+    RtlZeroMemory(&cs, sizeof(cs));
+    cs.Type = StatusConnection;
+    cs.ChildUid = 1;
+    cs.HotPlug.Connected = Connected;
+    st = Ctx->Dxgk.DxgkCbIndicateChildStatus(Ctx->Dxgk.DeviceHandle, &cs);
+    InterlockedIncrement(&Ctx->TvIndicates);
+    InterlockedExchange(&Ctx->TvIndicateSt, (LONG)st);
+}
+
 /* Unplugged: give the window back, stop DC-B, hold SOR1 and DC-B in reset
  * (the next bring-up starts both from reset, as in UEFI). */
 static VOID DpTearDown(PSWD_CONTEXT Ctx)
 {
     volatile ULONG *car;
+    BOOLEAN was = Ctx->TvConnected != 0;
     TvAudioDown();
-    TvStop(Ctx);
+    TvStop(Ctx);                            /* TvConnected = 0 */
+    if (was) TvIndicate(Ctx, FALSE);
     if (!DpMap()) return;
     car = (volatile ULONG *)gDpCar;
     if ((car[0x10 / 4] & (1u << 26)) != 0 && (car[0x04 / 4] & (1u << 26)) == 0) {
@@ -1089,7 +1152,7 @@ static VOID DpBringUp(PSWD_CONTEXT Ctx)
     mR426Ok = FALSE; mR427Ok = FALSE; mR429Ok = FALSE;
     mR426Step = NULL; mR427Step = NULL; mR429Step = NULL;
     mR426Hpd = FALSE; mR426DpcdOk = FALSE; mR426EdidOk = FALSE;
-    DpLog(L"switchdisplay 1.6.2 DP Alt bring-up (attempt %u)\r\n", Ctx->DpFails + 1);
+    DpLog(L"switchdisplay 1.7.0 DP Alt bring-up (attempt %u)\r\n", Ctx->DpFails + 1);
     if (!DpMap()) {
         DpLog(L"register mapping failed\r\n");
     } else {
@@ -1110,6 +1173,7 @@ static VOID DpBringUp(PSWD_CONTEXT Ctx)
     DpLogFlush();
     RegPutDword(L"DpLastStep", step);
     if (step == 5) {
+        TvIndicate(Ctx, TRUE);
         Ctx->DpFails = 0;
         InterlockedIncrement(&Ctx->DpUps);
         RegPutDword(L"DpUps", (ULONG)Ctx->DpUps);
@@ -1251,7 +1315,8 @@ NTSTATUS SwdAddDevice(IN_CONST_PDEVICE_OBJECT PhysicalDeviceObject, OUT_PPVOID M
     if (!ctx) return STATUS_INSUFFICIENT_RESOURCES;
     ctx->Pdo = PhysicalDeviceObject;
     ctx->Rotation = D3DKMDT_VPPR_IDENTITY;
-    ctx->Visible = TRUE;
+    ctx->Visible[0] = TRUE;
+    ctx->Visible[1] = TRUE;
     KeInitializeEvent(&ctx->StopEvent, NotificationEvent, FALSE);
     KeInitializeEvent(&ctx->DpEvent, SynchronizationEvent, FALSE);
     KeInitializeEvent(&ctx->TvLock, SynchronizationEvent, TRUE);
@@ -1418,11 +1483,16 @@ NTSTATUS SwdStartDevice(IN_CONST_PVOID MiniportDeviceContext, IN_PDXGK_START_INF
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
-    ctx->SrcWidth = ctx->FbWidth;
-    ctx->SrcHeight = ctx->FbHeight;
+    ctx->Extend = RegGetDword(L"TvExtend", 1) != 0;
+    RegPutDword(L"ExtendOn", ctx->Extend ? 1 : 0);
+    ctx->SrcW[0] = ctx->SrcW[1] = ctx->FbWidth;
+    ctx->SrcH[0] = ctx->SrcH[1] = ctx->FbHeight;
+    ctx->PanelSrc = 0;
+    ctx->TvSrc = ctx->Extend ? SWD_NOSRC : 0;  /* the TV keeps the boot image until Windows uses it */
     ctx->Rotation = D3DKMDT_VPPR_IDENTITY;
     ctx->Active = TRUE;      /* the boot image stays until the first commit */
-    ctx->Visible = TRUE;
+    ctx->Visible[0] = TRUE;
+    ctx->Visible[1] = TRUE;
     TvStart(ctx);
 
     KeClearEvent(&ctx->StopEvent);
@@ -1437,8 +1507,8 @@ NTSTATUS SwdStartDevice(IN_CONST_PVOID MiniportDeviceContext, IN_PDXGK_START_INF
 
     DpRegister(ctx);                         /* 1.4.0: after the thread exists */
 
-    *NumberOfVideoPresentSources = 1;
-    *NumberOfChildren = 1;
+    *NumberOfVideoPresentSources = ctx->Extend ? 2 : 1;
+    *NumberOfChildren = ctx->Extend ? 2 : 1;
     ctx->Started = TRUE;
     RegPutDword(L"LastStartStatus", 0);
     UNREFERENCED_PARAMETER(DxgkStartInfo);
@@ -1540,6 +1610,14 @@ BOOLEAN SwdInterruptRoutine(IN_CONST_PVOID MiniportDeviceContext, IN_ULONG Messa
         d.InterruptType = DXGK_INTERRUPT_DISPLAYONLY_VSYNC;
         d.DisplayOnlyVsync.VidPnTargetId = 0;
         ctx->Dxgk.DxgkCbNotifyInterrupt(ctx->Dxgk.DeviceHandle, &d);
+        if (ctx->Extend && ctx->TvSrc != SWD_NOSRC && ctx->TvConnected) {
+            /* 1.7.0: the TV has no interrupt of its own here; DC-B runs at
+             * 60 Hz too, so the panel's vblank paces it. */
+            RtlZeroMemory(&d, sizeof(d));
+            d.InterruptType = DXGK_INTERRUPT_DISPLAYONLY_VSYNC;
+            d.DisplayOnlyVsync.VidPnTargetId = 1;
+            ctx->Dxgk.DxgkCbNotifyInterrupt(ctx->Dxgk.DeviceHandle, &d);
+        }
         ctx->Dxgk.DxgkCbQueueDpc(ctx->Dxgk.DeviceHandle);
         InterlockedIncrement(&ctx->VsyncInts);
     } else {
@@ -1615,9 +1693,20 @@ NTSTATUS SwdControlInterrupt(IN_CONST_HANDLE hAdapter, IN_CONST_DXGK_INTERRUPT_T
 static NTSTATUS ImplQueryChildRelations(IN_CONST_PVOID MiniportDeviceContext, PDXGK_CHILD_DESCRIPTOR ChildRelations,
                                 ULONG ChildRelationsSize)
 {
-    UNREFERENCED_PARAMETER(MiniportDeviceContext);
-    if (!ChildRelations || ChildRelationsSize < sizeof(DXGK_CHILD_DESCRIPTOR)) return STATUS_BUFFER_TOO_SMALL;
-    RtlZeroMemory(&ChildRelations[0], sizeof(DXGK_CHILD_DESCRIPTOR));
+    PSWD_CONTEXT ctx = (PSWD_CONTEXT)MiniportDeviceContext;
+    ULONG n = ctx->Extend ? 2u : 1u;
+    if (!ChildRelations || ChildRelationsSize < n * sizeof(DXGK_CHILD_DESCRIPTOR)) return STATUS_BUFFER_TOO_SMALL;
+    RtlZeroMemory(ChildRelations, n * sizeof(DXGK_CHILD_DESCRIPTOR));
+    if (n == 2) {
+        /* 1.7.0: the TV over USB-C DP Alt Mode. */
+        ChildRelations[1].ChildDeviceType = TypeVideoOutput;
+        ChildRelations[1].ChildCapabilities.HpdAwareness = HpdAwarenessInterruptible;
+        ChildRelations[1].ChildCapabilities.Type.VideoOutput.InterfaceTechnology = D3DKMDT_VOT_DISPLAYPORT_EXTERNAL;
+        ChildRelations[1].ChildCapabilities.Type.VideoOutput.MonitorOrientationAwareness = D3DKMDT_MOA_NONE;
+        ChildRelations[1].ChildCapabilities.Type.VideoOutput.SupportsSdtvModes = FALSE;
+        ChildRelations[1].AcpiUid = 0;
+        ChildRelations[1].ChildUid = 1;
+    }
     ChildRelations[0].ChildDeviceType = TypeVideoOutput;
     ChildRelations[0].ChildCapabilities.HpdAwareness = HpdAwarenessAlwaysConnected;
     ChildRelations[0].ChildCapabilities.Type.VideoOutput.InterfaceTechnology = D3DKMDT_VOT_INTERNAL;
@@ -1631,12 +1720,12 @@ static NTSTATUS ImplQueryChildRelations(IN_CONST_PVOID MiniportDeviceContext, PD
 static NTSTATUS ImplQueryChildStatus(IN_CONST_PVOID MiniportDeviceContext, INOUT_PDXGK_CHILD_STATUS ChildStatus,
                              IN_BOOLEAN NonDestructiveOnly)
 {
-    UNREFERENCED_PARAMETER(MiniportDeviceContext);
+    PSWD_CONTEXT ctx = (PSWD_CONTEXT)MiniportDeviceContext;
     UNREFERENCED_PARAMETER(NonDestructiveOnly);
-    if (!ChildStatus || ChildStatus->ChildUid != 0) return STATUS_INVALID_PARAMETER;
+    if (!ChildStatus || ChildStatus->ChildUid > (ctx->Extend ? 1u : 0u)) return STATUS_INVALID_PARAMETER;
     switch (ChildStatus->Type) {
     case StatusConnection:
-        ChildStatus->HotPlug.Connected = TRUE;
+        ChildStatus->HotPlug.Connected = ChildStatus->ChildUid == 0 ? TRUE : (ctx->TvConnected != 0);
         return STATUS_SUCCESS;
     case StatusRotation:
         /* D3DKMDT_MOA_NONE was reported. */
@@ -1651,7 +1740,10 @@ static NTSTATUS ImplQueryDeviceDescriptor(IN_CONST_PVOID MiniportDeviceContext, 
 {
     ULONG len;
     UNREFERENCED_PARAMETER(MiniportDeviceContext);
-    if (ChildUid != 0 || !DeviceDescriptor) return STATUS_INVALID_PARAMETER;
+    if (ChildUid > 1 || !DeviceDescriptor) return STATUS_INVALID_PARAMETER;
+    /* 1.7.0: no EDID for the TV either (the panel's lesson: an EDID made
+     * Windows refuse target modes without frequencies). */
+    if (ChildUid == 1) return STATUS_MONITOR_NO_DESCRIPTOR;
     /* 1.0.6: no EDID unless UseEdid=1. With the EDID (1.0.3-1.0.5) every
      * target mode was refused with STATUS_GRAPHICS_INVALID_FREQUENCY while the
      * same signal was accepted as a monitor mode. The Basic Display sample
@@ -1763,6 +1855,26 @@ static NTSTATUS ImplEscape(IN_CONST_HANDLE hAdapter, IN_CONST_PDXGKARG_ESCAPE pE
 
 /* --- VidPN */
 
+/* 1.7.0: the source that drives target T in a topology (SWD_NOSRC: none). */
+static ULONG SourceOfTarget(D3DKMDT_HVIDPNTOPOLOGY Topo, const DXGK_VIDPNTOPOLOGY_INTERFACE *TopoIf, ULONG T)
+{
+    D3DDDI_VIDEO_PRESENT_SOURCE_ID s = 0;
+    if (!NT_SUCCESS(TopoIf->pfnGetPathSourceFromTarget(Topo, T, &s)) || s > 1) return SWD_NOSRC;
+    return (ULONG)s;
+}
+
+/* 1.0.9: like the Basic Display sample, a source that drives the panel has
+ * the panel's own size (720x1280), also for 90/270. The DWM then presents a
+ * 1280x720 surface with Flags.Rotate set and the driver rotates it.
+ * 1.7.0: a source that drives only the TV has the TV's size. */
+static VOID SourceSizeFor(PSWD_CONTEXT Ctx, BOOLEAN DrivesPanel, ULONG *W, ULONG *H)
+{
+    if (DrivesPanel) { *W = Ctx->FbWidth; *H = Ctx->FbHeight; }
+    else TargetSize(Ctx, 1, W, H);
+}
+
+static ULONG MaxSource(PSWD_CONTEXT Ctx) { return Ctx->Extend ? 1u : 0u; }
+
 static NTSTATUS CheckPinnedModes(PSWD_CONTEXT Ctx, D3DKMDT_HVIDPN hVidPn, const DXGK_VIDPN_INTERFACE *Vidpn,
                                  const D3DKMDT_VIDPN_PRESENT_PATH *Path, BOOLEAN *Ok)
 {
@@ -1772,6 +1884,7 @@ static NTSTATUS CheckPinnedModes(PSWD_CONTEXT Ctx, D3DKMDT_HVIDPN hVidPn, const 
     D3DKMDT_HVIDPNTARGETMODESET hTgt = NULL;
     const DXGK_VIDPNTARGETMODESET_INTERFACE *tgtIf = NULL;
     const D3DKMDT_VIDPN_TARGET_MODE *tgtMode = NULL;
+    ULONG tw, th;
     NTSTATUS st;
 
     st = Vidpn->pfnAcquireSourceModeSet(hVidPn, Path->VidPnSourceId, &hSrc, &srcIf);
@@ -1782,13 +1895,16 @@ static NTSTATUS CheckPinnedModes(PSWD_CONTEXT Ctx, D3DKMDT_HVIDPN hVidPn, const 
         ULONG h = (ULONG)srcMode->Format.Graphics.PrimSurfSize.cy;
         BOOLEAN native = (w == Ctx->FbWidth && h == Ctx->FbHeight);
         BOOLEAN swapped = (w == Ctx->FbHeight && h == Ctx->FbWidth);
+        BOOLEAN tv;
         D3DKMDT_VIDPN_PRESENT_PATH_ROTATION r = Path->ContentTransformation.Rotation;
+        TargetSize(Ctx, 1, &tw, &th);
+        tv = Ctx->Extend && w == tw && h == th;
         if (srcMode->Type != D3DKMDT_RMT_GRAPHICS ||
             (srcMode->Format.Graphics.PixelFormat != D3DDDIFMT_A8R8G8B8 &&
              srcMode->Format.Graphics.PixelFormat != D3DDDIFMT_X8R8G8B8)) {
             *Ok = FALSE;
             Reject(4, (LONG)srcMode->Type, (LONG)srcMode->Format.Graphics.PixelFormat);
-        } else if (!native && !swapped) {
+        } else if (!native && !swapped && !tv) {
             *Ok = FALSE; Reject(5, (LONG)((w << 16) | h), (LONG)r);
         }
         srcIf->pfnReleaseModeInfo(hSrc, srcMode);
@@ -1800,10 +1916,12 @@ static NTSTATUS CheckPinnedModes(PSWD_CONTEXT Ctx, D3DKMDT_HVIDPN hVidPn, const 
     if (!NT_SUCCESS(st)) return st;
     st = tgtIf->pfnAcquirePinnedModeInfo(hTgt, &tgtMode);
     if (NT_SUCCESS(st) && tgtMode) {
-        if (tgtMode->VideoSignalInfo.ActiveSize.cx != SWD_NATIVE_W ||
-            tgtMode->VideoSignalInfo.ActiveSize.cy != SWD_NATIVE_H) {
+        TargetSize(Ctx, Path->VidPnTargetId, &tw, &th);
+        if ((ULONG)tgtMode->VideoSignalInfo.ActiveSize.cx != tw ||
+            (ULONG)tgtMode->VideoSignalInfo.ActiveSize.cy != th) {
             *Ok = FALSE;
-            Reject(6, (LONG)((tgtMode->VideoSignalInfo.ActiveSize.cx << 16) | tgtMode->VideoSignalInfo.ActiveSize.cy), 0);
+            Reject(6, (LONG)((tgtMode->VideoSignalInfo.ActiveSize.cx << 16) | tgtMode->VideoSignalInfo.ActiveSize.cy),
+                   (LONG)Path->VidPnTargetId);
         }
         tgtIf->pfnReleaseModeInfo(hTgt, tgtMode);
     }
@@ -1833,8 +1951,9 @@ static NTSTATUS ImplIsSupportedVidPn(IN_CONST_HANDLE hAdapter, INOUT_PDXGKARG_IS
 
     st = topoIf->pfnAcquireFirstPathInfo(topo, &path);
     while (NT_SUCCESS(st) && path && ok) {
-        if (path->VidPnSourceId != 0 || path->VidPnTargetId != 0 ||
-            !ScalingOk(path->ContentTransformation.Scaling) ||
+        BOOLEAN scalingOk = path->VidPnTargetId == 1 ? TvScalingOk(path->ContentTransformation.Scaling)
+                                                     : ScalingOk(path->ContentTransformation.Scaling);
+        if (path->VidPnSourceId > MaxSource(ctx) || path->VidPnTargetId > MaxSource(ctx) || !scalingOk ||
             !RotationKnown(path->ContentTransformation.Rotation)) {
             ok = FALSE;
             Reject(1, (LONG)((path->VidPnSourceId << 16) | path->VidPnTargetId),
@@ -1863,6 +1982,7 @@ static NTSTATUS ImplRecommendFunctionalVidPn(IN_CONST_HANDLE hAdapter,
 }
 
 static NTSTATUS EnsureSourceModes(PSWD_CONTEXT Ctx, D3DKMDT_HVIDPN hVidPn, const DXGK_VIDPN_INTERFACE *Vidpn,
+                                  D3DKMDT_HVIDPNTOPOLOGY Topo, const DXGK_VIDPNTOPOLOGY_INTERFACE *TopoIf,
                                   const D3DKMDT_VIDPN_PRESENT_PATH *Path)
 {
     D3DKMDT_HVIDPNSOURCEMODESET hSet = NULL;
@@ -1884,8 +2004,7 @@ static NTSTATUS EnsureSourceModes(PSWD_CONTEXT Ctx, D3DKMDT_HVIDPN hVidPn, const
 
     st = Vidpn->pfnCreateNewSourceModeSet(hVidPn, Path->VidPnSourceId, &hSet, &setIf);
     if (!NT_SUCCESS(st)) return st;
-    SourceSizeFor(Ctx, RotationPinned(Path->ContentTransformation.Rotation) ?
-                  Path->ContentTransformation.Rotation : D3DKMDT_VPPR_IDENTITY, &w, &h);
+    SourceSizeFor(Ctx, SourceOfTarget(Topo, TopoIf, 0) == Path->VidPnSourceId, &w, &h);
     st = setIf->pfnCreateNewModeInfo(hSet, &mode);
     if (NT_SUCCESS(st)) {
         FillSourceMode(mode, w, h);
@@ -1897,13 +2016,14 @@ static NTSTATUS EnsureSourceModes(PSWD_CONTEXT Ctx, D3DKMDT_HVIDPN hVidPn, const
     return st;
 }
 
-static NTSTATUS EnsureTargetModes(D3DKMDT_HVIDPN hVidPn, const DXGK_VIDPN_INTERFACE *Vidpn,
+static NTSTATUS EnsureTargetModes(PSWD_CONTEXT Ctx, D3DKMDT_HVIDPN hVidPn, const DXGK_VIDPN_INTERFACE *Vidpn,
                                   const D3DKMDT_VIDPN_PRESENT_PATH *Path)
 {
     D3DKMDT_HVIDPNTARGETMODESET hSet = NULL;
     const DXGK_VIDPNTARGETMODESET_INTERFACE *setIf = NULL;
     const D3DKMDT_VIDPN_TARGET_MODE *pinned = NULL;
     D3DKMDT_VIDPN_TARGET_MODE *mode = NULL;
+    ULONG w, h;
     NTSTATUS st;
 
     st = Vidpn->pfnAcquireTargetModeSet(hVidPn, Path->VidPnTargetId, &hSet, &setIf);
@@ -1918,14 +2038,16 @@ static NTSTATUS EnsureTargetModes(D3DKMDT_HVIDPN hVidPn, const DXGK_VIDPN_INTERF
 
     st = Vidpn->pfnCreateNewTargetModeSet(hVidPn, Path->VidPnTargetId, &hSet, &setIf);
     if (!NT_SUCCESS(st)) return st;
+    TargetSize(Ctx, Path->VidPnTargetId, &w, &h);
     st = setIf->pfnCreateNewModeInfo(hSet, &mode);
     if (NT_SUCCESS(st)) {
-        FillSignalInfo(&mode->VideoSignalInfo);
+        FillSignalInfo(&mode->VideoSignalInfo, w, h);
         mode->Preference = D3DKMDT_MP_PREFERRED;
         st = setIf->pfnAddMode(hSet, mode);
         if (!NT_SUCCESS(st)) setIf->pfnReleaseModeInfo(hSet, mode);
     }
-    if (NT_SUCCESS(st)) st = Vidpn->pfnAssignTargetModeSet(hVidPn, Path->VidPnTargetId, hSet);    if (!NT_SUCCESS(st)) Vidpn->pfnReleaseTargetModeSet(hVidPn, hSet);
+    if (NT_SUCCESS(st)) st = Vidpn->pfnAssignTargetModeSet(hVidPn, Path->VidPnTargetId, hSet);
+    if (!NT_SUCCESS(st)) Vidpn->pfnReleaseTargetModeSet(hVidPn, hSet);
     return st;
 }
 
@@ -1951,13 +2073,16 @@ static NTSTATUS ImplEnumVidPnCofuncModality(IN_CONST_HANDLE hAdapter,
     while (NT_SUCCESS(st) && path) {
         BOOLEAN isPivotPath = (pEnumCofuncModality->EnumPivot.VidPnSourceId == path->VidPnSourceId &&
                                pEnumCofuncModality->EnumPivot.VidPnTargetId == path->VidPnTargetId);
+        BOOLEAN tvPath = path->VidPnTargetId == 1;
+        /* the TV path rotates only in Duplicate, where it follows the panel */
+        BOOLEAN allRot = !tvPath || SourceOfTarget(topo, topoIf, 0) == path->VidPnSourceId;
         if (!(pivot == D3DKMDT_EPT_VIDPNSOURCE && pEnumCofuncModality->EnumPivot.VidPnSourceId == path->VidPnSourceId)) {
-            st = EnsureSourceModes(ctx, hVidPn, vidpn, path);
+            st = EnsureSourceModes(ctx, hVidPn, vidpn, topo, topoIf, path);
             if (!NT_SUCCESS(st)) InterlockedExchange(&gCofuncStep, 1);
         }
         if (NT_SUCCESS(st) &&
             !(pivot == D3DKMDT_EPT_VIDPNTARGET && pEnumCofuncModality->EnumPivot.VidPnTargetId == path->VidPnTargetId)) {
-            st = EnsureTargetModes(hVidPn, vidpn, path);
+            st = EnsureTargetModes(ctx, hVidPn, vidpn, path);
             if (!NT_SUCCESS(st)) InterlockedExchange(&gCofuncStep, 2);
         }
         if (NT_SUCCESS(st)) {
@@ -1969,19 +2094,24 @@ static NTSTATUS ImplEnumVidPnCofuncModality(IN_CONST_HANDLE hAdapter,
                  local.ContentTransformation.Scaling == D3DKMDT_VPPS_NOTSPECIFIED)) {
                 RtlZeroMemory(&local.ContentTransformation.ScalingSupport, sizeof(local.ContentTransformation.ScalingSupport));
                 local.ContentTransformation.ScalingSupport.Identity = 1;
+                if (tvPath) {
+                    /* the TV copy fits any source into the TV buffer */
+                    local.ContentTransformation.ScalingSupport.Centered = 1;
+                    local.ContentTransformation.ScalingSupport.AspectRatioCenteredMax = 1;
+                }
                 changed = TRUE;
             }
             /* 1.0.8: report all four rotations also when the rotation is
              * already pinned (1.0.7 only did it while unpinned). */
-            if (!(pivot == D3DKMDT_EPT_ROTATION && isPivotPath) &&
-                !(local.ContentTransformation.RotationSupport.Identity && local.ContentTransformation.RotationSupport.Rotate90 &&
-                  local.ContentTransformation.RotationSupport.Rotate180 && local.ContentTransformation.RotationSupport.Rotate270)) {
-                RtlZeroMemory(&local.ContentTransformation.RotationSupport, sizeof(local.ContentTransformation.RotationSupport));
-                local.ContentTransformation.RotationSupport.Identity = 1;
-                local.ContentTransformation.RotationSupport.Rotate90 = 1;
-                local.ContentTransformation.RotationSupport.Rotate180 = 1;
-                local.ContentTransformation.RotationSupport.Rotate270 = 1;
-                changed = TRUE;
+            if (!(pivot == D3DKMDT_EPT_ROTATION && isPivotPath)) {
+                D3DKMDT_VIDPN_PRESENT_PATH_ROTATION_SUPPORT want;
+                RtlZeroMemory(&want, sizeof(want));
+                want.Identity = 1;
+                if (allRot) { want.Rotate90 = 1; want.Rotate180 = 1; want.Rotate270 = 1; }
+                if (RtlCompareMemory(&want, &local.ContentTransformation.RotationSupport, sizeof(want)) != sizeof(want)) {
+                    local.ContentTransformation.RotationSupport = want;
+                    changed = TRUE;
+                }
             }
             if (changed) {
                 st = topoIf->pfnUpdatePathSupportInfo(topo, &local);
@@ -2001,17 +2131,35 @@ static NTSTATUS ImplEnumVidPnCofuncModality(IN_CONST_HANDLE hAdapter,
     return st;
 }
 
+static VOID TvClearLocked(PSWD_CONTEXT Ctx)
+{
+    TvLock(Ctx);
+    if (Ctx->TvVa) TvClear(Ctx);
+    Ctx->TvLastW = 0;
+    Ctx->TvLastH = 0;
+    TvUnlock(Ctx);
+}
+
 static NTSTATUS ImplSetVidPnSourceVisibility(IN_CONST_HANDLE hAdapter,
                                      IN_CONST_PDXGKARG_SETVIDPNSOURCEVISIBILITY pSetVidPnSourceVisibility)
 {
     PSWD_CONTEXT ctx = (PSWD_CONTEXT)hAdapter;
-    if (pSetVidPnSourceVisibility->VidPnSourceId != 0 &&
-        pSetVidPnSourceVisibility->VidPnSourceId != D3DDDI_ID_ALL) return STATUS_INVALID_PARAMETER;
-    if (!pSetVidPnSourceVisibility->Visible && ctx->Visible) ClearFb(ctx);
-    ctx->Visible = pSetVidPnSourceVisibility->Visible;
+    ULONG id = pSetVidPnSourceVisibility->VidPnSourceId, s;
+    BOOLEAN vis = pSetVidPnSourceVisibility->Visible;
+    if (id != D3DDDI_ID_ALL && id > MaxSource(ctx)) return STATUS_INVALID_PARAMETER;
+    for (s = 0; s <= MaxSource(ctx); s++) {
+        if (id != D3DDDI_ID_ALL && id != s) continue;
+        if (!vis && ctx->Visible[s]) {
+            if (s == ctx->PanelSrc) ClearFb(ctx);
+            if (ctx->Extend && s == ctx->TvSrc) TvClearLocked(ctx);
+        }
+        ctx->Visible[s] = vis;
+    }
     return STATUS_SUCCESS;
 }
 
+/* 1.7.0: the whole topology is read at every commit: which source drives the
+ * panel and which the TV, their pinned sizes and the panel path's rotation. */
 static NTSTATUS ImplCommitVidPn(IN_CONST_HANDLE hAdapter, IN_CONST_PDXGKARG_COMMITVIDPN_CONST pCommitVidPn)
 {
     PSWD_CONTEXT ctx = (PSWD_CONTEXT)hAdapter;
@@ -2019,65 +2167,78 @@ static NTSTATUS ImplCommitVidPn(IN_CONST_HANDLE hAdapter, IN_CONST_PDXGKARG_COMM
     const DXGK_VIDPN_INTERFACE *vidpn;
     D3DKMDT_HVIDPNTOPOLOGY topo;
     const DXGK_VIDPNTOPOLOGY_INTERFACE *topoIf;
-    D3DKMDT_HVIDPNSOURCEMODESET hSet = NULL;
-    const DXGK_VIDPNSOURCEMODESET_INTERFACE *setIf = NULL;
-    const D3DKMDT_VIDPN_SOURCE_MODE *mode = NULL;
     const D3DKMDT_VIDPN_PRESENT_PATH *path = NULL;
     D3DKMDT_VIDPN_PRESENT_PATH_ROTATION rot = D3DKMDT_VPPR_IDENTITY;
-    SIZE_T n = 0;
-    ULONG w = 0, h = 0, ew, eh;
+    ULONG w[2] = { 0, 0 }, h[2] = { 0, 0 }, ps, ts, s;
     NTSTATUS st;
 
     InterlockedIncrement(&ctx->Commits);
-    if (pCommitVidPn->AffectedVidPnSourceId != 0 && pCommitVidPn->AffectedVidPnSourceId != D3DDDI_ID_ALL)
+    if (pCommitVidPn->AffectedVidPnSourceId != D3DDDI_ID_ALL && pCommitVidPn->AffectedVidPnSourceId > MaxSource(ctx))
         return STATUS_INVALID_PARAMETER;
 
     st = ctx->Dxgk.DxgkCbQueryVidPnInterface(hVidPn, DXGK_VIDPN_INTERFACE_VERSION_V1, &vidpn);
     if (!NT_SUCCESS(st)) return st;
     st = vidpn->pfnGetTopology(hVidPn, &topo, &topoIf);
     if (!NT_SUCCESS(st)) return st;
-    st = topoIf->pfnGetNumPathsFromSource(topo, 0, &n);
-    if (!NT_SUCCESS(st) || n == 0) {
-        /* Source 0 is not in the topology: nothing is shown. */
+    ps = SourceOfTarget(topo, topoIf, 0);
+    ts = ctx->Extend ? SourceOfTarget(topo, topoIf, 1) : SWD_NOSRC;
+
+    for (s = 0; s <= MaxSource(ctx); s++) {
+        D3DKMDT_HVIDPNSOURCEMODESET hSet = NULL;
+        const DXGK_VIDPNSOURCEMODESET_INTERFACE *setIf = NULL;
+        const D3DKMDT_VIDPN_SOURCE_MODE *mode = NULL;
+        if (s != ps && s != ts) continue;
+        st = vidpn->pfnAcquireSourceModeSet(hVidPn, s, &hSet, &setIf);
+        if (!NT_SUCCESS(st)) return st;
+        st = setIf->pfnAcquirePinnedModeInfo(hSet, &mode);
+        if (NT_SUCCESS(st) && mode) {
+            w[s] = (ULONG)mode->Format.Graphics.PrimSurfSize.cx;
+            h[s] = (ULONG)mode->Format.Graphics.PrimSurfSize.cy;
+            setIf->pfnReleaseModeInfo(hSet, mode);
+        }
+        vidpn->pfnReleaseSourceModeSet(hVidPn, hSet);
+    }
+    if (ps != SWD_NOSRC && (w[ps] == 0 || h[ps] == 0)) ps = SWD_NOSRC;
+    if (ts != SWD_NOSRC && (w[ts] == 0 || h[ts] == 0)) ts = SWD_NOSRC;
+
+    if (ps != SWD_NOSRC) {
+        st = topoIf->pfnAcquirePathInfo(topo, ps, 0, &path);
+        if (NT_SUCCESS(st) && path) {
+            rot = NormalizeRotation(path->ContentTransformation.Rotation);
+            topoIf->pfnReleasePathInfo(topo, path);
+        }
+        if (!((w[ps] == ctx->FbWidth && h[ps] == ctx->FbHeight) || (w[ps] == ctx->FbHeight && h[ps] == ctx->FbWidth)))
+            return STATUS_GRAPHICS_INVALID_VIDPN_SOURCEMODESET;
+    }
+
+    /* panel */
+    if (ps == SWD_NOSRC) {
+        /* Nothing is shown on the panel. */
         if (ctx->Active) ClearFb(ctx);
         ctx->Active = FALSE;
-        RegPutDword(L"CommitActive", 0);
-        return STATUS_SUCCESS;
+    } else {
+        if (!ctx->Active || ctx->PanelSrc != ps || ctx->Rotation != rot || ctx->SrcW[ps] != w[ps] || ctx->SrcH[ps] != h[ps])
+            ClearFb(ctx);
+        ctx->Rotation = rot;
+        ctx->Active = TRUE;
+    }
+    for (s = 0; s < 2; s++) if (w[s] && h[s]) { ctx->SrcW[s] = w[s]; ctx->SrcH[s] = h[s]; }
+    ctx->PanelSrc = ps;
+
+    /* TV */
+    if (ctx->Extend && ts != ctx->TvSrc) {
+        ctx->TvSrc = ts;
+        TvClearLocked(ctx);
     }
 
-    st = vidpn->pfnAcquireSourceModeSet(hVidPn, 0, &hSet, &setIf);
-    if (!NT_SUCCESS(st)) return st;
-    st = setIf->pfnAcquirePinnedModeInfo(hSet, &mode);
-    if (NT_SUCCESS(st) && mode) {
-        w = (ULONG)mode->Format.Graphics.PrimSurfSize.cx;
-        h = (ULONG)mode->Format.Graphics.PrimSurfSize.cy;
-        setIf->pfnReleaseModeInfo(hSet, mode);
-    }
-    vidpn->pfnReleaseSourceModeSet(hVidPn, hSet);
-    if (w == 0 || h == 0) {
-        if (ctx->Active) ClearFb(ctx);
-        ctx->Active = FALSE;
-        RegPutDword(L"CommitActive", 0);
-        return STATUS_SUCCESS;
-    }
-
-    st = topoIf->pfnAcquirePathInfo(topo, 0, 0, &path);
-    if (NT_SUCCESS(st) && path) {
-        rot = NormalizeRotation(path->ContentTransformation.Rotation);
-        topoIf->pfnReleasePathInfo(topo, path);
-    }
-    SourceSizeFor(ctx, rot, &ew, &eh);
-    if (!((w == ew && h == eh) || (w == eh && h == ew))) return STATUS_GRAPHICS_INVALID_VIDPN_SOURCEMODESET;
-
-    if (!ctx->Active || ctx->Rotation != rot || ctx->SrcWidth != w || ctx->SrcHeight != h) ClearFb(ctx);
-    ctx->Rotation = rot;
-    ctx->SrcWidth = w;
-    ctx->SrcHeight = h;
-    ctx->Active = TRUE;
-    RegPutDword(L"CommitActive", 1);
+    RegPutDword(L"CommitActive", ctx->Active ? 1 : 0);
+    RegPutDword(L"PanelSrc", ps);
+    RegPutDword(L"TvSrc", ctx->Extend ? ts : 0);
     RegPutDword(L"Rotation", (ULONG)rot);
-    RegPutDword(L"SrcWidth", w);
-    RegPutDword(L"SrcHeight", h);
+    RegPutDword(L"SrcWidth", ctx->SrcW[0]);
+    RegPutDword(L"SrcHeight", ctx->SrcH[0]);
+    RegPutDword(L"Src1Width", ctx->SrcW[1]);
+    RegPutDword(L"Src1Height", ctx->SrcH[1]);
     return STATUS_SUCCESS;
 }
 
@@ -2088,9 +2249,13 @@ static NTSTATUS ImplUpdateActiveVidPnPresentPath(IN_CONST_HANDLE hAdapter,
     const D3DKMDT_VIDPN_PRESENT_PATH *path = &pUpdateActiveVidPnPresentPath->VidPnPresentPathInfo;
     D3DKMDT_VIDPN_PRESENT_PATH_ROTATION rot;
 
-    if (path->VidPnSourceId != 0 || path->VidPnTargetId != 0) return STATUS_INVALID_PARAMETER;
-    if (!ScalingOk(path->ContentTransformation.Scaling)) return STATUS_GRAPHICS_VIDPN_MODALITY_NOT_SUPPORTED;
+    if (path->VidPnSourceId > MaxSource(ctx) || path->VidPnTargetId > MaxSource(ctx)) return STATUS_INVALID_PARAMETER;
     if (!RotationKnown(path->ContentTransformation.Rotation)) return STATUS_GRAPHICS_VIDPN_MODALITY_NOT_SUPPORTED;
+    if (path->VidPnTargetId == 1) {
+        /* the TV copy is always upright and fitted */
+        return TvScalingOk(path->ContentTransformation.Scaling) ? STATUS_SUCCESS : STATUS_GRAPHICS_VIDPN_MODALITY_NOT_SUPPORTED;
+    }
+    if (!ScalingOk(path->ContentTransformation.Scaling)) return STATUS_GRAPHICS_VIDPN_MODALITY_NOT_SUPPORTED;
     rot = NormalizeRotation(path->ContentTransformation.Rotation);
     /* 1.0.8: DRIVERCAPS says SupportSmoothRotation, so Windows rotates with
      * this call alone, also 0<->90 (the desktop surface then changes from
@@ -2098,25 +2263,26 @@ static NTSTATUS ImplUpdateActiveVidPnPresentPath(IN_CONST_HANDLE hAdapter,
     if (rot != ctx->Rotation) {
         ctx->Rotation = rot;
         ClearFb(ctx);
+        if (ctx->Extend && ctx->TvSrc == path->VidPnSourceId) TvClearLocked(ctx);
     }
     RegPutDword(L"Rotation", (ULONG)rot);
-    RegPutDword(L"SrcWidth", ctx->SrcWidth);
-    RegPutDword(L"SrcHeight", ctx->SrcHeight);
     return STATUS_SUCCESS;
 }
 
 static NTSTATUS ImplRecommendMonitorModes(IN_CONST_HANDLE hAdapter,
                                   IN_CONST_PDXGKARG_RECOMMENDMONITORMODES_CONST pRecommendMonitorModes)
 {
+    PSWD_CONTEXT ctx = (PSWD_CONTEXT)hAdapter;
     const DXGK_MONITORSOURCEMODESET_INTERFACE *setIf = pRecommendMonitorModes->pMonitorSourceModeSetInterface;
     D3DKMDT_HMONITORSOURCEMODESET hSet = pRecommendMonitorModes->hMonitorSourceModeSet;
     D3DKMDT_MONITOR_SOURCE_MODE *mode = NULL;
+    ULONG w, h;
     NTSTATUS st;
-    UNREFERENCED_PARAMETER(hAdapter);
 
+    TargetSize(ctx, pRecommendMonitorModes->VideoPresentTargetId == 1 ? 1u : 0u, &w, &h);
     st = setIf->pfnCreateNewModeInfo(hSet, &mode);
     if (!NT_SUCCESS(st)) return st;
-    FillSignalInfo(&mode->VideoSignalInfo);
+    FillSignalInfo(&mode->VideoSignalInfo, w, h);
     mode->ColorBasis = D3DKMDT_CB_SRGB;
     mode->ColorCoeffDynamicRanges.FirstChannel = 8;
     mode->ColorCoeffDynamicRanges.SecondChannel = 8;
@@ -2133,10 +2299,11 @@ static NTSTATUS ImplRecommendMonitorModes(IN_CONST_HANDLE hAdapter,
 }
 static NTSTATUS ImplQueryVidPnHWCapability(IN_CONST_HANDLE i_hAdapter, INOUT_PDXGKARG_QUERYVIDPNHWCAPABILITY io_pVidPnHWCaps)
 {
-    UNREFERENCED_PARAMETER(i_hAdapter);
-    if (io_pVidPnHWCaps->SourceId != 0 || io_pVidPnHWCaps->TargetId != 0) return STATUS_INVALID_PARAMETER;
+    PSWD_CONTEXT ctx = (PSWD_CONTEXT)i_hAdapter;
+    if (io_pVidPnHWCaps->SourceId > MaxSource(ctx) || io_pVidPnHWCaps->TargetId > MaxSource(ctx)) return STATUS_INVALID_PARAMETER;
     RtlZeroMemory(&io_pVidPnHWCaps->VidPnHWCaps, sizeof(io_pVidPnHWCaps->VidPnHWCaps));
     io_pVidPnHWCaps->VidPnHWCaps.DriverRotation = 1;   /* rotation is done in the copy */
+    if (io_pVidPnHWCaps->TargetId == 1) io_pVidPnHWCaps->VidPnHWCaps.DriverScaling = 1;   /* the TV copy fits */
     return STATUS_SUCCESS;
 }
 
@@ -2151,30 +2318,37 @@ NTSTATUS SwdPresentDisplayOnly(IN_CONST_HANDLE hAdapter, IN_CONST_PDXGKARG_PRESE
 {
     PSWD_CONTEXT ctx = (PSWD_CONTEXT)hAdapter;
     LONG top = MAXLONG, bottom = MINLONG;
-    ULONG i;
+    ULONG i, sid;
     PMDL mdl;
     PUCHAR src, va;
     SIZE_T len;
     KPROCESSOR_MODE mode;
     NTSTATUS st = STATUS_SUCCESS;
-    D3DKMDT_VIDPN_PRESENT_PATH_ROTATION rot;
+    D3DKMDT_VIDPN_PRESENT_PATH_ROTATION rot, srcRot;
+    BOOLEAN toPanel, toTv;
     LONG ws, hs;
 
     InterlockedIncrement(&ctx->Presents);
-    if (pPresent->VidPnSourceId != 0) return STATUS_INVALID_PARAMETER;
+    sid = pPresent->VidPnSourceId;
+    if (sid > MaxSource(ctx)) return STATUS_INVALID_PARAMETER;
     /* Drawing continues while the monitor is off (stage 1 keeps the panel
      * scanning), so the image is complete when it comes back on. */
-    if (!ctx->FbVa || !ctx->Active || !ctx->Visible || ctx->SystemDisplay) return STATUS_SUCCESS;
+    if (!ctx->FbVa || !ctx->Visible[sid] || ctx->SystemDisplay) return STATUS_SUCCESS;
+    toPanel = ctx->Active && ctx->PanelSrc == sid;
+    toTv = ctx->Extend ? (ctx->TvSrc == sid) : toPanel;   /* without Extend: the 1.3.0 mirror */
+    if (!toPanel && !toTv) return STATUS_SUCCESS;
     if (pPresent->BytesPerPixel != 4 || pPresent->Pitch <= 0 || !pPresent->pSource) {
         st = STATUS_INVALID_PARAMETER;
         goto out;
     }
 
     /* Surface shape: for 90/270 with Flags.Rotate the DWM surface is the mode
-     * size swapped (1280x720), as in the Basic Display sample. */
-    rot = pPresent->Flags.Rotate ? ctx->Rotation : D3DKMDT_VPPR_IDENTITY;
-    if (IsRotated(rot)) { ws = (LONG)ctx->SrcHeight; hs = (LONG)ctx->SrcWidth; }
-    else                { ws = (LONG)ctx->SrcWidth;  hs = (LONG)ctx->SrcHeight; }
+     * size swapped (1280x720), as in the Basic Display sample. Only the
+     * panel path rotates. */
+    srcRot = (sid == ctx->PanelSrc) ? ctx->Rotation : D3DKMDT_VPPR_IDENTITY;
+    rot = pPresent->Flags.Rotate ? srcRot : D3DKMDT_VPPR_IDENTITY;
+    if (IsRotated(rot)) { ws = (LONG)ctx->SrcH[sid]; hs = (LONG)ctx->SrcW[sid]; }
+    else                { ws = (LONG)ctx->SrcW[sid]; hs = (LONG)ctx->SrcH[sid]; }
 
     for (i = 0; i < pPresent->NumMoves; i++) GrowBounds(&top, &bottom, &pPresent->pMoves[i].DestRect);
     for (i = 0; i < pPresent->NumDirtyRects; i++) GrowBounds(&top, &bottom, &pPresent->pDirtyRect[i]);
@@ -2200,24 +2374,29 @@ NTSTATUS SwdPresentDisplayOnly(IN_CONST_HANDLE hAdapter, IN_CONST_PDXGKARG_PRESE
     if (src) {
         /* The source already holds the final image, so a move is copied
          * from the source at its destination like a dirty rect. */
-        for (i = 0; i < pPresent->NumMoves; i++) BltRect(ctx, src, top, pPresent->Pitch, pPresent->pMoves[i].DestRect, ws, hs, rot);
-        for (i = 0; i < pPresent->NumDirtyRects; i++) BltRect(ctx, src, top, pPresent->Pitch, pPresent->pDirtyRect[i], ws, hs, rot);
-        TvLock(ctx);
-        if (ctx->TvVa) {
-            /* The TV gets the picture upright: with Flags.Rotate the surface is
-             * upright already; without it the rotation is baked in (1.4.3). */
-            D3DKMDT_VIDPN_PRESENT_PATH_ROTATION baked = pPresent->Flags.Rotate ? D3DKMDT_VPPR_IDENTITY : ctx->Rotation;
-            LONG tw = IsRotated(baked) ? hs : ws, th = IsRotated(baked) ? ws : hs;
-            if (tw != ctx->TvLastW || th != ctx->TvLastH) {
-                TvClear(ctx);
-                ctx->TvLastW = tw;
-                ctx->TvLastH = th;
-            }
-            for (i = 0; i < pPresent->NumMoves; i++) TvBlt(ctx, src, top, pPresent->Pitch, pPresent->pMoves[i].DestRect, ws, hs, baked);
-            for (i = 0; i < pPresent->NumDirtyRects; i++) TvBlt(ctx, src, top, pPresent->Pitch, pPresent->pDirtyRect[i], ws, hs, baked);
-            InterlockedIncrement(&ctx->TvPresents);
+        if (toPanel) {
+            for (i = 0; i < pPresent->NumMoves; i++) BltRect(ctx, src, top, pPresent->Pitch, pPresent->pMoves[i].DestRect, ws, hs, rot);
+            for (i = 0; i < pPresent->NumDirtyRects; i++) BltRect(ctx, src, top, pPresent->Pitch, pPresent->pDirtyRect[i], ws, hs, rot);
         }
-        TvUnlock(ctx);
+        if (toTv) {
+            TvLock(ctx);
+            if (ctx->TvVa) {
+                /* The TV gets the picture upright: with Flags.Rotate the surface is
+                 * upright already; without it the rotation is baked in (1.4.3). */
+                D3DKMDT_VIDPN_PRESENT_PATH_ROTATION baked = pPresent->Flags.Rotate ? D3DKMDT_VPPR_IDENTITY : srcRot;
+                LONG tw = IsRotated(baked) ? hs : ws, th = IsRotated(baked) ? ws : hs;
+                if (tw != ctx->TvLastW || th != ctx->TvLastH) {
+                    TvClear(ctx);
+                    ctx->TvLastW = tw;
+                    ctx->TvLastH = th;
+                }
+                for (i = 0; i < pPresent->NumMoves; i++) TvBlt(ctx, src, top, pPresent->Pitch, pPresent->pMoves[i].DestRect, ws, hs, baked);
+                for (i = 0; i < pPresent->NumDirtyRects; i++) TvBlt(ctx, src, top, pPresent->Pitch, pPresent->pDirtyRect[i], ws, hs, baked);
+                InterlockedIncrement(&ctx->TvPresents);
+                if (!toPanel) InterlockedIncrement(&ctx->TvSrcPresents);
+            }
+            TvUnlock(ctx);
+        }
         KeMemoryBarrier();
     } else {
         st = STATUS_INSUFFICIENT_RESOURCES;
