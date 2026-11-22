@@ -12,6 +12,9 @@
   -Mode RotateTest : lists the display modes, then rotates with
                      ChangeDisplaySettingsEx (the API SwitchCenter uses) to 90,
                      180, 270 and back, 4 s each, printing each result code.
+  -Mode ExtendOff  : 1.7.0: TvExtend=0, the TV only mirrors the panel (one
+                     display, as 1.6.2). Takes effect after a restart.
+  -Mode ExtendOn   : 1.7.0: TvExtend=1 (default), the TV is a second display.
   -Mode Remove     : removes the driver package (and the old test root device).
                      Windows goes back to the Microsoft Basic Display Driver
                      after a restart.
@@ -19,7 +22,7 @@
   Log: C:\SwitchWOA-Display.txt
   This file must stay ASCII: Windows PowerShell 5.1 reads it as the ANSI code page.
 #>
-param([Parameter(Mandatory = $true)][ValidateSet('Report', 'Install', 'Status', 'Remove', 'RotateTest', 'GuardReset')][string]$Mode)
+param([Parameter(Mandatory = $true)][ValidateSet('Report', 'Install', 'Status', 'Remove', 'RotateTest', 'GuardReset', 'ExtendOff', 'ExtendOn')][string]$Mode)
 
 $ErrorActionPreference = 'Continue'
 $Sys = Join-Path $env:windir 'Sysnative'
@@ -108,6 +111,13 @@ function Show-Adapters {
   if ($found -eq 0) { Sum 'adapter: none found in the registry (ROOT, ACPI, SWD)' }
   Log '  pnputil /enum-devices /class Display:'
   (& $Pnputil /enum-devices /class Display 2>&1) | ForEach-Object { Log "    $_" }
+  # 1.7.0: the screens Windows uses (the TV is one of them when extended)
+  try {
+    Add-Type -AssemblyName System.Windows.Forms
+    foreach ($sc in [System.Windows.Forms.Screen]::AllScreens) {
+      Sum ('screen: {0}  {1}x{2} at ({3},{4})  primary {5}' -f $sc.DeviceName, $sc.Bounds.Width, $sc.Bounds.Height, $sc.Bounds.X, $sc.Bounds.Y, $sc.Primary)
+    }
+  } catch { Log "  screens: $($_.Exception.Message)" }
 }
 
 function Show-Trace {
@@ -129,6 +139,10 @@ function Show-Trace {
     if ($null -ne $p.TvAudioState) {
       # 1.6.0: 1 off (TvAudio=0), 2 mapping failed, 3 SOR1 clock off, 4 SOR partition off, 5 no link, 6 on, 7 off after unplug
       Sum ('TV audio (SOR1): state {0} (6 = on)  HDA clocks before 0x{1:X}  link 0x{2:X} (code/lanes/EF)  h/v blank symbols 0x{3:X8}  codec dev id 0x{4:X}  DP_AUDIO_CTRL 0x{5:X8}' -f $p.TvAudioState, [uint32]$p.TvAudioClocks, [uint32]$p.TvAudioLink, [uint32]$p.TvAudioSym, [uint32]$p.TvAudioDevId, [uint32]$p.TvAudioCtrl)
+    }
+    if ($null -ne $p.ExtendOn) {
+      $src = { param($v) if ($null -eq $v) { '-' } elseif ([uint32]$v -eq 255) { 'none' } else { "source $v" } }
+      Sum ('TV as 2nd display (1.7.0): {0}  connected {1}  buffer {2}x{3}  panel <- {4}  TV <- {5}  source 1 {6}x{7}  presents only to TV {8}  hot-plug reports {9} (last 0x{10:X8})' -f $(if ($p.ExtendOn) { 'on' } else { 'off (TvExtend=0: mirror)' }), $p.TvConnected, $p.TvBufW, $p.TvBufH, (& $src $p.PanelSrc), (& $src $p.TvSrc), $p.Src1Width, $p.Src1Height, $p.TvSrcPresents, $p.TvIndicates, [uint32]$p.TvIndicateSt)
     }
     Sum ('TV hot-plug: notes {0}  bring-ups OK {1}  unplugs {2}  failures {3}  last step 0x{4:X} (5 = TV on, 0x10N = stuck in stage N)  callback 0x{5:X}' -f $p.DpNotes, $p.DpUps, $p.DpDowns, $p.DpFails, $p.DpLastStep, [uint32]$p.DpRegister)
     if ($p.TvLog) { Log '--- TV bring-up log (last attempt)'; foreach ($l in ($p.TvLog -split "`r?`n")) { if ($l) { Log ('  ' + $l) } } }
@@ -219,6 +233,16 @@ function Show-Events {
 switch ($Mode) {
   'Report' { Show-Report }
   'Status' { Show-Adapters; Log ''; Show-Trace; Show-Events }
+  'ExtendOff' {
+    if (-not (Test-Path $Key)) { New-Item -Path $Key -Force | Out-Null }
+    Set-ItemProperty -Path $Key -Name TvExtend -Value 0 -Type DWord
+    Sum 'TvExtend = 0: after a restart the TV mirrors the panel again (one display).'
+  }
+  'ExtendOn' {
+    if (-not (Test-Path $Key)) { New-Item -Path $Key -Force | Out-Null }
+    Set-ItemProperty -Path $Key -Name TvExtend -Value 1 -Type DWord
+    Sum 'TvExtend = 1: after a restart the TV is a second display.'
+  }
   'GuardReset' {
     # 1.6.2: clears the boot-loop guard (StartPending). Before 1.6.2 it never cleared itself.
     if (-not (Test-Path $Key)) { New-Item -Path $Key -Force | Out-Null }
