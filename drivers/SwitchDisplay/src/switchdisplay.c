@@ -53,6 +53,9 @@
  *     1.6.1: TvAudioState is reset to 0 at every start, so switchaudio can
  *     read it (6 = on, 7 = off after unplug) next to the codec's pin sense,
  *     which stayed 0 after an unplug and re-plug with 1.6.0.
+ *   - 1.6.2: the boot-loop guard refuses one start and then lets the next
+ *     one try (it latched for good before: after quick restarts the TV kept
+ *     UEFI's portrait picture and got no audio set-up).
  *
  * Trace: HKLM\SYSTEM\CurrentControlSet\Services\switchdisplay\Parameters
  */#define DXGKDDI_INTERFACE_VERSION 0x4002 /* DXGKDDI_INTERFACE_VERSION_WDDM1_3 */
@@ -61,7 +64,7 @@
 #include <ntstrsafe.h>
 #include <stdarg.h>
 
-#define SWD_VERSION        0x00010601u   /* 1.6.1 */
+#define SWD_VERSION        0x00010602u   /* 1.6.2 */
 #define SWD_TAG            'DwsS'
 
 /* Boot framebuffer (coreboot display.c / UEFI MemoryMap.h "Display Reserved") */
@@ -1086,7 +1089,7 @@ static VOID DpBringUp(PSWD_CONTEXT Ctx)
     mR426Ok = FALSE; mR427Ok = FALSE; mR429Ok = FALSE;
     mR426Step = NULL; mR427Step = NULL; mR429Step = NULL;
     mR426Hpd = FALSE; mR426DpcdOk = FALSE; mR426EdidOk = FALSE;
-    DpLog(L"switchdisplay 1.6.1 DP Alt bring-up (attempt %u)\r\n", Ctx->DpFails + 1);
+    DpLog(L"switchdisplay 1.6.2 DP Alt bring-up (attempt %u)\r\n", Ctx->DpFails + 1);
     if (!DpMap()) {
         DpLog(L"register mapping failed\r\n");
     } else {
@@ -1308,6 +1311,10 @@ NTSTATUS SwdStartDevice(IN_CONST_PVOID MiniportDeviceContext, IN_PDXGK_START_INF
     if (pending >= 2 && RegGetDword(L"IgnoreGuard", 0) == 0) {
         RegPutDword(L"GuardTripped", RegGetDword(L"GuardTripped", 0) + 1);
         RegPutDword(L"LastStartStatus", (ULONG)STATUS_RETRY);
+        /* 1.6.2: refuse this start only. Before, the guard never cleared
+         * itself (the clear needs a start that runs 60 s), so after a few
+         * quick restarts the driver stayed off for good. */
+        RegPutDword(L"StartPending", 0);
         return STATUS_UNSUCCESSFUL;
     }
     RegPutDword(L"StartPending", pending + 1);

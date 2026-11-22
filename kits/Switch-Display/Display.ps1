@@ -19,7 +19,7 @@
   Log: C:\SwitchWOA-Display.txt
   This file must stay ASCII: Windows PowerShell 5.1 reads it as the ANSI code page.
 #>
-param([Parameter(Mandatory = $true)][ValidateSet('Report', 'Install', 'Status', 'Remove', 'RotateTest')][string]$Mode)
+param([Parameter(Mandatory = $true)][ValidateSet('Report', 'Install', 'Status', 'Remove', 'RotateTest', 'GuardReset')][string]$Mode)
 
 $ErrorActionPreference = 'Continue'
 $Sys = Join-Path $env:windir 'Sysnative'
@@ -219,10 +219,17 @@ function Show-Events {
 switch ($Mode) {
   'Report' { Show-Report }
   'Status' { Show-Adapters; Log ''; Show-Trace; Show-Events }
+  'GuardReset' {
+    # 1.6.2: clears the boot-loop guard (StartPending). Before 1.6.2 it never cleared itself.
+    if (-not (Test-Path $Key)) { New-Item -Path $Key -Force | Out-Null }
+    Set-ItemProperty -Path $Key -Name StartPending -Value 0 -Type DWord
+    Sum 'boot-loop guard cleared (StartPending = 0). Restart Windows now; the driver starts at the next boot.'
+  }
   'Install' {
     if (-not [Environment]::Is64BitProcess) { Sum 'This PowerShell is not 64-bit (ARM64); run Install.cmd from Explorer.'; break }
     $inf = Join-Path $Here 'switchdisplay.inf'
     if (-not (Test-Path $inf)) { Sum "missing: $inf"; break }
+    if (Test-Path $Key) { Set-ItemProperty -Path $Key -Name StartPending -Value 0 -Type DWord }   # 1.6.2: a fresh install starts clean
     # DISP must have been seen once (UEFI R408). Booted with an older UEFI, the
     # package is only staged and the next R408 boot installs it.
     $acpi = @(Get-ChildItem 'HKLM:\SYSTEM\CurrentControlSet\Enum\ACPI\SWOA0E01' -ErrorAction SilentlyContinue)
