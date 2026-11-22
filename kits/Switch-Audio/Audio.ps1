@@ -10,10 +10,15 @@
                   Windows audio engine (TestTone=1, then the device restarts), then report
   -Mode Check   : plays a Windows sound through the audio engine, lists audio errors from the
                   event logs (last hour), then report
+  -Mode TvTone  : (1.1.1+) the driver plays one second of 1 kHz to the TV from its own buffer
+                  (TvTestTone=1, picked up by the driver within a second), then report
+  -Mode TvReset : (1.1.0+) clears TvPending (set when a start hung in the TV part), restarts the device
+  -Mode TvOff   : (1.1.0+) TvAudioOff = 1: the driver leaves the HDA alone from the next boot (speaker only)
+  -Mode TvOn    : (1.1.0+) TvAudioOff = 0: TV audio again from the next boot
 
   Log: C:\SwitchWOA-Audio.txt
 #>
-param([Parameter(Mandatory = $true)][ValidateSet('Install', 'Status', 'Remove', 'Tone', 'Check')][string]$Mode)
+param([Parameter(Mandatory = $true)][ValidateSet('Install', 'Status', 'Remove', 'Tone', 'Check', 'TvTone', 'TvReset', 'TvOff', 'TvOn')][string]$Mode)
 
 $ErrorActionPreference = 'Continue'
 # Windows PowerShell on Windows 10 ARM64 is x86: reach System32 via Sysnative.
@@ -42,6 +47,7 @@ function Show-Status {
     # 1.0.0.4: CallLog digits: 1 NewStream 2 SetFormat 3 AllocateAudioBuffer 4 FreeAudioBuffer
     # 5 GetHWLatency 6 GetPositionRegister 7 GetClockRegister 8 GetPosition 9 SetState A freed.
     foreach ($q in $props) {
+      if ($q.Name -match '^Tv') { continue }
       if ($q.Name -match '^(ToneBefore|Tone|Run100|Run0|Start|Stop)(Adma\w*|Xbar|I2s\w*)$') {
         if (-not $snap[$Matches[1]]) { $snap[$Matches[1]] = @() }
         $snap[$Matches[1]] += ('{0}=0x{1:X}' -f $Matches[2], $q.Value)
@@ -67,7 +73,32 @@ function Show-Status {
     } elseif ($null -ne $p.JackSpb -and $p.JackSpb -ne 0) {
       Log ("JACK: off, the codec could not be opened over I2C (0x{0:X})." -f $p.JackSpb)
     }
+    # 1.1.0: the TV (HDA). TvStage: 0x20 SOR partition off, 0x21/0x22 controller reset stuck,
+    # 0x23 no codec, 0x24 codec does not answer, 0x25/0x26 widgets not found, 0x2C hda clock off,
+    # 0x2D skipped (the last start hung; -Mode TvReset), 0x2E no memory, 0x2F TvAudioOff=1,
+    # 0x30 controller, 0x31 codec ready, 0x32 TV endpoint registered.
+    $tv = @($props | Where-Object { $_.Name -match '^Tv' } | ForEach-Object { '{0}=0x{1:X}' -f $_.Name, $_.Value })
+    if ($tv.Count) { Log ('TV trace: ' + ($tv -join ' ')) }
+    if ($null -ne $p.TvStage) {
+      switch ($p.TvStage) {
+        0x32 { Log ("TV: endpoint registered, TV {0} (codec 0x{1:X})" -f $(if ($p.TvPresent -eq 1) { 'connected' } else { 'not connected' }), [uint32]$p.TvVendor) }
+        0x2D { Log 'TV: skipped, the last start did not finish. Run -Mode TvReset to try again.' }
+        default { Log ("TV: stopped at stage 0x{0:X}" -f $p.TvStage) }
+      }
+    }
   } else { Log 'driver trace: (no Parameters key)' }
+  # 1.1.1: every render endpoint Windows knows, with its state (also unplugged/disabled ones).
+  $mm = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\MMDevices\Audio\Render'
+  $states = @{ 1 = 'active'; 2 = 'disabled'; 4 = 'not present'; 8 = 'unplugged' }
+  foreach ($k in @(Get-ChildItem $mm -ErrorAction SilentlyContinue)) {
+    $st = (Get-ItemProperty $k.PSPath -ErrorAction SilentlyContinue).DeviceState
+    $pp = Get-ItemProperty (Join-Path $k.PSPath 'Properties') -ErrorAction SilentlyContinue
+    $name = $pp.'{a45c254e-df1c-4efd-8020-67d146a850e0},2'
+    $dev = $pp.'{b3f8fa53-0004-438e-9003-51a46e139bfc},6'
+    $s2 = $states[[int]($st -band 0xF)]
+    if (-not $s2) { $s2 = 'state' }
+    Log ("render endpoint: '{0}' ({1})  {2} 0x{3:X}" -f $name, $dev, $s2, [uint32]$st)
+  }
   $ep = @(Get-CimInstance Win32_PnPEntity -ErrorAction SilentlyContinue | Where-Object { $_.PNPClass -eq 'AudioEndpoint' })
   foreach ($e in $ep) { Log ("endpoint: '{0}' status={1} problem={2}" -f $e.Name, $e.Status, $e.ConfigManagerErrorCode) }
   if ($ep.Count -eq 0) { Log 'endpoint: none' }
@@ -111,6 +142,31 @@ switch ($Mode) {
     foreach ($d in $dev) { Log (& $Pnputil /restart-device $d.PNPDeviceID | Out-String) }
     Log 'Listen: a one-second 1 kHz tone should play now.'
     Start-Sleep -Seconds 3
+    Show-Status
+  }
+  'TvTone' {
+    if (-not (Test-Path $Key)) { New-Item -Path $Key | Out-Null }
+    Set-ItemProperty -Path $Key -Name TvTestTone -Value 1 -Type DWord
+    # 1.1.1: the driver's jack thread picks it up within a second (no device restart).
+    Log 'Listen: a one-second 1 kHz tone should play on the TV now.'
+    Start-Sleep -Seconds 4
+    Show-Status
+  }
+  'TvOff' {
+    if (-not (Test-Path $Key)) { New-Item -Path $Key | Out-Null }
+    Set-ItemProperty -Path $Key -Name TvAudioOff -Value 1 -Type DWord
+    Log 'TV audio OFF from the next boot (TvAudioOff = 1). Restart Windows now.'
+  }
+  'TvOn' {
+    if (-not (Test-Path $Key)) { New-Item -Path $Key | Out-Null }
+    Set-ItemProperty -Path $Key -Name TvAudioOff -Value 0 -Type DWord
+    Log 'TV audio ON from the next boot (TvAudioOff = 0). Restart Windows now.'
+  }
+  'TvReset' {
+    if (Test-Path $Key) { Set-ItemProperty -Path $Key -Name TvPending -Value 0 -Type DWord }
+    $dev = @(Get-CimInstance Win32_PnPEntity -ErrorAction SilentlyContinue | Where-Object { $_.PNPDeviceID -like 'ACPI\SWOA0C01*' })
+    foreach ($d in $dev) { Log (& $Pnputil /restart-device $d.PNPDeviceID | Out-String) }
+    Start-Sleep -Seconds 4
     Show-Status
   }
   'Remove' {

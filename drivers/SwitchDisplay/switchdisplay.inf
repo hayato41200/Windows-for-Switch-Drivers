@@ -9,7 +9,7 @@ Class       = Display
 ClassGuid   = {4d36e968-e325-11ce-bfc1-08002be10318}
 Provider    = %Mfg%
 CatalogFile = switchdisplay.cat
-DriverVer   = 11/20/2026,1.5.0.0
+DriverVer   = 11/22/2026,1.6.2.0
 PnpLockdown = 1
 
 [DestinationDirs]

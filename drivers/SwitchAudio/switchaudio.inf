@@ -1,5 +1,6 @@
 ;
-; switchaudio.inf - Nintendo Switch audio (speaker): Tegra210 ADMA/AHUB/I2S1 + ALC5639, PortCls WaveRT
+; switchaudio.inf - Nintendo Switch audio: speaker (Tegra210 ADMA/AHUB/I2S1 + ALC5639) and, since 1.1.0,
+; the TV over USB-C DP (Tegra HDA + its HDMI/DP codec), PortCls WaveRT
 ;
 
 [Version]
@@ -8,7 +9,7 @@ Class       = MEDIA
 ClassGuid   = {4d36e96c-e325-11ce-bfc1-08002be10318}
 Provider    = %Mfg%
 CatalogFile = switchaudio.cat
-DriverVer   = 11/02/2026,1.0.0.7
+DriverVer   = 11/21/2026,1.1.3.0
 PnpLockdown = 1
 
 [DestinationDirs]
@@ -45,6 +46,11 @@ AddInterface = %KSCATEGORY_RENDER%,   %KSNAME_Wave%,     SwAud_Wave
 AddInterface = %KSCATEGORY_REALTIME%, %KSNAME_Wave%,     SwAud_Wave
 AddInterface = %KSCATEGORY_AUDIO%,    %KSNAME_Topology%, SwAud_Topo
 AddInterface = %KSCATEGORY_TOPOLOGY%, %KSNAME_Topology%, SwAud_Topo
+AddInterface = %KSCATEGORY_AUDIO%,    %KSNAME_TvWave%,     SwAud_TvWave
+AddInterface = %KSCATEGORY_RENDER%,   %KSNAME_TvWave%,     SwAud_TvWave
+AddInterface = %KSCATEGORY_REALTIME%, %KSNAME_TvWave%,     SwAud_TvWave
+AddInterface = %KSCATEGORY_AUDIO%,    %KSNAME_TvTopology%, SwAud_TvTopo
+AddInterface = %KSCATEGORY_TOPOLOGY%, %KSNAME_TvTopology%, SwAud_TvTopo
 
 [SwAud_Wave]
 AddReg = SwAud_Wave_AddReg
@@ -59,6 +65,20 @@ AddReg = SwAud_Topo_AddReg
 [SwAud_Topo_AddReg]
 HKR,,CLSID,,%Proxy.CLSID%
 HKR,,FriendlyName,,%TopoDesc%
+
+[SwAud_TvWave]
+AddReg = SwAud_TvWave_AddReg
+
+[SwAud_TvWave_AddReg]
+HKR,,CLSID,,%Proxy.CLSID%
+HKR,,FriendlyName,,%TvWaveDesc%
+
+[SwAud_TvTopo]
+AddReg = SwAud_TvTopo_AddReg
+
+[SwAud_TvTopo_AddReg]
+HKR,,CLSID,,%Proxy.CLSID%
+HKR,,FriendlyName,,%TvTopoDesc%
 
 [SwAud_Inst.NT.Services]
 AddService = switchaudio, 0x00000002, SwAud_Service
@@ -77,6 +97,8 @@ DeviceDesc          = "Nintendo Switch Audio"
 ServiceDesc         = "Nintendo Switch Audio"
 WaveDesc            = "Nintendo Switch Speaker Wave"
 TopoDesc            = "Nintendo Switch Speaker Topology"
+TvWaveDesc          = "Nintendo Switch TV Wave"
+TvTopoDesc          = "Nintendo Switch TV"
 KSCATEGORY_AUDIO    = "{6994AD04-93EF-11D0-A3CC-00A0C9223196}"
 KSCATEGORY_RENDER   = "{65E8773E-8F56-11D0-A3B9-00A0C9223196}"
 KSCATEGORY_REALTIME = "{EB115FFC-10C8-4964-831D-6DCB02E6F23F}"
@@ -84,3 +106,5 @@ KSCATEGORY_TOPOLOGY = "{DDA54A40-1E4C-11D1-A050-405705C10000}"
 Proxy.CLSID         = "{17CCA71B-ECD7-11D0-B908-00A0C9223196}"
 KSNAME_Wave         = "Wave"
 KSNAME_Topology     = "Topology"
+KSNAME_TvWave       = "TvWave"
+KSNAME_TvTopology   = "TvTopology"
