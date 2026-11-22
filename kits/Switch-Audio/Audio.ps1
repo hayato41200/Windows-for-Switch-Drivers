@@ -13,10 +13,12 @@
   -Mode TvTone  : (1.1.1+) the driver plays one second of 1 kHz to the TV from its own buffer
                   (TvTestTone=1, picked up by the driver within a second), then report
   -Mode TvReset : (1.1.0+) clears TvPending (set when a start hung in the TV part), restarts the device
+  -Mode TvOff   : (1.1.0+) TvAudioOff = 1: the driver leaves the HDA alone from the next boot (speaker only)
+  -Mode TvOn    : (1.1.0+) TvAudioOff = 0: TV audio again from the next boot
 
   Log: C:\SwitchWOA-Audio.txt
 #>
-param([Parameter(Mandatory = $true)][ValidateSet('Install', 'Status', 'Remove', 'Tone', 'Check', 'TvTone', 'TvReset')][string]$Mode)
+param([Parameter(Mandatory = $true)][ValidateSet('Install', 'Status', 'Remove', 'Tone', 'Check', 'TvTone', 'TvReset', 'TvOff', 'TvOn')][string]$Mode)
 
 $ErrorActionPreference = 'Continue'
 # Windows PowerShell on Windows 10 ARM64 is x86: reach System32 via Sysnative.
@@ -149,6 +151,16 @@ switch ($Mode) {
     Log 'Listen: a one-second 1 kHz tone should play on the TV now.'
     Start-Sleep -Seconds 4
     Show-Status
+  }
+  'TvOff' {
+    if (-not (Test-Path $Key)) { New-Item -Path $Key | Out-Null }
+    Set-ItemProperty -Path $Key -Name TvAudioOff -Value 1 -Type DWord
+    Log 'TV audio OFF from the next boot (TvAudioOff = 1). Restart Windows now.'
+  }
+  'TvOn' {
+    if (-not (Test-Path $Key)) { New-Item -Path $Key | Out-Null }
+    Set-ItemProperty -Path $Key -Name TvAudioOff -Value 0 -Type DWord
+    Log 'TV audio ON from the next boot (TvAudioOff = 0). Restart Windows now.'
   }
   'TvReset' {
     if (Test-Path $Key) { Set-ItemProperty -Path $Key -Name TvPending -Value 0 -Type DWord }
