@@ -39,7 +39,7 @@
 #include <wdf.h>
 #include <spb.h>
 
-#define SWGPU_VERSION      0x00000438u   /* 0.4.56 */
+#define SWGPU_VERSION      0x00000449u   /* 0.4.73 */
 
 #define CAR_PHYS           0x60006000ull
 #define CAR_LEN            0x1000u
@@ -48,6 +48,8 @@
 #define MC_PHYS            0x70019000ull
 #define MC_LEN             0x1000u
 #define BAR0_MAP_LEN       0x1000000u   /* Claude: full 16 MB BAR0 (ACPI); GR/FECS are at 0x400000+ */
+#define BAR1_D3_LOW_VA     0x00100000u
+#define BAR1_D3_MAP_LEN    (BAR1_D3_LOW_VA + PAGE_SIZE)
 
 #define CAR_CLK_OUT_ENB_H  0x014
 #define CAR_CLK_ENB_H_SET  0x328
@@ -153,6 +155,10 @@ typedef struct _SWGPU_DEVICE {
     PHYSICAL_ADDRESS Bar0Phys;
     ULONG          Bar0Len;
     volatile UCHAR *Bar0;
+    PHYSICAL_ADDRESS Bar1Phys;
+    ULONG          Bar1Len;
+    ULONG          Bar1MapLen;
+    volatile UCHAR *Bar1Cpu;
     volatile UCHAR *Car;
     volatile UCHAR *Pmc;
     volatile UCHAR *Mc;
@@ -1094,6 +1100,11 @@ static VOID ProbeB2a(PSWGPU_DEVICE Dev)
 #define GR_VM_GPU_PGT_OFF  0x190000u
 #define GR_VM_INST_OFF     0x1D0000u
 #define GR_VM_SMMU_PGT_OFF 0x1D1000u
+#define GR_VM_D2_USERD_OFF 0x1D2000u
+#define GR_VM_D2_GPFIFO_OFF 0x1D3000u
+#define GR_VM_D2_RUNLIST_OFF 0x1D4000u
+#define GR_VM_D2_PUSHBUF_OFF 0x1D5000u
+#define GR_VM_GPU_PGT_BAR1_OFF 0x1A0000u /* spare 64 KiB-aligned segment within the PGT backing */
 #define GR_VM_GPU_VA       0x18000000u
 #define GR_VM_PAGE_COUNT   (GR_VM_ARENA_SIZE >> 12)
 
@@ -2647,8 +2658,9 @@ static ULONG B3cPrepareGrContext(PSWGPU_DEVICE Dev, ULONG goldenBytes,
     PHYSICAL_ADDRESS low, high, boundary, acrArenaPa, smmuPtPa;
     volatile UCHAR *B = Dev->Bar0;
     volatile ULONG *smmuPd = NULL, *smmuPt = NULL;
-    ULONGLONG *gpuPgd, *gpuPgt, *inst;
+    ULONGLONG *gpuPgd, *gpuPgt, *bar1GpuPgt, *inst;
     ULONG pmcEnable, result = 0, i, pageCount = GR_VM_PAGE_COUNT;
+    ULONG failPoint = 0u, allocRetry = 0u;
     ULONG grWindowBase, grPageFirst, grPteExpected, grPteRead;
     ULONG outerPdeExpected, outerPdeRead, gpuPteIndex, gpuPdeIndex, outerBadIndex = 0xFFFFFFFFu;
     ULONG gpuBadIndex = 0xFFFFFFFFu;
@@ -2660,7 +2672,8 @@ static ULONG B3cPrepareGrContext(PSWGPU_DEVICE Dev, ULONG goldenBytes,
     ULONG sample[8][3] = { 0 }, sampleCount = 0;
     ULONG backingSample[16][3] = { 0 };
     ULONG instPdbLo, instPdbHi, instLimitLo, instLimitHi;
-    ULONGLONG gpuPdb, gpuPdeExpected, wfiGpuVa;
+    ULONG bar1PdeIndex, bar1PteIndex;
+    ULONGLONG gpuPdb, gpuPdeExpected, wfiGpuVa, bar1PdeExpected, bar1PteExpected;
     ULONG *instWords;
     BOOLEAN smmuEnabled;
 
@@ -2669,10 +2682,10 @@ static ULONG B3cPrepareGrContext(PSWGPU_DEVICE Dev, ULONG goldenBytes,
     g_GrVm.Attempted = TRUE;
     pmcEnable = Rd(B, NV_PMC_ENABLE);
     Trace(L"B3cC2dPmcEnable", pmcEnable);
-    if (!(pmcEnable & (1u << 12))) { result = 0xE0000089u; goto done; }
+    if (!(pmcEnable & (1u << 12))) { failPoint = 1u; result = 0xE0000089u; goto done; }
     if (!g_AcrVm.Active || goldenBytes == 0 || zcullBytes == 0 || pmBytes == 0 ||
         goldenBytes > 0x20000u || zcullBytes > 0x20000u || pmBytes > 0x10000u) {
-        result = 0xE0000089u; goto done;
+        failPoint = 2u; result = 0xE0000089u; goto done;
     }
 
     /* GM20B gr_gm20b_calc_global_ctx_buffer_size(): beta is 0x400 + half,
@@ -2696,8 +2709,10 @@ static ULONG B3cPrepareGrContext(PSWGPU_DEVICE Dev, ULONG goldenBytes,
     Trace(L"B3cC2dZcullAligned", zcullAligned);
     Trace(L"B3cC2dPmAligned", pmAligned);
     if (attribBytes != 0x48000u || bundleBytes != 0x1800u || pagepoolBytes != 0x8000u ||
-        GR_VM_PM_OFF + pmAligned > GR_VM_ARENA_SIZE) {
-        result = 0xE0000089u; goto done;
+        GR_VM_PM_OFF + pmAligned > GR_VM_ARENA_SIZE ||
+        GR_VM_GPU_PGT_BAR1_OFF + PAGE_SIZE > GR_VM_INST_OFF ||
+        ((BAR1_D3_LOW_VA >> 12) & 0x7FFFu) >= PAGE_SIZE / sizeof(ULONGLONG)) {
+        failPoint = 3u; result = 0xE0000089u; goto done;
     }
 
     low.QuadPart = 0;
@@ -2705,19 +2720,25 @@ static ULONG B3cPrepareGrContext(PSWGPU_DEVICE Dev, ULONG goldenBytes,
     boundary.QuadPart = ACR_SMMU_WINDOW;
     g_GrVm.Arena = MmAllocateContiguousMemorySpecifyCache(
         GR_VM_ARENA_SIZE, low, high, boundary, MmNonCached);
-    if (g_GrVm.Arena == NULL) { result = 0xE0000089u; goto done; }
+    if (g_GrVm.Arena == NULL) {
+        allocRetry = 1u;
+        g_GrVm.Arena = MmAllocateContiguousMemorySpecifyCache(
+            GR_VM_ARENA_SIZE, low, high, boundary, MmNonCached);
+        Trace(L"B3cC2dAllocRetry", allocRetry);
+        if (g_GrVm.Arena == NULL) { failPoint = 4u; result = 0xE0000089u; goto done; }
+    }
     RtlZeroMemory(g_GrVm.Arena, GR_VM_ARENA_SIZE);
     g_GrVm.Pa = MmGetPhysicalAddress(g_GrVm.Arena);
     if (g_GrVm.Pa.HighPart != 0 || (g_GrVm.Pa.LowPart & 0xFFFu) != 0 ||
         g_GrVm.Pa.LowPart > 0xFFFFFFFFu - GR_VM_ARENA_SIZE) {
-        result = 0xE0000089u; goto done;
+        failPoint = 5u; result = 0xE0000089u; goto done;
     }
     {
         PHYSICAL_ADDRESS acrPa = MmGetPhysicalAddress(g_AcrVm.Arena);
         ULONG acrEnd = acrPa.LowPart + ACR_VM_ARENA_SIZE;
         ULONG grEnd = g_GrVm.Pa.LowPart + GR_VM_ARENA_SIZE;
         if (g_GrVm.Pa.LowPart < acrEnd && acrPa.LowPart < grEnd) {
-            result = 0xE0000089u; goto done;
+            failPoint = 6u; result = 0xE0000089u; goto done;
         }
         Trace(L"B3cC2dArenaDistinct", 1u);
     }
@@ -2725,7 +2746,7 @@ static ULONG B3cPrepareGrContext(PSWGPU_DEVICE Dev, ULONG goldenBytes,
     g_GrVm.SmmuPteFirst = (g_GrVm.Pa.LowPart - g_GrVm.SmmuWin) >> 12;
     pageCount = GR_VM_ARENA_SIZE >> 12;
     if (g_GrVm.SmmuPteFirst + pageCount > (ACR_SMMU_WINDOW >> 12)) {
-        result = 0xE0000089u; goto done;
+        failPoint = 7u; result = 0xE0000089u; goto done;
     }
     smmuEnabled = g_AcrVm.PtbChanged ? TRUE : FALSE;
     if (smmuEnabled) {
@@ -2763,7 +2784,7 @@ static ULONG B3cPrepareGrContext(PSWGPU_DEVICE Dev, ULONG goldenBytes,
         Trace(L"B3cC2dOuterPdeBefore", g_GrVm.OldSmmuPde);
         Trace(L"B3cC2dOuterPdeExpected", outerPdeExpected);
         Trace(L"B3cC2dOuterPdeRead", outerPdeRead);
-        if (outerPdeRead != outerPdeExpected) { result = 0xE000008Au; goto done; }
+        if (outerPdeRead != outerPdeExpected) { failPoint = 8u; result = 0xE000008Au; goto done; }
         for (i = 0; i < pageCount; ++i) {
             ULONG outerExpected = ((g_GrVm.Pa.LowPart >> 12) + i) | SMMU_ATTR_RWNS;
             if (smmuPt[g_GrVm.SmmuPteFirst + i] != outerExpected) {
@@ -2773,7 +2794,7 @@ static ULONG B3cPrepareGrContext(PSWGPU_DEVICE Dev, ULONG goldenBytes,
         }
         Trace(L"B3cC2dOuterPteVerified", i);
         Trace(L"B3cC2dOuterPteBadIndex", outerBadIndex);
-        if (i != pageCount) { result = 0xE000008Au; goto done; }
+        if (i != pageCount) { failPoint = 9u; result = 0xE000008Au; goto done; }
         {
             ULONG oldPteSample[3][3];
             oldPteSample[0][0] = g_GrVm.SmmuPteFirst;
@@ -2804,6 +2825,16 @@ static ULONG B3cPrepareGrContext(PSWGPU_DEVICE Dev, ULONG goldenBytes,
     gpuPteIndex = (GR_VM_GPU_VA >> 12) & 0x7FFFu;
     for (i = 0; i < pageCount; ++i)
         gpuPgt[gpuPteIndex + i] = ((g_GrVm.Iova + ((ULONGLONG)i << 12)) >> 8) | 1ull;
+    /* Map USERD at a BAR1-visible low VA using a distinct PDE. The compact
+     * second-level table occupies a page in an otherwise unused part of the
+     * current 256 KiB PGT backing, avoiding the main mapping's PTE index 0x100. */
+    bar1PdeIndex = BAR1_D3_LOW_VA >> 27;
+    bar1PteIndex = (BAR1_D3_LOW_VA >> 12) & 0x7FFFu;
+    bar1GpuPgt = (ULONGLONG *)((PUCHAR)g_GrVm.Arena + GR_VM_GPU_PGT_BAR1_OFF);
+    bar1PdeExpected = (((ULONGLONG)g_GrVm.Iova + GR_VM_GPU_PGT_BAR1_OFF) << 24) | (5ull << 32);
+    bar1PteExpected = ((g_GrVm.Iova + GR_VM_D2_USERD_OFF) >> 8) | 1ull;
+    gpuPgd[bar1PdeIndex] = bar1PdeExpected;
+    bar1GpuPgt[bar1PteIndex] = bar1PteExpected;
     gpuPdb = ((g_GrVm.Iova + GR_VM_GPU_PGD_OFF) & ~0xFFFULL) | 4u;
     inst[0x200 / sizeof(ULONGLONG)] = gpuPdb;
     inst[0x208 / sizeof(ULONGLONG)] = 0xFFFFFFFFFFULL;
@@ -2814,7 +2845,11 @@ static ULONG B3cPrepareGrContext(PSWGPU_DEVICE Dev, ULONG goldenBytes,
     instWords[132] = (ULONG)((wfiGpuVa & 0xFFFFF000ULL) | 4u);
     instWords[133] = (ULONG)((wfiGpuVa >> 32) & 0xFFu);
     KeMemoryBarrier();
-    if (gpuPgd[gpuPdeIndex] != gpuPdeExpected) { result = 0xE000008Au; goto done; }
+    if (gpuPgd[gpuPdeIndex] != gpuPdeExpected) { failPoint = 10u; result = 0xE000008Au; goto done; }
+    if (gpuPgd[bar1PdeIndex] != bar1PdeExpected ||
+        bar1GpuPgt[bar1PteIndex] != bar1PteExpected) {
+        failPoint = 15u; result = 0xE000008Au; goto done;
+    }
     for (i = 0; i < pageCount; ++i) {
         ULONGLONG gpuPteExpected = ((g_GrVm.Iova + ((ULONGLONG)i << 12)) >> 8) | 1ull;
         if (gpuPgt[gpuPteIndex + i] != gpuPteExpected) {
@@ -2824,7 +2859,7 @@ static ULONG B3cPrepareGrContext(PSWGPU_DEVICE Dev, ULONG goldenBytes,
     }
     Trace(L"B3cC2dGpuPteVerified", i);
     Trace(L"B3cC2dGpuPteBadIndex", gpuBadIndex);
-    if (i != pageCount) { result = 0xE000008Au; goto done; }
+    if (i != pageCount) { failPoint = 11u; result = 0xE000008Au; goto done; }
 
     instPdbLo = (ULONG)inst[0x200 / sizeof(ULONGLONG)];
     instPdbHi = (ULONG)(inst[0x200 / sizeof(ULONGLONG)] >> 32);
@@ -2840,6 +2875,17 @@ static ULONG B3cPrepareGrContext(PSWGPU_DEVICE Dev, ULONG goldenBytes,
     Trace(L"B3cC2dGpuPdeExpectedHi", (ULONG)(gpuPdeExpected >> 32));
     Trace(L"B3cC2dGpuPdeReadLo", (ULONG)gpuPgd[gpuPdeIndex]);
     Trace(L"B3cC2dGpuPdeReadHi", (ULONG)(gpuPgd[gpuPdeIndex] >> 32));
+    Trace(L"B3cD3UserdAliasGpuVa", BAR1_D3_LOW_VA);
+    Trace(L"B3cD3UserdAliasPdeIndex", bar1PdeIndex);
+    Trace(L"B3cD3UserdAliasPdeExpectedLo", (ULONG)bar1PdeExpected);
+    Trace(L"B3cD3UserdAliasPdeExpectedHi", (ULONG)(bar1PdeExpected >> 32));
+    Trace(L"B3cD3UserdAliasPdeReadLo", (ULONG)gpuPgd[bar1PdeIndex]);
+    Trace(L"B3cD3UserdAliasPdeReadHi", (ULONG)(gpuPgd[bar1PdeIndex] >> 32));
+    Trace(L"B3cD3UserdAliasPteIndex", bar1PteIndex);
+    Trace(L"B3cD3UserdAliasPteExpectedLo", (ULONG)bar1PteExpected);
+    Trace(L"B3cD3UserdAliasPteExpectedHi", (ULONG)(bar1PteExpected >> 32));
+    Trace(L"B3cD3UserdAliasPteReadLo", (ULONG)bar1GpuPgt[bar1PteIndex]);
+    Trace(L"B3cD3UserdAliasPteReadHi", (ULONG)(bar1GpuPgt[bar1PteIndex] >> 32));
     Trace(L"B3cC2dGpuPdeLo", (ULONG)gpuPgd[gpuPdeIndex]);
     Trace(L"B3cC2dGpuPdeHi", (ULONG)(gpuPgd[gpuPdeIndex] >> 32));
     Trace(L"B3cC2dInstPdbLo", instPdbLo);
@@ -2882,7 +2928,7 @@ static ULONG B3cPrepareGrContext(PSWGPU_DEVICE Dev, ULONG goldenBytes,
     backingSample[15][0] = GR_VM_PM_OFF + pmAligned - 4u; backingSample[15][1] = 0;
     for (i = 0; i < RTL_NUMBER_OF(backingSample); ++i) {
         backingSample[i][2] = *(volatile ULONG *)((PUCHAR)g_GrVm.Arena + backingSample[i][0]);
-        if (backingSample[i][2] != backingSample[i][1]) result = 0xE000008Au;
+        if (backingSample[i][2] != backingSample[i][1]) { failPoint = 12u; result = 0xE000008Au; }
     }
     TraceBin(L"B3cC2dBackingSamples", backingSample, sizeof(backingSample));
 
@@ -2906,7 +2952,7 @@ static ULONG B3cPrepareGrContext(PSWGPU_DEVICE Dev, ULONG goldenBytes,
         Trace(L"B3cC2dOuterPteIndex", grPageFirst + (pageCount >> 1));
         Trace(L"B3cC2dOuterPteExpected", grPteExpected);
         Trace(L"B3cC2dOuterPteRead", grPteRead);
-        if (grPteRead != grPteExpected) { result = 0xE000008Au; goto done; }
+        if (grPteRead != grPteExpected) { failPoint = 13u; result = 0xE000008Au; goto done; }
     }
     if (instPdbLo != (ULONG)gpuPdb || instPdbHi != (ULONG)(gpuPdb >> 32) ||
         instLimitLo != 0xFFFFFFFFu || instLimitHi != 0xFFu ||
@@ -2914,12 +2960,14 @@ static ULONG B3cPrepareGrContext(PSWGPU_DEVICE Dev, ULONG goldenBytes,
         instWords[133] != (ULONG)((wfiGpuVa >> 32) & 0xFFu) ||
         sample[0][1] != sample[0][2] || sample[1][1] != sample[1][2] ||
         sample[2][1] != sample[2][2]) {
-        result = 0xE000008Au; goto done;
+        failPoint = 14u; result = 0xE000008Au; goto done;
     }
     if (result != 0u) goto done;
     g_GrVm.Active = TRUE;
 
 done:
+    Trace(L"B3cC2dFailPoint", failPoint);
+    Trace(L"B3cC2dAllocRetry", allocRetry);
     TraceDurable(L"B3cC2dResult", result);
     return result;
 }
@@ -4297,6 +4345,995 @@ done:
     return result;
 }
 
+/* D1: expose the GM20B PFIFO/PBDMA hardware setup after the golden-context
+ * path has passed.  The topology and state reads are diagnostic only.  The
+ * small write set follows Nouveau gk104_fifo_init_pbdmas(),
+ * gk208_fifo_init_pbdma_timeout(), and gk104_fifo_init(); no runlist or USERD
+ * is published until D2 owns bounded backing for those structures. */
+static ULONG B3cInitFifoD1(PSWGPU_DEVICE Dev)
+{
+    volatile UCHAR *B = Dev->Bar0;
+    ULONG result = 0;
+    ULONG topNumGpcs, topTpcPerGpc, topNumFbps, topNumLtcs;
+    ULONG topInfo[64] = { 0 };
+    ULONG topCount = RTL_NUMBER_OF(topInfo), i;
+    ULONG mcPbEnableBefore, fifoIntrBefore, fifoIntrEnBefore;
+    ULONG fifoEngineStatusBefore, fifoPbdmaStatusBefore;
+    ULONG pbdmaStatusBefore, pbdmaIntrBefore, pbdmaIntrEnBefore;
+    ULONG mcPbEnableAfter = 0, fbTimeoutBefore = 0, fbTimeoutExpected = 0;
+    ULONG fbTimeoutAfter = 0, pbdmaTimeoutBefore = 0, pbdmaTimeoutAfter = 0;
+    ULONG fifoIntrAfterClear = 0, fifoIntrEnAfter = 0;
+    ULONG writes[5][4] = { 0 };
+    ULONG grEnabled;
+
+    Step(104);
+    B3cPrivRingResetWriteLog();
+    grEnabled = Rd(B, NV_PMC_ENABLE);
+    Trace(L"B3cD1PmcEnable", grEnabled);
+
+    topNumGpcs = Rd(B, 0x0022430u);
+    topTpcPerGpc = Rd(B, 0x0022434u);
+    topNumFbps = Rd(B, 0x0022438u);
+    topNumLtcs = Rd(B, 0x0022454u);
+    Trace(L"B3cD1TopNumGpcs", topNumGpcs);
+    Trace(L"B3cD1TopTpcPerGpc", topTpcPerGpc);
+    Trace(L"B3cD1TopNumFbps", topNumFbps);
+    Trace(L"B3cD1TopNumLtcs", topNumLtcs);
+    for (i = 0; i < topCount; ++i) {
+        topInfo[i] = Rd(B, 0x0022700u + i * 4u);
+        if ((topInfo[i] & 0x80000000u) == 0u && i != 0u) {
+            ++i;
+            break;
+        }
+    }
+    topCount = i;
+    Trace(L"B3cD1TopDeviceInfoWords", topCount);
+    if (topCount != 0u) TraceBin(L"B3cD1TopDeviceInfo", topInfo, topCount * sizeof(ULONG));
+
+    mcPbEnableBefore = Rd(B, 0x00000204u);
+    fifoIntrBefore = Rd(B, 0x00002100u);
+    fifoIntrEnBefore = Rd(B, 0x00002140u);
+    fifoEngineStatusBefore = Rd(B, 0x00002640u);
+    fifoPbdmaStatusBefore = Rd(B, 0x00003080u);
+    pbdmaStatusBefore = Rd(B, 0x00040100u);
+    pbdmaIntrBefore = Rd(B, 0x00040108u);
+    pbdmaIntrEnBefore = Rd(B, 0x0004010Cu);
+    Trace(L"B3cD1McEnablePbBefore", mcPbEnableBefore);
+    Trace(L"B3cD1FifoIntr0Before", fifoIntrBefore);
+    Trace(L"B3cD1FifoIntrEn0Before", fifoIntrEnBefore);
+    Trace(L"B3cD1FifoEngineStatus0Before", fifoEngineStatusBefore);
+    Trace(L"B3cD1FifoPbdmaStatus0Before", fifoPbdmaStatusBefore);
+    Trace(L"B3cD1PbdmaStatus0Before", pbdmaStatusBefore);
+    Trace(L"B3cD1PbdmaIntr0Before", pbdmaIntrBefore);
+    Trace(L"B3cD1PbdmaIntrEn0Before", pbdmaIntrEnBefore);
+
+    if (!(grEnabled & (1u << 12))) { result = 0xE000009Fu; goto done; }
+    if (!B3cPrivRingDrainBeforeWrites(B)) { result = 0xE0000095u; goto done; }
+
+    /* GM20B exposes PBDMA0 as MC_ENABLE_PB bit 0.  Nouveau derives this mask
+     * from its runlist/device topology and writes it to 0x204. */
+    writes[0][0] = 0x00000204u; writes[0][1] = mcPbEnableBefore;
+    writes[0][2] = 0x00000001u;
+    Wr(B, writes[0][0], writes[0][2]);
+    if (!B3cPrivRingAfterGrWrite(B, writes[0][0], writes[0][2])) { result = 0xE0000095u; goto done; }
+    mcPbEnableAfter = Rd(B, writes[0][0]); writes[0][3] = mcPbEnableAfter;
+    if ((mcPbEnableAfter & 1u) == 0u) { result = 0xE000009Fu; goto done; }
+
+    /* Nouveau gk104_fifo_init_pbdmas() applies this masked FB timeout policy. */
+    fbTimeoutBefore = Rd(B, 0x00002A04u);
+    fbTimeoutExpected = (fbTimeoutBefore & ~0xBFFFFFFFu) | 0xBFFFFFFFu;
+    writes[1][0] = 0x00002A04u; writes[1][1] = fbTimeoutBefore;
+    writes[1][2] = fbTimeoutExpected;
+    Wr(B, writes[1][0], writes[1][2]);
+    if (!B3cPrivRingAfterGrWrite(B, writes[1][0], writes[1][2])) { result = 0xE0000095u; goto done; }
+    fbTimeoutAfter = Rd(B, writes[1][0]); writes[1][3] = fbTimeoutAfter;
+    if ((fbTimeoutAfter & 0xBFFFFFFFu) != 0xBFFFFFFFu) { result = 0xE000009Fu; goto done; }
+
+    /* GM20B's Nouveau function table selects gk208_fifo_init_pbdma_timeout().
+     * Its one active PBDMA gets the documented 0x0000ffff timeout value. */
+    pbdmaTimeoutBefore = Rd(B, 0x0004012Cu);
+    writes[2][0] = 0x0004012Cu; writes[2][1] = pbdmaTimeoutBefore;
+    writes[2][2] = pbdmaTimeoutBefore | 0x0000FFFFu; /* Claude: nouveau gk208_fifo_init_pbdma_timeout() masks only bits 15:0 */
+    Wr(B, writes[2][0], writes[2][2]);
+    if (!B3cPrivRingAfterGrWrite(B, writes[2][0], writes[2][2])) { result = 0xE0000095u; goto done; }
+    pbdmaTimeoutAfter = Rd(B, writes[2][0]); writes[2][3] = pbdmaTimeoutAfter;
+    if (pbdmaTimeoutAfter != writes[2][2]) { result = 0xE000009Fu; goto done; }
+
+    /* gk104_fifo_init() clears pending PFIFO causes and enables local
+     * interrupts; MC/CPU interrupt routing remains untouched for polling. */
+    writes[3][0] = 0x00002100u; writes[3][1] = fifoIntrBefore;
+    writes[3][2] = 0xFFFFFFFFu;
+    Wr(B, writes[3][0], writes[3][2]);
+    if (!B3cPrivRingAfterGrWrite(B, writes[3][0], writes[3][2])) { result = 0xE0000095u; goto done; }
+    fifoIntrAfterClear = Rd(B, writes[3][0]); writes[3][3] = fifoIntrAfterClear;
+
+    writes[4][0] = 0x00002140u; writes[4][1] = fifoIntrEnBefore;
+    writes[4][2] = 0x7FFFFFFFu;
+    Wr(B, writes[4][0], writes[4][2]);
+    if (!B3cPrivRingAfterGrWrite(B, writes[4][0], writes[4][2])) { result = 0xE0000095u; goto done; }
+    fifoIntrEnAfter = Rd(B, writes[4][0]); writes[4][3] = fifoIntrEnAfter;
+    /* Claude: only implemented bits latch (hardware 0.4.57 read 0x79810101).
+     * Require no bits outside the write and the PBDMA (29) / MMU fault (28) bits. */
+    if ((fifoIntrEnAfter & ~writes[4][2]) != 0u ||
+        (fifoIntrEnAfter & 0x30000000u) != 0x30000000u) { result = 0xE000009Fu; goto done; }
+    KeMemoryBarrier();
+
+done:
+    Trace(L"B3cD1McEnablePbAfter", mcPbEnableAfter);
+    Trace(L"B3cD1FbTimeoutBefore", fbTimeoutBefore);
+    Trace(L"B3cD1FbTimeoutExpected", fbTimeoutExpected);
+    Trace(L"B3cD1FbTimeoutAfter", fbTimeoutAfter);
+    Trace(L"B3cD1PbdmaTimeoutBefore", pbdmaTimeoutBefore);
+    Trace(L"B3cD1PbdmaTimeoutAfter", pbdmaTimeoutAfter);
+    Trace(L"B3cD1FifoIntr0AfterClear", fifoIntrAfterClear);
+    Trace(L"B3cD1FifoIntrEn0After", fifoIntrEnAfter);
+    TraceBin(L"B3cD1Writes", writes, sizeof(writes));
+    Trace(L"B3cD1Result", result);
+    B3cPrivRingTraceWriteLog(L"B3cD1PrivWriteErrorCount",
+        L"B3cD1PrivWriteErrorDropped", L"B3cD1PrivAckTimeouts",
+        L"B3cD1PrivWriteErrors");
+    return result;
+}
+
+/* A single channel uses only memory inside the C2d arena.  RAMFC offsets and
+ * values below follow MIT Nouveau gk104_chan_ramfc_write()/chan_bind(); the
+ * two-DWORD runlist entry follows gk104_runl_insert_chan().  Register fields
+ * are cross-checked against the MIT GM20B hw_ram/hw_ccsr/hw_fifo headers. */
+static BOOLEAN B3cD2Write(volatile UCHAR *B, ULONG writeTable[64][4],
+                           ULONG *writeCount, ULONG writeAddress,
+                           ULONG writeValue)
+{
+    ULONG slot;
+    if (*writeCount >= 64u) return FALSE;
+    slot = *writeCount;
+    writeTable[slot][0] = writeAddress;
+    writeTable[slot][1] = Rd(B, writeAddress);
+    writeTable[slot][2] = writeValue;
+    Wr(B, writeAddress, writeValue);
+    KeMemoryBarrier();
+    if (!B3cPrivRingAfterGrWrite(B, writeAddress, writeValue)) {
+        writeTable[slot][3] = Rd(B, writeAddress);
+        ++(*writeCount);
+        return FALSE;
+    }
+    writeTable[slot][3] = Rd(B, writeAddress);
+    ++(*writeCount);
+    return TRUE;
+}
+
+/* One host-only Kepler+ submission: SET_REFERENCE followed by SEMAPHORE
+ * RELEASE. Method encodings are checked against NVIDIA's public GM20B/PBDMA
+ * definitions. The semaphore occupies the final 16 bytes of this mapped PB
+ * page, so it cannot overlap the seven command dwords. */
+static ULONG B3cRunD3(PSWGPU_DEVICE Dev, PULONG userd, PULONG gpfifo,
+                      PULONG pushbuffer, ULONGLONG pushbufferGpuVa)
+{
+    volatile UCHAR *B = Dev->Bar0;
+    volatile ULONG *semSlot;
+    volatile ULONG *bar1GpPut = NULL;
+    ULONGLONG semGpuVa = (ULONGLONG)GR_VM_GPU_VA + GR_VM_D2_PUSHBUF_OFF + PAGE_SIZE - 16u;
+    ULONG result = 0u, polls = 0u, userdGpGet = 0u, pbGpGet = 0u;
+    ULONG pbGet = 0u, pbPut = 0u, semValue = 0u, refCount = 0u;
+    ULONG pbIntr0Before = 0u, pbIntr0After = 0u, pbIntr1 = 0u, method0 = 0u;
+    ULONG data0 = 0u, fifoIntr0 = 0u, pbdmaStatus = 0u;
+    ULONG pushWords[7] = { 0 }, gpWords[2] = { 0 }, userdGpPutBefore = 0u;
+    ULONG bar1GpPutReadback = 0u, backingGpPutAfterBar1 = 0u;
+    ULONG fifoMmuFaultBefore = 0u, fifoMmuFaultAfter = 0u, fifoIntrAfterBar1 = 0u;
+    ULONG bar1WriteFault = 0u;
+    ULONG i;
+
+    Step(106);
+    Trace(L"B3cD3Bar1Phys", Dev->Bar1Phys.LowPart);
+    Trace(L"B3cD3Bar1PhysHi", (ULONG)Dev->Bar1Phys.HighPart);
+    Trace(L"B3cD3Bar1Len", Dev->Bar1Len);
+    Trace(L"B3cD3Bar1MapLen", Dev->Bar1MapLen);
+    Trace(L"B3cD3Bar1Mapped", Dev->Bar1Cpu != NULL ? 1u : 0u);
+    if (userd == NULL || gpfifo == NULL || pushbuffer == NULL ||
+        pushbufferGpuVa == 0u || (pushbufferGpuVa & 3u) != 0u ||
+        semGpuVa + 16u > (ULONGLONG)GR_VM_GPU_VA + GR_VM_ARENA_SIZE ||
+        Dev->Bar1Cpu == NULL || Dev->Bar1MapLen < BAR1_D3_MAP_LEN) {
+        result = 0xE00000A1u;
+        goto done;
+    }
+    bar1GpPut = (volatile ULONG *)(Dev->Bar1Cpu + BAR1_D3_LOW_VA + 0x8Cu);
+    semSlot = (volatile ULONG *)((PUCHAR)pushbuffer + PAGE_SIZE - 16u);
+    pushWords[0] = 0x20010014u; /* INC, count 1, subch 0, SET_REFERENCE 0x50 */
+    pushWords[1] = 0x00001234u;
+    pushWords[2] = 0x20040004u; /* INC, count 4, subch 0, SEMAPHOREA 0x10 */
+    pushWords[3] = (ULONG)(semGpuVa >> 32);
+    pushWords[4] = (ULONG)semGpuVa;
+    pushWords[5] = 0xD3D3D3D3u;
+    pushWords[6] = 0x01100002u; /* RELEASE, 4-byte payload, release_wfi disabled */
+    for (i = 0; i < RTL_NUMBER_OF(pushWords); ++i) pushbuffer[i] = pushWords[i];
+    for (i = 0; i < 4u; ++i) semSlot[i] = 0u;
+    gpWords[0] = (ULONG)pushbufferGpuVa & ~3u; /* Claude 0.4.68: GP entry word0 holds GET address bits 31:2 in place (nouveau ib: lower_32_bits(offset)) */
+    gpWords[1] = (ULONG)((pushbufferGpuVa >> 32) & 0xFFu) | (7u << 10);
+    gpfifo[0] = gpWords[0];
+    gpfifo[1] = gpWords[1];
+    pbIntr0Before = Rd(B, 0x00040108u);
+    userdGpPutBefore = userd[0x8Cu >> 2];
+    KeMemoryBarrier();
+    fifoMmuFaultBefore = Rd(B, 0x00002A30u);
+    Trace(L"B3cD3FifoMmuFaultStatusBefore", fifoMmuFaultBefore);
+    Trace(L"B3cD3Bar1GpPutOffset", BAR1_D3_LOW_VA + 0x8Cu);
+    Trace(L"B3cD3Bar1GpPutValue", 1u);
+    *bar1GpPut = 1u; /* nvgpu gk20a_bar1_writel(USERD GP_PUT) is the host doorbell. */
+    KeMemoryBarrier();
+    bar1GpPutReadback = *bar1GpPut;
+    backingGpPutAfterBar1 = userd[0x8Cu >> 2];
+    fifoMmuFaultAfter = Rd(B, 0x00002A30u);
+    fifoIntrAfterBar1 = Rd(B, 0x00002100u);
+    Trace(L"B3cD3Bar1GpPutReadback", bar1GpPutReadback);
+    Trace(L"B3cD3BackingGpPutAfterBar1Write", backingGpPutAfterBar1);
+    Trace(L"B3cD3FifoMmuFaultStatusAfterBar1Write", fifoMmuFaultAfter);
+    Trace(L"B3cD3FifoIntr0AfterBar1Write", fifoIntrAfterBar1);
+    if (bar1GpPutReadback != 1u ||
+        (bar1GpPutReadback & 0xFFF00000u) == 0xBAD00000u ||
+        /* Claude 0.4.71: 0.4.70 hw read BAR1 back as 1 while the sysmem
+         * backing still read 0 (host keeps snooped USERD; the channel was
+         * loaded ON_PBDMA right after). Backing is traced, not required. */
+        (fifoMmuFaultAfter != fifoMmuFaultBefore) ||
+        (fifoIntrAfterBar1 & 0x10000000u) != 0u) {
+        bar1WriteFault = 1u;
+        result = 0xE00000A1u;
+        goto done;
+    }
+
+    for (polls = 0; polls < 2000u; ++polls) {
+        userdGpGet = *(volatile ULONG *)(Dev->Bar1Cpu + BAR1_D3_LOW_VA + 0x88u); /* Claude 0.4.71: USERD GP_GET via BAR1 */
+        pbGpGet = Rd(B, 0x00040014u);
+        semValue = semSlot[0];
+        if (userdGpGet == 1u && pbGpGet == 1u && semValue == 0xD3D3D3D3u) break;
+        fifoMmuFaultAfter = Rd(B, 0x00002A30u);
+        fifoIntrAfterBar1 = Rd(B, 0x00002100u);
+        if ((fifoMmuFaultAfter != fifoMmuFaultBefore) ||
+            (fifoIntrAfterBar1 & 0x10000000u) != 0u) {
+            bar1WriteFault = 1u;
+            result = 0xE00000A1u;
+            break;
+        }
+        Us(1u);
+    }
+    userdGpGet = *(volatile ULONG *)(Dev->Bar1Cpu + BAR1_D3_LOW_VA + 0x88u); /* Claude 0.4.71 */
+    pbGpGet = Rd(B, 0x00040014u);
+    pbGet = Rd(B, 0x00040018u);
+    pbPut = Rd(B, 0x0004005Cu);
+    semValue = semSlot[0];
+    Trace(L"B3cD3SemValueBeforeL2Flush", semValue);
+    /* Claude 0.4.73: 0.4.72 hw consumed the entry (GP_GET 1, PB GET == PUT
+     * after 7 dwords) but the CPU still read 0: the host semaphore release
+     * is held in GPU L2 (sysmem PTE not volatile). Flush/invalidate L2 the
+     * same way as C2e (gk20a_mm_l2_flush), then re-read. */
+    {
+        ULONG l2State[4] = { 0 };
+        ULONG l2Ok = B3cC2eL2Flush(B, l2State) ? 1u : 0u;
+        KeMemoryBarrier();
+        Trace(L"B3cD3L2FlushOk", l2Ok);
+        Trace(L"B3cD3L2FlushPolls", l2State[0]);
+        Trace(L"B3cD3L2FlushStatus", l2State[1]);
+        Trace(L"B3cD3L2InvalidatePolls", l2State[2]);
+        Trace(L"B3cD3L2InvalidateStatus", l2State[3]);
+    }
+    semValue = semSlot[0];
+    Trace(L"B3cD3SemWord1", semSlot[1]);
+    Trace(L"B3cD3SemWord2", semSlot[2]);
+    Trace(L"B3cD3SemWord3", semSlot[3]);
+    refCount = *(volatile ULONG *)(Dev->Bar1Cpu + BAR1_D3_LOW_VA + 0x48u); /* Claude 0.4.73: USERD ref via BAR1 */
+    Trace(L"B3cD3RefCountBacking", userd[0x48u >> 2]);
+    pbIntr0After = Rd(B, 0x00040108u);
+    pbIntr1 = Rd(B, 0x00040148u);
+    method0 = Rd(B, 0x000400C0u);
+    data0 = Rd(B, 0x000400C4u);
+    fifoIntr0 = Rd(B, 0x00002100u);
+    pbdmaStatus = Rd(B, 0x00003080u);
+    if (userdGpGet != 1u || pbGpGet != 1u || semValue != 0xD3D3D3D3u)
+        result = 0xE00000A1u;
+
+done:
+    Trace(L"B3cD3GpGetPolls", polls);
+    Trace(L"B3cD3UserdGpGet", userdGpGet);
+    Trace(L"B3cD3PbGpGet", pbGpGet);
+    Trace(L"B3cD3PbGet", pbGet);
+    Trace(L"B3cD3PbPut", pbPut);
+    Trace(L"B3cD3SemValue", semValue);
+    Trace(L"B3cD3RefCount", refCount);
+    Trace(L"B3cD3PbIntr0Before", pbIntr0Before);
+    Trace(L"B3cD3PbIntr0After", pbIntr0After);
+    Trace(L"B3cD3PbIntr1", pbIntr1);
+    Trace(L"B3cD3PbMethod0", method0);
+    Trace(L"B3cD3PbData0", data0);
+    Trace(L"B3cD3FifoIntr0", fifoIntr0);
+    Trace(L"B3cD3PbdmaStatus", pbdmaStatus);
+    Trace(L"B3cD3PushbufferGpuVa", (ULONG)pushbufferGpuVa);
+    Trace(L"B3cD3SemGpuVa", (ULONG)semGpuVa);
+    TraceBin(L"B3cD3PushbufferWords", pushWords, sizeof(pushWords));
+    TraceBin(L"B3cD3GpfifoEntry", gpWords, sizeof(gpWords));
+    Trace(L"B3cD3UserdGpPutBefore", userdGpPutBefore);
+    Trace(L"B3cD3UserdGpPutAfter", userd != NULL ? userd[0x8Cu >> 2] : 0u);
+    Trace(L"B3cD3Bar1GpPutReadback", bar1GpPutReadback);
+    Trace(L"B3cD3BackingGpPutAfterBar1Write", backingGpPutAfterBar1);
+    Trace(L"B3cD3FifoMmuFaultStatusBefore", fifoMmuFaultBefore);
+    Trace(L"B3cD3FifoMmuFaultStatusAfterBar1Write", fifoMmuFaultAfter);
+    Trace(L"B3cD3FifoIntr0AfterBar1Write", fifoIntrAfterBar1);
+    Trace(L"B3cD3Bar1WriteFault", bar1WriteFault);
+    Trace(L"B3cD3BackingGpPutFinal", userd != NULL ? userd[0x8Cu >> 2] : 0u);
+    Trace(L"B3cD3Bar1GpGetFinal", bar1GpPut != NULL ? *(volatile ULONG *)((volatile UCHAR *)bar1GpPut - 4u) : 0u);
+    TraceDurable(L"B3cD3Result", result);
+    return result;
+}
+
+/* Claude 0.4.61: 0.4.60 bind error code 0x2 = SNOOP_WITHOUT_BAR1 (name from
+ * nouveau's bind-reason table).  Bind BAR1 to the GR instance block
+ * (bus_bar1_block 0x1704, virtual mode, sys_mem_ncoh) before the channel
+ * bind, poll bus_bind_status (0x1710) bounded, and restore it on exit. */
+static ULONG g_D2Bar1Before = 0u;
+static ULONG g_D2Bar1Bound = 0u;
+/* Claude 0.4.63: 0.4.62 got bind error 0x2 for all 6 aperture combinations,
+ * so the target is not the cause.  nvgpu gk20a_init_fifo_setup_hw() programs
+ * fifo_bar1_base (0x2254) = BAR1-visible USERD GPU VA >> 12 | valid (bit 28)
+ * before channel bind. D3 maps a low-VA alias for the CPU BAR1 aperture. */
+static ULONG g_D2UserdBar1Before = 0u;
+static ULONG g_D2UserdBar1Set = 0u;
+static ULONG g_D2PbdmaInten0Before = 0u;
+static ULONG g_D2PbdmaStallBefore = 0u;
+static ULONG g_D2PbdmaMasksSaved = 0u;
+
+static ULONG B3cInitFifoD2(PSWGPU_DEVICE Dev)
+{
+    volatile UCHAR *B = Dev->Bar0;
+    PULONG ramfc = NULL;
+    PULONG userd = NULL;
+    PULONG gpfifo = NULL;
+    PULONG runlist = NULL;
+    PULONG pushbuffer = NULL;
+    PULONG instWords = NULL;
+    ULONG result = 0, stage = 0, grEnabled, topInfo[3] = { 0 };
+    ULONG grEngineId = 0, runlistId = 0, chid = 0;
+    ULONG ccsrInstReg = 0x00800000u, ccsrChannelReg = 0x00800004u;
+    ULONG fifoRunlistBaseReg = 0x00002270u, fifoRunlistReg = 0x00002274u;
+    ULONG fifoRunlistPendingReg = 0x00002284u, fifoPreemptReg = 0x00002634u;
+    ULONG fifoIntrReg = 0x00002100u, pbdmaStatusReg = 0x00040100u;
+    ULONG pbdmaIntrReg = 0x00040108u, fifoEngineStatusReg = 0x00002640u;
+    ULONG ccsrInstValue = 0, ccsrChannelBefore = 0, ccsrChannelValue = 0;
+    ULONG runlistBaseValue = 0, runlistSubmitValue = 0, runlistEmptyValue = 0;
+    ULONG engineStatus = 0, channelRead = 0, instRead = 0, pendingRead = 0;
+    ULONG fifoIntrAfter = 0, pbdmaStatusAfter = 0, pbdmaIntrAfter = 0;
+    ULONG runlistPolls = 0, runlistLast = 0, preemptPolls = 0, preemptLast = 0;
+    ULONG cleanupRunlistPolls = 0, cleanupRunlistLast = 0;
+    ULONG userdZeroOk = 0, ringZeroOk = 0, pushbufferZeroOk = 0;
+    ULONG userdZeroWords = 0, ringZeroWords = 0, pushbufferZeroWords = 0;
+    ULONG zeroBadOffset = 0xFFFFFFFFu;
+    ULONG memoryLayout[5][4] = { 0 }, ramfcTrace[15][3] = { 0 };
+    ULONG wfiTrace[2][3] = { 0 }, runlistTrace[2][3] = { 0 };
+    ULONG zeroSamples[3][4] = { 0 }, writes[64][4] = { 0 };
+    ULONG privBound = 0, channelEnableIssued = 0, runlistSubmitted = 0;
+    ULONG cleanupError = 0, writeCount = 0, disableValue = 0, i;
+    ULONG pbdmaInten0Before = 0u, pbdmaStallBefore = 0u;
+    ULONG pbdmaInten0Masked = 0u, pbdmaStallMasked = 0u;
+    ULONG d3Result = 0u;
+    ULONGLONG userdIova = 0, runlistIova = 0;
+    ULONGLONG instIova = 0, gpfifoGpuVa = 0;
+    ULONG ramfcValues[15][2] = { 0 };
+    ULONG ramfcCount = RTL_NUMBER_OF(ramfcValues);
+    ULONG instPage = 0, runlistPage = 0, limit2 = 9u;
+    ULONG expectedWfiLo = 0, expectedWfiHi = 0;
+
+    Step(105);
+    B3cPrivRingResetWriteLog();
+    g_D2PbdmaMasksSaved = 0u;
+    grEnabled = Rd(B, NV_PMC_ENABLE);
+    Trace(L"B3cD2PmcEnable", grEnabled);
+    if (!(grEnabled & (1u << 12)) || !g_GrVm.Active || g_GrVm.Arena == NULL) {
+        result = 0xE00000A0u; stage = 1u; goto done;
+    }
+    if (!B3cPrivRingDrainBeforeWrites(B)) {
+        result = 0xE00000A0u; stage = 2u; goto done;
+    }
+
+    /* TOP device-info header carries the hardware engine and runlist enums.
+     * GM20B reports the graphics engine on this one-GR device. */
+    for (i = 0; i < RTL_NUMBER_OF(topInfo); ++i)
+        topInfo[i] = Rd(B, 0x00022700u + i * 4u);
+    grEngineId = (topInfo[0] >> 26) & 0xFu;
+    runlistId = (topInfo[0] >> 21) & 0xFu;
+    TraceBin(L"B3cD2TopDeviceInfo", topInfo, sizeof(topInfo));
+    Trace(L"B3cD2TopEntryType", topInfo[0] & 3u);
+    Trace(L"B3cD2GrEngineId", grEngineId);
+    Trace(L"B3cD2RunlistId", runlistId);
+    if ((topInfo[0] & 3u) != 2u || grEngineId >= 16u || runlistId >= 16u) {
+        result = 0xE00000A0u; stage = 3u; goto done;
+    }
+
+    if (GR_VM_D2_PUSHBUF_OFF + PAGE_SIZE > GR_VM_ARENA_SIZE ||
+        GR_VM_D2_RUNLIST_OFF + PAGE_SIZE > GR_VM_ARENA_SIZE ||
+        GR_VM_D2_GPFIFO_OFF + PAGE_SIZE > GR_VM_ARENA_SIZE ||
+        GR_VM_D2_USERD_OFF + PAGE_SIZE > GR_VM_ARENA_SIZE ||
+        GR_VM_INST_OFF + PAGE_SIZE > GR_VM_ARENA_SIZE ||
+        ((g_GrVm.Iova + GR_VM_D2_RUNLIST_OFF) >> 12) > 0x0FFFFFFFu) {
+        result = 0xE00000A0u; stage = 4u; goto done;
+    }
+    ramfc = (PULONG)((PUCHAR)g_GrVm.Arena + GR_VM_INST_OFF);
+    userd = (PULONG)((PUCHAR)g_GrVm.Arena + GR_VM_D2_USERD_OFF);
+    gpfifo = (PULONG)((PUCHAR)g_GrVm.Arena + GR_VM_D2_GPFIFO_OFF);
+    runlist = (PULONG)((PUCHAR)g_GrVm.Arena + GR_VM_D2_RUNLIST_OFF);
+    pushbuffer = (PULONG)((PUCHAR)g_GrVm.Arena + GR_VM_D2_PUSHBUF_OFF);
+    instWords = (PULONG)((PUCHAR)g_GrVm.Arena + GR_VM_INST_OFF);
+    userdIova = g_GrVm.Iova + GR_VM_D2_USERD_OFF;
+    runlistIova = g_GrVm.Iova + GR_VM_D2_RUNLIST_OFF;
+    instIova = g_GrVm.Iova + GR_VM_INST_OFF;
+    gpfifoGpuVa = (ULONGLONG)GR_VM_GPU_VA + GR_VM_D2_GPFIFO_OFF;
+    instPage = (ULONG)((instIova >> 12) & 0x0FFFFFFFu);
+    runlistPage = (ULONG)(runlistIova >> 12);
+    fifoRunlistPendingReg = 0x00002284u + runlistId * 8u;
+    fifoEngineStatusReg = 0x00002640u + grEngineId * 8u;
+    ccsrInstReg += chid * 8u;
+    ccsrChannelReg += chid * 8u;
+
+    /* C2e uses a temporary golden-image WFI pointer and clears it on exit.
+     * Restore the C2d channel-context pointer before exposing RAMIN to PFIFO. */
+    expectedWfiLo = (GR_VM_GPU_VA + GR_VM_CTX_OFF) | 4u;
+    expectedWfiHi = 0u;
+    instWords[132] = expectedWfiLo;
+    instWords[133] = expectedWfiHi;
+    wfiTrace[0][0] = 132u * sizeof(ULONG); wfiTrace[0][1] = expectedWfiLo;
+    wfiTrace[0][2] = instWords[132];
+    wfiTrace[1][0] = 133u * sizeof(ULONG); wfiTrace[1][1] = expectedWfiHi;
+    wfiTrace[1][2] = instWords[133];
+    KeMemoryBarrier();
+
+    /* A 4-KiB RAMFC starts at the instance-block base; the GPU page-directory
+     * words at 0x200..0x20c remain untouched.  Zero all bounded channel storage. */
+    RtlZeroMemory((PUCHAR)ramfc, 0x200u);
+    RtlZeroMemory((PUCHAR)userd, PAGE_SIZE);
+    RtlZeroMemory((PUCHAR)gpfifo, PAGE_SIZE);
+    RtlZeroMemory((PUCHAR)runlist, PAGE_SIZE);
+    RtlZeroMemory((PUCHAR)pushbuffer, PAGE_SIZE);
+
+    ramfcValues[0][0] = 0x008u; ramfcValues[0][1] = ((ULONG)userdIova & ~0x1FFu) | 0x3u; /* Claude 0.4.60: USERD target sys_mem_ncoh (pbdma_userd_target_sys_mem_ncoh_f) */
+    ramfcValues[1][0] = 0x00Cu; ramfcValues[1][1] = (ULONG)(userdIova >> 32);
+    ramfcValues[2][0] = 0x010u; ramfcValues[2][1] = 0x0000FACEu;
+    /* nvgpu channel_gk20a_setup_ramfc(): acquire retry/timeout fields only;
+     * bit 31 is outside the GM20B timeout field mask and must remain clear. */
+    ramfcValues[3][0] = 0x030u; ramfcValues[3][1] = 0x7FFFF902u;
+    ramfcValues[4][0] = 0x048u; ramfcValues[4][1] = (ULONG)gpfifoGpuVa;
+    ramfcValues[5][0] = 0x04Cu; ramfcValues[5][1] = (ULONG)(gpfifoGpuVa >> 32) | (limit2 << 16);
+    ramfcValues[6][0] = 0x084u; ramfcValues[6][1] = 0x20400000u;
+    /* nvgpu channel_gk20a_setup_ramfc() writes subdevice id 1, ACTIVE and
+     * CHANNEL_DMA_ENABLE. 0xFFF was an invalid ID in the previous image. */
+    ramfcValues[7][0] = 0x094u; ramfcValues[7][1] = 0x30000001u;
+    ramfcValues[8][0] = 0x09Cu; ramfcValues[8][1] = 0x00000100u;
+    ramfcValues[9][0] = 0x0ACu; ramfcValues[9][1] = 0x0000001Fu;
+    ramfcValues[10][0] = 0x0E4u; ramfcValues[10][1] = 0x00000020u;
+    ramfcValues[11][0] = 0x0E8u; ramfcValues[11][1] = chid;
+    ramfcValues[12][0] = 0x0B8u; ramfcValues[12][1] = 0xF8000000u;
+    ramfcValues[13][0] = 0x0F8u; ramfcValues[13][1] = 0x10003080u;
+    ramfcValues[14][0] = 0x0FCu; ramfcValues[14][1] = 0x10000010u;
+    for (i = 0; i < ramfcCount; ++i) {
+        ULONG wordOffset = ramfcValues[i][0] >> 2;
+        ramfc[wordOffset] = ramfcValues[i][1];
+        ramfcTrace[i][0] = ramfcValues[i][0];
+        ramfcTrace[i][1] = ramfcValues[i][1];
+        ramfcTrace[i][2] = ramfc[wordOffset];
+        if (ramfcTrace[i][1] != ramfcTrace[i][2]) {
+            result = 0xE00000A0u; stage = 5u; goto done;
+        }
+    }
+    runlist[0] = chid; /* Nouveau gk104_runl_insert_chan(): plain channel entry. */
+    runlist[1] = 0u;
+    KeMemoryBarrier();
+    runlistTrace[0][0] = 0u; runlistTrace[0][1] = chid; runlistTrace[0][2] = runlist[0];
+    runlistTrace[1][0] = 4u; runlistTrace[1][1] = 0u; runlistTrace[1][2] = runlist[1];
+    zeroSamples[0][0] = GR_VM_D2_USERD_OFF; zeroSamples[0][1] = userd[0];
+    zeroSamples[0][2] = userd[64]; zeroSamples[0][3] = userd[127];
+    zeroSamples[1][0] = GR_VM_D2_GPFIFO_OFF; zeroSamples[1][1] = gpfifo[0];
+    zeroSamples[1][2] = gpfifo[64]; zeroSamples[1][3] = gpfifo[1023];
+    zeroSamples[2][0] = GR_VM_D2_PUSHBUF_OFF; zeroSamples[2][1] = pushbuffer[0];
+    zeroSamples[2][2] = pushbuffer[64]; zeroSamples[2][3] = pushbuffer[1023];
+    for (i = 0; i < PAGE_SIZE / sizeof(ULONG); ++i) {
+        if (userd[i] != 0u) { zeroBadOffset = GR_VM_D2_USERD_OFF + i * sizeof(ULONG); break; }
+        ++userdZeroWords;
+    }
+    if (zeroBadOffset == 0xFFFFFFFFu) {
+        for (i = 0; i < PAGE_SIZE / sizeof(ULONG); ++i) {
+            if (gpfifo[i] != 0u) { zeroBadOffset = GR_VM_D2_GPFIFO_OFF + i * sizeof(ULONG); break; }
+            ++ringZeroWords;
+        }
+    }
+    if (zeroBadOffset == 0xFFFFFFFFu) {
+        for (i = 0; i < PAGE_SIZE / sizeof(ULONG); ++i) {
+            if (pushbuffer[i] != 0u) { zeroBadOffset = GR_VM_D2_PUSHBUF_OFF + i * sizeof(ULONG); break; }
+            ++pushbufferZeroWords;
+        }
+    }
+    userdZeroOk = userdZeroWords == PAGE_SIZE / sizeof(ULONG);
+    ringZeroOk = ringZeroWords == PAGE_SIZE / sizeof(ULONG);
+    pushbufferZeroOk = pushbufferZeroWords == PAGE_SIZE / sizeof(ULONG);
+    memoryLayout[0][0] = GR_VM_INST_OFF; memoryLayout[0][1] = 0x1000u;
+    memoryLayout[0][2] = (ULONG)instIova; memoryLayout[0][3] = (ULONG)(instIova >> 32);
+    memoryLayout[1][0] = GR_VM_D2_USERD_OFF; memoryLayout[1][1] = PAGE_SIZE;
+    memoryLayout[1][2] = (ULONG)userdIova; memoryLayout[1][3] = (ULONG)(userdIova >> 32);
+    memoryLayout[2][0] = GR_VM_D2_GPFIFO_OFF; memoryLayout[2][1] = PAGE_SIZE;
+    memoryLayout[2][2] = (ULONG)(g_GrVm.Iova + GR_VM_D2_GPFIFO_OFF);
+    memoryLayout[2][3] = (ULONG)((g_GrVm.Iova + GR_VM_D2_GPFIFO_OFF) >> 32);
+    memoryLayout[3][0] = GR_VM_D2_RUNLIST_OFF; memoryLayout[3][1] = PAGE_SIZE;
+    memoryLayout[3][2] = (ULONG)runlistIova; memoryLayout[3][3] = (ULONG)(runlistIova >> 32);
+    memoryLayout[4][0] = GR_VM_D2_PUSHBUF_OFF; memoryLayout[4][1] = PAGE_SIZE;
+    memoryLayout[4][2] = (ULONG)(g_GrVm.Iova + GR_VM_D2_PUSHBUF_OFF);
+    memoryLayout[4][3] = (ULONG)((g_GrVm.Iova + GR_VM_D2_PUSHBUF_OFF) >> 32);
+    TraceBin(L"B3cD2MemoryLayout", memoryLayout, sizeof(memoryLayout));
+    TraceBin(L"B3cD2RamfcFields", ramfcTrace, sizeof(ramfcTrace));
+    TraceBin(L"B3cD2RunlistEntry", runlistTrace, sizeof(runlistTrace));
+    TraceBin(L"B3cD2ZeroSamples", zeroSamples, sizeof(zeroSamples));
+    Trace(L"B3cD2UserdZeroOk", userdZeroOk);
+    Trace(L"B3cD2GpfifoEmptyOk", ringZeroOk);
+    Trace(L"B3cD2PushbufferZeroOk", pushbufferZeroOk);
+    Trace(L"B3cD2UserdZeroWords", userdZeroWords);
+    Trace(L"B3cD2GpfifoZeroWords", ringZeroWords);
+    Trace(L"B3cD2PushbufferZeroWords", pushbufferZeroWords);
+    Trace(L"B3cD2MemoryZeroBadOffset", zeroBadOffset);
+    Trace(L"B3cD2GpfifoEntries", PAGE_SIZE / 8u);
+    Trace(L"B3cD2RunlistBaseIovaLo", (ULONG)runlistIova);
+    Trace(L"B3cD2RunlistBaseIovaHi", (ULONG)(runlistIova >> 32));
+    Trace(L"B3cD2GpfifoGpuVa", (ULONG)gpfifoGpuVa);
+    Trace(L"B3cD2UserdIovaLo", (ULONG)userdIova);
+    Trace(L"B3cD2UserdIovaHi", (ULONG)(userdIova >> 32));
+    Trace(L"B3cD2RamfcAcquireExpected", ramfcValues[3][1]);
+    Trace(L"B3cD2RamfcSubdeviceExpected", ramfcValues[7][1]);
+    if (!userdZeroOk || !ringZeroOk || !pushbufferZeroOk ||
+        runlistTrace[0][2] != chid || runlistTrace[1][2] != 0u ||
+        instWords[132] != expectedWfiLo || instWords[133] != expectedWfiHi) {
+        result = 0xE00000A0u; stage = 6u; goto done;
+    }
+    TraceBin(L"B3cD2WfiPointer", wfiTrace, sizeof(wfiTrace));
+
+    /* Claude 0.4.59: 0.4.58 with target VID memory raised PFIFO BIND_ERROR
+     * (fifo_intr_0 bit0).  Use the aperture FECS accepted in stage C
+     * (sys_mem_ncoh, 3 << 28), bind=1. */
+    ccsrInstValue = instPage | 0xB0000000u;
+    runlistBaseValue = 0x30000000u | runlistPage; /* system memory, noncoherent */
+    runlistSubmitValue = (runlistId << 20) | 1u;
+    runlistEmptyValue = (runlistId << 20);
+    ccsrChannelBefore = Rd(B, ccsrChannelReg);
+    ccsrChannelValue = (ccsrChannelBefore & ~0x000F0000u) | (runlistId << 16);
+    Trace(L"B3cD2CcsrInstValue", ccsrInstValue);
+    Trace(L"B3cD2RunlistBaseValue", runlistBaseValue);
+    Trace(L"B3cD2RunlistSubmitValue", runlistSubmitValue);
+    Trace(L"B3cD2CcsrChannelBefore", ccsrChannelBefore);
+
+    /* Publish runlist memory, assign this channel to the TOP-selected runlist,
+     * bind the shared RAMIN block, and enable channel 0.  No GPFIFO entry is
+     * written or submitted in D2. */
+    stage = 7u;
+    if (!B3cD2Write(B, writes, &writeCount, fifoRunlistBaseReg, runlistBaseValue)) {
+        result = 0xE00000A0u; goto done;
+    }
+    if (writes[writeCount - 1u][3] != runlistBaseValue) {
+        result = 0xE00000A0u; stage = 8u; goto done;
+    }
+    if (!B3cD2Write(B, writes, &writeCount, ccsrChannelReg, ccsrChannelValue)) {
+        result = 0xE00000A0u; stage = 9u; goto done;
+    }
+    if ((writes[writeCount - 1u][3] & 0x000F0000u) != (runlistId << 16)) {
+        result = 0xE00000A0u; stage = 10u; goto done;
+    }
+    /* Claude 0.4.65: 0.4.64 showed PBDMA0 intr_0 bit 24 latched once the
+     * channel was loaded and a write-1 clear did not remove it; the preempt
+     * then never finished.  nouveau gk104_runq_init() initialises each PBDMA
+     * before use: clear stall-mask bits 0x10000010 in 0x4013C, clear intr_0 /
+     * intr_1 (0x40108 / 0x40148), enable intr_0 = 0xFFFFFEFF (0x4010C) and
+     * intr_1 = 0xFFFFFFFF (0x4014C).  Do the same here (PBDMA0 only); MC
+     * routing stays untouched so the CPU still gets no interrupt. */
+    {
+        pbdmaStallBefore = Rd(B, 0x0004013Cu);
+        pbdmaInten0Before = Rd(B, 0x0004010Cu);
+        pbdmaStallMasked = pbdmaStallBefore & ~0x11000010u;
+        pbdmaInten0Masked = 0xFEFFFEFFu; /* existing enable mask, with bit 24 masked */
+        g_D2PbdmaStallBefore = pbdmaStallBefore;
+        g_D2PbdmaInten0Before = pbdmaInten0Before;
+        g_D2PbdmaMasksSaved = 1u;
+        Trace(L"B3cD2PbIntrStallBefore", pbdmaStallBefore);
+        Trace(L"B3cD2PbIntrEn0Before", Rd(B, 0x0004010Cu));
+        Trace(L"B3cD2PbIntrEn1Before", Rd(B, 0x0004014Cu));
+        Trace(L"B3cD3PbdmaStallBefore", pbdmaStallBefore);
+        Trace(L"B3cD3PbdmaInten0Before", pbdmaInten0Before);
+        if (!B3cD2Write(B, writes, &writeCount, 0x0004013Cu, pbdmaStallMasked) ||
+            !B3cD2Write(B, writes, &writeCount, 0x00040108u, 0xFFFFFFFFu) ||
+            !B3cD2Write(B, writes, &writeCount, 0x00040148u, 0xFFFFFFFFu) ||
+            !B3cD2Write(B, writes, &writeCount, 0x0004010Cu, pbdmaInten0Masked) ||
+            !B3cD2Write(B, writes, &writeCount, 0x0004014Cu, 0xFFFFFFFFu)) {
+            result = 0xE00000A0u; stage = 30u; goto done;
+        }
+        Trace(L"B3cD2PbIntrStallAfter", Rd(B, 0x0004013Cu));
+        Trace(L"B3cD2PbIntrEn0After", Rd(B, 0x0004010Cu));
+        Trace(L"B3cD2PbIntr0AfterInit", Rd(B, 0x00040108u));
+        Trace(L"B3cD3PbdmaStallAfter", Rd(B, 0x0004013Cu));
+        Trace(L"B3cD3PbdmaInten0After", Rd(B, 0x0004010Cu));
+        Trace(L"B3cD3Bit24Masked", ((Rd(B, 0x0004013Cu) & 0x01000000u) == 0u &&
+                                      (Rd(B, 0x0004010Cu) & 0x01000000u) == 0u) ? 1u : 0u);
+    }
+    /* Claude 0.4.60: find which write raises PFIFO BIND_ERROR.  Record
+     * fifo_intr_0 and fifo_intr_bind_error (0x252C, read only) before the
+     * instance bind, clear a stale bit0, then read both again after. */
+    fifoIntrAfter = Rd(B, fifoIntrReg);
+    Trace(L"B3cD2FifoIntr0BeforeInstWrite", fifoIntrAfter);
+    Trace(L"B3cD2BindErrorInfoBeforeInstWrite", Rd(B, 0x0000252Cu));
+    if ((fifoIntrAfter & 1u) != 0u) {
+        if (!B3cD2Write(B, writes, &writeCount, fifoIntrReg, 1u)) {
+            result = 0xE00000A0u; stage = 18u; goto done;
+        }
+        Trace(L"B3cD2FifoIntr0AfterStaleClear", Rd(B, fifoIntrReg));
+    }
+    {
+        ULONG bar1Reg = 0x00001704u, bindStatusReg = 0x00001710u;
+        ULONG bar1Value = instPage | 0x30000000u | 0x80000000u;
+        ULONG bindStatus = 0u, bindPolls = 0u;
+        g_D2Bar1Before = Rd(B, bar1Reg);
+        Trace(L"B3cD2Bar1Before", g_D2Bar1Before);
+        Trace(L"B3cD2Bar1Value", bar1Value);
+        g_D2Bar1Bound = 1u;
+        if (!B3cD2Write(B, writes, &writeCount, bar1Reg, bar1Value)) {
+            result = 0xE00000A0u; stage = 19u; goto done;
+        }
+        for (bindPolls = 0; bindPolls < 2000u; ++bindPolls) {
+            bindStatus = Rd(B, bindStatusReg);
+            if ((bindStatus & 0x3u) == 0u) break;
+            Us(1000u);
+        }
+        Trace(L"B3cD2Bar1Readback", writes[writeCount - 1u][3]);
+        Trace(L"B3cD2Bar1BindPolls", bindPolls);
+        Trace(L"B3cD2Bar1BindStatus", bindStatus);
+        Trace(L"B3cD2FifoIntr0AfterBar1", Rd(B, fifoIntrReg));
+        if (bindPolls == 2000u) { result = 0xE00000A0u; stage = 20u; goto done; }
+    }
+    {
+        ULONG userdBar1Value = (BAR1_D3_LOW_VA >> 12) | 0x10000000u;
+        g_D2UserdBar1Before = Rd(B, 0x00002254u);
+        Trace(L"B3cD2UserdBar1Before", g_D2UserdBar1Before);
+        Trace(L"B3cD2UserdBar1Value", userdBar1Value);
+        g_D2UserdBar1Set = 1u;
+        if (!B3cD2Write(B, writes, &writeCount, 0x00002254u, userdBar1Value)) {
+            result = 0xE00000A0u; stage = 29u; goto done;
+        }
+        Trace(L"B3cD2UserdBar1Readback", writes[writeCount - 1u][3]);
+        Trace(L"B3cD2FifoIntr0AfterUserdBar1", Rd(B, fifoIntrReg));
+    }
+    /* Claude 0.4.62: 0.4.61 still got bind error 0x2 with BAR1 bound.  Probe
+     * BAR1 target {ncoh 3, vid 0} x channel-inst/USERD target {vid 0, coh 2,
+     * ncoh 3} in one run: clear intr0 bit0, bind, record intr0 + 0x252C,
+     * unbind, record again.  Then use the first combination without error.
+     * Only 0x1704, 0x800000 (chid 0), 0x2100 are written; every write is
+     * priv-ring checked; every BAR1 rebind wait is bounded. */
+    {
+        static const ULONG bar1Targets[2] = { 3u, 0u };
+        static const ULONG instTargets[3] = { 0u, 2u, 3u };
+        ULONG probe[6][4] = { 0 };
+        ULONG bi, ti, n = 0u, chosen = 0xFFFFFFFFu, polls, st;
+        ULONG probeBar1Value, probeInstValue;
+        for (bi = 0; bi < 2u; ++bi) {
+            probeBar1Value = instPage | (bar1Targets[bi] << 28) | 0x80000000u;
+            if (!B3cD2Write(B, writes, &writeCount, 0x00001704u, probeBar1Value)) {
+                result = 0xE00000A0u; stage = 22u; goto done;
+            }
+            for (polls = 0; polls < 2000u; ++polls) {
+                st = Rd(B, 0x00001710u);
+                if ((st & 0x3u) == 0u) break;
+                Us(1000u);
+            }
+            if (polls == 2000u) { result = 0xE00000A0u; stage = 23u; goto done; }
+            for (ti = 0; ti < 3u; ++ti) {
+                ramfc[0x008u >> 2] = ((ULONG)userdIova & ~0x1FFu) | instTargets[ti];
+                KeMemoryBarrier();
+                if (!B3cD2Write(B, writes, &writeCount, fifoIntrReg, 1u)) {
+                    result = 0xE00000A0u; stage = 24u; goto done;
+                }
+                probeInstValue = instPage | (instTargets[ti] << 28) | 0x80000000u;
+                if (!B3cD2Write(B, writes, &writeCount, ccsrInstReg, probeInstValue)) {
+                    result = 0xE00000A0u; stage = 25u; goto done;
+                }
+                probe[n][0] = (bar1Targets[bi] << 4) | instTargets[ti];
+                probe[n][1] = Rd(B, fifoIntrReg);
+                probe[n][2] = Rd(B, 0x0000252Cu);
+                if (!B3cD2Write(B, writes, &writeCount, ccsrInstReg, 0u)) {
+                    result = 0xE00000A0u; stage = 26u; goto done;
+                }
+                probe[n][3] = Rd(B, fifoIntrReg);
+                if (!B3cD2Write(B, writes, &writeCount, fifoIntrReg, 1u)) {
+                    result = 0xE00000A0u; stage = 24u; goto done;
+                }
+                if (chosen == 0xFFFFFFFFu && (probe[n][1] & 1u) == 0u) chosen = n;
+                ++n;
+            }
+        }
+        Trace(L"B3cD2ProbeCount", n);
+        {
+            static const PCWSTR probeNames[6][4] = {
+                { L"B3cD2Probe0Combo", L"B3cD2Probe0Intr0AfterBind", L"B3cD2Probe0BindErrorInfo", L"B3cD2Probe0Intr0AfterUnbind" },
+                { L"B3cD2Probe1Combo", L"B3cD2Probe1Intr0AfterBind", L"B3cD2Probe1BindErrorInfo", L"B3cD2Probe1Intr0AfterUnbind" },
+                { L"B3cD2Probe2Combo", L"B3cD2Probe2Intr0AfterBind", L"B3cD2Probe2BindErrorInfo", L"B3cD2Probe2Intr0AfterUnbind" },
+                { L"B3cD2Probe3Combo", L"B3cD2Probe3Intr0AfterBind", L"B3cD2Probe3BindErrorInfo", L"B3cD2Probe3Intr0AfterUnbind" },
+                { L"B3cD2Probe4Combo", L"B3cD2Probe4Intr0AfterBind", L"B3cD2Probe4BindErrorInfo", L"B3cD2Probe4Intr0AfterUnbind" },
+                { L"B3cD2Probe5Combo", L"B3cD2Probe5Intr0AfterBind", L"B3cD2Probe5BindErrorInfo", L"B3cD2Probe5Intr0AfterUnbind" }
+            };
+            for (bi = 0; bi < n && bi < 6u; ++bi) {
+                for (ti = 0; ti < 4u; ++ti) Trace(probeNames[bi][ti], probe[bi][ti]);
+            }
+        }
+        Trace(L"B3cD2ProbeChosen", chosen);
+        if (chosen == 0xFFFFFFFFu) {
+            ramfc[0x008u >> 2] = ((ULONG)userdIova & ~0x1FFu) | 0x3u;
+            result = 0xE00000A0u; stage = 21u; goto done;
+        }
+        {
+            ULONG bar1T = probe[chosen][0] >> 4, instT = probe[chosen][0] & 0xFu;
+            ramfc[0x008u >> 2] = ((ULONG)userdIova & ~0x1FFu) | instT;
+            KeMemoryBarrier();
+            if (!B3cD2Write(B, writes, &writeCount, 0x00001704u,
+                            instPage | (bar1T << 28) | 0x80000000u)) {
+                result = 0xE00000A0u; stage = 27u; goto done;
+            }
+            for (polls = 0; polls < 2000u; ++polls) {
+                st = Rd(B, 0x00001710u);
+                if ((st & 0x3u) == 0u) break;
+                Us(1000u);
+            }
+            if (polls == 2000u) { result = 0xE00000A0u; stage = 23u; goto done; }
+            ccsrInstValue = instPage | (instT << 28) | 0x80000000u;
+            runlistBaseValue = (instT << 28) | runlistPage;
+            if (!B3cD2Write(B, writes, &writeCount, fifoRunlistBaseReg, runlistBaseValue)) {
+                result = 0xE00000A0u; stage = 28u; goto done;
+            }
+            Trace(L"B3cD2ChosenCcsrInstValue", ccsrInstValue);
+            Trace(L"B3cD2ChosenRunlistBaseValue", runlistBaseValue);
+        }
+    }
+    privBound = 1u;
+    if (!B3cD2Write(B, writes, &writeCount, ccsrInstReg, ccsrInstValue)) {
+        result = 0xE00000A0u; stage = 11u; goto done;
+    }
+    instRead = writes[writeCount - 1u][3];
+    fifoIntrAfter = Rd(B, fifoIntrReg);
+    Trace(L"B3cD2CcsrInstReadAfterWrite", instRead);
+    Trace(L"B3cD2FifoIntr0AfterInstWrite", fifoIntrAfter);
+    Trace(L"B3cD2BindErrorInfoAfterInstWrite", Rd(B, 0x0000252Cu));
+    Trace(L"B3cD2RamfcUserdLo", ramfc[0x008u >> 2]);
+    /* Claude 0.4.59: compare pointer + target only (bind may read back 0);
+     * a PFIFO BIND_ERROR (bit0) is the real failure signal. */
+    if ((instRead & 0x3FFFFFFFu) != (ccsrInstValue & 0x3FFFFFFFu) ||
+        (fifoIntrAfter & 1u) != 0u) {
+        result = 0xE00000A0u; stage = 12u; goto done;
+    }
+    channelEnableIssued = 1u;
+    channelRead = Rd(B, ccsrChannelReg);
+    if (!B3cD2Write(B, writes, &writeCount, ccsrChannelReg,
+                    channelRead | 0x00000400u)) {
+        result = 0xE00000A0u; stage = 13u; goto done;
+    }
+    channelRead = writes[writeCount - 1u][3];
+    Trace(L"B3cD2PbIntr0AfterEnable", Rd(B, 0x00040108u));
+    if ((channelRead & 1u) == 0u) {
+        result = 0xE00000A0u; stage = 14u; goto done;
+    }
+    runlistSubmitted = 1u;
+    /* Read-only candidate checks immediately before and after scheduling:
+     * PBDMA routing/target, interrupt policy, and the FECS context left by C2. */
+    Trace(L"B3cD2PbdmaMapBeforeRunlist", Rd(B, 0x00002390u));
+    Trace(L"B3cD2PbdmaTargetBeforeRunlist", Rd(B, 0x000400ACu));
+    Trace(L"B3cD2PbdmaStatusBeforeRunlist", Rd(B, pbdmaStatusReg));
+    Trace(L"B3cD2PbdmaIntr0BeforeRunlist", Rd(B, pbdmaIntrReg));
+    Trace(L"B3cD2PbdmaIntrEn0BeforeRunlist", Rd(B, 0x0004010Cu));
+    Trace(L"B3cD2PbdmaIntrStallBeforeRunlist", Rd(B, 0x0004013Cu));
+    Trace(L"B3cD2FecsCurrentCtxBeforeRunlist", Rd(B, 0x00409B00u));
+    Trace(L"B3cD2FecsNewCtxBeforeRunlist", Rd(B, 0x00409B04u));
+    Trace(L"B3cD2FifoEngineStatusBeforeRunlist", Rd(B, fifoEngineStatusReg));
+    Trace(L"B3cD2RunlistPendingBeforeSubmit", Rd(B, fifoRunlistPendingReg));
+    if (!B3cD2Write(B, writes, &writeCount, fifoRunlistReg, runlistSubmitValue)) {
+        result = 0xE00000A0u; stage = 15u; goto done;
+    }
+    runlistLast = Rd(B, fifoRunlistPendingReg);
+    for (runlistPolls = 0; runlistPolls < 2000u; ++runlistPolls) {
+        runlistLast = Rd(B, fifoRunlistPendingReg);
+        if ((runlistLast & 0x00100000u) == 0u) break;
+        Us(1000u);
+    }
+    Trace(L"B3cD2RunlistPolls", runlistPolls);
+    Trace(L"B3cD2RunlistPendingAfter", runlistLast);
+    Trace(L"B3cD2PbIntr0AfterRunlist", Rd(B, 0x00040108u));
+    Trace(L"B3cD2PbdmaMapAfterRunlist", Rd(B, 0x00002390u));
+    Trace(L"B3cD2PbdmaTargetAfterRunlist", Rd(B, 0x000400ACu));
+    Trace(L"B3cD2FecsCurrentCtxAfterRunlist", Rd(B, 0x00409B00u));
+    Trace(L"B3cD2FecsNewCtxAfterRunlist", Rd(B, 0x00409B04u));
+    if (runlistPolls == 2000u) { result = 0xE00000A0u; stage = 16u; goto done; }
+    stage = 17u;
+    engineStatus = Rd(B, fifoEngineStatusReg);
+    channelRead = Rd(B, ccsrChannelReg);
+    instRead = Rd(B, ccsrInstReg);
+    fifoIntrAfter = Rd(B, fifoIntrReg);
+    pbdmaStatusAfter = Rd(B, pbdmaStatusReg);
+    pbdmaIntrAfter = Rd(B, pbdmaIntrReg);
+    Trace(L"B3cD2FifoEngineStatusAfterBind", engineStatus);
+    Trace(L"B3cD2CcsrChannelAfterBind", channelRead);
+    Trace(L"B3cD2CcsrChannelEnableAfterBind", channelRead & 1u);
+    Trace(L"B3cD2CcsrChannelStatusAfterBind", (channelRead >> 24) & 0xFu);
+    Trace(L"B3cD2CcsrInstAfterBind", instRead);
+    Trace(L"B3cD2FifoIntr0AfterBind", fifoIntrAfter);
+    Trace(L"B3cD2Pbdma0StatusAfterBind", pbdmaStatusAfter);
+    Trace(L"B3cD2Pbdma0IntrAfterBind", pbdmaIntrAfter);
+    /* Claude 0.4.69: with PBDMA bit 24 masked (0.4.68) the empty channel is
+     * saved off the PBDMA and reads back enabled + status 0 (idle); 0.4.67
+     * and earlier held it ON_PBDMA (5). Both are valid for posting GP_PUT. */
+    Trace(L"B3cD2ChannelStatusAccepted", (channelRead >> 24) & 0xFu);
+    if ((channelRead & 1u) == 0u ||
+        (((channelRead >> 24) & 0xFu) != 5u && ((channelRead >> 24) & 0xFu) != 0u)) {
+        result = 0xE00000A0u; stage = 31u; goto done;
+    }
+    /* Claude 0.4.64: 0.4.63 reached here (channel ON_PBDMA) with PBDMA0
+     * intr_0 bit 24 pending, and the cleanup preempt then timed out.  Dump
+     * PBDMA0 state (read only, hw_pbdma_gm20b.h offsets) for diagnosis. */
+    {
+        static const ULONG pbRegs[14] = {
+            0x00040000u, 0x00040010u, 0x00040014u, 0x00040018u, 0x00040050u,
+            0x0004005Cu, 0x00040084u, 0x000400C0u, 0x000400C4u, 0x000400E4u,
+            0x00040120u, 0x00040148u, 0x00003080u, 0x0000252Cu };
+        static const PCWSTR pbNames[14] = {
+            L"B3cD2PbGpPut", L"B3cD2PbSignature", L"B3cD2PbGpGet", L"B3cD2PbGet",
+            L"B3cD2PbGpFetch", L"B3cD2PbPut", L"B3cD2PbPbHeader", L"B3cD2PbMethod0",
+            L"B3cD2PbData0", L"B3cD2PbHceCtrl", L"B3cD2PbChannel", L"B3cD2PbIntr1",
+            L"B3cD2FifoPbdmaStatus0", L"B3cD2BindErrorInfoAfterRunlist" };
+        ULONG k;
+        for (k = 0; k < 14u; ++k) Trace(pbNames[k], Rd(B, pbRegs[k]));
+        Trace(L"B3cD2UserdGpGet", userd[0x88u >> 2]);
+        /* Claude 0.4.66: PBDMA intr_0 bit 24 is "[ENGINE]" in nvgpu's
+         * pbdma_intr_fault_type_desc[].  Dump GR / FECS / FIFO state (read
+         * only) right after the runlist to see which engine side is unhappy. */
+        {
+            static const ULONG grRegs[14] = {
+                0x00400100u, 0x00400108u, 0x0040060Cu, 0x00400700u, 0x00404000u,
+                0x00409C18u, 0x00409800u, 0x00409804u, 0x00409B00u, 0x00002640u,
+                0x000025A0u, 0x00002A30u, 0x0004011Cu, 0x00040130u };
+            static const PCWSTR grNames[14] = {
+                L"B3cD2EnGrIntr", L"B3cD2EnGrException", L"B3cD2EnGrEngineStatus",
+                L"B3cD2EnGrStatus", L"B3cD2EnFeHwwEsr", L"B3cD2EnFecsHostInt",
+                L"B3cD2EnFecsMailbox0", L"B3cD2EnFecsMailbox1", L"B3cD2EnFecsCurrentCtx",
+                L"B3cD2EnFifoEngineStatus0", L"B3cD2EnFifoIntrPbdmaId",
+                L"B3cD2EnFifoMmuFaultStatus", L"B3cD2EnPb11C", L"B3cD2EnPb130" };
+            ULONG g;
+            for (g = 0; g < 14u; ++g) Trace(grNames[g], Rd(B, grRegs[g]));
+        }
+        Trace(L"B3cD2UserdGpPut", userd[0x8Cu >> 2]);
+    }
+
+    /* D3 runs while the channel is ON_PBDMA. Its failure is recorded, then
+     * control always continues through the existing D2 cleanup path. */
+    d3Result = B3cRunD3(Dev, userd, gpfifo, pushbuffer,
+                        (ULONGLONG)GR_VM_GPU_VA + GR_VM_D2_PUSHBUF_OFF);
+    Trace(L"B3cD2D3Result", d3Result);
+    if (d3Result != 0u) { result = d3Result; stage = 18u; }
+
+done:
+    /* Always tear down any channel state published by this one-shot probe.
+     * Each cleanup write is still priv-ring checked; both asynchronous waits
+     * have the same fixed 2000 x 1 ms bound as the forward runlist wait. */
+    if (channelEnableIssued) {
+        disableValue = Rd(B, ccsrChannelReg) | 0x00000800u;
+        if (!B3cD2Write(B, writes, &writeCount, ccsrChannelReg, disableValue))
+            cleanupError |= 1u;
+        /* Claude 0.4.64: a pending PBDMA interrupt stalls the channel save,
+         * so the preempt never completes.  Clear PBDMA0 intr_0 / intr_1
+         * (write-1-to-clear, the value just read) before preempting. */
+        {
+            ULONG pi0 = Rd(B, pbdmaIntrReg), pi1 = Rd(B, 0x00040148u);
+            Trace(L"B3cD2CleanupPbdmaIntr0", pi0);
+            Trace(L"B3cD2CleanupPbdmaIntr1", pi1);
+            /* Claude 0.4.66: nouveau gk104_runq_intr() writes method0
+             * (0x400C0) = 0x80600008 before clearing the PBDMA interrupt,
+             * so the PBDMA drops the faulting method instead of re-raising. */
+            if (pi0 != 0u && !B3cD2Write(B, writes, &writeCount, 0x000400C0u, 0x80600008u))
+                cleanupError |= 512u;
+            if (pi0 != 0u && !B3cD2Write(B, writes, &writeCount, pbdmaIntrReg, pi0))
+                cleanupError |= 512u;
+            if (pi1 != 0u && !B3cD2Write(B, writes, &writeCount, 0x00040148u, pi1))
+                cleanupError |= 512u;
+            Trace(L"B3cD2CleanupPbdmaIntr0AfterClear", Rd(B, pbdmaIntrReg));
+        }
+        if (!B3cD2Write(B, writes, &writeCount, fifoPreemptReg,
+                        chid | 0u /* channel type, channel id 0 */))
+            cleanupError |= 2u;
+        preemptLast = Rd(B, fifoPreemptReg);
+        for (preemptPolls = 0; preemptPolls < 2000u; ++preemptPolls) {
+            preemptLast = Rd(B, fifoPreemptReg);
+            if ((preemptLast & 0x00100000u) == 0u) break;
+            Us(1000u);
+        }
+        if (preemptPolls == 2000u) cleanupError |= 4u;
+        Trace(L"B3cD2PreemptPbdmaIntr0", Rd(B, pbdmaIntrReg));
+    Trace(L"B3cD2PreemptPbdmaStatusReg", Rd(B, pbdmaStatusReg));
+    Trace(L"B3cD2PreemptCcsrChannel", Rd(B, ccsrChannelReg));
+    Trace(L"B3cD2PreemptEngineStatus", Rd(B, fifoEngineStatusReg));
+        Trace(L"B3cD2PreemptFifoIntr0", Rd(B, fifoIntrReg));
+        Trace(L"B3cD2PreemptPbdmaStatus", Rd(B, 0x00003080u));
+    }
+    if (runlistSubmitted) {
+        if (!B3cD2Write(B, writes, &writeCount, fifoRunlistReg, runlistEmptyValue))
+            cleanupError |= 8u;
+        cleanupRunlistLast = Rd(B, fifoRunlistPendingReg);
+        for (cleanupRunlistPolls = 0; cleanupRunlistPolls < 2000u; ++cleanupRunlistPolls) {
+            cleanupRunlistLast = Rd(B, fifoRunlistPendingReg);
+            if ((cleanupRunlistLast & 0x00100000u) == 0u) break;
+            Us(1000u);
+        }
+        if (cleanupRunlistPolls == 2000u) cleanupError |= 16u;
+    }
+    if (privBound && !B3cD2Write(B, writes, &writeCount, ccsrInstReg, 0u))
+        cleanupError |= 32u;
+    if (g_D2PbdmaMasksSaved) {
+        if (!B3cD2Write(B, writes, &writeCount, 0x0004010Cu, g_D2PbdmaInten0Before))
+            cleanupError |= 1024u;
+        if (!B3cD2Write(B, writes, &writeCount, 0x0004013Cu, g_D2PbdmaStallBefore))
+            cleanupError |= 1024u;
+        Trace(L"B3cD3PbdmaInten0Restored", Rd(B, 0x0004010Cu));
+        Trace(L"B3cD3PbdmaStallRestored", Rd(B, 0x0004013Cu));
+        g_D2PbdmaMasksSaved = 0u;
+    }
+    if (g_D2UserdBar1Set) {
+        if (!B3cD2Write(B, writes, &writeCount, 0x00002254u, g_D2UserdBar1Before))
+            cleanupError |= 256u;
+        Trace(L"B3cD2UserdBar1Final", Rd(B, 0x00002254u));
+        g_D2UserdBar1Set = 0u;
+    }
+    if (g_D2Bar1Bound) {
+        ULONG restorePolls, restoreStatus = 0u;
+        if (!B3cD2Write(B, writes, &writeCount, 0x00001704u, g_D2Bar1Before))
+            cleanupError |= 64u;
+        for (restorePolls = 0; restorePolls < 2000u; ++restorePolls) {
+            restoreStatus = Rd(B, 0x00001710u);
+            if ((restoreStatus & 0x3u) == 0u) break;
+            Us(1000u);
+        }
+        if (restorePolls == 2000u) cleanupError |= 128u;
+        Trace(L"B3cD2Bar1RestorePolls", restorePolls);
+        Trace(L"B3cD2Bar1Final", Rd(B, 0x00001704u));
+        g_D2Bar1Bound = 0u;
+    }
+    if (cleanupError != 0u && result == 0u) result = 0xE00000A0u;
+    channelRead = Rd(B, ccsrChannelReg);
+    instRead = Rd(B, ccsrInstReg);
+    pendingRead = Rd(B, fifoRunlistPendingReg);
+    engineStatus = Rd(B, fifoEngineStatusReg);
+    fifoIntrAfter = Rd(B, fifoIntrReg);
+    pbdmaStatusAfter = Rd(B, pbdmaStatusReg);
+    pbdmaIntrAfter = Rd(B, pbdmaIntrReg);
+    Trace(L"B3cD2BindErrorInfoFinal", Rd(B, 0x0000252Cu));
+    Trace(L"B3cD2Stage", stage);
+    Trace(L"B3cD2Result", result);
+    Trace(L"B3cD2CleanupError", cleanupError);
+    Trace(L"B3cD2WriteCount", writeCount);
+    TraceBin(L"B3cD2Writes", writes, sizeof(writes));
+    TraceBin(L"B3cD2RamfcFields", ramfcTrace, sizeof(ramfcTrace));
+    TraceBin(L"B3cD2MemoryLayout", memoryLayout, sizeof(memoryLayout));
+    TraceBin(L"B3cD2WfiPointer", wfiTrace, sizeof(wfiTrace));
+    TraceBin(L"B3cD2RunlistEntry", runlistTrace, sizeof(runlistTrace));
+    TraceBin(L"B3cD2ZeroSamples", zeroSamples, sizeof(zeroSamples));
+    Trace(L"B3cD2RunlistPolls", runlistPolls);
+    Trace(L"B3cD2RunlistLast", runlistLast);
+    Trace(L"B3cD2PreemptPolls", preemptPolls);
+    Trace(L"B3cD2PreemptLast", preemptLast);
+    Trace(L"B3cD2CleanupRunlistPolls", cleanupRunlistPolls);
+    Trace(L"B3cD2CleanupRunlistLast", cleanupRunlistLast);
+    Trace(L"B3cD2CcsrInstFinal", instRead);
+    Trace(L"B3cD2CcsrChannelFinal", channelRead);
+    Trace(L"B3cD2CcsrChannelEnableFinal", channelRead & 1u);
+    Trace(L"B3cD2CcsrChannelStatusFinal", (channelRead >> 24) & 0xFu);
+    Trace(L"B3cD2RunlistPendingFinal", pendingRead);
+    Trace(L"B3cD2FifoEngineStatusFinal", engineStatus);
+    Trace(L"B3cD2FifoIntr0Final", fifoIntrAfter);
+    Trace(L"B3cD2Pbdma0StatusFinal", pbdmaStatusAfter);
+    Trace(L"B3cD2Pbdma0IntrFinal", pbdmaIntrAfter);
+    B3cPrivRingTraceWriteLog(L"B3cD2PrivWriteErrorCount",
+        L"B3cD2PrivWriteErrorDropped", L"B3cD2PrivAckTimeouts",
+        L"B3cD2PrivWriteErrors");
+    return result;
+}
+
 /* Only called after the existing GPU block reset; restore exactly the outer
  * mapping entries C2d changed before releasing its separate arena. */
 static VOID GrVmCleanupAfterGpuReset(PSWGPU_DEVICE Dev)
@@ -4903,7 +5940,7 @@ static VOID ProbeB3a(PSWGPU_DEVICE Dev, BOOLEAN RunAcr)
     ULONG nsOff, nsSize, dataBase, dataSize, numApps, app0Off, app0Size, sigSrc;
     ULONG hwcfg, imemSize, dmemSize, imemBase, dbgFused;
     ULONG wprRawStart, wprRawLimit, wprAllocLen = 0, wprUsed = 0;
-    ULONG bootPolls, pmuArgv = 0, fecsErr = 0, c1Err = 0, c2aErr = 0, c2cErr = 0, c2dErr = 0, c2eErr = 0;
+    ULONG bootPolls, pmuArgv = 0, fecsErr = 0, c1Err = 0, c2aErr = 0, c2cErr = 0, c2dErr = 0, c2eErr = 0, d1Err = 0, d2Err = 0;
     ULONG c1GoldenBytes = 0, c1ZcullBytes = 0, c1PmBytes = 0;
     BOOLEAN acrAttempted = FALSE;
     ULONGLONG arenaIova = 0, instIova = 0;
@@ -5080,10 +6117,15 @@ static VOID ProbeB3a(PSWGPU_DEVICE Dev, BOOLEAN RunAcr)
         {
             ULONG en = Rd(B, NV_PMC_ENABLE), w;
             Trace(L"B3cFifoPmcWas", en);
-            Wr(B, NV_PMC_ENABLE, en & ~0x100u);
+            /* Claude 0.4.72: nvgpu gk20a_init_fifo_reset_enable_hw() resets
+             * PFIFO together with CE2 (mc_enable_ce2, bit 21). CE2 shares
+             * runlist 0 with GR on GM20B; leaving it in reset made PBDMA0
+             * latch INTR_0 bit 24 = ENG_RESET (open-gpu-doc dev_pbdma.ref)
+             * as soon as the channel was loaded, which froze the PBDMA. */
+            Wr(B, NV_PMC_ENABLE, en & ~(0x100u | 0x200000u));
             (VOID)Rd(B, NV_PMC_ENABLE);
             Us(20);
-            Wr(B, NV_PMC_ENABLE, en | 0x100u);
+            Wr(B, NV_PMC_ENABLE, en | 0x100u | 0x200000u);
             (VOID)Rd(B, NV_PMC_ENABLE);
             Us(20);
             Trace(L"B3cFifoPmcNow", Rd(B, NV_PMC_ENABLE));
@@ -5352,6 +6394,14 @@ static VOID ProbeB3a(PSWGPU_DEVICE Dev, BOOLEAN RunAcr)
                                 else {
                                     c2eErr = B3cCreateGoldenContext(Dev);
                                     if (c2eErr != 0) err = c2eErr;
+                                    else {
+                                        d1Err = B3cInitFifoD1(Dev);
+                                        if (d1Err != 0) err = d1Err;
+                                        else {
+                                            d2Err = B3cInitFifoD2(Dev);
+                                            if (d2Err != 0) err = d2Err;
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -5547,6 +6597,7 @@ NTSTATUS SwGpuEvtPrepareHardware(WDFDEVICE Device, WDFCMRESLIST Raw, WDFCMRESLIS
         if (Desc == NULL) continue;
         if (Desc->Type == CmResourceTypeMemory) {
             if (Mem == 0) { Dev->Bar0Phys = Desc->u.Memory.Start; Dev->Bar0Len = Desc->u.Memory.Length; }
+            else if (Mem == 1) { Dev->Bar1Phys = Desc->u.Memory.Start; Dev->Bar1Len = Desc->u.Memory.Length; }
             ++Mem;
         } else if (Desc->Type == CmResourceTypeConnection &&
                    Desc->u.Connection.Class == CM_RESOURCE_CONNECTION_CLASS_SERIAL &&
@@ -5559,17 +6610,24 @@ NTSTATUS SwGpuEvtPrepareHardware(WDFDEVICE Device, WDFCMRESLIST Raw, WDFCMRESLIS
     Trace(L"ResMem", Mem);
     Trace(L"ResI2c", I2c);
     Trace(L"Bar0Lo", Dev->Bar0Phys.LowPart);
-    if (Mem < 1 || I2c < 2 || Dev->Bar0Len < BAR0_MAP_LEN) return STATUS_DEVICE_CONFIGURATION_ERROR;
+    Trace(L"Bar1Lo", Dev->Bar1Phys.LowPart);
+    Trace(L"Bar1Len", Dev->Bar1Len);
+    if (Mem < 2 || I2c < 2 || Dev->Bar0Len < BAR0_MAP_LEN ||
+        Dev->Bar1Len < BAR1_D3_MAP_LEN) return STATUS_DEVICE_CONFIGURATION_ERROR;
 
     /* Mapping BAR0 is safe; only reading it while the GPU is off is not. */
     Dev->Bar0 = (volatile UCHAR *)MmMapIoSpaceEx(Dev->Bar0Phys, BAR0_MAP_LEN, PAGE_READWRITE | PAGE_NOCACHE);
+    Dev->Bar1MapLen = BAR1_D3_MAP_LEN;
+    Dev->Bar1Cpu = (volatile UCHAR *)MmMapIoSpaceEx(Dev->Bar1Phys, Dev->Bar1MapLen,
+                                                     PAGE_READWRITE | PAGE_NOCACHE);
     Pa.QuadPart = (LONGLONG)CAR_PHYS;
     Dev->Car = (volatile UCHAR *)MmMapIoSpaceEx(Pa, CAR_LEN, PAGE_READWRITE | PAGE_NOCACHE);
     Pa.QuadPart = (LONGLONG)PMC_PHYS;
     Dev->Pmc = (volatile UCHAR *)MmMapIoSpaceEx(Pa, PMC_LEN, PAGE_READWRITE | PAGE_NOCACHE);
     Pa.QuadPart = (LONGLONG)MC_PHYS;
     Dev->Mc = (volatile UCHAR *)MmMapIoSpaceEx(Pa, MC_LEN, PAGE_READWRITE | PAGE_NOCACHE);
-    if (!Dev->Bar0 || !Dev->Car || !Dev->Pmc || !Dev->Mc) return STATUS_INSUFFICIENT_RESOURCES;
+    if (!Dev->Bar0 || !Dev->Bar1Cpu || !Dev->Car || !Dev->Pmc || !Dev->Mc)
+        return STATUS_INSUFFICIENT_RESOURCES;
     return STATUS_SUCCESS;
 }
 
@@ -5578,6 +6636,7 @@ NTSTATUS SwGpuEvtReleaseHardware(WDFDEVICE Device, WDFCMRESLIST Translated)
     PSWGPU_DEVICE Dev = SwGpuGetDevice(Device);
     UNREFERENCED_PARAMETER(Translated);
     if (Dev->Bar0) { MmUnmapIoSpace((PVOID)Dev->Bar0, BAR0_MAP_LEN); Dev->Bar0 = NULL; }
+    if (Dev->Bar1Cpu) { MmUnmapIoSpace((PVOID)Dev->Bar1Cpu, Dev->Bar1MapLen); Dev->Bar1Cpu = NULL; }
     if (Dev->Car)  { MmUnmapIoSpace((PVOID)Dev->Car, CAR_LEN);       Dev->Car = NULL; }
     if (Dev->Pmc)  { MmUnmapIoSpace((PVOID)Dev->Pmc, PMC_LEN);       Dev->Pmc = NULL; }
     if (Dev->Mc)   { MmUnmapIoSpace((PVOID)Dev->Mc, MC_LEN);         Dev->Mc = NULL; }

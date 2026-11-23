@@ -1,4 +1,4 @@
-﻿# GPU 段階 A / B1 / B2a: switchgpu(試験)
+# GPU 段階 A / B1 / B2a: switchgpu(試験)
 
 GM20B の GPU に Windows から電源とクロックを入れ、GPU が応答するか(ID レジスター `NV_PMC_BOOT_0` が読めるか)を確かめるテスト用ドライバーです。GPU で描くための最初の一歩で、画面の表示には関係しません。
 
@@ -468,3 +468,47 @@ Step 83 にあった PE stream-master と zCull の 6 write は Step 101 へ移�
 ## 0.4.56 (Claude): 0.4.55 の止まり方の修正
 
 0.4.55 の実機では、Step 101 の zcull の設定で、書いた値と読み返しが違うレジスターがあり(0x500910 は bit30 が足される、0x500918 と放送用の 0x41BFD4 は 0 と読める)、E000009C で止まった。priv ring の拒否はなく、同じ値は以前の Step 83 でも止めずに書いていたので、読み返しの違いは記録だけにした。また 0x120074(FBP の数)が 0 と読めたので、0 のときは nouveau 流の ROP 設定を飛ばし、Step 92 の nvgpu 流(LTC の数 2)に任せる(B3cC2eNouveauRopSkippedZeroFbp)。
+
+## Stage D: channel command path
+
+各段階は一回だけ実行し、成功/失敗のどちらでも既存の GPU reset と一時領域の cleanup へ進みます。各 wait は上限を設けます。C2e の golden context までの処理は変更しません。
+
+| Version | Sub-step | Steps / errors | Scope |
+| --- | --- | --- | --- |
+| 0.4.57 | D1 | Step 104 / `E000009F` | PFIFO/PBDMA topology と状態を記録し、確認できた最小の PFIFO/PBDMA 初期化を実施。runlist/USERD はまだ設定しない。 |
+| 0.4.58 | D2 | Step 105 / `E00000A0` | D1 成功後に C2d arena の RAMIN/RAMFC、USERD、空の GPFIFO ring、pushbuffer を設定し、channel 0 を GR runlist に登録して bounded wait 後に unbind/cleanup する。GPFIFO entry は送らない。 |
+| 0.4.59 | D2 再試行 | Step 105 / `E00000A0` | 0.4.58 は channel instance の bind で PFIFO BIND_ERROR(target VID)。target を stage C の FECS bind と同じ sys_mem_ncoh(3)に変更。 |
+| 0.4.60 | D2 再試行 2 | Step 105 / `E00000A0` | 0.4.59 は inst の読み返し OK でも BIND_ERROR。USERD の target も sys_mem_ncoh(3)にし、bind 前後の fifo_intr_0 と 0x252C(bind error 情報)を記録。古い bit0 は bind 前に消す。 |
+| 0.4.61 | D2 再試行 3 | Step 105 / `E00000A0` | 0.4.60 の bind error 情報 0x2 = SNOOP_WITHOUT_BAR1。channel bind の前に BAR1(0x1704)を GR instance block に結び、0x1710 を bounded wait、終了時に元へ戻す。 |
+| 0.4.62 | D2 再試行 4 | Step 105 / `E00000A0` | 0.4.61 は BAR1 を結んでも bind error 0x2。1 回の実行で BAR1 target {3, 0} x inst/USERD target {0, 2, 3} の 6 通りを bind/unbind して intr0 と 0x252C を記録し、エラーのない最初の組で続ける。 |
+| 0.4.63 | D2 再試行 5 | Step 105 / `E00000A0` | 0.4.62 は 6 通りすべて bind error 0x2(target は無関係)。nvgpu の FIFO 初期化と同じく fifo_bar1_base(0x2254)= USERD の GPU VA >> 12 | valid を bind 前に設定し、終了時に戻す。6 通りの試しも残す。 |
+| 0.4.64 | D2 後片付け | Step 105 / `E00000A0` | 0.4.63 で bind / runlist / channel ON_PBDMA まで成功。PBDMA0 intr_0 bit 24 が残り preempt が時間切れ。PBDMA0 の状態を記録し、preempt の前に PBDMA の割り込みを消す。 |
+| 0.4.65 | D2 PBDMA 初期化 | Step 105 / `E00000A0` | 0.4.64 で PBDMA0 intr_0 bit 24 は write-1 でも消えず preempt 時間切れ。nouveau gk104_runq_init と同じ PBDMA0 初期化(0x4013C、0x40108、0x40148、0x4010C、0x4014C)を bind 前に行い、bit 24 が立つ時点を記録。 |
+| 0.4.66 | D2 ENGINE 割り込み | Step 105 / `E00000A0` | 0.4.65: PBDMA 初期化後も bit 24(nvgpu の名前で [ENGINE])が runlist の直後に立つ。GR / FECS / FIFO の状態を記録し、後片付けでは nouveau と同じく method0 = 0x80600008 にしてから割り込みを消す。 |
+| 0.4.67 | D2 RAMFC 修正 | Step 105 / `E00000A0` | RAMFC は nvgpu 値と一致し channel は ON_PBDMA、runlist submit も完了したが、PBDMA0 intr_0 bit 24 が発生。W1C で消えず cleanup preempt は 2000 poll timeout。 |
+| 0.4.69 | D3 GP_PUT 試行 | Step 106 / `E00000A1` | GPFIFO entry と pushbuffer は正しく配置されたが、CPU が USERD backing page に GP_PUT=1 を書いても USERD/PBDMA GP_GET は 0、semaphore も 0 のまま。PBDMA bit24 はマスク状態で残り、FIFO PBDMA status は 0x2000。BAR1 snoop を使う doorbell が必要。 |
+| 0.4.70 | D3 BAR1 doorbell retry | Step 106 / `E00000A1` | BAR1 を CPU map し、USERD を低位 GPU VA 0x00100000 に alias。BAR1+VA+0x8C で GP_PUT を通知し、BAR1 readback、backing、MMU fault、FIFO intr0 を記録してから bounded wait。 |
+| 0.4.71 | D3 再試行 | Step 106 / `E00000A1` | 0.4.70 実機: BAR1 経由 GP_PUT は読み直し 1、元のメモリーは 0 のままで、この不一致を失敗と扱い待つ前に中断。元のメモリー一致の条件を外し、USERD GP_GET も BAR1 から読む(Claude)。 |
+| 0.4.72 | D3 再試行 | Step 106 / `E00000A1` | bit 24 = ENG_RESET(open-gpu-doc)。CE2(PMC_ENABLE bit 21、runlist 0 を GR と共有)が reset のままだった。PFIFO と一緒に CE2 も reset 解除(nvgpu と同じ順)(Claude)。 |
+| 0.4.73 | D3 再試行 | Step 106 / `E00000A1` | 0.4.72 実機で bit 24 解消、GP_GET 1、PB GET=PUT、preempt 完了。semaphore 値だけ CPU から見えないため、L2 flush/invalidate 後に読み直し、ref は BAR1 経由で読む(Claude)。 |
+| 0.4.73 実機 | **D3 完了** | semaphore 0xD3D3D3D3、ref 0x1234、D2/D3 結果 0、cleanup 0。 |
+| 0.4.71 | D4 | Steps 109-110 / `E00000A3` | Stage C の golden context を使い、GM20B 3D (`0xB197`) または compute (`0xB1C0`) class を bind して GR 側の semaphore/report を確認する。 |
+| 0.4.72 | D5 | Steps 111-112 / `E00000A4` | 最小の clear/2D または compute dispatch を発行し、結果を readback する。 |
+
+0.4.69 では USERD backing page に CPU write した GP_PUT が PBDMA に届かず、GP_GET と semaphore は 0 のままでした。0.4.70 は2つ目の Memory32Fixed resource を必要範囲だけ uncached map し、GPU PGT に USERD の低位 VA alias を追加します。fifo_bar1_base (0x2254) は alias の page number と valid bit にし、BAR1 block (0x1704) は従来どおり GR instance block に結びます。GP_PUT は BAR1 CPU mapping + 0x00100000 + 0x8C へ書き、BAR1/backing readback と FIFO MMU fault/intr を確認します。BAR1 mapping は ReleaseHardware で解除します。
+
+0.4.67 は D2 の RAMFC subdevice/acquire fields を nvgpu の GM20B `hw_ram_gm20b.h` と `channel_gk20a_setup_ramfc()` に合わせる診断付き修正です。新しい MMIO write は追加せず、RAMFC の subdevice field を `0x30000001`、acquire field を `0x7FFFF902` とします。BAR1/CCSR probe の全 MMIO write は `B3cD2Writes` に記録し、各 write 後に priv-ring を確認します。実機では PBDMA0 interrupt、map/target、FECS current/new context の runlist 前後の値と cleanup 結果を確認してください。
+
+### 0.4.57 D1: PFIFO/PBDMA setup
+
+Step 104 は C2e の成功後にだけ実行します。まず TOP の GPC/TPC/FBP/LTC 値と device-info table、PFIFO interrupt/status、engine status、PBDMA0 status/interrupt と MC_ENABLE_PB を読みます。GM20B の TOP/MC headers で確認できる範囲で PBDMA0 を識別し、TOP device-info の raw words も残します。書き込みは `gk104_fifo_init_pbdmas()` に沿う MC_ENABLE_PB (`0x204`)、PFIFO FB-timeout (`0x2A04`)、GM20B FIFO function table が選ぶ `gk208_fifo_init_pbdma_timeout()` の PBDMA0 timeout (`0x4012C`)、および `gk104_fifo_init()` の PFIFO interrupt clear/enable (`0x2100`, `0x2140`) に限定します。各 write 後に priv-ring station を確認し、readback を記録します。この段階では polling wait は行いません。`E0000095` は priv-ring ACK timeout、`E000009F` は D1 の GR-enable guard/readback failure です。
+
+PFIFO/GR 外の write は MC aperture の `0x204` (Nouveau `gk104_fifo_init_pbdmas()` の PBDMA mask) と PBDMA0 の `0x4012C` (Nouveau `gk208_fifo_init_pbdma_timeout()` の timeout) です。`0x2A04` / `0x2100` / `0x2140` は PFIFO registers です。MC interrupt routing は変更しません。runlist/USERD/RAMFC は backing と IOVA を用意する D2 まで設定せず、PBDMA local interrupt enable は D1 では変更せず現状値を記録します。TOP/device-info encoding と register offsets は MIT nvgpu L4T `hw_top_gm20b.h`, `hw_fifo_gm20b.h`, `hw_pbdma_gm20b.h`, `hw_ram_gm20b.h`, `hw_mc_gm20b.h` で照合しました。Nouveau の GM20B path は `gm20b_fifo` → `gk104_fifo_init_pbdmas()`, `gk208_fifo_init_pbdma_timeout()`, `gk104_fifo_init()` を使います。nvgpu の `gk20a_init_fifo_setup_hw()` の残りと per-PBDMA interrupt policy は D1 の hardware trace を確認後に扱います。
+
+### 0.4.58 D2: one empty channel and runlist registration
+
+Step 105 は C2e と D1 が成功した場合だけ実行します。既存の C2d 2 MiB GR arena 内に RAMFC/RAMIN (同じ instance block と GPU page directory)、USERD page、空の 512-entry GPFIFO ring、空の pushbuffer、GR runlist の1-entry backing を配置します。RAMFC の channel fields と runlist entry は readback し、WFI pointer は C2e が golden save 後に消した値を channel context VA に戻してから公開します。TOP device-info の engine/runlist enum を読み、runlist ID と GR engine ID を別々に記録します。
+
+Nouveau MIT `gk104.c:gk104_chan_ramfc_write()` の RAMFC fields、`gk104_chan_bind()` / `gk104_chan_bind_inst()` の runlist/instance binding、`gk104_runl_insert_chan()` の2-DWORD plain channel entry、`gk104_runl_commit()` の runlist base/submit、`gk104_runl_pending()` の pending bit を参照しました。channel 0 を CCSR に bind/enable して 1-entry runlist の完了を最大2000 poll待ちし、最後は enable clear、channel preempt、empty runlist submit、instance unbind を行います。各 wait は最大2000回 x 1 ms、各 MMIO write は `B3cPrivRingAfterGrWrite()` で確認します。失敗は `E00000A0` です。
+
+明示的な MMIO write は CCSR channel `0x800004` (runlist ID と enable set/clear)、CCSR instance `0x800000` (bind/unbind)、PFIFO runlist base/submit `0x2270/0x2274`、PFIFO preempt `0x2634` です。これら以外に MC interrupt routing や CPU interrupt を変更しません。USERD、GPFIFO、runlist、pushbuffer は C2d の既存 SMMU/GPU page table にマップされた arena suballocation で、追加の物理 allocation はありません。GPFIFO command は一つも投稿せず、channel 登録後に clean unbind してから既存 reset/arena cleanup に進みます。実機では TOP engine/runlist IDs、各 `B3cD2Writes` 行、runlist/pending と preempt polls、channel status、PFIFO/PBDMA/GR status、cleanup final values を確認してください。

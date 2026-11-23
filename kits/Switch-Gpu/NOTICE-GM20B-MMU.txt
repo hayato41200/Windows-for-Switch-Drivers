@@ -1,4 +1,4 @@
-﻿The 4K small-page PDE encoding in switchgpu.c is adapted from
+The 4K small-page PDE encoding in switchgpu.c is adapted from
 Linux nouveau v6.12, nvkm/subdev/mmu/vmmgf100.c, gf100_vmm_pgd_pde.
 https://github.com/torvalds/linux/blob/v6.12/drivers/gpu/drm/nouveau/nvkm/subdev/mmu/vmmgf100.c
 
@@ -400,3 +400,38 @@ Addresses and field values were verified against MIT nvgpu
 hw_gr_gm20b.h and hw_top_gm20b.h. No source code was copied. The fixed
 one-GPC/two-TPC zcull mapping follows the existing driver setup; the added
 FIFO access value is access_enabled | semaphore_access_enabled (0x00010001).
+
+0.4.57 PFIFO/PBDMA setup was compared with MIT-licensed Linux Nouveau
+nvkm/engine/fifo/gm20b.c (gm20b_fifo), gk104.c
+(gk104_fifo_init_pbdmas, gk104_fifo_init, gk104_fifo_runl_ctor), and gk208.c
+(gk208_fifo_init_pbdma_timeout). Register offsets and field definitions were
+cross-checked against MIT nvgpu L4T r32.7.6 hw_top_gm20b.h,
+hw_fifo_gm20b.h, hw_pbdma_gm20b.h, hw_ram_gm20b.h, and hw_mc_gm20b.h.
+No source code was copied. The nvgpu FIFO implementation file was not in the
+local nvgpu-ref snapshot; per-PBDMA interrupt policy remains read-only in this
+step.
+
+0.4.58 D2 channel RAMFC, binding, runlist entry, and runlist submission were
+compared with Linux Nouveau MIT nvkm/engine/fifo/gk104.c functions
+gk104_chan_ramfc_write(), gk104_chan_bind(), gk104_chan_bind_inst(),
+gk104_chan_start(), gk104_chan_stop(), gk104_chan_unbind(),
+gk104_runl_insert_chan(), gk104_runl_commit(), and gk104_runl_pending().
+The TOP, RAM, CCSR, FIFO, and PBDMA field encodings were cross-checked against
+the MIT nvgpu L4T r32.7.6 hw_top_gm20b.h, hw_ram_gm20b.h,
+hw_ccsr_gm20b.h, hw_fifo_gm20b.h, and hw_pbdma_gm20b.h. The referenced
+Nouveau RAMFC values and channel/runlist ordering are used as data; no
+third-party source code was copied. Original MIT copyright and license
+notices remain with their referenced sources and headers.
+
+0.4.67 D2 RAMFC fields were checked against MIT Switchroot nvgpu 1ae0167d,
+gk20a/channel_gk20a.c function channel_gk20a_setup_ramfc(), and unmodified
+MIT nvgpu L4T r32.7.6 hw_ram_gm20b.h and hw_pbdma_gm20b.h. The subdevice ID,
+active/channel-DMA flags, and acquire timeout field values are used as data;
+no source code was copied. Original MIT copyright and license notices remain
+with the referenced source and headers.
+
+
+0.4.68 D3 packet and GPFIFO field values were cross-checked against NVIDIA's public GM20B/PBDMA register headers and public host-method definitions (SET_REFERENCE and SEMAPHORE RELEASE). These values are used as data only; no third-party source code was copied or adapted.
+
+
+0.4.70 BAR1 USERD doorbell and alias translation were checked against MIT nvgpu GM20B/GK20A FIFO and BAR1 setup (gk20a_bar1_writel(), gk20a_init_fifo_setup_hw()) and the unmodified GM20B GPU page-table register definitions. Only register/method values and flow were used as reference; no third-party source code was copied.
