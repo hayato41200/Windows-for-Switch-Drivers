@@ -64,9 +64,9 @@ switch ($Mode) {
     while ($true) {
       $p = Get-ItemProperty $Key -ErrorAction SilentlyContinue
       if ($p) {
-        Write-Host ("{0}  {1,4}  {2,5}  {3,6}  {4,7}  {5,6}  {6},{7}  held={8} flicker={9} merge={10} lift={11}" -f (Get-Date -Format 'HH:mm:ss'),
+        Write-Host ("{0}  {1,4}  {2,5}  {3,6}  {4,7}  {5,6}  {6},{7}  held={8} flicker={9} merge={10} lift={11} retap={12}({13} ms)" -f (Get-Date -Format 'HH:mm:ss'),
                     $p.Irqs, $p.Polls, $p.Events, $p.Reports, $p.Errors, $p.LastLandscapeX, $p.LastLandscapeY, $p.Held,
-                    $p.Flickers, $p.Merges, $p.Releases)
+                    $p.Flickers, $p.Merges, $p.Releases, $p.QuickRetaps, $p.LastRetapMs)
       }
       Start-Sleep -Seconds 1
     }
