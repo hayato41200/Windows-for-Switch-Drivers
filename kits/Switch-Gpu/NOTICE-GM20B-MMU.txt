@@ -450,3 +450,12 @@ gr_gk20a_set_fecs_watchdog_timeout(), gr_gk20a_enable_ctxsw(), and
 gr_gk20a_ctrl_ctxsw(), plus hw_ctxsw_prog_gm20b.h and hw_gr_gm20b.h.
 Function order and register/header values are used as data; no third-party
 source code was copied or adapted.
+
+0.4.77 D5 color-clear method identifiers and fields were checked against
+NVIDIA open-gpu-doc MIT classes/3d/clb197.h (MAXWELL_B 0xB197; color-target,
+surface-clip, clear-rectangle, clear-value, and CLEAR_SURFACE definitions).
+Clear-rectangle and RGBA clear-mask ordering were cross-checked against the
+MIT Mesa Nouveau source src/nouveau/vulkan/nvk_cmd_clear.c, functions
+emit_clear_rects() and nvk_CmdClearAttachments(). These definitions and
+method values are used as data; no third-party source code was copied or
+adapted. Original MIT notices remain with the referenced files.

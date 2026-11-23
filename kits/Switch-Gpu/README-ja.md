@@ -19,7 +19,7 @@ GM20B の GPU に Windows から電源とクロックを入れ、GPU が応答�
 | `AcrTest.cmd` | 段階 B3c。GPU の WPR 保護領域と SMMU の範囲を確認し、署名付き ACR を一度だけ起動した後、LS PMU と FECS の bootstrap を試す。待ちは上限付きで、必ず GPU をリセットしてから一時メモリーと変換表を戻す |
 | `Remove.cmd` | switchgpu を外す |
 
-どれも右クリックして「管理者として実行」。最後の `SUMMARY` を写真に撮る。記録は `C:\SwitchWOA-Gpu.txt` に追記される。
+どれもダブルクリックで動く(0.4.78 から)。UAC の確認が出たら「はい」を押す。右クリックの「管理者として実行」でもよい。最後の `SUMMARY` を写真に撮る。記録は `C:\SwitchWOA-Gpu.txt` に追記される。
 
 ## 手順
 
@@ -492,10 +492,10 @@ Step 83 にあった PE stream-master と zCull の 6 write は Step 101 へ移�
 | 0.4.72 | D3 再試行 | Step 106 / `E00000A1` | bit 24 = ENG_RESET(open-gpu-doc)。CE2(PMC_ENABLE bit 21、runlist 0 を GR と共有)が reset のままだった。PFIFO と一緒に CE2 も reset 解除(nvgpu と同じ順)(Claude)。 |
 | 0.4.73 | D3 再試行 | Step 106 / `E00000A1` | 0.4.72 実機で bit 24 解消、GP_GET 1、PB GET=PUT、preempt 完了。semaphore 値だけ CPU から見えないため、L2 flush/invalidate 後に読み直し、ref は BAR1 経由で読む(Claude)。 |
 | 0.4.73 実機 | **D3 完了** | semaphore 0xD3D3D3D3、ref 0x1234、GP_GET 1、PB GET=PUT、preempt/cleanup 成功。bit 24 は CE2 reset 解除不足 (ENG_RESET) が原因で、D1 の CE2 enable で解消した。 |
-| 0.4.74-0.4.76 | **D4 完了** | SET_OBJECT 0xB197 + NOP + WFI semaphore。golden をチャンネル ctx に複写しヘッダー修正、FECS watchdog + START_CTXSW、semaphore を L2 flush しながら待つ。0.4.76 実機で 0xD4D4D4D4。 |
+| 0.4.74-0.4.75 | D4 の実装・再試行 | Steps 107-108 / `E00000A2`-`E00000A3` | SET_OBJECT 0xB197 + NOP + WFI semaphore。golden を channel context に複写し、header、FECS watchdog、START_CTXSW を設定。GP_GET 後の semaphore 完了を追跡する診断を追加。 |
 | 0.4.74 実機 | D3 成功、D4 context switch 停止 | D3 semaphore `0xD3D3D3D3`。D4 GP_GET=2、全 9 dword 読み込み、PBDMA/FIFO/MMU/GR intr は 0。FECS current context は channel instance、FIFO engine は `0x8000A000` (CTXSW_LOAD)。semaphore 未完了、cleanup preempt は CTXSW_SAVE で timeout。 |
-| 0.4.75 | **D4 retry: channel golden context と FECS ctxsw 初期化** | Steps 107-108 / `E00000A2`-`E00000A3` | nvgpu `gr_gk20a_load_golden_ctx_image()` の順で C2e golden image を D2 channel context (`GR_VM_CTX_OFF`) へ複製し、patch/priv-map/zcull/PM/header fields を設定。さらに `gr_gk20a_init_ctx_state()` の watchdog method と `gr_gk20a_enable_ctxsw()` の START_CTXSW を実行し、mailbox-1 の PASS を待ってから class `0xB197` + NOP + WFI semaphore を送る。GP_GET 後に semaphore が止まった時と cleanup preempt timeout 時に FECS/GPCCS/ctxsw/header を採取。 |
-| 0.4.76 | D5 | Steps 109-110 / `E00000A4` | D4 が通過した後、最小の clear/2D または compute dispatch を発行し、結果を readback する。 |
+| 0.4.76 実機 | **D4 完了** | semaphore `0xD4D4D4D4` を 70 回目に確認、engine `0x2000`、GR status/intr `0`、preempt 成功。GP_GET=2 後も完了 semaphore を L2 flush/invalidate しながら bounded wait する。 |
+| 0.4.77 | **D5: 3D color clear** | Step 109 / `E00000A4` | D4 成功後、arena offset `0x1D6000` の 64x64 A8R8G8B8 pitch-linear RT を `0xFFFF00FF` に clear。GP_GET と WFI semaphore を bounded wait し、4096 pixels を CPU readback する。Step 108 は D4 が使用中のため D5 は Step 109。 |
 
 0.4.69 では USERD backing page に CPU write した GP_PUT が PBDMA に届かず、GP_GET と semaphore は 0 のままでした。0.4.70 は2つ目の Memory32Fixed resource を必要範囲だけ uncached map し、GPU PGT に USERD の低位 VA alias を追加します。fifo_bar1_base (0x2254) は alias の page number と valid bit にし、BAR1 block (0x1704) は従来どおり GR instance block に結びます。GP_PUT は BAR1 CPU mapping + 0x00100000 + 0x8C へ書き、BAR1/backing readback と FIFO MMU fault/intr を確認します。BAR1 mapping は ReleaseHardware で解除します。
 

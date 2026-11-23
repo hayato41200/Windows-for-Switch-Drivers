@@ -39,7 +39,7 @@
 #include <wdf.h>
 #include <spb.h>
 
-#define SWGPU_VERSION      0x0000044Cu   /* 0.4.76 */
+#define SWGPU_VERSION      0x0000044Fu   /* 0.4.79 */
 
 #define CAR_PHYS           0x60006000ull
 #define CAR_LEN            0x1000u
@@ -1106,6 +1106,7 @@ static VOID ProbeB2a(PSWGPU_DEVICE Dev)
 #define GR_VM_D2_GPFIFO_OFF 0x1D3000u
 #define GR_VM_D2_RUNLIST_OFF 0x1D4000u
 #define GR_VM_D2_PUSHBUF_OFF 0x1D5000u
+#define GR_VM_D2_RT_OFF      0x1D6000u /* D5 pitch-linear 64x64x4 render target */
 #define GR_VM_GPU_PGT_BAR1_OFF 0x1A0000u /* spare 64 KiB-aligned segment within the PGT backing */
 #define GR_VM_GPU_VA       0x18000000u
 #define GR_VM_PAGE_COUNT   (GR_VM_ARENA_SIZE >> 12)
@@ -4513,6 +4514,57 @@ static BOOLEAN B3cD2Write(volatile UCHAR *B, ULONG writeTable[64][4],
     return TRUE;
 }
 
+/* D5 L2 maintenance uses a bounded writes[] ledger because the semaphore
+ * visibility poll may request up to 2000 flush/invalidate pairs. */
+static BOOLEAN B3cD5Write(volatile UCHAR *B, ULONG (*writeTable)[4],
+                           ULONG *writeCount, ULONG writeCapacity,
+                           ULONG writeAddress, ULONG writeValue)
+{
+    ULONG slot;
+    if (writeTable == NULL || writeCount == NULL || *writeCount >= writeCapacity)
+        return FALSE;
+    slot = *writeCount;
+    writeTable[slot][0] = writeAddress;
+    writeTable[slot][1] = Rd(B, writeAddress);
+    writeTable[slot][2] = writeValue;
+    Wr(B, writeAddress, writeValue);
+    KeMemoryBarrier();
+    if (!B3cPrivRingAfterGrWrite(B, writeAddress, writeValue)) {
+        writeTable[slot][3] = Rd(B, writeAddress);
+        ++(*writeCount);
+        return FALSE;
+    }
+    writeTable[slot][3] = Rd(B, writeAddress);
+    ++(*writeCount);
+    return TRUE;
+}
+
+static BOOLEAN B3cD5L2Flush(volatile UCHAR *B, ULONG (*writes)[4],
+                             ULONG *writeCount, ULONG writeCapacity, PULONG state)
+{
+    ULONG polls, status = 0u;
+    if (!B3cD5Write(B, writes, writeCount, writeCapacity, 0x00070010u, 1u))
+        return FALSE;
+    for (polls = 0u; polls < 2000u; ++polls) {
+        status = Rd(B, 0x00070010u);
+        if ((status & 3u) == 0u) break;
+        Us(5u);
+    }
+    state[0] = polls; state[1] = status;
+    if (polls == 2000u ||
+        !B3cD5Write(B, writes, writeCount, writeCapacity, 0x00070004u, 1u)) {
+        state[2] = 0u; state[3] = 0u;
+        return FALSE;
+    }
+    for (polls = 0u; polls < 2000u; ++polls) {
+        status = Rd(B, 0x00070004u);
+        if ((status & 3u) == 0u) break;
+        Us(5u);
+    }
+    state[2] = polls; state[3] = status;
+    return polls < 2000u;
+}
+
 /* Capture the FECS/GPCCS and channel-context state when a host context switch
  * stalls. ICD trace-index writes are routed through B3cD2Write so each write
  * is recorded and checked by the priv-ring handler. Addresses/fields follow
@@ -5165,6 +5217,289 @@ done:
     return result;
 }
 
+/* D5: issue a pitch-linear Maxwell B 3D color clear through channel 0.
+ * The method offsets/data are from NVIDIA MIT open-gpu-doc classes/3d/clb197.h.
+ * The host semaphore is kept in the already mapped pushbuffer page, separate
+ * from the 16 KiB render target at GR_VM_D2_RT_OFF. */
+static ULONG B3cRunD5(PSWGPU_DEVICE Dev, PULONG userd, PULONG gpfifo,
+                      PULONG pushbuffer, ULONGLONG pushbufferGpuVa)
+{
+    volatile UCHAR *B = Dev->Bar0;
+    volatile ULONG *bar1GpPut = NULL;
+    volatile ULONG *semSlot = NULL;
+    PULONG renderTarget = NULL;
+    PULONGLONG gpuPgt = NULL;
+    ULONGLONG renderGpuVa = (ULONGLONG)GR_VM_GPU_VA + GR_VM_D2_RT_OFF;
+    ULONGLONG semGpuVa = (ULONGLONG)GR_VM_GPU_VA + GR_VM_D2_PUSHBUF_OFF + PAGE_SIZE - 64u;
+    ULONG result = 0u, grEnabled = 0u, cursor = 0u, methodCount = 0u;
+    ULONG gpWords[2] = { 0u, 0u }, methodTrace[40][2] = { { 0u } };
+    ULONG semWords[4] = { 0u };
+    ULONG gpGetPolls = 0u, semPolls = 0u, l2Fails = 0u;
+    ULONG userdGpGet = 0u, pbGpGet = 0u, pbGet = 0u, pbPut = 0u;
+    ULONG semValue = 0u, pbIntr0 = 0u, pbIntr1 = 0u, pbMethod0 = 0u;
+    ULONG pbData0 = 0u, fifoIntr0 = 0u, mmuFault = 0u, pbdmaStatus = 0u;
+    ULONG grIntr = 0u, grException = 0u, grStatus = 0u, engineStatus = 0u;
+    ULONG feEsr = 0u, dsEsr = 0u, sccEsr = 0u, pdEsr = 0u, mmeEsr = 0u, skedEsr = 0u;
+    ULONG expected = 0xFFFF00FFu, expectedPixels = 0u, stalePixels = 0u;
+    ULONG rtPteIndex = 0u, rtPteExpectedLo = 0u, rtPteReadLo = 0u;
+    ULONGLONG rtPteExpected = 0u, rtPteRead = 0u;
+    ULONG otherPixels = 0u, firstPixel = 0u, middlePixel = 0u, lastPixel = 0u;
+    ULONG firstMismatchOffset = 0xFFFFFFFFu, firstMismatchValue = 0u;
+    ULONG uniformValue = 0u, uniform = 1u;
+    ULONG (*writes)[4] = NULL;
+    ULONG diagWrites[64][4] = { { 0u } }, diagWriteCount = 0u;
+    ULONG writeSamples[8][4] = { { 0u } };
+    ULONG writeCount = 0u, writeCapacity = 8192u, surfaceScanned = 0u;
+    ULONG l2State[4] = { 0u }, i;
+
+    Step(109); /* D4 already uses Step 108 in B3cRunD4. */
+    B3cPrivRingResetWriteLog();
+    grEnabled = Rd(B, NV_PMC_ENABLE);
+    if ((grEnabled & (1u << 12)) == 0u || userd == NULL || gpfifo == NULL ||
+        pushbuffer == NULL || pushbufferGpuVa == 0u || Dev->Bar1Cpu == NULL ||
+        Dev->Bar1MapLen < BAR1_D3_MAP_LEN || !g_GrVm.Active || g_GrVm.Arena == NULL ||
+        GR_VM_D2_RT_OFF + 64u * 64u * sizeof(ULONG) > GR_VM_ARENA_SIZE ||
+        semGpuVa + 16u > (ULONGLONG)GR_VM_GPU_VA + GR_VM_ARENA_SIZE) {
+        result = 0xE00000A4u;
+        goto done;
+    }
+    writes = (ULONG (*)[4])ExAllocatePool2(POOL_FLAG_NON_PAGED,
+        (SIZE_T)writeCapacity * sizeof(writes[0]), SWGPU_TAG);
+    if (writes == NULL) { result = 0xE00000A4u; goto done; }
+    RtlZeroMemory(writes, (SIZE_T)writeCapacity * sizeof(writes[0]));
+    bar1GpPut = (volatile ULONG *)(Dev->Bar1Cpu + BAR1_D3_LOW_VA + 0x8Cu);
+    semSlot = (volatile ULONG *)((PUCHAR)pushbuffer + PAGE_SIZE - 64u);
+    renderTarget = (PULONG)((PUCHAR)g_GrVm.Arena + GR_VM_D2_RT_OFF);
+    gpuPgt = (PULONGLONG)((PUCHAR)g_GrVm.Arena + GR_VM_GPU_PGT_OFF);
+    rtPteIndex = (ULONG)((renderGpuVa >> 12) & 0x7FFFu);
+    rtPteExpected = ((g_GrVm.Iova + GR_VM_D2_RT_OFF) >> 8) | 1ull;
+    rtPteExpectedLo = (ULONG)rtPteExpected;
+    rtPteRead = gpuPgt[rtPteIndex];
+    rtPteReadLo = (ULONG)rtPteRead;
+    if (rtPteRead != rtPteExpected) {
+        result = 0xE00000A4u; goto done;
+    }
+
+    /* Prefill distinctly from zero and make the CPU contents visible before
+     * the GPU's write; every 32-bit pixel is initialized within the arena. */
+    for (i = 0u; i < 64u * 64u; ++i) renderTarget[i] = 0x11111111u;
+    for (i = 0u; i < 4u; ++i) semSlot[i] = 0u;
+    if (!B3cD5Write(B, writes, &writeCount, writeCapacity, 0x00070010u, 1u)) {
+        result = 0xE00000A4u; goto done;
+    }
+    for (i = 0u; i < 2000u; ++i) {
+        l2State[1] = Rd(B, 0x00070010u);
+        if ((l2State[1] & 3u) == 0u) break;
+        Us(5u);
+    }
+    l2State[0] = i;
+    if (i == 2000u || !B3cD5Write(B, writes, &writeCount, writeCapacity, 0x00070004u, 1u)) {
+        result = 0xE00000A4u; goto done;
+    }
+    for (i = 0u; i < 2000u; ++i) {
+        l2State[3] = Rd(B, 0x00070004u);
+        if ((l2State[3] & 3u) == 0u) break;
+        Us(5u);
+    }
+    l2State[2] = i;
+    if (i == 2000u) { result = 0xE00000A4u; goto done; }
+
+    /* Each INC packet below is a single Maxwell B 3D method.  SET_OBJECT
+     * reasserts the already bound B197 class on subchannel zero. */
+#define D5_METHOD(m, v) do { \
+        if (cursor + 2u >= PAGE_SIZE / sizeof(ULONG) - 16u || methodCount >= RTL_NUMBER_OF(methodTrace)) { result = 0xE00000A4u; goto done; } \
+        pushbuffer[cursor++] = 0x20010000u | ((ULONG)(m) >> 2); \
+        pushbuffer[cursor++] = (ULONG)(v); \
+        methodTrace[methodCount][0] = (ULONG)(m); methodTrace[methodCount][1] = (ULONG)(v); ++methodCount; \
+    } while (0)
+    D5_METHOD(0x0000u, 0x0000B197u); /* SET_OBJECT */
+    D5_METHOD(0x121Cu, 0x00000001u); /* SET_CT_SELECT: one target, target 0 */
+    D5_METHOD(0x0800u, (ULONG)(renderGpuVa >> 32)); /* SET_COLOR_TARGET_A(0) */
+    D5_METHOD(0x0804u, (ULONG)renderGpuVa); /* SET_COLOR_TARGET_B(0) */
+    D5_METHOD(0x0808u, 256u); /* SET_COLOR_TARGET_WIDTH(0): pitch layout takes the pitch in bytes (64 px x 4), as nouveau nvc0_validate_fb (Claude 0.4.77) */
+    D5_METHOD(0x080Cu, 64u); /* SET_COLOR_TARGET_HEIGHT(0) */
+    D5_METHOD(0x0810u, 0xCFu); /* SET_COLOR_TARGET_FORMAT(0): A8R8G8B8 */
+    D5_METHOD(0x0814u, 0x00001000u); /* SET_COLOR_TARGET_MEMORY(0): pitch layout */
+    D5_METHOD(0x0818u, 1u); /* SET_COLOR_TARGET_THIRD_DIMENSION(0) */
+    D5_METHOD(0x081Cu, 0u); /* SET_COLOR_TARGET_ARRAY_PITCH(0): one layer, zero layer stride */
+    D5_METHOD(0x0820u, 0u); /* SET_COLOR_TARGET_LAYER(0) */
+    D5_METHOD(0x0FE0u, 0u); /* SET_ZT_A: no depth surface */
+    D5_METHOD(0x0FE4u, 0u); /* SET_ZT_B */
+    D5_METHOD(0x1538u, 0u); /* SET_ZT_SELECT: zero targets */
+    D5_METHOD(0x0FF4u, 0x00400000u); /* SET_SURFACE_CLIP_HORIZONTAL: 0..64 */
+    D5_METHOD(0x0FF8u, 0x00400000u); /* SET_SURFACE_CLIP_VERTICAL: 0..64 */
+    D5_METHOD(0x0DF8u, 0u); /* SET_WINDOW_OFFSET_X */
+    D5_METHOD(0x0DFCu, 0u); /* SET_WINDOW_OFFSET_Y */
+    D5_METHOD(0x0E00u, 0u); /* SET_SCISSOR_ENABLE(0): disabled */
+    D5_METHOD(0x10F8u, 0x00000010u); /* SET_CLEAR_SURFACE_CONTROL: use clear rect */
+    D5_METHOD(0x0D6Cu, 0x00400000u); /* SET_CLEAR_RECT_HORIZONTAL: [0,64) */
+    D5_METHOD(0x0D70u, 0x00400000u); /* SET_CLEAR_RECT_VERTICAL: [0,64) */
+    D5_METHOD(0x0D80u, 0x3F800000u); /* SET_COLOR_CLEAR_VALUE(0): R=1 */
+    D5_METHOD(0x0D84u, 0x00000000u); /* SET_COLOR_CLEAR_VALUE(1): G=0 */
+    D5_METHOD(0x0D88u, 0x3F800000u); /* SET_COLOR_CLEAR_VALUE(2): B=1 */
+    D5_METHOD(0x0D8Cu, 0x3F800000u); /* SET_COLOR_CLEAR_VALUE(3): A=1 */
+    /* Claude 0.4.79: 0.4.78 hw trapped CLASS_ERROR code 4 at method 0x0FA4
+     * data 0x10 (gr_trapped_addr). The sample-mask / MRT / AA methods
+     * (0x0FA4, 0x0FA8, 0x0FAC, 0x0FB8) are not needed for a 1x clear and
+     * were removed; the golden-context defaults stay in effect. */
+    D5_METHOD(0x19D0u, 0x0000003Cu); /* CLEAR_SURFACE: RGBA, target 0, layer 0 */
+    if (cursor + 6u >= PAGE_SIZE / sizeof(ULONG) - 16u) { result = 0xE00000A4u; goto done; }
+    pushbuffer[cursor++] = 0x20040004u; /* host SEMAPHOREA..D, release_wfi enabled */
+    pushbuffer[cursor++] = (ULONG)(semGpuVa >> 32);
+    pushbuffer[cursor++] = (ULONG)semGpuVa;
+    pushbuffer[cursor++] = 0xD5D5D5D5u;
+    pushbuffer[cursor++] = 0x01000002u;
+#undef D5_METHOD
+    methodTrace[methodCount][0] = 0xFFFFFFFFu;
+    methodTrace[methodCount][1] = 0xD5D5D5D5u;
+    ++methodCount;
+    KeMemoryBarrier();
+    gpWords[0] = (ULONG)pushbufferGpuVa & ~3u;
+    gpWords[1] = (ULONG)((pushbufferGpuVa >> 32) & 0xFFu) | (cursor << 10);
+    gpfifo[4] = gpWords[0]; gpfifo[5] = gpWords[1];
+    KeMemoryBarrier();
+    if (!B3cPrivRingDrainBeforeWrites(B)) { result = 0xE00000A4u; goto done; }
+    *bar1GpPut = 3u;
+    KeMemoryBarrier();
+    if (*bar1GpPut != 3u || Rd(B, 0x00002A30u) != 0u ||
+        (Rd(B, 0x00002100u) & 0x10000000u) != 0u) {
+        result = 0xE00000A4u; goto done;
+    }
+    for (gpGetPolls = 0u; gpGetPolls < 2000u; ++gpGetPolls) {
+        userdGpGet = *(volatile ULONG *)(Dev->Bar1Cpu + BAR1_D3_LOW_VA + 0x88u);
+        pbGpGet = Rd(B, 0x00040014u);
+        if (userdGpGet == 3u && pbGpGet == 3u) break;
+        Us(1u);
+    }
+    userdGpGet = *(volatile ULONG *)(Dev->Bar1Cpu + BAR1_D3_LOW_VA + 0x88u);
+    pbGpGet = Rd(B, 0x00040014u);
+    pbGet = Rd(B, 0x00040018u); pbPut = Rd(B, 0x0004005Cu);
+    if (userdGpGet != 3u || pbGpGet != 3u) { result = 0xE00000A4u; goto done; }
+    for (semPolls = 0u; semPolls < 2000u && semValue != 0xD5D5D5D5u; ++semPolls) {
+        ULONG roundState[4] = { 0u };
+        if (!B3cD5L2Flush(B, writes, &writeCount, writeCapacity, roundState)) ++l2Fails;
+        KeMemoryBarrier(); semValue = semSlot[0];
+        if (semValue == 0xD5D5D5D5u) break;
+        Us(10u);
+    }
+    if (!B3cD5L2Flush(B, writes, &writeCount, writeCapacity, l2State)) ++l2Fails;
+    KeMemoryBarrier();
+    for (i = 0u; i < 64u * 64u; ++i) {
+        ULONG pixel = renderTarget[i];
+        if (i == 0u) firstPixel = pixel;
+        else if (pixel != firstPixel) uniform = 0u;
+        if (i == 2048u) middlePixel = pixel;
+        if (i == 4095u) lastPixel = pixel;
+        if (pixel == expected) ++expectedPixels;
+        else if (pixel == 0x11111111u) ++stalePixels;
+        else {
+            ++otherPixels;
+            if (firstMismatchOffset == 0xFFFFFFFFu) { firstMismatchOffset = i * sizeof(ULONG); firstMismatchValue = pixel; }
+        }
+    }
+    surfaceScanned = 1u;
+    uniformValue = firstPixel;
+    if (semValue == 0xD5D5D5D5u && expectedPixels == 4096u) result = 0u;
+    else result = 0xE00000A4u;
+
+done:
+    if (renderTarget != NULL && surfaceScanned == 0u) {
+        if (writes != NULL) {
+            if (!B3cD5L2Flush(B, writes, &writeCount, writeCapacity, l2State)) ++l2Fails;
+        }
+        KeMemoryBarrier();
+        for (i = 0u; i < 64u * 64u; ++i) {
+            ULONG pixel = renderTarget[i];
+            if (i == 0u) firstPixel = pixel;
+            else if (pixel != firstPixel) uniform = 0u;
+            if (i == 2048u) middlePixel = pixel;
+            if (i == 4095u) lastPixel = pixel;
+            if (pixel == expected) ++expectedPixels;
+            else if (pixel == 0x11111111u) ++stalePixels;
+            else {
+                ++otherPixels;
+                if (firstMismatchOffset == 0xFFFFFFFFu) {
+                    firstMismatchOffset = i * sizeof(ULONG); firstMismatchValue = pixel;
+                }
+            }
+        }
+        surfaceScanned = 1u;
+        uniformValue = firstPixel;
+    }
+    userdGpGet = (Dev->Bar1Cpu != NULL && Dev->Bar1MapLen >= BAR1_D3_MAP_LEN) ?
+        *(volatile ULONG *)(Dev->Bar1Cpu + BAR1_D3_LOW_VA + 0x88u) : userdGpGet;
+    pbGpGet = Rd(B, 0x00040014u); pbGet = Rd(B, 0x00040018u); pbPut = Rd(B, 0x0004005Cu);
+    pbIntr0 = Rd(B, 0x00040108u); pbIntr1 = Rd(B, 0x00040148u);
+    pbMethod0 = Rd(B, 0x000400C0u); pbData0 = Rd(B, 0x000400C4u);
+    fifoIntr0 = Rd(B, 0x00002100u); mmuFault = Rd(B, 0x00002A30u);
+    pbdmaStatus = Rd(B, 0x00003080u); engineStatus = Rd(B, 0x00002640u);
+    if ((grEnabled & (1u << 12)) != 0u) {
+        grIntr = Rd(B, 0x00400100u); grException = Rd(B, 0x00400108u); grStatus = Rd(B, 0x00400700u);
+        feEsr = Rd(B, 0x00404000u); dsEsr = Rd(B, 0x0040C000u); sccEsr = Rd(B, 0x00405800u);
+        pdEsr = Rd(B, 0x00410A00u); mmeEsr = Rd(B, 0x00403000u); skedEsr = Rd(B, 0x00407000u);
+    }
+    if (semSlot != NULL) {
+        for (i = 0u; i < RTL_NUMBER_OF(semWords); ++i) semWords[i] = semSlot[i];
+        semValue = semWords[0];
+    }
+    Trace(L"B3cD5Step", 109u); Trace(L"B3cD5RtOffset", GR_VM_D2_RT_OFF);
+    Trace(L"B3cD5RtGpuVa", (ULONG)renderGpuVa); Trace(L"B3cD5RtBytes", 64u * 64u * sizeof(ULONG));
+    Trace(L"B3cD5RtPteIndex", rtPteIndex); Trace(L"B3cD5RtPteExpectedLo", rtPteExpectedLo);
+    Trace(L"B3cD5RtPteExpectedHi", (ULONG)(rtPteExpected >> 32));
+    Trace(L"B3cD5RtPteReadLo", rtPteReadLo); Trace(L"B3cD5RtPteReadHi", (ULONG)(rtPteRead >> 32));
+    Trace(L"B3cD5Pitch", 256u); Trace(L"B3cD5ExpectedPixel", expected);
+    Trace(L"B3cD5GpGetPolls", gpGetPolls); Trace(L"B3cD5SemPolls", semPolls);
+    Trace(L"B3cD5L2Polls", l2State[0]); Trace(L"B3cD5L2InvalidatePolls", l2State[2]); Trace(L"B3cD5L2Fails", l2Fails);
+    Trace(L"B3cD5UserdGpGet", userdGpGet); Trace(L"B3cD5PbGpGet", pbGpGet);
+    Trace(L"B3cD5PbGet", pbGet); Trace(L"B3cD5PbPut", pbPut); Trace(L"B3cD5SemValue", semValue);
+    Trace(L"B3cD5SemWfi", 1u); TraceBin(L"B3cD5SemaphoreWords", semWords, sizeof(semWords));
+    Trace(L"B3cD5ExpectedPixels", expectedPixels); Trace(L"B3cD5StalePixels", stalePixels);
+    Trace(L"B3cD5OtherPixels", otherPixels); Trace(L"B3cD5Uniform", uniform);
+    Trace(L"B3cD5UniformPartial", (uniform != 0u && expectedPixels != 4096u) ? 1u : 0u);
+    Trace(L"B3cD5UniformValue", uniformValue); Trace(L"B3cD5FirstPixel", firstPixel);
+    Trace(L"B3cD5MiddlePixel", middlePixel); Trace(L"B3cD5LastPixel", lastPixel);
+    Trace(L"B3cD5FirstMismatchOffset", firstMismatchOffset); Trace(L"B3cD5FirstMismatchValue", firstMismatchValue);
+    Trace(L"B3cD5PbIntr0", pbIntr0); Trace(L"B3cD5PbIntr1", pbIntr1);
+    Trace(L"B3cD5PbMethod0", pbMethod0); Trace(L"B3cD5PbData0", pbData0);
+    Trace(L"B3cD5FifoIntr0", fifoIntr0); Trace(L"B3cD5MmuFault", mmuFault); Trace(L"B3cD5PbdmaStatus", pbdmaStatus);
+    Trace(L"B3cD5GrIntr", grIntr); Trace(L"B3cD5GrException", grException); Trace(L"B3cD5GrStatus", grStatus);
+    /* Claude 0.4.78: 0.4.77 hw raised GR intr bit 20 (CLASS_ERROR). Record
+     * the nvgpu gk20a_gr_isr trap set (read-only): gr_class_error (code),
+     * gr_trapped_addr (method 13:2, subch 18:16, status 31), trapped data. */
+    Trace(L"B3cD5GrClassError", Rd(B, 0x00400110u));
+    Trace(L"B3cD5GrTrappedAddr", Rd(B, 0x00400704u));
+    Trace(L"B3cD5GrTrappedMethod", (Rd(B, 0x00400704u) & 0x3FFCu));
+    Trace(L"B3cD5GrTrappedDataLo", Rd(B, 0x00400708u));
+    Trace(L"B3cD5GrTrappedDataHi", Rd(B, 0x0040070Cu));
+    Trace(L"B3cD5GrFeObjectTable0", Rd(B, 0x00404200u));
+    Trace(L"B3cD5EngineStatus", engineStatus); Trace(L"B3cD5FeHwwEsr", feEsr);
+    Trace(L"B3cD5DsHwwEsr", dsEsr); Trace(L"B3cD5SccHwwEsr", sccEsr);
+    Trace(L"B3cD5PdHwwEsr", pdEsr); Trace(L"B3cD5MmeHwwEsr", mmeEsr); Trace(L"B3cD5SkedHwwEsr", skedEsr);
+    Trace(L"B3cD5WriteCount", writeCount);
+    for (i = 0u; i < writeCount && i < RTL_NUMBER_OF(writeSamples); ++i)
+        RtlCopyMemory(writeSamples[i], writes[i], sizeof(writeSamples[i]));
+    TraceBin(L"B3cD5Methods", methodTrace, methodCount * sizeof(methodTrace[0]));
+    TraceBin(L"B3cD5GpfifoEntry", gpWords, sizeof(gpWords));
+    TraceBin(L"B3cD5WriteSamples", writeSamples, sizeof(writeSamples));
+    if (result != 0u) {
+        ULONG grDump[B3C_GR_STATUS_DUMP_REGS * 2u] = { 0u };
+        if ((grEnabled & (1u << 12)) != 0u) {
+            B3cCaptureGrStatusDump(B, L"B3cD5GrStatusDump", grDump);
+            if (g_GrVm.Arena != NULL)
+                B3cD4CaptureCtxswDiag(B, (PUCHAR)g_GrVm.Arena + GR_VM_CTX_OFF,
+                    diagWrites, &diagWriteCount, FALSE);
+        }
+    }
+    if (writes != NULL)
+        TraceBin(L"B3cD5PrivRingWrites", writes, writeCount * sizeof(writes[0]));
+    TraceBin(L"B3cD5DiagWrites", diagWrites, diagWriteCount * sizeof(diagWrites[0]));
+    B3cPrivRingTraceWriteLog(L"B3cD5PrivErrorCount", L"B3cD5PrivErrorDropped",
+        L"B3cD5PrivAckTimeouts", L"B3cD5PrivErrors");
+    TraceDurable(L"B3cD5Result", result);
+    if (writes != NULL) ExFreePoolWithTag(writes, SWGPU_TAG);
+    return result;
+}
+
 /* Claude 0.4.61: 0.4.60 bind error code 0x2 = SNOOP_WITHOUT_BAR1 (name from
  * nouveau's bind-reason table).  Bind BAR1 to the GR instance block
  * (bus_bar1_block 0x1704, virtual mode, sys_mem_ncoh) before the channel
@@ -5212,7 +5547,7 @@ static ULONG B3cInitFifoD2(PSWGPU_DEVICE Dev)
     ULONG cleanupError = 0, writeCount = 0, disableValue = 0, i;
     ULONG pbdmaInten0Before = 0u, pbdmaStallBefore = 0u;
     ULONG pbdmaInten0Init = 0u;
-    ULONG d3Result = 0u, d4Result = 0u, d4Run = 0u;
+    ULONG d3Result = 0u, d4Result = 0u, d4Run = 0u, d5Result = 0u;
     ULONG diagWrites[64][4] = { { 0u } }, diagWriteCount = 0u;
     ULONGLONG userdIova = 0, runlistIova = 0;
     ULONGLONG instIova = 0, gpfifoGpuVa = 0;
@@ -5713,6 +6048,12 @@ static ULONG B3cInitFifoD2(PSWGPU_DEVICE Dev)
                                 (ULONGLONG)GR_VM_GPU_VA + GR_VM_D2_PUSHBUF_OFF);
             Trace(L"B3cD2D4Result", d4Result);
             if (d4Result != 0u) { result = d4Result; stage = 20u; }
+            else {
+                d5Result = B3cRunD5(Dev, userd, gpfifo, pushbuffer,
+                    (ULONGLONG)GR_VM_GPU_VA + GR_VM_D2_PUSHBUF_OFF);
+                Trace(L"B3cD2D5Result", d5Result);
+                if (d5Result != 0u) { result = d5Result; stage = 21u; }
+            }
         }
     }
 
