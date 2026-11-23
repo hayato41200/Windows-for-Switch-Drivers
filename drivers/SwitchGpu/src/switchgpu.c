@@ -39,7 +39,7 @@
 #include <wdf.h>
 #include <spb.h>
 
-#define SWGPU_VERSION      0x00000501u   /* 0.5.1 */
+#define SWGPU_VERSION      0x00000600u   /* 0.6.0 */
 
 #define CAR_PHYS           0x60006000ull
 #define CAR_LEN            0x1000u
@@ -157,6 +157,7 @@ static const GUID GUID_DEVINTERFACE_SWGPU_RESIDENT =
     { 0x2cc9cb4d, 0x6412, 0x4f31, { 0xa7, 0x81, 0x5d, 0x78, 0x1e, 0x09, 0x4b, 0x63 } };
 #define IOCTL_SWGPU_RESIDENT_STATUS CTL_CODE(FILE_DEVICE_UNKNOWN, 0x800, METHOD_BUFFERED, FILE_READ_ACCESS | FILE_WRITE_ACCESS)
 #define IOCTL_SWGPU_RESIDENT_STOP   CTL_CODE(FILE_DEVICE_UNKNOWN, 0x801, METHOD_BUFFERED, FILE_READ_ACCESS | FILE_WRITE_ACCESS)
+#define IOCTL_SWGPU_SUBMIT_TEST     CTL_CODE(FILE_DEVICE_UNKNOWN, 0x802, METHOD_BUFFERED, FILE_READ_ACCESS | FILE_WRITE_ACCESS)
 
 typedef struct _SWGPU_RESIDENT_STATUS {
     ULONG Version;
@@ -180,6 +181,14 @@ typedef struct _SWGPU_RESIDENT_STATUS {
     ULONG MmuFaultStatus;
     ULONG ShutdownResult;
 } SWGPU_RESIDENT_STATUS, *PSWGPU_RESIDENT_STATUS;
+
+typedef struct _SWGPU_E2_RESULT {
+    ULONG Version, Result, Rounds, RingEntries, Wraps, FailRound, MaxPolls, TotalUs;
+    ULONG FirstColor, LastColor, FirstSemaphore, LastSemaphore;
+    ULONG GpGet, GpPut, Semaphore, Channel, PbdmaStatus, PbdmaIntr0, FifoIntr0;
+    ULONG GrIntr, GrException, GrStatus, MmuFault, ClassError, TrappedAddr;
+    ULONG TrappedDataLo, TrappedDataHi, PixelFirst, PixelMiddle, PixelLast;
+} SWGPU_E2_RESULT, *PSWGPU_E2_RESULT;
 
 typedef struct _SWGPU_RESIDENT_POWER {
     UCHAR Vout;
@@ -5563,6 +5572,273 @@ done:
     return result;
 }
 
+/* E2 runs sequentially on the already-resident D2 channel. Reusing the single
+ * mapped pushbuffer/RT pages is safe because each round waits for GP_GET and
+ * the WFI semaphore before overwriting them. Ring size is the 4 KiB GPFIFO
+ * page (512 8-byte entries), and GP_PUT is advanced modulo that size. */
+static ULONG B3eResidentSubmitTest(PSWGPU_DEVICE Dev, PSWGPU_E2_RESULT Out)
+{
+    volatile UCHAR *B = Dev != NULL ? Dev->Bar0 : NULL;
+    volatile ULONG *bar1GpPut;
+    volatile ULONG *bar1GpGet;
+    volatile ULONG *semSlot;
+    PULONG ring;
+    PULONG push;
+    PULONG pixels;
+    ULONG (*writes)[4] = NULL;
+    ULONG (*history)[4] = NULL;
+    ULONG writeCount = 0u, writeCapacity = 16u;
+    ULONG ringEntries = PAGE_SIZE / 8u, rounds = 2u * (PAGE_SIZE / 8u) + 3u;
+    ULONG put = 0u, newPut = 0u, gpGet = 0u, pbGpGet = 0u;
+    ULONG round = 0u, doneRounds = 0u, wraps = 0u, maxPolls = 0u;
+    ULONG gpPolls = 0u, semPolls = 0u, l2State[4] = { 0u };
+    ULONG cursor = 0u, colorIndex = 0u, color = 0u, semaphore = 0u, semValue = 0u;
+    ULONG expectedFirst = 0u, expectedMiddle = 0u, expectedLast = 0u;
+    ULONG gotFirst = 0u, gotMiddle = 0u, gotLast = 0u;
+    ULONG result = 0u, failure = 0u, grEnabled = 0u;
+    ULONG channel = 0u, pbdmaStatus = 0u, pbdmaIntr0 = 0u, fifoIntr0 = 0u;
+    ULONG grIntr = 0u, grException = 0u, grStatus = 0u, mmuFault = 0u;
+    ULONG classError = 0u, trappedAddr = 0u, trappedDataLo = 0u, trappedDataHi = 0u;
+    ULONG totalWriteCount = 0u, i = 0u;
+    LARGE_INTEGER qpcStart, qpcEnd, qpcFrequency;
+    ULONGLONG elapsedTicks = 0u, totalUs = 0u;
+
+    if (Out == NULL) return STATUS_INVALID_PARAMETER;
+    RtlZeroMemory(Out, sizeof(*Out));
+    Out->Version = SWGPU_VERSION;
+    Out->RingEntries = ringEntries;
+    Out->Rounds = rounds;
+    if (Dev == NULL || !Dev->ResidentActive || g_ResidentOwner != Dev) {
+        result = STATUS_DEVICE_NOT_READY;
+        goto done;
+    }
+    Step(113);
+    B3cPrivRingResetWriteLog();
+    grEnabled = Rd(B, NV_PMC_ENABLE);
+    if ((grEnabled & (1u << 12)) == 0u || !g_GrVm.Active || g_GrVm.Arena == NULL ||
+        Dev->Bar1Cpu == NULL || Dev->Bar1MapLen < BAR1_D3_MAP_LEN ||
+        !Dev->ResidentChannelEnabled || !Dev->ResidentRunlistSubmitted ||
+        !Dev->ResidentInstBound || ringEntries < 8u || rounds > 4096u ||
+        GR_VM_D2_PUSHBUF_OFF + PAGE_SIZE > GR_VM_ARENA_SIZE ||
+        GR_VM_D2_RT_OFF + 64u * 64u * sizeof(ULONG) > GR_VM_ARENA_SIZE ||
+        GR_VM_D2_GPFIFO_OFF + PAGE_SIZE > GR_VM_ARENA_SIZE ||
+        GR_VM_D2_USERD_OFF + PAGE_SIZE > GR_VM_ARENA_SIZE) {
+        result = 0xE00000A6u;
+        goto done;
+    }
+    ring = (PULONG)((PUCHAR)g_GrVm.Arena + GR_VM_D2_GPFIFO_OFF);
+    push = (PULONG)((PUCHAR)g_GrVm.Arena + GR_VM_D2_PUSHBUF_OFF);
+    pixels = (PULONG)((PUCHAR)g_GrVm.Arena + GR_VM_D2_RT_OFF);
+    semSlot = (volatile ULONG *)((PUCHAR)push + PAGE_SIZE - 64u);
+    bar1GpPut = (volatile ULONG *)(Dev->Bar1Cpu + BAR1_D3_LOW_VA + 0x8Cu);
+    bar1GpGet = (volatile ULONG *)(Dev->Bar1Cpu + BAR1_D3_LOW_VA + 0x88u);
+    writes = (ULONG (*)[4])ExAllocatePool2(POOL_FLAG_NON_PAGED,
+        writeCapacity * sizeof(writes[0]), SWGPU_TAG);
+    history = (ULONG (*)[4])ExAllocatePool2(POOL_FLAG_NON_PAGED,
+        rounds * sizeof(history[0]), SWGPU_TAG);
+    if (writes == NULL || history == NULL) { result = 0xE00000A6u; goto done; }
+    RtlZeroMemory(writes, writeCapacity * sizeof(writes[0]));
+    RtlZeroMemory(history, rounds * sizeof(history[0]));
+    put = *bar1GpPut;
+    if (put >= ringEntries) { result = 0xE00000A6u; goto done; }
+    qpcStart = KeQueryPerformanceCounter(&qpcFrequency);
+    Trace(L"E2StartGpPut", put);
+    Trace(L"E2RingEntries", ringEntries);
+    Trace(L"E2PlannedRounds", rounds);
+
+    for (round = 0u; round < rounds; ++round) {
+        /* The known-good D5 clear maps float 1.0 to a full 8-bit channel.
+         * Cycle all eight RGB bit patterns; alpha remains opaque. */
+        cursor = 0u;
+        colorIndex = round & 7u;
+        color = 0xFF000000u |
+            ((colorIndex & 1u) ? 0x00FF0000u : 0u) |
+            ((colorIndex & 2u) ? 0x0000FF00u : 0u) |
+            ((colorIndex & 4u) ? 0x000000FFu : 0u);
+        semaphore = 0xE2000000u | (round + 1u);
+        semValue = 0u;
+        if (round == 0u) { Out->FirstColor = color; Out->FirstSemaphore = semaphore; }
+        Out->LastColor = color; Out->LastSemaphore = semaphore;
+        expectedFirst = color; expectedMiddle = color; expectedLast = color;
+        for (i = 0u; i < 64u * 64u; ++i) pixels[i] = 0x11111111u;
+        for (i = 0u; i < 4u; ++i) semSlot[i] = 0u;
+
+#define E2_METHOD(method, value) do { \
+        if (cursor + 2u >= PAGE_SIZE / sizeof(ULONG) - 16u) { failure = 1u; goto round_fail; } \
+        push[cursor++] = 0x20010000u | ((ULONG)(method) >> 2); \
+        push[cursor++] = (ULONG)(value); \
+    } while (0)
+        E2_METHOD(0x0000u, 0x0000B197u); /* SET_OBJECT: Maxwell B 3D */
+        E2_METHOD(0x121Cu, 1u); /* SET_CT_SELECT: one color target, target 0 */
+        E2_METHOD(0x0800u, 0u); /* SET_COLOR_TARGET_A: high address bits */
+        E2_METHOD(0x0804u, (ULONGLONG)GR_VM_GPU_VA + GR_VM_D2_RT_OFF); /* target VA */
+        E2_METHOD(0x0808u, 256u); /* pitch bytes, as validated by D5 */
+        E2_METHOD(0x080Cu, 64u); E2_METHOD(0x0810u, 0xCFu);
+        E2_METHOD(0x0814u, 0x1000u); E2_METHOD(0x0818u, 1u);
+        E2_METHOD(0x081Cu, 0u); E2_METHOD(0x0820u, 0u);
+        E2_METHOD(0x0FE0u, 0u); E2_METHOD(0x0FE4u, 0u);
+        E2_METHOD(0x1538u, 0u); E2_METHOD(0x0FF4u, 0x00400000u);
+        E2_METHOD(0x0FF8u, 0x00400000u); E2_METHOD(0x0DF8u, 0u);
+        E2_METHOD(0x0DFCu, 0u); E2_METHOD(0x0E00u, 0u);
+        E2_METHOD(0x10F8u, 0x10u); E2_METHOD(0x0D6Cu, 0x00400000u);
+        E2_METHOD(0x0D70u, 0x00400000u);
+        E2_METHOD(0x0D80u, (colorIndex & 1u) ? 0x3F800000u : 0u); /* R */
+        E2_METHOD(0x0D84u, (colorIndex & 2u) ? 0x3F800000u : 0u); /* G */
+        E2_METHOD(0x0D88u, (colorIndex & 4u) ? 0x3F800000u : 0u); /* B */
+        E2_METHOD(0x0D8Cu, 0x3F800000u); /* A = 1.0 */
+        E2_METHOD(0x19D0u, 0x3Cu); /* CLEAR_SURFACE: RGBA target 0 */
+#undef E2_METHOD
+        if (cursor + 5u >= PAGE_SIZE / sizeof(ULONG) - 16u) { failure = 1u; goto round_fail; }
+        push[cursor++] = 0x20040004u; /* host SEMAPHOREA..D, release_wfi enabled */
+        push[cursor++] = 0u; /* semaphore VA high */
+        push[cursor++] = (ULONG)((ULONGLONG)GR_VM_GPU_VA + GR_VM_D2_PUSHBUF_OFF + PAGE_SIZE - 64u);
+        push[cursor++] = semaphore;
+        push[cursor++] = 0x01000002u;
+        KeMemoryBarrier();
+
+        /* Each packet is fetched from this one reusable PB segment. */
+        i = put * 2u;
+        ring[i] = (ULONG)((ULONGLONG)GR_VM_GPU_VA + GR_VM_D2_PUSHBUF_OFF) & ~3u;
+        ring[i + 1u] = cursor << 10; /* 32-bit VA, dword count in bits 19:10 */
+        KeMemoryBarrier();
+        writeCount = 0u;
+        l2State[0] = l2State[1] = l2State[2] = l2State[3] = 0u;
+        if (!B3cD5L2Flush(B, writes, &writeCount, writeCapacity, l2State)) {
+            failure = 2u; goto round_fail;
+        }
+        totalWriteCount += writeCount;
+        newPut = put + 1u;
+        if (newPut == ringEntries) { newPut = 0u; ++wraps; }
+        KeMemoryBarrier();
+        *bar1GpPut = newPut;
+        KeMemoryBarrier();
+        if (*bar1GpPut != newPut || Rd(B, 0x00002A30u) != 0u ||
+            (Rd(B, 0x00002100u) & 0x10000000u) != 0u) {
+            failure = 3u; goto round_fail;
+        }
+        for (gpPolls = 0u; gpPolls < 2000u; ++gpPolls) {
+            gpGet = *bar1GpGet;
+            pbGpGet = Rd(B, 0x00040014u);
+            if (gpGet == newPut && pbGpGet == newPut) break;
+            Us(1u);
+        }
+        if (gpPolls > maxPolls) maxPolls = gpPolls;
+        if (gpPolls == 2000u) { failure = 4u; goto round_fail; }
+        for (semPolls = 0u; semPolls < 2000u; ++semPolls) {
+            writeCount = 0u;
+            if (!B3cD5L2Flush(B, writes, &writeCount, writeCapacity, l2State)) {
+                failure = 2u; goto round_fail;
+            }
+            totalWriteCount += writeCount;
+            KeMemoryBarrier();
+            semValue = semSlot[0];
+            if (semValue == semaphore) break;
+            Us(10u);
+        }
+        if (semPolls > maxPolls) maxPolls = semPolls;
+        if (semPolls == 2000u) { failure = 5u; goto round_fail; }
+        writeCount = 0u;
+        if (!B3cD5L2Flush(B, writes, &writeCount, writeCapacity, l2State)) {
+            failure = 2u; goto round_fail;
+        }
+        totalWriteCount += writeCount;
+        KeMemoryBarrier();
+        gotFirst = pixels[0]; gotMiddle = pixels[2048]; gotLast = pixels[4095];
+        history[round][0] = round; history[round][1] = gpPolls;
+        history[round][2] = semPolls; history[round][3] = newPut;
+        if (gotFirst != expectedFirst || gotMiddle != expectedMiddle || gotLast != expectedLast) {
+            failure = 6u; goto round_fail;
+        }
+        ++doneRounds;
+        put = newPut;
+        continue;
+
+round_fail:
+        history[round][0] = round; history[round][1] = gpPolls;
+        history[round][2] = semPolls; history[round][3] = newPut;
+        result = 0xE00000A6u;
+        Out->FailRound = round + 1u;
+        break;
+    }
+    if (round == rounds) result = 0u;
+    qpcEnd = KeQueryPerformanceCounter(NULL);
+    elapsedTicks = (ULONGLONG)(qpcEnd.QuadPart - qpcStart.QuadPart);
+    if (qpcFrequency.QuadPart > 0) {
+        totalUs = (elapsedTicks / (ULONGLONG)qpcFrequency.QuadPart) * 1000000ull +
+            ((elapsedTicks % (ULONGLONG)qpcFrequency.QuadPart) * 1000000ull) /
+            (ULONGLONG)qpcFrequency.QuadPart;
+    }
+    Out->Rounds = doneRounds;
+    Out->Wraps = wraps;
+    Out->MaxPolls = maxPolls;
+    Out->TotalUs = (ULONG)(totalUs > 0xFFFFFFFFull ? 0xFFFFFFFFu : totalUs);
+    Out->GpPut = (Dev->Bar1Cpu != NULL && Dev->Bar1MapLen >= BAR1_D3_MAP_LEN) ?
+        *(volatile ULONG *)(Dev->Bar1Cpu + BAR1_D3_LOW_VA + 0x8Cu) : put;
+    Out->GpGet = (Dev->Bar1Cpu != NULL && Dev->Bar1MapLen >= BAR1_D3_MAP_LEN) ?
+        *(volatile ULONG *)(Dev->Bar1Cpu + BAR1_D3_LOW_VA + 0x88u) : gpGet;
+    Out->Semaphore = semValue;
+    Out->PixelFirst = gotFirst; Out->PixelMiddle = gotMiddle; Out->PixelLast = gotLast;
+    Out->Result = result;
+    Trace(L"E2Result", result); Trace(L"E2Rounds", doneRounds);
+    Trace(L"E2RingEntries", ringEntries); Trace(L"E2Wraps", wraps);
+    Trace(L"E2FailRound", Out->FailRound); Trace(L"E2MaxPolls", maxPolls);
+    Trace(L"E2TotalUs", Out->TotalUs); Trace(L"E2FirstColor", Out->FirstColor);
+    Trace(L"E2LastColor", Out->LastColor); Trace(L"E2FirstSemaphore", Out->FirstSemaphore);
+    Trace(L"E2LastSemaphore", Out->LastSemaphore); Trace(L"E2GpGet", Out->GpGet);
+    Trace(L"E2GpPut", Out->GpPut); Trace(L"E2Semaphore", Out->Semaphore);
+    Trace(L"E2FailureStage", failure);
+    Trace(L"E2PixelFirst", gotFirst); Trace(L"E2PixelMiddle", gotMiddle); Trace(L"E2PixelLast", gotLast);
+    Trace(L"E2WriteCount", totalWriteCount);
+    if (result != 0u && B != NULL) {
+        channel = Rd(B, 0x00800004u); pbdmaStatus = Rd(B, 0x00003080u);
+        pbdmaIntr0 = Rd(B, 0x00040108u); fifoIntr0 = Rd(B, 0x00002100u);
+        mmuFault = Rd(B, 0x00002A30u);
+        grEnabled = Rd(B, NV_PMC_ENABLE);
+        if (grEnabled & (1u << 12)) {
+            grIntr = Rd(B, 0x00400100u); grException = Rd(B, 0x00400108u);
+            grStatus = Rd(B, 0x00400700u); classError = Rd(B, 0x00400110u);
+            trappedAddr = Rd(B, 0x00400704u); trappedDataLo = Rd(B, 0x00400708u);
+            trappedDataHi = Rd(B, 0x0040070Cu);
+            {
+                ULONG grDump[B3C_GR_STATUS_DUMP_REGS * 2u] = { 0u };
+                B3cCaptureGrStatusDump(B, L"E2GrStatusDump", grDump);
+            }
+        }
+        Out->Channel = channel; Out->PbdmaStatus = pbdmaStatus; Out->PbdmaIntr0 = pbdmaIntr0;
+        Out->FifoIntr0 = fifoIntr0;
+        Out->GrIntr = grIntr; Out->GrException = grException; Out->GrStatus = grStatus;
+        Out->MmuFault = mmuFault; Out->ClassError = classError; Out->TrappedAddr = trappedAddr;
+        Out->TrappedDataLo = trappedDataLo; Out->TrappedDataHi = trappedDataHi;
+        Trace(L"E2FailGpGet", Out->GpGet); Trace(L"E2FailGpPut", Out->GpPut);
+        Trace(L"E2FailSemaphore", Out->Semaphore); Trace(L"E2FailChannel", channel);
+        Trace(L"E2FailPbdmaStatus", pbdmaStatus); Trace(L"E2FailPbdmaIntr0", pbdmaIntr0);
+        Trace(L"E2FailFifoIntr0", fifoIntr0);
+        Trace(L"E2FailGrIntr", grIntr); Trace(L"E2FailGrException", grException);
+        Trace(L"E2FailGrStatus", grStatus); Trace(L"E2FailMmuFault", mmuFault);
+        Trace(L"E2FailClassError", classError); Trace(L"E2FailTrappedAddr", trappedAddr);
+        Trace(L"E2FailTrappedDataLo", trappedDataLo); Trace(L"E2FailTrappedDataHi", trappedDataHi);
+    }
+    TraceBin(L"E2RoundHistory", history, (round < rounds ? round + 1u : rounds) * sizeof(history[0]));
+    if (writes != NULL) { TraceBin(L"E2LastWrites", writes, writeCount * sizeof(writes[0])); }
+    B3cPrivRingTraceWriteLog(L"E2PrivErrorCount", L"E2PrivErrorDropped",
+        L"E2PrivAckTimeouts", L"E2PrivErrors");
+done:
+    Out->Result = result;
+    Trace(L"E2Result", result); Trace(L"E2Rounds", Out->Rounds);
+    Trace(L"E2RingEntries", Out->RingEntries); Trace(L"E2Wraps", Out->Wraps);
+    Trace(L"E2FailRound", Out->FailRound); Trace(L"E2MaxPolls", Out->MaxPolls);
+    Trace(L"E2TotalUs", Out->TotalUs); Trace(L"E2FirstColor", Out->FirstColor);
+    Trace(L"E2LastColor", Out->LastColor); Trace(L"E2FirstSemaphore", Out->FirstSemaphore);
+    Trace(L"E2LastSemaphore", Out->LastSemaphore);
+    Trace(L"E2FailureStage", failure); Trace(L"E2GpGet", Out->GpGet);
+    Trace(L"E2GpPut", Out->GpPut); Trace(L"E2Semaphore", Out->Semaphore);
+    Trace(L"E2PixelFirst", Out->PixelFirst); Trace(L"E2PixelMiddle", Out->PixelMiddle);
+    Trace(L"E2PixelLast", Out->PixelLast);
+    if (writes != NULL) ExFreePoolWithTag(writes, SWGPU_TAG);
+    if (history != NULL) ExFreePoolWithTag(history, SWGPU_TAG);
+    return result;
+}
+
 /* Claude 0.4.61: 0.4.60 bind error code 0x2 = SNOOP_WITHOUT_BAR1 (name from
  * nouveau's bind-reason table).  Bind BAR1 to the GR instance block
  * (bus_bar1_block 0x1704, virtual mode, sys_mem_ncoh) before the channel
@@ -7716,8 +7992,25 @@ VOID SwGpuEvtIoDeviceControl(WDFQUEUE Queue, WDFREQUEST Request,
     WDFDEVICE Device = WdfIoQueueGetDevice(Queue);
     PSWGPU_DEVICE Dev = SwGpuGetDevice(Device);
     PSWGPU_RESIDENT_STATUS out = NULL;
+    PSWGPU_E2_RESULT e2Out = NULL;
     NTSTATUS status;
     UNREFERENCED_PARAMETER(InputBufferLength);
+    if (IoControlCode == IOCTL_SWGPU_SUBMIT_TEST) {
+        if (!Dev->ResidentActive || g_ResidentOwner != Dev) {
+            Trace(L"E2IoctlNotReady", STATUS_DEVICE_NOT_READY);
+            WdfRequestComplete(Request, STATUS_DEVICE_NOT_READY); return;
+        }
+        if (OutputBufferLength < sizeof(SWGPU_E2_RESULT)) {
+            WdfRequestComplete(Request, STATUS_BUFFER_TOO_SMALL); return;
+        }
+        status = WdfRequestRetrieveOutputBuffer(Request, sizeof(SWGPU_E2_RESULT),
+            (PVOID *)&e2Out, NULL);
+        if (!NT_SUCCESS(status)) { WdfRequestComplete(Request, status); return; }
+        TraceDurable(L"B3eControlMode", 9u);
+        (VOID)B3eResidentSubmitTest(Dev, e2Out);
+        WdfRequestCompleteWithInformation(Request, STATUS_SUCCESS, sizeof(*e2Out));
+        return;
+    }
     if (IoControlCode != IOCTL_SWGPU_RESIDENT_STATUS &&
         IoControlCode != IOCTL_SWGPU_RESIDENT_STOP) {
         WdfRequestComplete(Request, STATUS_INVALID_DEVICE_REQUEST); return;

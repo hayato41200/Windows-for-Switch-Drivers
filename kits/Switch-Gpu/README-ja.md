@@ -526,3 +526,11 @@ Nouveau MIT `gk104.c:gk104_chan_ramfc_write()` の RAMFC fields、`gk104_chan_bi
 `Resident.cmd` は E1 を一度だけ開始します。PowerTest は実行前に 0 へ戻します。`ResidentStatus.cmd` は読み取り専用の管理者向け device-interface IOCTL を使い、PnP restart を行いません。`ResidentStop.cmd` は別の IOCTL で channel disable、bounded preempt、空 runlist、unbind、BAR1 復元、GPU reset/power-off、arena/SMMU cleanup を順に実行します。PnP restart は ReleaseHardware を呼んで resident GPU を停止するため、状態確認と停止には使いません。resident 中は WDF idle reference を保持し、最終的な device removal/shutdown では同じ idempotent teardown を呼びます。
 
 E1 は実験段階です。停止処理前に強制電源断、bugcheck、device removal が起きた場合、Switch 側の reset まで GPU が動作状態で残る可能性があります。通常起動では従来どおり GPU に触れず、GPU を停止したままにします。E1 の実機 lifecycle、IOCTL 列挙、shutdown 順序、idle-reference 動作は未検証です。
+
+### 0.6.0 E2: 常駐 channel の反復 clear
+
+| Version | Sub-step | Steps / errors | Scope |
+| --- | --- | --- | --- |
+| 0.6.0 | E2: GPFIFO ring wraparound | Step 113 / `E00000A6` | Submit IOCTL は ResidentActive 中だけ動作し、電源投入や teardown を行いません。512-entry ring に 2 x entries + 3 回の clear を順番に投稿し、毎回 BAR1 GP_PUT/GP_GET、WFI semaphore、64x64 RT の先頭・中央・末尾 pixel を bounded wait で確認します。失敗時も GPU を resident のまま残し、ResidentStop で停止します。 |
+
+Submit.cmd は E1 で起動済みの resident channel に Submit IOCTL を送り、device restart はしません。失敗時は round、GET/PUT、semaphore、channel/PBDMA/GR/MMU、CLASS_ERROR/trap を記録します。E2 の反復負荷、ring wrap、失敗後の停止手順は実機で確認してください。

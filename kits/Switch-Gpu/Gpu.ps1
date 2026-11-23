@@ -37,12 +37,13 @@
                     a PnP restart; stop resets the GPU and frees its mappings.
   -Mode ResidentStatus : query safe resident registers through a read-only IOCTL.
   -Mode ResidentStop : stop the channel and power down through a bounded IOCTL.
+  -Mode Submit : submit repeated 3D clears on the resident channel (E2); no power-up.
   -Mode Remove    : removes the driver package.
 
   Log: C:\SwitchWOA-Gpu.txt
   This file must stay ASCII: Windows PowerShell 5.1 reads it as the ANSI code page.
 #>
-param([Parameter(Mandatory = $true)][ValidateSet('Install', 'Status', 'PowerTest', 'ProbeTest', 'DmaTest', 'FwTest', 'AcrTest', 'Resident', 'ResidentStatus', 'ResidentStop', 'Remove')][string]$Mode)
+param([Parameter(Mandatory = $true)][ValidateSet('Install', 'Status', 'PowerTest', 'ProbeTest', 'DmaTest', 'FwTest', 'AcrTest', 'Resident', 'ResidentStatus', 'ResidentStop', 'Submit', 'Remove')][string]$Mode)
 
 $ErrorActionPreference = 'Continue'
 $Sys = Join-Path $env:windir 'Sysnative'
@@ -168,6 +169,65 @@ public static class SwGpuResidentControl {
     $s.Resident, (Hex $s.PtimerHi), (Hex $s.PtimerLoBefore), (Hex $s.PtimerLoAfter), (Hex $s.PtimerDelta), (Hex $s.FecsMailbox0), (Hex $s.CcsrChannel), (Hex $channelStatus), (Hex $s.PbdmaStatus), (Hex $s.PbdmaIntr0), (Hex $s.GrIntr), (Hex $s.GrStatus), (Hex $s.MmuFaultStatus), (Hex $s.ShutdownResult))
 }
 
+function Invoke-ResidentSubmit {
+  $src = @'
+using System;
+using System.Runtime.InteropServices;
+using Microsoft.Win32.SafeHandles;
+public static class SwGpuSubmitControl {
+  [StructLayout(LayoutKind.Sequential)] public struct Result {
+    public UInt32 Version, ResultCode, Rounds, RingEntries, Wraps, FailRound, MaxPolls, TotalUs;
+    public UInt32 FirstColor, LastColor, FirstSemaphore, LastSemaphore;
+    public UInt32 GpGet, GpPut, Semaphore, Channel, PbdmaStatus, PbdmaIntr0, FifoIntr0;
+    public UInt32 GrIntr, GrException, GrStatus, MmuFault, ClassError, TrappedAddr;
+    public UInt32 TrappedDataLo, TrappedDataHi, PixelFirst, PixelMiddle, PixelLast;
+  }
+  [StructLayout(LayoutKind.Sequential)] struct IfData { public Int32 cbSize; public Guid guid; public Int32 flags; public IntPtr reserved; }
+  [DllImport("setupapi.dll", CharSet=CharSet.Unicode, SetLastError=true)] static extern IntPtr SetupDiGetClassDevs(ref Guid g, IntPtr e, IntPtr w, UInt32 f);
+  [DllImport("setupapi.dll", SetLastError=true)] static extern bool SetupDiEnumDeviceInterfaces(IntPtr s, IntPtr d, ref Guid g, UInt32 i, ref IfData data);
+  [DllImport("setupapi.dll", CharSet=CharSet.Unicode, SetLastError=true)] static extern bool SetupDiGetDeviceInterfaceDetail(IntPtr s, ref IfData data, IntPtr detail, UInt32 size, out UInt32 required, IntPtr devinfo);
+  [DllImport("setupapi.dll", SetLastError=true)] static extern bool SetupDiDestroyDeviceInfoList(IntPtr s);
+  [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)] static extern SafeFileHandle CreateFile(string n, UInt32 a, UInt32 share, IntPtr sec, UInt32 disp, UInt32 flags, IntPtr template);
+  [DllImport("kernel32.dll", SetLastError=true)] static extern bool DeviceIoControl(SafeFileHandle h, UInt32 code, IntPtr input, UInt32 inSize, out Result output, UInt32 outSize, out UInt32 returned, IntPtr overlapped);
+  public static Result Run() {
+    Guid g = new Guid("2cc9cb4d-6412-4f31-a781-5d781e094b63");
+    IntPtr set = SetupDiGetClassDevs(ref g, IntPtr.Zero, IntPtr.Zero, 0x12);
+    if (set == new IntPtr(-1)) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+    try {
+      for (UInt32 i=0; i<32; ++i) {
+        IfData d = new IfData(); d.cbSize = Marshal.SizeOf(typeof(IfData));
+        if (!SetupDiEnumDeviceInterfaces(set, IntPtr.Zero, ref g, i, ref d)) break;
+        UInt32 need; SetupDiGetDeviceInterfaceDetail(set, ref d, IntPtr.Zero, 0, out need, IntPtr.Zero);
+        if (need < 8) continue;
+        IntPtr b = Marshal.AllocHGlobal((int)need);
+        try {
+          Marshal.WriteInt32(b, IntPtr.Size == 8 ? 8 : 6);
+          if (!SetupDiGetDeviceInterfaceDetail(set, ref d, b, need, out need, IntPtr.Zero)) continue;
+          string path = Marshal.PtrToStringUni(IntPtr.Add(b, 4));
+          using (SafeFileHandle h = CreateFile(path, 0xC0000000, 3, IntPtr.Zero, 3, 0, IntPtr.Zero)) {
+            if (h.IsInvalid) continue;
+            Result r; UInt32 got;
+            if (!DeviceIoControl(h, 0x22E008u, IntPtr.Zero, 0, out r, (UInt32)Marshal.SizeOf(typeof(Result)), out got, IntPtr.Zero))
+              throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+            return r;
+          }
+        } finally { Marshal.FreeHGlobal(b); }
+      }
+      throw new InvalidOperationException("SwitchGpu resident interface was not found");
+    } finally { SetupDiDestroyDeviceInfoList(set); }
+  }
+}
+'@
+  if (-not ('SwGpuSubmitControl' -as [type])) { Add-Type -TypeDefinition $src -Language CSharp }
+  $r = [SwGpuSubmitControl]::Run()
+  Sum ('E2 result {0}; rounds {1}; ring entries {2}; wraps {3}; fail round {4}; max polls {5}; total us {6}; colors {7}->{8}; semaphores {9}->{10}; GET/PUT {11}/{12}; pixels {13}/{14}/{15}' -f `
+    (Hex $r.ResultCode), $r.Rounds, $r.RingEntries, $r.Wraps, $r.FailRound, $r.MaxPolls, $r.TotalUs, (Hex $r.FirstColor), (Hex $r.LastColor), (Hex $r.FirstSemaphore), (Hex $r.LastSemaphore), (Hex $r.GpGet), (Hex $r.GpPut), (Hex $r.PixelFirst), (Hex $r.PixelMiddle), (Hex $r.PixelLast))
+  if ($r.ResultCode -ne 0) {
+    Sum ('E2 failure state: semaphore {0}; channel {1}; PBDMA {2}/{3}; FIFO intr {4}; GR {5}/{6}/{7}; MMU {8}; class/trap {9}/{10}/{11}/{12}' -f `
+      (Hex $r.Semaphore), (Hex $r.Channel), (Hex $r.PbdmaStatus), (Hex $r.PbdmaIntr0), (Hex $r.FifoIntr0), (Hex $r.GrIntr), (Hex $r.GrException), (Hex $r.GrStatus), (Hex $r.MmuFault), (Hex $r.ClassError), (Hex $r.TrappedAddr), (Hex $r.TrappedDataLo), (Hex $r.TrappedDataHi))
+  }
+}
+
 function Show-Trace {
   $p = Get-ItemProperty $Key -ErrorAction SilentlyContinue
   if (-not $p) { Sum 'switchgpu trace: (no Parameters key: driver never started)'; return }
@@ -181,6 +241,21 @@ function Show-Trace {
     $e1Why = ''; if ((Key32 $p.E1Result) -eq 'E00000A5') { $e1Why = 'resident state was not published' }
     Sum ('E1 resident result {0} {1}; active {2}; idle reference {3}; shutdown {4}; power-down {5}; PTIMER delta {6}; FECS mailbox0 {7}; channel {8}' -f (Hex $p.E1Result), $e1Why, (Hex $p.B3eResidentActive), (Hex $p.B3eIdleRefStatus), (Hex $p.B3eShutdownResult), (Hex $p.B3ePowerDownResult), (Hex $p.B3eStatusPtimerDelta), (Hex $p.B3eStatusFecsMailbox0), (Hex $p.B3eStatusCcsrChannel))
     Sum ('E1 status FIFO engine {0}; PBDMA status/intr {1}/{2}; GR intr/status {3}/{4}; MMU fault {5}; shutdown polls preempt/runlist {6}/{7}' -f (Hex $p.B3eStatusFifoEngineStatus), (Hex $p.B3eStatusPbdmaStatus), (Hex $p.B3eStatusPbdmaIntr0), (Hex $p.B3eStatusGrIntr), (Hex $p.B3eStatusGrStatus), (Hex $p.B3eStatusMmuFaultStatus), (Hex $p.B3eChannelCleanupPreemptPolls), (Hex $p.B3eChannelCleanupRunlistPolls))
+  }
+  if ($null -ne $p.E2Result) {
+    $e2Why = 'OK'; if ((Key32 $p.E2Result) -eq 'E00000A6') { $e2Why = 'round timeout, memory readback mismatch, or setup failure; GPU remains resident' }
+    Sum ('E2 result {0} ({1}); completed {2}; ring {3}; wraps {4}; failed round {5}; max polls {6}; total us {7}; colors {8}->{9}; semaphores {10}->{11}' -f (Hex $p.E2Result), $e2Why, (Hex $p.E2Rounds), (Hex $p.E2RingEntries), (Hex $p.E2Wraps), (Hex $p.E2FailRound), (Hex $p.E2MaxPolls), (Hex $p.E2TotalUs), (Hex $p.E2FirstColor), (Hex $p.E2LastColor), (Hex $p.E2FirstSemaphore), (Hex $p.E2LastSemaphore))
+    if ($null -ne $p.E2RoundHistory) {
+      $eh = [byte[]]$p.E2RoundHistory; $en = [int]($eh.Length / 16); $egp = 0; $esem = 0
+      $ehRows = @(); for ($er = 0; $er -lt $en; $er++) {
+        $eo = $er * 16; $ew = @(); for ($ek = 0; $ek -lt 4; $ek++) { $ew += [BitConverter]::ToUInt32($eh, $eo + $ek * 4) }
+        $egp = [Math]::Max($egp, [int]$ew[1]); $esem = [Math]::Max($esem, [int]$ew[2])
+        $ehRows += ('{0:X8} {1:X8} {2:X8} {3:X8}' -f $ew[0], $ew[1], $ew[2], $ew[3])
+      }
+      Add-Content -Path $Log -Value 'E2 per-round history (round, GP_GET polls, semaphore polls, GP_PUT):' -Encoding UTF8
+      foreach ($ehr in $ehRows) { Add-Content -Path $Log -Value ('  ' + $ehr) -Encoding UTF8 }
+      Sum ('E2 poll history: {0} records; max GP_GET/semaphore polls {1}/{2} (full rows in log)' -f $en, $egp, $esem)
+    }
   }
   if ($p.TestRuns) {
     $steps = @{ 1 = 'read the regulator'; 2 = 'VDD_GPU on'; 3 = 'clocks on'; 4 = 'reset assert'; 5 = 'clamp off'; 6 = 'reset deassert'; 7 = 'MC flush'; 8 = 'first BAR0 read (BOOT_0)'; 9 = 'PTIMER and WPR reads'; 20 = 'B1: topology read'; 21 = 'B1: PMU falcon read'; 22 = 'B1: DMEM test'; 23 = 'B1: priv ring init'; 29 = 'B2a: priv ring init'; 40 = 'B3a: firmware from registry'; 41 = 'B3a: bl.bin header'; 42 = 'B3a: ucode_load.bin headers'; 43 = 'B3a: signed image'; 44 = 'B3a: PMU reset + IMEM PIO'; 45 = 'B3a: DMEM descriptor'; 46 = 'B3b: CPU-side image (user code)'; 47 = 'B3c: read hardware WPR range'; 48 = 'B3c: build bounded WPR image'; 49 = 'B3c: prepare SMMU and PMU VM'; 50 = 'B3c: bind PMU instance block'; 51 = 'B3c: write ACR DMA descriptors'; 52 = 'B3c: legacy ACR step'; 53 = 'B3c: priv ring init'; 62 = 'B3c: snapshot and clear old PFIFO MMU faults'; 54 = 'B3c: invalidate selected PMU PDB'; 55 = 'B3c: invalidate all PMU PDBs'; 56 = 'B3c: one-shot ACR boot'; 57 = 'B3c: select per-instance PDB page size'; 58 = 'B3c: write advertised PMU argv and start LS PMU'; 59 = 'B3c: wait for and inspect PMU INIT'; 60 = 'B3c: read PMU post-wait diagnostics'; 61 = 'B3c: snapshot LS loader IMEM, DMA, FBIF, bind and faults'; 63 = 'B3c: snapshot DMACTL before LS start'; 64 = 'B3c: build PMU loader DMA bases from WPR address'; 65 = 'B3c: parse PMU INIT and validate command queues'; 66 = 'B3c: send INIT_WPR_REGION and wait for reply'; 67 = 'B3c: enable GR and snapshot FECS mailbox'; 68 = 'B3c: post FECS bootstrap command'; 69 = 'B3c: sample PMU and HPQ while waiting'; 70 = 'B3c: read final FECS, GPCCS and PMU state'; 71 = 'B3c: PMU checkpoint before FECS bootstrap (stop if halted)'; 72 = 'B3c: PMU state right after FECS bootstrap post'; 30 = 'B2a: SMMU check'; 31 = 'B2a: DMA setup'; 32 = 'B2a: DMA memory -> DMEM'; 33 = 'B2a: DMA DMEM -> memory'; 34 = 'B2a: DMA setup restore'; 35 = 'B2a: memory path read'; 36 = 'B2a: DMA try 1'; 37 = 'B2a: DMA try 2 (after PMU reset)'; 38 = 'B2a: DMA try 3 (after PMU reset)'; 39 = 'B2a: PMU instance bind'; 10 = 'power down'; 11 = 'done'; 100 = 'done, GPU left on (KeepOn)' }
@@ -223,6 +298,7 @@ function Show-Trace {
     $steps[110] = 'E1: leave the completed GPU/channel resident'
     $steps[111] = 'E1: disable channel, preempt, unbind, reset, and free mappings'
     $steps[112] = 'E1: safe resident status IOCTL'
+    $steps[113] = 'E2: repeated 3D clears with resident GPFIFO wraparound'
     Sum ('power test runs {0}: last step {1} ({2})  result {3}  took {4} us' -f $p.TestRuns, $p.Step, $steps[[int]$p.Step], (Hex $p.Result), $p.TestUs)
     if ($null -ne $p.McHotStatAfterReset) {
       $pts = @(@('GPU off', $p.McHotStatAtStart), @('after reset', $p.McHotStatAfterReset), @('after flush', $p.McHotStatAfterFlush), @('after BAR0 reads', $p.McHotStatAfterBar0), @('B2a start', $p.McHotStatB2aStart), @('before DMA', $p.McHotStatBeforeDma), @('after DMA', $p.McHotStatAfterDma))
@@ -397,7 +473,7 @@ function Show-Trace {
       }
     }
     if ($null -ne $p.B3aResult) {
-      $b3err = @{ '00000000' = 'OK'; 'E0000041' = 'firmware missing in the registry (run FwTest from the kit)'; 'E0000042' = 'bl.bin too short'; 'E0000043' = 'bl.bin header bad'; 'E0000044' = 'bl.bin descriptor bad'; 'E0000045' = 'ucode_load.bin too short'; 'E0000046' = 'ucode_load.bin header bad'; 'E0000047' = 'patch location outside the file'; 'E0000048' = 'load header outside the file'; 'E0000049' = 'app table bad'; 'E000004A' = 'signature/section offsets bad'; 'E000004B' = 'no memory'; 'E000004C' = 'bootloader does not fit IMEM'; 'E000004D' = 'no memory'; 'E0000061' = 'invalid WPR range'; 'E0000062' = 'built WPR is larger than the hardware protected region'; 'E0000063' = 'ACR descriptor is too short'; 'E0000064' = 'could not map WPR/VM memory'; 'E0000065' = 'PMU virtual-memory bind failed'; 'E0000066' = 'ACR DMA descriptor readback mismatch'; 'E0000067' = 'ACR boot timed out'; 'E0000068' = 'ACR boot mailbox indicated failure'; 'E0000069' = 'WPR CPU write/readback mismatch'; 'E000006A' = 'PMU PDB MMU invalidate failed'; 'E000006B' = 'all-PDB MMU invalidate could not observe FIFO empty'; 'E000006C' = 'MMU per-instance PDB page-size selection readback failed'; 'E000006D' = 'ACR did not leave PMU halted with empty mailboxes'; 'E000006E' = 'PMU DMEM size is outside the supported range'; 'E000006F' = 'PMU HS halt interrupt did not clear'; 'E0000070' = 'PMU LS INIT did not appear within 2000 polls (2 s)'; 'E0000071' = 'PMU INIT queue pointers stayed invalid for 2000 polls'; 'E0000072' = 'PMU INIT message header/type or PIO cursor mismatch'; 'E0000073' = 'PMU cmdline args DMEM readback/cursor mismatch'; 'E0000074' = 'WPR-advertised PMU argv does not match the runtime DMEM args location'; 'E0000075' = 'pre-ACR PFIFO MMU fault latches did not clear; ACR was skipped'; 'E0000076' = 'PMU DMACTL REQUIRE_CTX did not clear before LS start'; 'E0000077' = 'PMU loader WPR DMA address cannot be represented in the descriptor'; 'E0000078' = 'FECS bootstrap command, PMU reply, or LS-ready wait failed'; 'E0000079' = 'PMU INIT_WPR_REGION command, reply, or success status failed'; 'E000007A' = 'PMU did not dequeue the FECS bootstrap command before timeout'; 'E000007B' = 'PMU HALT observed before FECS bootstrap post'; 'E000007C' = 'PMU HALT observed immediately after FECS bootstrap post'; 'E000007D' = 'FECS CPUCTL HALT bit did not clear after CPUCTL_ALIAS start'; 'E000007E' = 'GPCCS inst/data firmware missing from registry'; 'E000007F' = 'GPCCS firmware is invalid or exceeds Falcon IMEM/DMEM capacity'; 'E0000080' = 'GPCCS CPUCTL HALT bit did not clear after start'; 'E0000081' = 'FECS size query mailbox stayed zero for 2000 polls'; 'E0000082' = 'FECS size query returned FAIL marker or invalid all-ones'; 'E0000083' = 'GR is disabled before C1 FECS method queries'; 'E0000084' = 'GR init-list blob missing or exceeds 128 KiB'; 'E0000085' = 'GR init-list blob is empty, malformed, or has an invalid register address'; 'E0000086' = 'GR is disabled before C2a list validation'; 'E0000087' = 'C2b GR reset, nonctx range/readback, scrub, or idle stage failed'; 'E0000088' = 'C2c sw_ctx validation, apply, or idle stage failed'; 'E0000089' = 'C2d GR arena allocation, bounds, topology, or PMC_ENABLE check failed'; 'E000008A' = 'C2d GR SMMU, GPU page-table, or instance-block readback failed'; 'E000008B' = 'C2e FECS method/bind or bounded GR idle wait timed out'; 'E000008C' = 'C2e FECS method failure, bundle validation, or golden image header mismatch'; 'E000008D' = 'C2e FE power/reset handshake or GR PDB invalidate failed'; 'E000008E' = 'C2e GR floorsweep/zcull or exception setup address validation/readback failed'; 'E000008F' = 'C2e FE HWW ESR is nonzero before setup or first bundle entry'; 'E0000090' = 'C2e bounded L2 flush or invalidate did not complete before golden header copy'; 'E0000091' = 'C2e GR engine remained busy through the bounded pre-save idle check'; 'E0000092' = 'C2e Nouveau GR idle predicate timed out at a generation checkpoint'; 'E0000093' = 'C2b GM20B GPC MMU register validation failed'; 'E0000094' = 'C2e FE/GR exception state changed during bundle replay'; 'E0000095' = 'priv-ring ACK_INTERRUPT command did not return to NO_CMD within 2000 polls'; 'E0000096' = 'C2e BE active-LTC ROP readback was invalid'; 'E0000097' = 'C2e active LTC count, CBC parameters, or LTC FS readback was invalid'; 'E0000098' = 'C2e FB active-LTC count readback was invalid'; 'E0000099' = 'C2e bounded ZBC idle, table validation, or ZBC readback failed'; 'E000009A' = 'C2e zero-comptag CBC base readback failed'; 'E000009B' = 'C2e bounded GM20B read-coalesce setup readback failed'; 'E000009C' = 'C2e early PE or zcull setup readback failed'; 'E000009D' = 'C2e Nouveau active-FBP ROP count setup failed'; 'E000009E' = 'C2e GR FIFO/semaphore access setup failed'; 'E000009F' = 'D1 GR-enable guard or PFIFO/PBDMA readback failed'; 'E00000A0' = 'D2 RAMFC, USERD, GPFIFO, channel bind, runlist, or bounded cleanup failed'; 'E00000A1' = 'D3 BAR1 USERD doorbell fault/readback or semaphore/GPFIFO progress failed'; 'E00000A2' = 'D4 class method, bounded GP_GET, L2 visibility, or completion semaphore failed'; 'E00000A3' = 'D4 context image/header prep or FECS watchdog/START_CTXSW method failed'; 'E00000A4' = 'D5 3D color clear, bounded channel progress, or surface readback failed'; 'E00000A5' = 'E1 completed without publishing resident channel state' }
+      $b3err = @{ '00000000' = 'OK'; 'E0000041' = 'firmware missing in the registry (run FwTest from the kit)'; 'E0000042' = 'bl.bin too short'; 'E0000043' = 'bl.bin header bad'; 'E0000044' = 'bl.bin descriptor bad'; 'E0000045' = 'ucode_load.bin too short'; 'E0000046' = 'ucode_load.bin header bad'; 'E0000047' = 'patch location outside the file'; 'E0000048' = 'load header outside the file'; 'E0000049' = 'app table bad'; 'E000004A' = 'signature/section offsets bad'; 'E000004B' = 'no memory'; 'E000004C' = 'bootloader does not fit IMEM'; 'E000004D' = 'no memory'; 'E0000061' = 'invalid WPR range'; 'E0000062' = 'built WPR is larger than the hardware protected region'; 'E0000063' = 'ACR descriptor is too short'; 'E0000064' = 'could not map WPR/VM memory'; 'E0000065' = 'PMU virtual-memory bind failed'; 'E0000066' = 'ACR DMA descriptor readback mismatch'; 'E0000067' = 'ACR boot timed out'; 'E0000068' = 'ACR boot mailbox indicated failure'; 'E0000069' = 'WPR CPU write/readback mismatch'; 'E000006A' = 'PMU PDB MMU invalidate failed'; 'E000006B' = 'all-PDB MMU invalidate could not observe FIFO empty'; 'E000006C' = 'MMU per-instance PDB page-size selection readback failed'; 'E000006D' = 'ACR did not leave PMU halted with empty mailboxes'; 'E000006E' = 'PMU DMEM size is outside the supported range'; 'E000006F' = 'PMU HS halt interrupt did not clear'; 'E0000070' = 'PMU LS INIT did not appear within 2000 polls (2 s)'; 'E0000071' = 'PMU INIT queue pointers stayed invalid for 2000 polls'; 'E0000072' = 'PMU INIT message header/type or PIO cursor mismatch'; 'E0000073' = 'PMU cmdline args DMEM readback/cursor mismatch'; 'E0000074' = 'WPR-advertised PMU argv does not match the runtime DMEM args location'; 'E0000075' = 'pre-ACR PFIFO MMU fault latches did not clear; ACR was skipped'; 'E0000076' = 'PMU DMACTL REQUIRE_CTX did not clear before LS start'; 'E0000077' = 'PMU loader WPR DMA address cannot be represented in the descriptor'; 'E0000078' = 'FECS bootstrap command, PMU reply, or LS-ready wait failed'; 'E0000079' = 'PMU INIT_WPR_REGION command, reply, or success status failed'; 'E000007A' = 'PMU did not dequeue the FECS bootstrap command before timeout'; 'E000007B' = 'PMU HALT observed before FECS bootstrap post'; 'E000007C' = 'PMU HALT observed immediately after FECS bootstrap post'; 'E000007D' = 'FECS CPUCTL HALT bit did not clear after CPUCTL_ALIAS start'; 'E000007E' = 'GPCCS inst/data firmware missing from registry'; 'E000007F' = 'GPCCS firmware is invalid or exceeds Falcon IMEM/DMEM capacity'; 'E0000080' = 'GPCCS CPUCTL HALT bit did not clear after start'; 'E0000081' = 'FECS size query mailbox stayed zero for 2000 polls'; 'E0000082' = 'FECS size query returned FAIL marker or invalid all-ones'; 'E0000083' = 'GR is disabled before C1 FECS method queries'; 'E0000084' = 'GR init-list blob missing or exceeds 128 KiB'; 'E0000085' = 'GR init-list blob is empty, malformed, or has an invalid register address'; 'E0000086' = 'GR is disabled before C2a list validation'; 'E0000087' = 'C2b GR reset, nonctx range/readback, scrub, or idle stage failed'; 'E0000088' = 'C2c sw_ctx validation, apply, or idle stage failed'; 'E0000089' = 'C2d GR arena allocation, bounds, topology, or PMC_ENABLE check failed'; 'E000008A' = 'C2d GR SMMU, GPU page-table, or instance-block readback failed'; 'E000008B' = 'C2e FECS method/bind or bounded GR idle wait timed out'; 'E000008C' = 'C2e FECS method failure, bundle validation, or golden image header mismatch'; 'E000008D' = 'C2e FE power/reset handshake or GR PDB invalidate failed'; 'E000008E' = 'C2e GR floorsweep/zcull or exception setup address validation/readback failed'; 'E000008F' = 'C2e FE HWW ESR is nonzero before setup or first bundle entry'; 'E0000090' = 'C2e bounded L2 flush or invalidate did not complete before golden header copy'; 'E0000091' = 'C2e GR engine remained busy through the bounded pre-save idle check'; 'E0000092' = 'C2e Nouveau GR idle predicate timed out at a generation checkpoint'; 'E0000093' = 'C2b GM20B GPC MMU register validation failed'; 'E0000094' = 'C2e FE/GR exception state changed during bundle replay'; 'E0000095' = 'priv-ring ACK_INTERRUPT command did not return to NO_CMD within 2000 polls'; 'E0000096' = 'C2e BE active-LTC ROP readback was invalid'; 'E0000097' = 'C2e active LTC count, CBC parameters, or LTC FS readback was invalid'; 'E0000098' = 'C2e FB active-LTC count readback was invalid'; 'E0000099' = 'C2e bounded ZBC idle, table validation, or ZBC readback failed'; 'E000009A' = 'C2e zero-comptag CBC base readback failed'; 'E000009B' = 'C2e bounded GM20B read-coalesce setup readback failed'; 'E000009C' = 'C2e early PE or zcull setup readback failed'; 'E000009D' = 'C2e Nouveau active-FBP ROP count setup failed'; 'E000009E' = 'C2e GR FIFO/semaphore access setup failed'; 'E000009F' = 'D1 GR-enable guard or PFIFO/PBDMA readback failed'; 'E00000A0' = 'D2 RAMFC, USERD, GPFIFO, channel bind, runlist, or bounded cleanup failed'; 'E00000A1' = 'D3 BAR1 USERD doorbell fault/readback or semaphore/GPFIFO progress failed'; 'E00000A2' = 'D4 class method, bounded GP_GET, L2 visibility, or completion semaphore failed'; 'E00000A3' = 'D4 context image/header prep or FECS watchdog/START_CTXSW method failed'; 'E00000A4' = 'D5 3D color clear, bounded channel progress, or surface readback failed'; 'E00000A5' = 'E1 completed without publishing resident channel state'; 'E00000A6' = 'E2 resident clear, bounded channel progress, or pixel readback failed' }
       $why3 = $b3err[(Key32 $p.B3aResult)]; if (-not $why3) { $why3 = '?' }
       Sum ('B3c PMU app version {0}; argv in WPR {1}' -f (Hex $p.B3cPmuAppVersion), (Hex $p.B3bPmuArgv))
       Sum ('B3a firmware: bl.bin {0} bytes magic {1} (hdr {2} data {3}+{4})  start tag {5} dmem off {6} code {7}+{8}' -f $p.B3aBlLen, (Hex $p.B3aBlMagic), (Hex $p.B3aBlHdrOff), (Hex $p.B3aBlDataOff), (Hex $p.B3aBlDataSize), (Hex $p.B3aBlStartTag), (Hex $p.B3aBlDmemLoadOff), (Hex $p.B3aBlCodeOff), (Hex $p.B3aBlCodeSize))
@@ -768,6 +844,17 @@ switch ($Mode) {
     try { Invoke-ResidentControl ($Mode -eq 'ResidentStop') }
     catch { Sum ('resident IOCTL failed: {0}' -f $_.Exception.Message) }
     Show-Device; Log ''; Show-Trace
+  }
+  'Submit' {
+    $oldE2 = Get-ItemProperty $Key -ErrorAction SilentlyContinue
+    if ($oldE2) {
+      foreach ($n in @($oldE2.PSObject.Properties | Where-Object { $_.Name -match '^E2' } | ForEach-Object { $_.Name })) {
+        Remove-ItemProperty -Path $Key -Name $n -ErrorAction SilentlyContinue
+      }
+    }
+    try { Invoke-ResidentSubmit }
+    catch { Sum ('E2 IOCTL failed (resident channel required): {0}' -f $_.Exception.Message) }
+    Log ''; Show-Trace
   }
   { $_ -eq 'PowerTest' -or $_ -eq 'ProbeTest' -or $_ -eq 'DmaTest' -or $_ -eq 'FwTest' -or $_ -eq 'AcrTest' -or $_ -eq 'Resident' } {
     $tv = 1; if ($Mode -eq 'ProbeTest') { $tv = 2 }; if ($Mode -eq 'DmaTest') { $tv = 3 }; if ($Mode -eq 'FwTest') { $tv = 4 }; if ($Mode -eq 'AcrTest') { $tv = 5 }; if ($Mode -eq 'Resident') { $tv = 6 }
