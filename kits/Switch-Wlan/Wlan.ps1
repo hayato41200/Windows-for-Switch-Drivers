@@ -86,6 +86,9 @@ function Show-Status {
   if ($p.WlanCmdLog) { Log ("cmdlog : ({0}) {1}" -f $p.WlanCmdLogN, $p.WlanCmdLog) }
   # 0.6.6: frames between the chip and Windows, connect timing
   if ($p.WlanOsPath) { Log ("os     : {0}" -f $p.WlanOsPath) }
+  # 0.6.15: datapath queues (created / cancelled / destroyed by NetAdapterCx; now=1 means the driver has one)
+  if ($p.WlanQueues) { Log ("queues : {0}" -f $p.WlanQueues) }
+  if ($p.WlanQueueLog) { Log ("qlog   : {0}  (1/2/3 rx create/cancel/destroy, 5/6/7 tx; +8 = not the current queue; @ seconds since boot)" -f $p.WlanQueueLog) }
   # 0.6.11: what the association really is (PHY 4=OFDM 6=ERP 7=HT 8=VHT)
   if ($null -ne $p.WlanPhy) { Log ("link   : phy={0} bandwidth={1} MHz rate={2} Mbit/s chanspec={3}" -f $p.WlanPhy, $p.WlanBandwidth, ([double]$p.LinkRate500k / 2), $(if ($null -ne $p.LinkChanspec) { '{0:X4}' -f $p.LinkChanspec } else { '-' })) }
   if ($p.WlanFormat) { Log ("format : {0}" -f $p.WlanFormat) }

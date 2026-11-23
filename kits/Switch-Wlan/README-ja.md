@@ -128,3 +128,27 @@
 - 本体の Wi-Fi MAC（98:B6:E9:…）で動くようになった（Status `mac … 98:B6:E9:xx:xx:xx nvram=1`、設定画面の物理アドレスも同じ）。接続・鍵（keys set=4）も問題なし。
 - 0.6.13：Install が `wifi-mac.txt` から書いた `Parameters\MacAddress` を、ファームウェアに渡す前の NVRAM の `macaddr=` に書き込む（なければ追加）。0.6.3〜の cur_etheraddr の設定は受け付けられるが読み返すと変わっておらず、Status の `source=0` / `try=2` はそのため（表示だけの問題）。
 - `wifi-mac.txt` は手元専用キットにだけ入れる。リポジトリと配布物には入れない。
+
+## 0.6.14（2026-11-08、実機未確認）
+
+- 0.6.13 で、Windows を再起動すると自動でつながらず、手動でもつながらなかった（ユーザー報告）。スキャンはできていて、`Retry.cmd` のあとはつながる。
+- 理由（推定）：再起動では Switch の電源が切れず、前の Windows のファームウェアがチップで動いたまま残る。ドライバーは「UEFI が電源を入れたばかり」という前提で、CPU の停止と D11 のリセットだけをしてファームウェアを入れていた。
+- 0.6.14：ファームウェアを入れる前に、brcmfmac の `brcmf_pcie_reset_device` と同じチップの watchdog リセットをする（ASPM を切る → ChipCommon watchdog=4 → 100 ms 待つ → ASPM を戻す → PCIe2 コアの設定レジスタを書き直す → mailbox 割り込みを消す）。リセット前の状態を `PrevCr4Ioctl` / `PrevShared` に、リセット後を `ResetEpId` / `ResetChipId` / `ResetCr4Ioctl` に記録する。
+
+## 0.6.14 の実機結果と 0.6.15（2026-11-08）
+
+- 0.6.14 でも再起動後はつながらなかった。Status：AP の M1 は届いている（`rx eapol=28`）が、Windows から 1 フレームも来ない（`tx fromOs=0 adv=0`）。AP が鍵交換タイムアウト（reason 15）で切る。
+- 再起動をまたいだ netsh trace（Trace-Boot.cmd）：起動から 45 秒ほどで、Native WiFi Filter などが後からバインドされる。そのためミニポートがいったん Pause → Restart される（16:55:57〜58）。Retry のときはバインドが済んでいるので、この Pause が起きない。NWiFi の統計では RxUnicastCount=0 で、Windows の上の層には受信フレームが届いていない。
+- Status の `rx queued=28 noQueue=28`：受信した 28 フレームすべてが、ドライバーが Rx キューを持っていない（ポインターが NULL）ときに来ていた。Pause/Restart でキューが作り直されたあと、ポインターが消えたままと見ている。
+- 0.6.15：キューの Cancel では、それが今のキューのときだけポインターを消す。キューの破棄（EvtDestroyCallback）でも同じようにする。Status に `queues`（作成・Cancel・破棄の回数と、今キューを持っているか）と `qlog`（時刻つきの順番）を足した。
+
+## 0.6.15 の実機結果と 0.6.16（2026-11-10）
+
+- 0.6.15 でも、再起動後は手動でもつながらなかった。qlog：`5@10.2 1@10.3`（起動 10 秒で Tx/Rx キューを作る）、`6@46.9 2@46.9`（Pause で Cancel）、`14@47.2 10@47.2`（もう一度 Cancel）。そのあとキューの作成も破棄も 1 回も起きていない（create=1 destroy=0）。
+- つまり NetAdapterCx は、Pause でキューを Cancel したあと、同じキューを Restart して使い続ける。Cancel はキューの終わりではない。0.6.15 まではドライバーが Cancel でキューを忘れていたので、その後は Windows に「受信フレームがある」と知らせなかった。M1 は、まれな Advance のときに遅れて渡るだけになり、鍵交換が 5 秒で切れていた（`noQueue` が全部、`tx fromOs=0`）。
+- 0.6.16：Cancel では、パケットを全部返して通知を止めるだけにする。キューを忘れるのは破棄（EvtDestroyCallback）のときだけ。
+
+## 0.6.16 の実機結果（2026-11-23、ユーザー報告）
+
+- 再起動のあと、自動でつながった（Retry は不要）。再起動後につながらない問題はこれで直った。
+- 0.6.14 で足したチップの watchdog リセットは、原因ではなかったが残している（Linux の brcmfmac と同じ手順で、害はない）。

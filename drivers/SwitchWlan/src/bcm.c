@@ -12,7 +12,7 @@
 #include <wdf.h>
 #include "bcm.h"
 
-#define SWWIFI_VERSION      0x00060000u     /* switchwlan 0.6.0 */
+#define SWWIFI_VERSION      0x00061000u     /* switchwlan 0.6.16 */
 
 #define RP_LINK_STATUS      0x090           /* bit 29: data link up */
 #define RP_XP_VC0           0xF00           /* bit 30: DL up */
@@ -331,8 +331,10 @@ static VOID SwWifiProbe(PSWWIFI_DEVICE Dev)
  * firmware then writes the address of its shared area to the last RAM word.
  * The files are the user's own (not distributed): brcmfmac4356-pcie.bin and,
  * if there is one, brcmfmac4356-pcie.txt, in System32\drivers\switchwifi.
- * Not done (yet): the chip watchdog reset of brcmf_pcie_reset_device; UEFI
- * has just powered the chip, so it is still in its boot ROM.
+ * 0.6.14: the chip watchdog reset of brcmf_pcie_reset_device first. A warm
+ * restart of Windows does not power the chip off, so the last session's
+ * firmware is still running when this driver starts (connect then failed
+ * until Retry).
  */
 #define FW_DIR              L"\\SystemRoot\\System32\\drivers\\switchwifi\\"
 #define FW_MAX              (1024u * 1024u)
@@ -1581,6 +1583,56 @@ static VOID SwWifiMsgbuf(PSWWIFI_DEVICE Dev, ULONG Shared)
     SwWifiFlush();
 }
 
+/* brcmf_pcie_reset_device (Linux 4.9): ASPM off, ChipCommon watchdog, ASPM
+ * back, then re-latch the PCIe2 core's shadowed config registers (core rev
+ * 13 or older). Clears the mailbox interrupts as brcmf_pcie_buscore_reset. */
+#define EP_LINK_STATUS_CTRL 0xBC
+#define EP_ASPM_ENAB        0x3u
+#define CC_WATCHDOG         0x80
+static BOOLEAN SwWifiWatchdogReset(PSWWIFI_DEVICE Dev)
+{
+    static const USHORT CfgOff[] = { 0x004, 0x04C, 0x058, 0x05C, 0x060, 0x064, 0x0DC, 0x228, 0x248, 0x4E0, 0x4F4 };
+    LARGE_INTEGER Delay;
+    ULONG Lsc, I, V, Id;
+
+    SwWifiSetWindow(Dev, mCr4Wrap);
+    SwWifiTrace(L"PrevCr4Ioctl", Rd(Dev->Bar0, AI_IOCTL));
+    SwWifiTrace(L"PrevShared", Rd(Dev->Bar2, TCM_RAMBASE + mRamBytes - 4));
+
+    Lsc = Rd(Dev->Cfg, EP_LINK_STATUS_CTRL);
+    SwWifiTrace(L"ResetLsc", Lsc);
+    Wr(Dev->Cfg, EP_LINK_STATUS_CTRL, Lsc & ~EP_ASPM_ENAB);
+    (VOID)Rd(Dev->Cfg, EP_LINK_STATUS_CTRL);
+
+    SwWifiSetWindow(Dev, SI_ENUM_BASE);
+    Wr(Dev->Bar0, CC_WATCHDOG, 4);
+    Delay.QuadPart = -100 * 10000LL;
+    KeDelayExecutionThread(KernelMode, FALSE, &Delay);
+
+    Wr(Dev->Cfg, EP_LINK_STATUS_CTRL, Lsc);
+    (VOID)Rd(Dev->Cfg, EP_LINK_STATUS_CTRL);
+    SwWifiSetWindow(Dev, PCIE2_CORE);
+    if (mPcie2Rev <= 13) {
+        for (I = 0; I < RTL_NUMBER_OF(CfgOff); I++) {
+            Wr(Dev->Bar0, PCIE2_CONFIGADDR, CfgOff[I]);
+            V = Rd(Dev->Bar0, PCIE2_CONFIGDATA);
+            Wr(Dev->Bar0, PCIE2_CONFIGDATA, V);
+        }
+    }
+    V = Rd(Dev->Bar0, PCIE2_MAILBOXINT);
+    if (V != 0xFFFFFFFFu && V != 0) Wr(Dev->Bar0, PCIE2_MAILBOXINT, V);
+
+    Id = Rd(Dev->Cfg, 0x00);
+    SwWifiSetWindow(Dev, SI_ENUM_BASE);
+    V = Rd(Dev->Bar0, CC_CHIPID);
+    SwWifiTrace(L"ResetEpId", Id);
+    SwWifiTrace(L"ResetChipId", V);
+    SwWifiSetWindow(Dev, mCr4Wrap);
+    SwWifiTrace(L"ResetCr4Ioctl", Rd(Dev->Bar0, AI_IOCTL));
+    SwWifiSetWindow(Dev, SI_ENUM_BASE);
+    return Id == EP_ID_BCM4356 && (V & 0xFFFFu) == 0x4356u;
+}
+
 static VOID SwWifiFirmware(PSWWIFI_DEVICE Dev)
 {
     PUCHAR Fw = NULL, NvText = NULL, Nv = NULL;
@@ -1617,6 +1669,14 @@ static VOID SwWifiFirmware(PSWWIFI_DEVICE Dev)
     SwWifiTrace(L"NvSize", NvLen);
     if (FwLen + NvLen + 4 > mRamBytes) {
         SwWifiTraceText(L"FwResult", L"not tried: firmware + NVRAM do not fit in device RAM");
+        goto Out;
+    }
+
+    /* 0.6.14: start from a reset chip, also after a warm restart. */
+    SwWifiStep(9);
+    SwWifiTrace(L"FwStage", 9);
+    if (!SwWifiWatchdogReset(Dev)) {
+        SwWifiTraceText(L"FwResult", L"not tried: the chip did not come back after the watchdog reset");
         goto Out;
     }
 

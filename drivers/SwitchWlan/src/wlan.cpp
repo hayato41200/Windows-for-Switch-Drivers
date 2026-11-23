@@ -25,7 +25,7 @@
 #include "bcm.h"
 #include <ntstrsafe.h>
 
-#define WLAN_VERSION        0x00060D00u     /* 0.6.13 */
+#define WLAN_VERSION        0x00061000u     /* 0.6.16 */
 #define WLAN_TAG            'nlWS'
 #define WLAN_FRAME_MAX      2048u
 #define WLAN_FRAME_QUEUE    256u    /* 0.6.9: 32 frames per poll capped Rx at ~12 Mbit/s */
@@ -82,6 +82,9 @@ typedef struct _WLAN_DEVICE {
     /* 0.6.6 diagnostics: frames between the chip and Windows */
     ULONG RxQueued, RxNoQueue, RxFull, RxToOs, RxEapolToOs, RxAdvance;
     ULONG TxFromOs, TxEapolFromOs, TxDropNotReady, TxAdvance;
+    /* 0.6.15: queue lifetimes (NDIS pause/restart recreates them at boot) */
+    ULONG RxCreates, RxCancels, RxDestroys, TxCreates, TxCancels, TxDestroys, StaleCancels;
+    ULONG QLog[12], QLogN;              /* code | seconds since boot (tenths) */
     ULONG ConnLinkMs, ConnDoneMs;
     ULONG RxDstMine, RxDstGroup, RxDstOther;
     ULONG TxL2Last, TxConverted, TxNot80211;
@@ -127,6 +130,23 @@ static VOID WlanSaveTrace(PWLAN_DEVICE Ctx)
             Ctx->RxQueued, Ctx->RxNoQueue, Ctx->RxFull, Ctx->RxToOs, Ctx->RxEapolToOs, Ctx->RxAdvance,
             Ctx->TxFromOs, Ctx->TxEapolFromOs, Ctx->TxDropNotReady, Ctx->TxAdvance, Ctx->ConnLinkMs, Ctx->ConnDoneMs);
         BcmTraceText(L"WlanOsPath", Os);
+        (VOID)RtlStringCbPrintfW(Os, sizeof(Os), L"rx create=%u cancel=%u destroy=%u now=%u | tx create=%u cancel=%u destroy=%u now=%u | stale=%u",
+            Ctx->RxCreates, Ctx->RxCancels, Ctx->RxDestroys, Ctx->RxQueue != NULL ? 1u : 0u,
+            Ctx->TxCreates, Ctx->TxCancels, Ctx->TxDestroys, Ctx->TxQueue != NULL ? 1u : 0u, Ctx->StaleCancels);
+        BcmTraceText(L"WlanQueues", Os);
+        {
+            static WCHAR QText[400];
+            ULONG I, N = Ctx->QLogN, First = (N > RTL_NUMBER_OF(Ctx->QLog)) ? N - RTL_NUMBER_OF(Ctx->QLog) : 0;
+            size_t Used = 0;
+            QText[0] = 0;
+            (VOID)RtlStringCbPrintfW(QText, sizeof(QText), L"now %u.%u s:", (ULONG)(KeQueryInterruptTime() / 10000000ULL), (ULONG)(KeQueryInterruptTime() / 1000000ULL % 10));
+            for (I = First; I < N; I++) {
+                ULONG V = Ctx->QLog[I % RTL_NUMBER_OF(Ctx->QLog)];
+                (VOID)RtlStringCbLengthW(QText, sizeof(QText), &Used);
+                (VOID)RtlStringCbPrintfW(QText + Used / sizeof(WCHAR), sizeof(QText) - Used, L" %u@%u.%u", V >> 24, (V & 0xFFFFFFu) / 10, (V & 0xFFFFFFu) % 10);
+            }
+            BcmTraceText(L"WlanQueueLog", QText);
+        }
         (VOID)RtlStringCbPrintfW(Os, sizeof(Os), L"mine=%u group=%u other=%u (other OUI %02X:%02X:%02X)",
             Ctx->RxDstMine, Ctx->RxDstGroup, Ctx->RxDstOther, Ctx->RxOtherOui[0], Ctx->RxOtherOui[1], Ctx->RxOtherOui[2]);
         BcmTraceText(L"WlanRxDst", Os);
@@ -154,6 +174,7 @@ static EVT_NET_ADAPTER_CREATE_RXQUEUE EvtCreateRxQueue;
 static EVT_PACKET_QUEUE_ADVANCE EvtTxAdvance;
 static EVT_PACKET_QUEUE_SET_NOTIFICATION_ENABLED EvtTxNotify;
 static EVT_PACKET_QUEUE_CANCEL EvtTxCancel;
+static VOID WlanQLog(struct _WLAN_DEVICE *Ctx, ULONG Code);
 static EVT_PACKET_QUEUE_ADVANCE EvtRxAdvance;
 static EVT_PACKET_QUEUE_SET_NOTIFICATION_ENABLED EvtRxNotify;
 static EVT_PACKET_QUEUE_CANCEL EvtRxCancel;
@@ -1159,8 +1180,18 @@ static VOID EvtTxCancel(NETPACKETQUEUE Queue)
     PWLAN_QUEUE Q = WlanGetQueue(Queue);
     KIRQL Irql;
     KeAcquireSpinLock(&Q->Device->Lock, &Irql);
-    Q->Device->TxNotifyEnabled = FALSE;
-    Q->Device->TxQueue = NULL;
+    Q->Device->TxCancels++;
+    WlanQLog(Q->Device, Q->Device->TxQueue == Queue ? 6 : 14);
+    /* 0.6.16: Cancel is not the end of the queue. On an NDIS pause (filters
+     * binding at boot) NetAdapterCx cancels, then restarts the SAME queue
+     * (0.6.15 qlog: create once, cancel at pause, no destroy, no new create).
+     * 0.6.15 and older forgot the queue here and never notified it again.
+     * Only the destroy callback forgets it now. */
+    if (Q->Device->TxQueue == Queue) {
+        Q->Device->TxNotifyEnabled = FALSE;
+    } else {
+        Q->Device->StaleCancels++;
+    }
     KeReleaseSpinLock(&Q->Device->Lock, Irql);
     WlanReturnAll(Queue, FALSE);
 }
@@ -1245,10 +1276,45 @@ static VOID EvtRxCancel(NETPACKETQUEUE Queue)
     PWLAN_QUEUE Q = WlanGetQueue(Queue);
     KIRQL Irql;
     KeAcquireSpinLock(&Q->Device->Lock, &Irql);
-    Q->Device->RxNotifyEnabled = FALSE;
-    Q->Device->RxQueue = NULL;
+    Q->Device->RxCancels++;
+    WlanQLog(Q->Device, Q->Device->RxQueue == Queue ? 2 : 10);
+    if (Q->Device->RxQueue == Queue) {
+        Q->Device->RxNotifyEnabled = FALSE;     /* 0.6.16: keep the queue (see EvtTxCancel) */
+    } else {
+        Q->Device->StaleCancels++;
+    }
     KeReleaseSpinLock(&Q->Device->Lock, Irql);
     WlanReturnAll(Queue, TRUE);
+}
+
+/* 0.6.15: queue events with time, for comparing with a netsh trace.
+ * Codes: 1 rx create, 2 rx cancel, 3 rx destroy, 5 tx create, 6 tx cancel, 7 tx destroy (+8 stale). */
+static VOID WlanQLog(PWLAN_DEVICE Ctx, ULONG Code)       /* under Ctx->Lock */
+{
+    ULONG Tenths = (ULONG)(KeQueryInterruptTime() / 1000000ULL);
+    Ctx->QLog[Ctx->QLogN % RTL_NUMBER_OF(Ctx->QLog)] = (Code << 24) | (Tenths & 0xFFFFFFu);
+    Ctx->QLogN++;
+}
+
+/* 0.6.15: never keep a handle to a queue that is gone. */
+static VOID EvtQueueDestroy(WDFOBJECT Object)
+{
+    NETPACKETQUEUE Queue = (NETPACKETQUEUE)Object;
+    PWLAN_QUEUE Q = WlanGetQueue(Queue);
+    PWLAN_DEVICE Ctx = Q->Device;
+    KIRQL Irql;
+    if (Ctx == NULL) return;
+    KeAcquireSpinLock(&Ctx->Lock, &Irql);
+    if (Q->IsRx) {
+        Ctx->RxDestroys++;
+        WlanQLog(Ctx, Ctx->RxQueue == Queue ? 3 : 11);
+        if (Ctx->RxQueue == Queue) { Ctx->RxQueue = NULL; Ctx->RxNotifyEnabled = FALSE; }
+    } else {
+        Ctx->TxDestroys++;
+        WlanQLog(Ctx, Ctx->TxQueue == Queue ? 7 : 15);
+        if (Ctx->TxQueue == Queue) { Ctx->TxQueue = NULL; Ctx->TxNotifyEnabled = FALSE; }
+    }
+    KeReleaseSpinLock(&Ctx->Lock, Irql);
 }
 
 static NTSTATUS EvtCreateTxQueue(NETADAPTER Adapter, NETTXQUEUE_INIT *Init)
@@ -1260,6 +1326,7 @@ static NTSTATUS EvtCreateTxQueue(NETADAPTER Adapter, NETTXQUEUE_INIT *Init)
     PWLAN_DEVICE Ctx = WlanGetDevice(WlanGetAdapter(Adapter)->Device);
     NET_PACKET_QUEUE_CONFIG_INIT(&Config, EvtTxAdvance, EvtTxNotify, EvtTxCancel);
     WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&Attributes, WLAN_QUEUE);
+    Attributes.EvtDestroyCallback = EvtQueueDestroy;
     NTSTATUS Status = NetTxQueueCreate(Init, &Attributes, &Config, &Queue);
     if (!NT_SUCCESS(Status)) return Status;
     PWLAN_QUEUE Q = WlanGetQueue(Queue);
@@ -1271,6 +1338,8 @@ static NTSTATUS EvtCreateTxQueue(NETADAPTER Adapter, NETTXQUEUE_INIT *Init)
     KIRQL Irql;
     KeAcquireSpinLock(&Ctx->Lock, &Irql);
     Ctx->TxQueue = Queue;
+    Ctx->TxCreates++;
+    WlanQLog(Ctx, 5);
     KeReleaseSpinLock(&Ctx->Lock, Irql);
     return STATUS_SUCCESS;
 }
@@ -1284,6 +1353,7 @@ static NTSTATUS EvtCreateRxQueue(NETADAPTER Adapter, NETRXQUEUE_INIT *Init)
     PWLAN_DEVICE Ctx = WlanGetDevice(WlanGetAdapter(Adapter)->Device);
     NET_PACKET_QUEUE_CONFIG_INIT(&Config, EvtRxAdvance, EvtRxNotify, EvtRxCancel);
     WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&Attributes, WLAN_QUEUE);
+    Attributes.EvtDestroyCallback = EvtQueueDestroy;
     NTSTATUS Status = NetRxQueueCreate(Init, &Attributes, &Config, &Queue);
     if (!NT_SUCCESS(Status)) return Status;
     PWLAN_QUEUE Q = WlanGetQueue(Queue);
@@ -1295,6 +1365,8 @@ static NTSTATUS EvtCreateRxQueue(NETADAPTER Adapter, NETRXQUEUE_INIT *Init)
     KIRQL Irql;
     KeAcquireSpinLock(&Ctx->Lock, &Irql);
     Ctx->RxQueue = Queue;
+    Ctx->RxCreates++;
+    WlanQLog(Ctx, 1);
     KeReleaseSpinLock(&Ctx->Lock, Irql);
     return STATUS_SUCCESS;
 }
