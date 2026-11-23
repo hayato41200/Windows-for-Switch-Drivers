@@ -514,3 +514,15 @@ Step 105 は C2e と D1 が成功した場合だけ実行します。既存の C
 Nouveau MIT `gk104.c:gk104_chan_ramfc_write()` の RAMFC fields、`gk104_chan_bind()` / `gk104_chan_bind_inst()` の runlist/instance binding、`gk104_runl_insert_chan()` の2-DWORD plain channel entry、`gk104_runl_commit()` の runlist base/submit、`gk104_runl_pending()` の pending bit を参照しました。channel 0 を CCSR に bind/enable して 1-entry runlist の完了を最大2000 poll待ちし、最後は enable clear、channel preempt、empty runlist submit、instance unbind を行います。各 wait は最大2000回 x 1 ms、各 MMIO write は `B3cPrivRingAfterGrWrite()` で確認します。失敗は `E00000A0` です。
 
 明示的な MMIO write は CCSR channel `0x800004` (runlist ID と enable set/clear)、CCSR instance `0x800000` (bind/unbind)、PFIFO runlist base/submit `0x2270/0x2274`、PFIFO preempt `0x2634` です。これら以外に MC interrupt routing や CPU interrupt を変更しません。USERD、GPFIFO、runlist、pushbuffer は C2d の既存 SMMU/GPU page table にマップされた arena suballocation で、追加の物理 allocation はありません。GPFIFO command は一つも投稿せず、channel 登録後に clean unbind してから既存 reset/arena cleanup に進みます。実機では TOP engine/runlist IDs、各 `B3cD2Writes` 行、runlist/pending と preempt polls、channel status、PFIFO/PBDMA/GR status、cleanup final values を確認してください。
+
+| 0.4.79 | D5 実機成功 | `0xFFFF00FF` を期待する 4096 pixels すべてで確認。pitch layout の target width は byte pitch 256。D5 で使用しない 0x0FA4 系 method は除去済み。 |
+## Stage E: resident driver
+
+| Version | Sub-step | Steps / errors | Scope |
+| --- | --- | --- | --- |
+| 0.5.0 | E1: Resident | Step 110 / `E00000A5` + 各段階の既存エラー | PowerTest mode 6 で A から D5 までを実行します。成功時は GPU、PMU/FECS/GPCCS、SMMU/GR のマッピング、BAR1、channel、arena を維持します。失敗時は mode 5 と同じ GPU reset と cleanup を行います。 |
+| 0.5.1 | E1: Resident(実機 OK) | Step 110〜112、結果 0 | 0.5.0 はデバイスが作れなかった(Code 31、0xC0000079)。管理者だけの制限を INF の `Security` に移して解決。実機で Resident、ResidentStatus 2 回、ResidentStop がすべて成功(エラー、fault なし)。 |
+
+`Resident.cmd` は E1 を一度だけ開始します。PowerTest は実行前に 0 へ戻します。`ResidentStatus.cmd` は読み取り専用の管理者向け device-interface IOCTL を使い、PnP restart を行いません。`ResidentStop.cmd` は別の IOCTL で channel disable、bounded preempt、空 runlist、unbind、BAR1 復元、GPU reset/power-off、arena/SMMU cleanup を順に実行します。PnP restart は ReleaseHardware を呼んで resident GPU を停止するため、状態確認と停止には使いません。resident 中は WDF idle reference を保持し、最終的な device removal/shutdown では同じ idempotent teardown を呼びます。
+
+E1 は実験段階です。停止処理前に強制電源断、bugcheck、device removal が起きた場合、Switch 側の reset まで GPU が動作状態で残る可能性があります。通常起動では従来どおり GPU に触れず、GPU を停止したままにします。E1 の実機 lifecycle、IOCTL 列挙、shutdown 順序、idle-reference 動作は未検証です。

@@ -15,7 +15,7 @@
  * At every start the driver only READS: PMC_GPU_RG_CNTRL, the GPU clock and
  * reset bits, PLLP_OUTC, the fuse clock, the MC hot reset bits, the MAX77621
  * registers and MAX77620 GPIO6. Nothing is written unless the registry value
- * PowerTest = 1; then, once (PowerTest is reset to 0 first), the GPU is
+ * PowerTest is 1..6; then, once (PowerTest is reset to 0 first), the GPU is
  * powered as L4T nvgpu gm20b_tegra_unrailgate does:
  *   VDD_GPU 1.0 V (VOUT = VOUT_DVS = 0xBF) and GPIO6 high, 2 ms;
  *   clocks: gpu gate (CLK_X 24), pllg_ref (CLK_X 29), pll_p_out5 204 MHz
@@ -27,8 +27,8 @@
  * then NV_PMC_BOOT_0 (BAR0 + 0), PTIMER (BAR0 + 0x9400 / 0x9410) and the WPR the
  * GPU sees (NV_PFB 0x100CD4, index 2 / 3, as nouveau's gm200_acr_wpr_check) are read,
  * BAR0 only if the clamp is off, the clock on and the reset low. Unless
- * KeepOn = 1, the GPU is then powered down in the reverse order and every
- * register is put back as it was found.
+ * KeepOn = 1, the GPU is then powered down. Mode 6 retains it only after the
+ * full E1 path succeeds; resident status/stop use admin-only device IOCTLs.
  *
  * Before each step "Step" is written and the key flushed to disk, so after a
  * hang and a restart Status.cmd shows where it stopped.
@@ -39,7 +39,7 @@
 #include <wdf.h>
 #include <spb.h>
 
-#define SWGPU_VERSION      0x0000044Fu   /* 0.4.79 */
+#define SWGPU_VERSION      0x00000501u   /* 0.5.1 */
 
 #define CAR_PHYS           0x60006000ull
 #define CAR_LEN            0x1000u
@@ -150,6 +150,52 @@
 #define MC_SMMU_CLIENT_230 0x230       /* bit 24 GPUSRD, bit 25 GPUSWR */
 #define MC_SMMU_CLIENT_B98 0xB98       /* bit 8 GPUSRD2, bit 9 GPUSWR2 */
 
+/* E1 resident controls use a device interface rather than a PnP restart:
+ * restarting the device invokes ReleaseHardware and intentionally shuts the
+ * resident GPU down. The interface is restricted to SYSTEM and Administrators. */
+static const GUID GUID_DEVINTERFACE_SWGPU_RESIDENT =
+    { 0x2cc9cb4d, 0x6412, 0x4f31, { 0xa7, 0x81, 0x5d, 0x78, 0x1e, 0x09, 0x4b, 0x63 } };
+#define IOCTL_SWGPU_RESIDENT_STATUS CTL_CODE(FILE_DEVICE_UNKNOWN, 0x800, METHOD_BUFFERED, FILE_READ_ACCESS | FILE_WRITE_ACCESS)
+#define IOCTL_SWGPU_RESIDENT_STOP   CTL_CODE(FILE_DEVICE_UNKNOWN, 0x801, METHOD_BUFFERED, FILE_READ_ACCESS | FILE_WRITE_ACCESS)
+
+typedef struct _SWGPU_RESIDENT_STATUS {
+    ULONG Version;
+    ULONG Resident;
+    ULONG Boot0;
+    ULONG PtimerLoBefore;
+    ULONG PtimerHi;
+    ULONG PtimerLoAfter;
+    ULONG PtimerDelta;
+    ULONG PmcEnable;
+    ULONG PrivRingStatus0;
+    ULONG PrivRingStatus1;
+    ULONG FecsMailbox0;
+    ULONG FecsCpuctl;
+    ULONG FifoEngineStatus;
+    ULONG CcsrChannel;
+    ULONG PbdmaStatus;
+    ULONG PbdmaIntr0;
+    ULONG GrIntr;
+    ULONG GrStatus;
+    ULONG MmuFaultStatus;
+    ULONG ShutdownResult;
+} SWGPU_RESIDENT_STATUS, *PSWGPU_RESIDENT_STATUS;
+
+typedef struct _SWGPU_RESIDENT_POWER {
+    UCHAR Vout;
+    UCHAR VoutDvs;
+    UCHAR Gpio6;
+    BOOLEAN Valid;
+    BOOLEAN RailOn;
+    BOOLEAN ClocksOn;
+    BOOLEAN OutcChanged;
+    BOOLEAN FuseChanged;
+    ULONG ClkX;
+    ULONG ClkH;
+    ULONG PllOutc;
+    ULONG McHotResetCtrl;
+} SWGPU_RESIDENT_POWER, *PSWGPU_RESIDENT_POWER;
+
 typedef struct _SWGPU_DEVICE {
     WDFDEVICE      Device;
     PHYSICAL_ADDRESS Bar0Phys;
@@ -166,8 +212,22 @@ typedef struct _SWGPU_DEVICE {
     LARGE_INTEGER  PmicId;
     WDFIOTARGET    Vdd;          /* MAX77621 0x1C */
     WDFIOTARGET    Pmic;         /* MAX77620 0x3C */
+    BOOLEAN        ResidentRequested;
+    BOOLEAN        ResidentActive;
+    BOOLEAN        ResidentChannelEnabled;
+    BOOLEAN        ResidentRunlistSubmitted;
+    BOOLEAN        ResidentInstBound;
+    BOOLEAN        ResidentIdleRefHeld;
+    ULONG          ResidentRunlistEmptyValue;
+    ULONG          ResidentChannelId;
+    ULONG          ResidentShutdownResult;
+    SWGPU_RESIDENT_POWER ResidentPower;
 } SWGPU_DEVICE, *PSWGPU_DEVICE;
 WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(SWGPU_DEVICE, SwGpuGetDevice)
+
+/* g_AcrVm/g_GrVm back a single ACPI GPU instance. The resident owner records
+ * which device keeps these shared arenas and mappings live. */
+static PSWGPU_DEVICE g_ResidentOwner;
 
 #define B2A_RETAINED_PAGE_PAIRS 8u
 static PVOID g_B2aRetainedPages[B2A_RETAINED_PAGE_PAIRS][2];
@@ -178,6 +238,8 @@ EVT_WDF_DRIVER_DEVICE_ADD SwGpuEvtDeviceAdd;
 EVT_WDF_DEVICE_PREPARE_HARDWARE SwGpuEvtPrepareHardware;
 EVT_WDF_DEVICE_RELEASE_HARDWARE SwGpuEvtReleaseHardware;
 EVT_WDF_DEVICE_SELF_MANAGED_IO_INIT SwGpuEvtSelfManagedIoInit;
+EVT_WDF_DEVICE_D0_EXIT SwGpuEvtD0Exit;
+EVT_WDF_IO_QUEUE_IO_DEVICE_CONTROL SwGpuEvtIoDeviceControl;
 
 static WCHAR SwGpuParamsPath[256];
 
@@ -350,6 +412,7 @@ static ULONG I2cTrace(WDFIOTARGET Target, UCHAR Register, PCWSTR Name)
 static VOID Snapshot(PSWGPU_DEVICE Dev, BOOLEAN After)
 {
 #define N(a, b) (After ? L##b : L##a)
+    if (Dev->ResidentActive) { Trace(L"B3eSnapshotSkipped", After ? 2u : 1u); return; }
     Trace(N("RgCntrlAtStart",  "RgCntrlAfter"),  Rd(Dev->Pmc, PMC_GPU_RG_CNTRL));
     Trace(N("ClkXAtStart",     "ClkXAfter"),     Rd(Dev->Car, CAR_CLK_OUT_ENB_X));
     Trace(N("RstXAtStart",     "RstXAfter"),     Rd(Dev->Car, CAR_RST_DEVICES_X));
@@ -5515,6 +5578,104 @@ static ULONG g_D2UserdBar1Set = 0u;
 static ULONG g_D2PbdmaInten0Before = 0u;
 static ULONG g_D2PbdmaMasksSaved = 0u;
 
+/* Shared D2 channel teardown. Normal one-shot execution calls this from its
+ * exit path; E1 invokes the same routine later while the channel is resident. */
+static ULONG B3cD2CleanupPublishedState(PSWGPU_DEVICE Dev, ULONG writes[64][4],
+    PULONG writeCount, BOOLEAN channelEnabled, BOOLEAN runlistSubmitted,
+    BOOLEAN instBound, ULONG channelId, ULONG runlistEmptyValue,
+    PULONG outPreemptPolls, PULONG outPreemptLast,
+    PULONG outRunlistPolls, PULONG outRunlistLast,
+    BOOLEAN d4WasRun, ULONG diagWrites[64][4], PULONG diagWriteCount)
+{
+    volatile UCHAR *B = Dev->Bar0;
+    ULONG error = 0u, value = 0u, preemptPolls = 0u, preemptLast = 0u;
+    ULONG runlistPolls = 0u, runlistLast = 0u, restorePolls = 0u, restoreStatus = 0u;
+    ULONG channelReg = 0x00800004u, instReg = 0x00800000u;
+    ULONG preemptReg = 0x00002634u, runlistReg = 0x00002274u;
+    ULONG pendingReg = 0x00002284u, pbdmaIntrReg = 0x00040108u;
+    if (outPreemptPolls) *outPreemptPolls = 0u;
+    if (outPreemptLast) *outPreemptLast = 0u;
+    if (outRunlistPolls) *outRunlistPolls = 0u;
+    if (outRunlistLast) *outRunlistLast = 0u;
+    if (B == NULL || writes == NULL || writeCount == NULL) return 0x80000000u;
+
+    if (channelEnabled) {
+        value = Rd(B, channelReg) | 0x00000800u;
+        if (!B3cD2Write(B, writes, writeCount, channelReg, value)) error |= 1u;
+        {
+            ULONG intr0 = Rd(B, pbdmaIntrReg), intr1 = Rd(B, 0x00040148u);
+            Trace(L"B3cD2CleanupPbdmaIntr0", intr0);
+            Trace(L"B3cD2CleanupPbdmaIntr1", intr1);
+            if (intr0 != 0u && !B3cD2Write(B, writes, writeCount, 0x000400C0u, 0x80600008u)) error |= 512u;
+            if (intr0 != 0u && !B3cD2Write(B, writes, writeCount, pbdmaIntrReg, intr0)) error |= 512u;
+            if (intr1 != 0u && !B3cD2Write(B, writes, writeCount, 0x00040148u, intr1)) error |= 512u;
+            Trace(L"B3cD2CleanupPbdmaIntr0AfterClear", Rd(B, pbdmaIntrReg));
+        }
+        if (!B3cD2Write(B, writes, writeCount, preemptReg, channelId)) error |= 2u;
+        for (preemptPolls = 0u; preemptPolls < 2000u; ++preemptPolls) {
+            preemptLast = Rd(B, preemptReg);
+            if ((preemptLast & 0x00100000u) == 0u) break;
+            Us(1000u);
+        }
+        if (preemptPolls == 2000u) {
+            error |= 4u;
+            if (d4WasRun && g_GrVm.Arena != NULL && diagWrites != NULL && diagWriteCount != NULL)
+                B3cD4CaptureCtxswDiag(B, (PUCHAR)g_GrVm.Arena + GR_VM_CTX_OFF,
+                    diagWrites, diagWriteCount, TRUE);
+        }
+        Trace(L"B3cD2PreemptPolls", preemptPolls); Trace(L"B3cD2PreemptLast", preemptLast);
+        Trace(L"B3cD2PreemptPbdmaIntr0", Rd(B, pbdmaIntrReg));
+        Trace(L"B3cD2PreemptPbdmaStatusReg", Rd(B, 0x00040100u));
+        Trace(L"B3cD2PreemptCcsrChannel", Rd(B, channelReg));
+        Trace(L"B3cD2PreemptEngineStatus", Rd(B, 0x00002640u));
+        Trace(L"B3cD2PreemptFifoIntr0", Rd(B, 0x00002100u));
+        Trace(L"B3cD2PreemptPbdmaStatus", Rd(B, 0x00003080u));
+    }
+    if (runlistSubmitted) {
+        if (!B3cD2Write(B, writes, writeCount, runlistReg, runlistEmptyValue)) error |= 8u;
+        for (runlistPolls = 0u; runlistPolls < 2000u; ++runlistPolls) {
+            runlistLast = Rd(B, pendingReg);
+            if ((runlistLast & 0x00100000u) == 0u) break;
+            Us(1000u);
+        }
+        if (runlistPolls == 2000u) error |= 16u;
+        Trace(L"B3cD2CleanupRunlistPolls", runlistPolls);
+        Trace(L"B3cD2CleanupRunlistLast", runlistLast);
+    }
+    if (instBound && !B3cD2Write(B, writes, writeCount, instReg, 0u)) error |= 32u;
+    if (g_D2PbdmaMasksSaved) {
+        if (!B3cD2Write(B, writes, writeCount, 0x0004010Cu, g_D2PbdmaInten0Before)) error |= 1024u;
+        Trace(L"B3cD3PbdmaInten0Restored", Rd(B, 0x0004010Cu));
+        Trace(L"B3cD3PbdmaStallUnchanged", Rd(B, 0x0004013Cu));
+        g_D2PbdmaMasksSaved = 0u;
+    }
+    if (g_D2UserdBar1Set) {
+        if (!B3cD2Write(B, writes, writeCount, 0x00002254u, g_D2UserdBar1Before)) error |= 256u;
+        Trace(L"B3cD2UserdBar1Final", Rd(B, 0x00002254u));
+        g_D2UserdBar1Set = 0u;
+    }
+    if (g_D2Bar1Bound) {
+        if (!B3cD2Write(B, writes, writeCount, 0x00001704u, g_D2Bar1Before)) error |= 64u;
+        for (restorePolls = 0u; restorePolls < 2000u; ++restorePolls) {
+            restoreStatus = Rd(B, 0x00001710u);
+            if ((restoreStatus & 3u) == 0u) break;
+            Us(1000u);
+        }
+        if (restorePolls == 2000u) error |= 128u;
+        Trace(L"B3cD2Bar1RestorePolls", restorePolls);
+        Trace(L"B3cD2Bar1Final", Rd(B, 0x00001704u));
+        g_D2Bar1Bound = 0u;
+    }
+    Trace(L"B3eChannelCleanupError", error);
+    Trace(L"B3eChannelCleanupPreemptPolls", preemptPolls);
+    Trace(L"B3eChannelCleanupRunlistPolls", runlistPolls);
+    if (outPreemptPolls) *outPreemptPolls = preemptPolls;
+    if (outPreemptLast) *outPreemptLast = preemptLast;
+    if (outRunlistPolls) *outRunlistPolls = runlistPolls;
+    if (outRunlistLast) *outRunlistLast = runlistLast;
+    return error;
+}
+
 static ULONG B3cInitFifoD2(PSWGPU_DEVICE Dev)
 {
     volatile UCHAR *B = Dev->Bar0;
@@ -5528,7 +5689,7 @@ static ULONG B3cInitFifoD2(PSWGPU_DEVICE Dev)
     ULONG grEngineId = 0, runlistId = 0, chid = 0;
     ULONG ccsrInstReg = 0x00800000u, ccsrChannelReg = 0x00800004u;
     ULONG fifoRunlistBaseReg = 0x00002270u, fifoRunlistReg = 0x00002274u;
-    ULONG fifoRunlistPendingReg = 0x00002284u, fifoPreemptReg = 0x00002634u;
+    ULONG fifoRunlistPendingReg = 0x00002284u;
     ULONG fifoIntrReg = 0x00002100u, pbdmaStatusReg = 0x00040100u;
     ULONG pbdmaIntrReg = 0x00040108u, fifoEngineStatusReg = 0x00002640u;
     ULONG ccsrInstValue = 0, ccsrChannelBefore = 0, ccsrChannelValue = 0;
@@ -5544,7 +5705,7 @@ static ULONG B3cInitFifoD2(PSWGPU_DEVICE Dev)
     ULONG wfiTrace[2][3] = { 0 }, runlistTrace[2][3] = { 0 };
     ULONG zeroSamples[3][4] = { 0 }, writes[64][4] = { 0 };
     ULONG privBound = 0, channelEnableIssued = 0, runlistSubmitted = 0;
-    ULONG cleanupError = 0, writeCount = 0, disableValue = 0, i;
+    ULONG cleanupError = 0, writeCount = 0, i;
     ULONG pbdmaInten0Before = 0u, pbdmaStallBefore = 0u;
     ULONG pbdmaInten0Init = 0u;
     ULONG d3Result = 0u, d4Result = 0u, d4Run = 0u, d5Result = 0u;
@@ -6058,93 +6219,27 @@ static ULONG B3cInitFifoD2(PSWGPU_DEVICE Dev)
     }
 
 done:
-    /* Always tear down any channel state published by this one-shot probe.
-     * Each cleanup write is still priv-ring checked; both asynchronous waits
-     * have the same fixed 2000 x 1 ms bound as the forward runlist wait. */
-    if (channelEnableIssued) {
-        disableValue = Rd(B, ccsrChannelReg) | 0x00000800u;
-        if (!B3cD2Write(B, writes, &writeCount, ccsrChannelReg, disableValue))
-            cleanupError |= 1u;
-        /* Claude 0.4.64: a pending PBDMA interrupt stalls the channel save,
-         * so the preempt never completes.  Clear PBDMA0 intr_0 / intr_1
-         * (write-1-to-clear, the value just read) before preempting. */
-        {
-            ULONG pi0 = Rd(B, pbdmaIntrReg), pi1 = Rd(B, 0x00040148u);
-            Trace(L"B3cD2CleanupPbdmaIntr0", pi0);
-            Trace(L"B3cD2CleanupPbdmaIntr1", pi1);
-            /* Claude 0.4.66: nouveau gk104_runq_intr() writes method0
-             * (0x400C0) = 0x80600008 before clearing the PBDMA interrupt,
-             * so the PBDMA drops the faulting method instead of re-raising. */
-            if (pi0 != 0u && !B3cD2Write(B, writes, &writeCount, 0x000400C0u, 0x80600008u))
-                cleanupError |= 512u;
-            if (pi0 != 0u && !B3cD2Write(B, writes, &writeCount, pbdmaIntrReg, pi0))
-                cleanupError |= 512u;
-            if (pi1 != 0u && !B3cD2Write(B, writes, &writeCount, 0x00040148u, pi1))
-                cleanupError |= 512u;
-            Trace(L"B3cD2CleanupPbdmaIntr0AfterClear", Rd(B, pbdmaIntrReg));
-        }
-        if (!B3cD2Write(B, writes, &writeCount, fifoPreemptReg,
-                        chid | 0u /* channel type, channel id 0 */))
-            cleanupError |= 2u;
-        preemptLast = Rd(B, fifoPreemptReg);
-        for (preemptPolls = 0; preemptPolls < 2000u; ++preemptPolls) {
-            preemptLast = Rd(B, fifoPreemptReg);
-            if ((preemptLast & 0x00100000u) == 0u) break;
-            Us(1000u);
-        }
-        if (preemptPolls == 2000u) {
-            cleanupError |= 4u;
-            if (d4Run && g_GrVm.Arena != NULL)
-                B3cD4CaptureCtxswDiag(B,
-                    (PUCHAR)g_GrVm.Arena + GR_VM_CTX_OFF,
-                    diagWrites, &diagWriteCount, TRUE);
-        }
-        Trace(L"B3cD2PreemptPbdmaIntr0", Rd(B, pbdmaIntrReg));
-    Trace(L"B3cD2PreemptPbdmaStatusReg", Rd(B, pbdmaStatusReg));
-    Trace(L"B3cD2PreemptCcsrChannel", Rd(B, ccsrChannelReg));
-    Trace(L"B3cD2PreemptEngineStatus", Rd(B, fifoEngineStatusReg));
-        Trace(L"B3cD2PreemptFifoIntr0", Rd(B, fifoIntrReg));
-        Trace(L"B3cD2PreemptPbdmaStatus", Rd(B, 0x00003080u));
-    }
-    if (runlistSubmitted) {
-        if (!B3cD2Write(B, writes, &writeCount, fifoRunlistReg, runlistEmptyValue))
-            cleanupError |= 8u;
-        cleanupRunlistLast = Rd(B, fifoRunlistPendingReg);
-        for (cleanupRunlistPolls = 0; cleanupRunlistPolls < 2000u; ++cleanupRunlistPolls) {
-            cleanupRunlistLast = Rd(B, fifoRunlistPendingReg);
-            if ((cleanupRunlistLast & 0x00100000u) == 0u) break;
-            Us(1000u);
-        }
-        if (cleanupRunlistPolls == 2000u) cleanupError |= 16u;
-    }
-    if (privBound && !B3cD2Write(B, writes, &writeCount, ccsrInstReg, 0u))
-        cleanupError |= 32u;
-    if (g_D2PbdmaMasksSaved) {
-        if (!B3cD2Write(B, writes, &writeCount, 0x0004010Cu, g_D2PbdmaInten0Before))
-            cleanupError |= 1024u;
-        Trace(L"B3cD3PbdmaInten0Restored", Rd(B, 0x0004010Cu));
-        Trace(L"B3cD3PbdmaStallUnchanged", Rd(B, 0x0004013Cu));
-        g_D2PbdmaMasksSaved = 0u;
-    }
-    if (g_D2UserdBar1Set) {
-        if (!B3cD2Write(B, writes, &writeCount, 0x00002254u, g_D2UserdBar1Before))
-            cleanupError |= 256u;
-        Trace(L"B3cD2UserdBar1Final", Rd(B, 0x00002254u));
-        g_D2UserdBar1Set = 0u;
-    }
-    if (g_D2Bar1Bound) {
-        ULONG restorePolls, restoreStatus = 0u;
-        if (!B3cD2Write(B, writes, &writeCount, 0x00001704u, g_D2Bar1Before))
-            cleanupError |= 64u;
-        for (restorePolls = 0; restorePolls < 2000u; ++restorePolls) {
-            restoreStatus = Rd(B, 0x00001710u);
-            if ((restoreStatus & 0x3u) == 0u) break;
-            Us(1000u);
-        }
-        if (restorePolls == 2000u) cleanupError |= 128u;
-        Trace(L"B3cD2Bar1RestorePolls", restorePolls);
-        Trace(L"B3cD2Bar1Final", Rd(B, 0x00001704u));
-        g_D2Bar1Bound = 0u;
+    Dev->ResidentChannelEnabled = channelEnableIssued ? TRUE : FALSE;
+    Dev->ResidentRunlistSubmitted = runlistSubmitted ? TRUE : FALSE;
+    Dev->ResidentInstBound = privBound ? TRUE : FALSE;
+    Dev->ResidentRunlistEmptyValue = runlistEmptyValue;
+    Dev->ResidentChannelId = chid;
+    if (Dev->ResidentRequested && result == 0u) {
+        Dev->ResidentActive = TRUE;
+        g_ResidentOwner = Dev;
+        TraceDurable(L"B3eResidentActive", 1u);
+        Trace(L"B3eResidentChannelEnabled", channelEnableIssued);
+        Trace(L"B3eResidentRunlistSubmitted", runlistSubmitted);
+    } else {
+        cleanupError = B3cD2CleanupPublishedState(Dev, writes, &writeCount,
+            channelEnableIssued ? TRUE : FALSE, runlistSubmitted ? TRUE : FALSE,
+            privBound ? TRUE : FALSE, chid, runlistEmptyValue,
+            &preemptPolls, &preemptLast, &cleanupRunlistPolls, &cleanupRunlistLast,
+            d4Run ? TRUE : FALSE,
+            diagWrites, &diagWriteCount);
+        Dev->ResidentChannelEnabled = FALSE;
+        Dev->ResidentRunlistSubmitted = FALSE;
+        Dev->ResidentInstBound = FALSE;
     }
     if (cleanupError != 0u && result == 0u) result = 0xE00000A0u;
     channelRead = Rd(B, ccsrChannelReg);
@@ -7280,25 +7375,99 @@ out:
     if (uc != NULL) ExFreePoolWithTag(uc, SWGPU_TAG);
 }
 
+static ULONG B3ePowerDownGpu(PSWGPU_DEVICE Dev, PSWGPU_RESIDENT_POWER Power)
+{
+    ULONG i, error = 0u;
+    NTSTATUS writeStatus;
+    if (Power == NULL || !Power->Valid) return 0u;
+    TraceDurable(L"B3ePowerDownBegin", 1u);
+    if (Power->ClocksOn) {
+        Wr(Dev->Mc, MC_HOTRESET_CTRL_1, Rd(Dev->Mc, MC_HOTRESET_CTRL_1) | MC_HOTRESET_GPU);
+        for (i = 0; i < 500u && !(Rd(Dev->Mc, MC_HOTRESET_STAT_1) & MC_HOTRESET_GPU); ++i) Us(10);
+        Trace(L"B3eMcFlushPolls", i);
+        if (i == 500u) error |= 1u;
+        Us(10);
+        Wr(Dev->Pmc, PMC_GPU_RG_CNTRL, 1u);
+        (VOID)Rd(Dev->Pmc, PMC_GPU_RG_CNTRL);
+        Us(10);
+        Wr(Dev->Car, CAR_RST_DEV_X_SET, CLK_X_GPU);
+        Us(10);
+        Wr(Dev->Car, CAR_CLK_ENB_X_CLR, (CLK_X_GPU | CLK_X_PLLG_REF) & ~Power->ClkX);
+        Wr(Dev->Mc, MC_HOTRESET_CTRL_1,
+            (Rd(Dev->Mc, MC_HOTRESET_CTRL_1) & ~MC_HOTRESET_GPU) |
+            (Power->McHotResetCtrl & MC_HOTRESET_GPU));
+        if (Power->FuseChanged) Wr(Dev->Car, CAR_CLK_ENB_H_CLR, CLK_H_FUSE);
+        if (Power->OutcChanged) Wr(Dev->Car, CAR_PLLP_OUTC, Power->PllOutc);
+        Us(10);
+        Power->ClocksOn = FALSE;
+    }
+    if (Power->RailOn) {
+        writeStatus = I2cWrite(Dev->Pmic, MAX77620_GPIO6, Power->Gpio6);
+        Trace(L"B3ePowerDownGpioStatus", (ULONG)writeStatus); if (!NT_SUCCESS(writeStatus)) error |= 2u;
+        writeStatus = I2cWrite(Dev->Vdd, MAX77621_VOUT, Power->Vout);
+        Trace(L"B3ePowerDownVoutStatus", (ULONG)writeStatus); if (!NT_SUCCESS(writeStatus)) error |= 4u;
+        writeStatus = I2cWrite(Dev->Vdd, MAX77621_VOUT_DVS, Power->VoutDvs);
+        Trace(L"B3ePowerDownDvsStatus", (ULONG)writeStatus); if (!NT_SUCCESS(writeStatus)) error |= 8u;
+        Power->RailOn = FALSE;
+    }
+    FreeB2aPagesAfterGpuReset();
+    GrVmCleanupAfterGpuReset(Dev);
+    AcrVmCleanupAfterGpuReset(Dev);
+    Power->Valid = FALSE;
+    Trace(L"B3ePowerDownError", error);
+    TraceDurable(L"B3ePowerDownDone", 1u);
+    return error;
+}
+
 static NTSTATUS PowerTest(PSWGPU_DEVICE Dev, BOOLEAN KeepOn, ULONG Mode)
 {
     UCHAR vout0 = 0, dvs0 = 0, gpio0 = 0, v = 0;
     ULONG clkx0, clkh0, outc0, rg, clkx, rstx, boot0 = 0xDEADDEADu, t0 = 0, t1 = 0, th = 0, en = 0, i;
+    ULONG e1Result = 0u;
     BOOLEAN railOn = FALSE, clocksOn = FALSE, outcChanged = FALSE, fuseChanged = FALSE;
     NTSTATUS st;
 
     /* ACR may leave signed Falcon firmware running. Always reset the GPU and
      * release the temporary DMA mappings before returning from the opt-in run. */
-    if (Mode == 5) KeepOn = FALSE;
+    if (Mode >= 5) KeepOn = FALSE;
+    Dev->ResidentRequested = (Mode == 6);
+    if (Mode == 6 && g_ResidentOwner != NULL) {
+        Dev->ResidentRequested = FALSE;
+        TraceDurable(L"E1Result", STATUS_DEVICE_BUSY);
+        return STATUS_DEVICE_BUSY;
+    }
+    Dev->ResidentActive = FALSE;
+    if (Mode == 6) {
+        Dev->ResidentShutdownResult = 0u;
+        TraceDurable(L"B3aResult", 0xFFFFFFFFu);
+        TraceDurable(L"B3eResidentActive", 0u);
+    }
 
     Step(1);    /* read what is there now */
     st = I2cRead(Dev->Vdd, MAX77621_VOUT, &vout0);
     if (NT_SUCCESS(st)) st = I2cRead(Dev->Vdd, MAX77621_VOUT_DVS, &dvs0);
     if (NT_SUCCESS(st)) st = I2cRead(Dev->Pmic, MAX77620_GPIO6, &gpio0);
-    if (!NT_SUCCESS(st)) { Trace(L"Result", (ULONG)st); return st; }
+    if (!NT_SUCCESS(st)) {
+        Trace(L"Result", (ULONG)st);
+        if (Mode == 6) TraceDurable(L"E1Result", (ULONG)st);
+        Dev->ResidentRequested = FALSE;
+        return st;
+    }
     clkx0 = Rd(Dev->Car, CAR_CLK_OUT_ENB_X);
     clkh0 = Rd(Dev->Car, CAR_CLK_OUT_ENB_H);
     outc0 = Rd(Dev->Car, CAR_PLLP_OUTC);
+    Dev->ResidentPower.Vout = vout0;
+    Dev->ResidentPower.VoutDvs = dvs0;
+    Dev->ResidentPower.Gpio6 = gpio0;
+    Dev->ResidentPower.ClkX = clkx0;
+    Dev->ResidentPower.ClkH = clkh0;
+    Dev->ResidentPower.PllOutc = outc0;
+    Dev->ResidentPower.McHotResetCtrl = Rd(Dev->Mc, MC_HOTRESET_CTRL_1);
+    Dev->ResidentPower.Valid = TRUE;
+    Dev->ResidentPower.RailOn = FALSE;
+    Dev->ResidentPower.ClocksOn = FALSE;
+    Dev->ResidentPower.OutcChanged = FALSE;
+    Dev->ResidentPower.FuseChanged = FALSE;
 
     /* 0.3.11: start the run with a clean MC interrupt status (write 1 to
      * clear, as B2a already does), so the reads below show only new errors. */
@@ -7311,6 +7480,7 @@ static NTSTATUS PowerTest(PSWGPU_DEVICE Dev, BOOLEAN KeepOn, ULONG Mode)
     if (NT_SUCCESS(st)) st = I2cWrite(Dev->Vdd, MAX77621_VOUT, VDD_GPU_1000MV);
     if (NT_SUCCESS(st)) st = I2cWrite(Dev->Pmic, MAX77620_GPIO6, GPIO_PUSHPULL_HIGH);
     railOn = TRUE;      /* restore below even after a partial write */
+    Dev->ResidentPower.RailOn = TRUE;
     if (!NT_SUCCESS(st)) goto down;
     Ms(2);
     if (NT_SUCCESS(I2cRead(Dev->Pmic, MAX77620_GPIO6, &v))) Trace(L"Gpio6On", v);
@@ -7323,10 +7493,12 @@ static NTSTATUS PowerTest(PSWGPU_DEVICE Dev, BOOLEAN KeepOn, ULONG Mode)
         Wr(Dev->Car, CAR_PLLP_OUTC, (outc0 & 0x0000FFFFu) | PLLP_OUT5_204MHZ | PLLP_OUT5_OVRRIDE |
                                     PLLP_OUT5_CLKEN | PLLP_OUT5_RSTN);
         outcChanged = TRUE;
+        Dev->ResidentPower.OutcChanged = TRUE;
     }
-    if (!(clkh0 & CLK_H_FUSE)) { Wr(Dev->Car, CAR_CLK_ENB_H_SET, CLK_H_FUSE); fuseChanged = TRUE; }
+    if (!(clkh0 & CLK_H_FUSE)) { Wr(Dev->Car, CAR_CLK_ENB_H_SET, CLK_H_FUSE); fuseChanged = TRUE; Dev->ResidentPower.FuseChanged = TRUE; }
     Wr(Dev->Car, CAR_CLK_ENB_X_SET, CLK_X_GPU | CLK_X_PLLG_REF);
     clocksOn = TRUE;
+    Dev->ResidentPower.ClocksOn = TRUE;
     Us(10);
     Trace(L"PllpOutcOn", Rd(Dev->Car, CAR_PLLP_OUTC));
 
@@ -7401,41 +7573,181 @@ static NTSTATUS PowerTest(PSWGPU_DEVICE Dev, BOOLEAN KeepOn, ULONG Mode)
     if (NT_SUCCESS(st) && Mode == 2) ProbeB1(Dev);
     if (NT_SUCCESS(st) && Mode == 3) ProbeB2a(Dev);
     if (NT_SUCCESS(st) && Mode == 4) ProbeB3a(Dev, FALSE);
-    if (NT_SUCCESS(st) && Mode == 5) ProbeB3a(Dev, TRUE);
+    if (NT_SUCCESS(st) && (Mode == 5 || Mode == 6)) ProbeB3a(Dev, TRUE);
+    if (Mode == 6 && NT_SUCCESS(st)) {
+        ULONG acrResult = ReadParam(L"B3aResult", 0xFFFFFFFFu);
+        if (acrResult != 0u) { e1Result = acrResult; st = STATUS_DEVICE_HARDWARE_ERROR; }
+        else if (!Dev->ResidentActive) { e1Result = 0xE00000A5u; st = STATUS_DEVICE_HARDWARE_ERROR; }
+    }
+    if (Mode == 6 && NT_SUCCESS(st) && Dev->ResidentActive) {
+        Dev->ResidentRequested = FALSE;
+        TraceDurable(L"E1Result", 0u);
+        TraceDurable(L"B3eResidentActive", 1u);
+        Step(110);
+        return st;
+    }
     if (KeepOn && !g_GrVm.Attempted) { Step(100); return st; }
     if (KeepOn && g_GrVm.Attempted)
         TraceDurable(L"B3cC2dKeepOnReset", 1u); /* C2d backing must be released after reset. */
 
 down:
     Step(10);   /* power down, put everything back */
-    if (clocksOn) {
-        Wr(Dev->Mc, MC_HOTRESET_CTRL_1, Rd(Dev->Mc, MC_HOTRESET_CTRL_1) | MC_HOTRESET_GPU);
-        for (i = 0; i < 500 && !(Rd(Dev->Mc, MC_HOTRESET_STAT_1) & MC_HOTRESET_GPU); ++i) Us(10);
-        Us(10);
-        Wr(Dev->Pmc, PMC_GPU_RG_CNTRL, 1);
-        (VOID)Rd(Dev->Pmc, PMC_GPU_RG_CNTRL);
-        Us(10);
-        Wr(Dev->Car, CAR_RST_DEV_X_SET, CLK_X_GPU);
-        Us(10);
-        FreeB2aPagesAfterGpuReset();
-        GrVmCleanupAfterGpuReset(Dev);
-        AcrVmCleanupAfterGpuReset(Dev);
-        Wr(Dev->Car, CAR_CLK_ENB_X_CLR, (CLK_X_GPU | CLK_X_PLLG_REF) & ~clkx0);
-        Wr(Dev->Mc, MC_HOTRESET_CTRL_1, Rd(Dev->Mc, MC_HOTRESET_CTRL_1) & ~MC_HOTRESET_GPU);
-        if (fuseChanged) Wr(Dev->Car, CAR_CLK_ENB_H_CLR, CLK_H_FUSE);
-        if (outcChanged) Wr(Dev->Car, CAR_PLLP_OUTC, outc0);
-        Us(10);
+    Dev->ResidentPower.ClocksOn = clocksOn;
+    Dev->ResidentPower.RailOn = railOn;
+    Dev->ResidentPower.OutcChanged = outcChanged;
+    Dev->ResidentPower.FuseChanged = fuseChanged;
+    {
+        ULONG powerError = B3ePowerDownGpu(Dev, &Dev->ResidentPower);
+        Trace(L"B3ePowerDownResult", powerError);
     }
-    if (railOn) {
-        (VOID)I2cWrite(Dev->Pmic, MAX77620_GPIO6, gpio0);
-        (VOID)I2cWrite(Dev->Vdd, MAX77621_VOUT, vout0);
-        (VOID)I2cWrite(Dev->Vdd, MAX77621_VOUT_DVS, dvs0);
+    if (Dev->ResidentIdleRefHeld) {
+        WdfDeviceResumeIdle(Dev->Device);
+        Dev->ResidentIdleRefHeld = FALSE;
     }
     Step(11);
+    if (Mode == 6) TraceDurable(L"E1Result", e1Result != 0u ? e1Result : (ULONG)st);
+    Dev->ResidentRequested = FALSE;
+    Dev->ResidentActive = FALSE;
+    Dev->ResidentPower.Valid = FALSE;
     return st;
 }
 
 /* ------------------------------------------------------------------- PnP */
+
+static ULONG B3eResidentShutdown(PSWGPU_DEVICE Dev)
+{
+    ULONG writes[64][4] = { { 0u } }, diagWrites[64][4] = { { 0u } };
+    ULONG writeCount = 0u, diagWriteCount = 0u, error = 0u;
+    ULONG preemptPolls = 0u, preemptLast = 0u, runlistPolls = 0u, runlistLast = 0u;
+    if (Dev == NULL || !Dev->ResidentActive) {
+        if (Dev != NULL) Trace(L"B3eShutdownNoop", 1u);
+        return Dev ? Dev->ResidentShutdownResult : STATUS_INVALID_PARAMETER;
+    }
+    if (g_ResidentOwner != NULL && g_ResidentOwner != Dev) {
+        TraceDurable(L"B3eShutdownOwnerMismatch", 1u);
+        return STATUS_DEVICE_BUSY;
+    }
+    TraceDurable(L"B3eShutdownBegin", 1u);
+    Step(111);
+    error = B3cD2CleanupPublishedState(Dev, writes, &writeCount,
+        Dev->ResidentChannelEnabled, Dev->ResidentRunlistSubmitted,
+        Dev->ResidentInstBound, Dev->ResidentChannelId,
+        Dev->ResidentRunlistEmptyValue, &preemptPolls, &preemptLast,
+        &runlistPolls, &runlistLast, TRUE, diagWrites, &diagWriteCount);
+    TraceBin(L"B3eShutdownWrites", writes, sizeof(writes));
+    TraceBin(L"B3eShutdownDiagWrites", diagWrites, sizeof(diagWrites));
+    B3cPrivRingTraceWriteLog(L"B3eShutdownPrivErrorCount",
+        L"B3eShutdownPrivErrorDropped", L"B3eShutdownPrivAckTimeouts",
+        L"B3eShutdownPrivErrors");
+    Dev->ResidentChannelEnabled = FALSE;
+    Dev->ResidentRunlistSubmitted = FALSE;
+    Dev->ResidentInstBound = FALSE;
+    Trace(L"B3eShutdownPreemptPolls", preemptPolls);
+    Trace(L"B3eShutdownPreemptLast", preemptLast);
+    Trace(L"B3eShutdownRunlistPolls", runlistPolls);
+    Trace(L"B3eShutdownRunlistLast", runlistLast);
+    {
+        ULONG powerError = B3ePowerDownGpu(Dev, &Dev->ResidentPower);
+        Trace(L"B3ePowerDownResult", powerError);
+        error |= (powerError << 16);
+    }
+    if (Dev->ResidentIdleRefHeld) {
+        WdfDeviceResumeIdle(Dev->Device);
+        Dev->ResidentIdleRefHeld = FALSE;
+    }
+    Dev->ResidentActive = FALSE;
+    Dev->ResidentRequested = FALSE;
+    g_ResidentOwner = NULL;
+    Dev->ResidentShutdownResult = error;
+    TraceDurable(L"B3eShutdownResult", error);
+    TraceDurable(L"B3eResidentActive", 0u);
+    return error;
+}
+
+static VOID B3eResidentStatus(PSWGPU_DEVICE Dev, PSWGPU_RESIDENT_STATUS Out)
+{
+    volatile UCHAR *B = Dev->Bar0;
+    ULONG pmc = 0u, lo0 = 0u, lo1 = 0u, hi = 0u;
+    RtlZeroMemory(Out, sizeof(*Out));
+    Out->Version = SWGPU_VERSION;
+    Out->Resident = Dev->ResidentActive ? 1u : 0u;
+    Out->ShutdownResult = Dev->ResidentShutdownResult;
+    if (B == NULL || !Dev->ResidentActive) {
+        Trace(L"B3eStatusResident", Out->Resident);
+        return;
+    }
+    Out->Boot0 = Rd(B, NV_PMC_BOOT_0);
+    lo0 = Rd(B, NV_PTIMER_TIME_0);
+    hi = Rd(B, NV_PTIMER_TIME_1);
+    lo1 = Rd(B, NV_PTIMER_TIME_0);
+    Out->PtimerLoBefore = lo0; Out->PtimerHi = hi; Out->PtimerLoAfter = lo1;
+    Out->PtimerDelta = lo1 - lo0;
+    pmc = Rd(B, NV_PMC_ENABLE); Out->PmcEnable = pmc;
+    Out->PrivRingStatus0 = Rd(B, 0x0012005Cu);
+    Out->PrivRingStatus1 = Rd(B, 0x00120060u);
+    Out->FecsMailbox0 = Rd(B, 0x00409800u);
+    Out->FecsCpuctl = Rd(B, 0x00409100u);
+    Out->FifoEngineStatus = Rd(B, 0x00002640u);
+    Out->CcsrChannel = Rd(B, 0x00800004u);
+    Out->PbdmaStatus = Rd(B, 0x00003080u);
+    Out->PbdmaIntr0 = Rd(B, 0x00040108u);
+    Out->MmuFaultStatus = Rd(B, 0x000025A0u);
+    if (pmc & (1u << 12)) {
+        Out->GrIntr = Rd(B, 0x00400100u);
+        Out->GrStatus = Rd(B, 0x00400700u);
+    }
+#define STATUS_TRACE(name, field) Trace(L"B3eStatus" name, Out->field)
+    STATUS_TRACE(L"Resident", Resident); STATUS_TRACE(L"Boot0", Boot0);
+    STATUS_TRACE(L"PtimerLoBefore", PtimerLoBefore); STATUS_TRACE(L"PtimerHi", PtimerHi);
+    STATUS_TRACE(L"PtimerLoAfter", PtimerLoAfter); STATUS_TRACE(L"PtimerDelta", PtimerDelta);
+    STATUS_TRACE(L"PmcEnable", PmcEnable); STATUS_TRACE(L"PrivRingStatus0", PrivRingStatus0);
+    STATUS_TRACE(L"PrivRingStatus1", PrivRingStatus1); STATUS_TRACE(L"FecsMailbox0", FecsMailbox0);
+    STATUS_TRACE(L"FecsCpuctl", FecsCpuctl); STATUS_TRACE(L"FifoEngineStatus", FifoEngineStatus);
+    STATUS_TRACE(L"CcsrChannel", CcsrChannel); STATUS_TRACE(L"PbdmaStatus", PbdmaStatus);
+    STATUS_TRACE(L"PbdmaIntr0", PbdmaIntr0); STATUS_TRACE(L"GrIntr", GrIntr);
+    STATUS_TRACE(L"GrStatus", GrStatus); STATUS_TRACE(L"MmuFaultStatus", MmuFaultStatus);
+    STATUS_TRACE(L"ShutdownResult", ShutdownResult);
+#undef STATUS_TRACE
+}
+
+VOID SwGpuEvtIoDeviceControl(WDFQUEUE Queue, WDFREQUEST Request,
+    size_t OutputBufferLength, size_t InputBufferLength, ULONG IoControlCode)
+{
+    WDFDEVICE Device = WdfIoQueueGetDevice(Queue);
+    PSWGPU_DEVICE Dev = SwGpuGetDevice(Device);
+    PSWGPU_RESIDENT_STATUS out = NULL;
+    NTSTATUS status;
+    UNREFERENCED_PARAMETER(InputBufferLength);
+    if (IoControlCode != IOCTL_SWGPU_RESIDENT_STATUS &&
+        IoControlCode != IOCTL_SWGPU_RESIDENT_STOP) {
+        WdfRequestComplete(Request, STATUS_INVALID_DEVICE_REQUEST); return;
+    }
+    if (OutputBufferLength < sizeof(SWGPU_RESIDENT_STATUS)) {
+        WdfRequestComplete(Request, STATUS_BUFFER_TOO_SMALL); return;
+    }
+    status = WdfRequestRetrieveOutputBuffer(Request, sizeof(SWGPU_RESIDENT_STATUS),
+        (PVOID *)&out, NULL);
+    if (!NT_SUCCESS(status)) { WdfRequestComplete(Request, status); return; }
+    if (IoControlCode == IOCTL_SWGPU_RESIDENT_STOP) {
+        TraceDurable(L"B3eControlMode", 8u);
+        B3eResidentStatus(Dev, out);
+        out->ShutdownResult = B3eResidentShutdown(Dev);
+        Trace(L"B3eStatusShutdownResult", out->ShutdownResult);
+    } else {
+        Step(112);
+        TraceDurable(L"B3eControlMode", 7u);
+        B3eResidentStatus(Dev, out);
+    }
+    WdfRequestCompleteWithInformation(Request, STATUS_SUCCESS, sizeof(*out));
+}
+
+NTSTATUS SwGpuEvtD0Exit(WDFDEVICE Device, WDF_POWER_DEVICE_STATE TargetState)
+{
+    PSWGPU_DEVICE Dev = SwGpuGetDevice(Device);
+    if (TargetState == WdfPowerDeviceD3Final && Dev->ResidentActive)
+        (VOID)B3eResidentShutdown(Dev);
+    return STATUS_SUCCESS;
+}
 
 NTSTATUS SwGpuEvtPrepareHardware(WDFDEVICE Device, WDFCMRESLIST Raw, WDFCMRESLIST Translated)
 {
@@ -7487,6 +7799,7 @@ NTSTATUS SwGpuEvtReleaseHardware(WDFDEVICE Device, WDFCMRESLIST Translated)
 {
     PSWGPU_DEVICE Dev = SwGpuGetDevice(Device);
     UNREFERENCED_PARAMETER(Translated);
+    (VOID)B3eResidentShutdown(Dev);
     if (Dev->Bar0) { MmUnmapIoSpace((PVOID)Dev->Bar0, BAR0_MAP_LEN); Dev->Bar0 = NULL; }
     if (Dev->Bar1Cpu) { MmUnmapIoSpace((PVOID)Dev->Bar1Cpu, Dev->Bar1MapLen); Dev->Bar1Cpu = NULL; }
     if (Dev->Car)  { MmUnmapIoSpace((PVOID)Dev->Car, CAR_LEN);       Dev->Car = NULL; }
@@ -7511,7 +7824,7 @@ NTSTATUS SwGpuEvtSelfManagedIoInit(WDFDEVICE Device)
     Snapshot(Dev, FALSE);
 
     mode = ReadParam(L"PowerTest", 0);
-    if (mode >= 1 && mode <= 5) {     /* 5 = isolated B3c signed ACR boot */
+    if (mode >= 1 && mode <= 6) {     /* 5 = one-shot; 6 = resident through D5 */
         BOOLEAN keep = ReadParam(L"KeepOn", 0) == 1;
         LARGE_INTEGER t0, t1, f;
         TraceDurable(L"PowerTest", 0);      /* once: a hang does not repeat at the next boot */
@@ -7521,6 +7834,15 @@ NTSTATUS SwGpuEvtSelfManagedIoInit(WDFDEVICE Device)
         (VOID)PowerTest(Dev, keep, mode);
         t1 = KeQueryPerformanceCounter(NULL);
         Trace(L"TestUs", (ULONG)((t1.QuadPart - t0.QuadPart) * 1000000 / (f.QuadPart ? f.QuadPart : 1)));
+        if (mode == 6 && Dev->ResidentActive) {
+            NTSTATUS idleStatus = WdfDeviceStopIdle(Device, FALSE);
+            TraceDurable(L"B3eIdleRefStatus", (ULONG)idleStatus);
+            if (NT_SUCCESS(idleStatus)) Dev->ResidentIdleRefHeld = TRUE;
+            else {
+                TraceDurable(L"E1Result", (ULONG)idleStatus);
+                (VOID)B3eResidentShutdown(Dev);
+            }
+        }
         Snapshot(Dev, TRUE);
         Trace(L"TestRuns", ReadParam(L"TestRuns", 0) + 1);
     }
@@ -7539,11 +7861,24 @@ NTSTATUS SwGpuEvtDeviceAdd(WDFDRIVER Driver, PWDFDEVICE_INIT DeviceInit)
     Pnp.EvtDevicePrepareHardware = SwGpuEvtPrepareHardware;
     Pnp.EvtDeviceReleaseHardware = SwGpuEvtReleaseHardware;
     Pnp.EvtDeviceSelfManagedIoInit = SwGpuEvtSelfManagedIoInit;
+    Pnp.EvtDeviceD0Exit = SwGpuEvtD0Exit;
     WdfDeviceInitSetPnpPowerEventCallbacks(DeviceInit, &Pnp);
+    WdfDeviceInitSetDeviceType(DeviceInit, FILE_DEVICE_UNKNOWN);
+    /* Claude 0.5.1: an unnamed PnP FDO rejects WdfDeviceInitAssignSDDLString (0xC0000079).
+       Admin-only access now comes from the INF [SwGpu_Inst.NT.HW] Security value. */
     WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&Attributes, SWGPU_DEVICE);
     Status = WdfDeviceCreate(&DeviceInit, &Attributes, &Device);
     if (!NT_SUCCESS(Status)) return Status;
     SwGpuGetDevice(Device)->Device = Device;
+    Status = WdfDeviceCreateDeviceInterface(Device, &GUID_DEVINTERFACE_SWGPU_RESIDENT, NULL);
+    if (!NT_SUCCESS(Status)) return Status;
+    {
+        WDF_IO_QUEUE_CONFIG QueueConfig;
+        WDF_IO_QUEUE_CONFIG_INIT_DEFAULT_QUEUE(&QueueConfig, WdfIoQueueDispatchSequential);
+        QueueConfig.EvtIoDeviceControl = SwGpuEvtIoDeviceControl;
+        Status = WdfIoQueueCreate(Device, &QueueConfig, WDF_NO_OBJECT_ATTRIBUTES, WDF_NO_HANDLE);
+        if (!NT_SUCCESS(Status)) return Status;
+    }
     return STATUS_SUCCESS;
 }
 

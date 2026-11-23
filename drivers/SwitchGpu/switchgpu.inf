@@ -9,7 +9,7 @@ Class       = System
 ClassGuid   = {4d36e97d-e325-11ce-bfc1-08002be10318}
 Provider    = %Mfg%
 CatalogFile = switchgpu.cat
-DriverVer   = 11/23/2026,0.4.79.0
+DriverVer   = 11/23/2026,0.5.1.0
 PnpLockdown = 1
 
 [DestinationDirs]
@@ -32,6 +32,12 @@ CopyFiles = SwGpu_Copy
 
 [SwGpu_Copy]
 switchgpu.sys
+
+[SwGpu_Inst.NT.HW]
+AddReg = SwGpu_Security
+
+[SwGpu_Security]
+HKR,,Security,,"D:P(A;;GA;;;SY)(A;;GA;;;BA)"
 
 [SwGpu_Inst.NT.Services]
 AddService = switchgpu, 0x00000002, SwGpu_Service
