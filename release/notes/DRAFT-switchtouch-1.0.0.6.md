@@ -1,0 +1,26 @@
+## 変更内容 / What changed
+
+**タッチで長押しすると、右クリックのメニューが安定して出るようになりました。**
+
+- **switchtouch 1.0.0.6:**
+  - 長押しが、ときどきダブルクリックになってファイルが開いてしまっていました。指を置いたままでも、タッチのチップが一瞬「指が離れた」と報告することがあり、Windows には短いタップが2回に見えていました。今は、60 ms 以内にまた触れたら、押し続けているものとして扱います（チップが別の番号を付けて戻ってきても、約 5 mm 以内なら同じ指です）。
+  - 指の小さなぶれを無視する範囲を、約 1.2 mm から約 4.3 mm に広げました。
+  - 報告にスキャン時刻を付けました。
+  - 調整用の値 `CfgReleaseMs`、`CfgHoldRadius`、`CfgMergeRadius` と、記録の `Flickers`、`Merges`、`Releases` を足しました（`kits/Switch-Touch/README-ja.md`）。
+
+**実機で確認したこと:**
+- 長押しで右クリックのメニューが出る: 10 回中 9 回（1.0.0.4 では、ときどきファイルが開いてしまっていた）。失敗しても、ファイルが開くことはなく、ふつうの左クリックになる。
+- なぞるスクロールの出だしが引っかからない。
+
+**まだ確認していないこと:**
+- 範囲をさらに広げたとき（約 6.4 mm）の長押しとスクロール。
+
+**今後実装する予定:**
+- 長押しの成功を 10 回中 10 回に近づける（範囲の調整）。
+
+**Touch press-and-hold now reliably opens the right-click menu.**
+- switchtouch 1.0.0.6: a long press sometimes became a double tap and opened the file, because the FTM4 briefly reports a resting finger as lifted. A lift is now held back for 60 ms; a touch on the same id, or on another id within ~5 mm, continues the same contact. The hold dead zone is ~4.3 mm (was ~1.2 mm). Reports carry a HID scan time. New tunables CfgReleaseMs / CfgHoldRadius / CfgMergeRadius and counters Flickers / Merges / Releases.
+
+Tested on hardware: press-and-hold opens the context menu 9 of 10 times; a miss is a plain left click, never an open; scrolling starts without a catch.
+Not tested: a wider hold dead zone (~6.4 mm).
+Planned: tune the dead zone further toward 10 of 10.

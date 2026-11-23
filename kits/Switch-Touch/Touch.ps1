@@ -8,11 +8,12 @@
   -Mode Status    : report TCH0 (ACPI\SWOA0501), vhf, the HID touch screen and the driver trace
   -Mode Watch     : print the driver counters and last touch every second (Ctrl+C to stop)
   -Mode Calibrate : touch the TOP-LEFT corner of the screen; sets CfgInvertX/Y and restarts the device
+  -Mode Restart   : restart the device (re-reads the Cfg* values)
   -Mode Remove    : remove the driver package
 
   Log: C:\SwitchWOA-Touch.txt
 #>
-param([Parameter(Mandatory = $true)][ValidateSet('Install', 'Status', 'Watch', 'Calibrate', 'Remove')][string]$Mode)
+param([Parameter(Mandatory = $true)][ValidateSet('Install', 'Status', 'Watch', 'Calibrate', 'Restart', 'Remove')][string]$Mode)
 
 $ErrorActionPreference = 'Continue'
 # Windows PowerShell on Windows 10 ARM64 is x86: reach System32 via Sysnative.
@@ -63,8 +64,9 @@ switch ($Mode) {
     while ($true) {
       $p = Get-ItemProperty $Key -ErrorAction SilentlyContinue
       if ($p) {
-        Write-Host ("{0}  {1,4}  {2,5}  {3,6}  {4,7}  {5,6}  {6},{7}  held={8}" -f (Get-Date -Format 'HH:mm:ss'), $p.Irqs, $p.Polls, $p.Events,
-                    $p.Reports, $p.Errors, $p.LastLandscapeX, $p.LastLandscapeY, $p.Held)
+        Write-Host ("{0}  {1,4}  {2,5}  {3,6}  {4,7}  {5,6}  {6},{7}  held={8} flicker={9} merge={10} lift={11}" -f (Get-Date -Format 'HH:mm:ss'),
+                    $p.Irqs, $p.Polls, $p.Events, $p.Reports, $p.Errors, $p.LastLandscapeX, $p.LastLandscapeY, $p.Held,
+                    $p.Flickers, $p.Merges, $p.Releases)
       }
       Start-Sleep -Seconds 1
     }
@@ -88,6 +90,16 @@ switch ($Mode) {
     Log ("touch at landscape {0},{1} -> CfgInvertX={2} CfgInvertY={3} (was {4}/{5})" -f $lx, $ly, $ix, $iy, $before.CfgInvertX, $before.CfgInvertY)
     Set-ItemProperty $Key -Name CfgInvertX -Value $ix -Type DWord
     Set-ItemProperty $Key -Name CfgInvertY -Value $iy -Type DWord
+    foreach ($d in Get-TouchDevice) {
+      Log "pnputil /restart-device $($d.PNPDeviceID)"
+      (& $Pnputil /restart-device $d.PNPDeviceID 2>&1) | ForEach-Object { Log "  $_" }
+    }
+    Start-Sleep -Seconds 3
+    Show-Status
+  }
+  'Restart' {
+    Log ''
+    Log "=== Touch Restart  $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
     foreach ($d in Get-TouchDevice) {
       Log "pnputil /restart-device $($d.PNPDeviceID)"
       (& $Pnputil /restart-device $d.PNPDeviceID 2>&1) | ForEach-Object { Log "  $_" }

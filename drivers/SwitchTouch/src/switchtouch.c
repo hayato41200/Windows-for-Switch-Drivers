@@ -20,6 +20,15 @@
  *
  * The interrupt is the main path. A one-shot passive timer also polls: every
  * 12 ms while no interrupt has been seen, every 250 ms once they work.
+ *
+ * Press-and-hold (right click), 1.0.0.5/6: the FTM4 sometimes drops a resting
+ * finger for a scan or two (leave, then enter again, maybe with a new touch
+ * id). Reported as is, Windows sees two quick taps = a double tap, and a long
+ * press on a file opens it. So a leave is held back for CfgReleaseMs: an
+ * enter on the same id, or on another id within CfgMergeRadius, continues the
+ * same contact (same HID contact id, same touch-down point). Until the finger
+ * moves more than CfgHoldRadius from where it touched down, the touch-down
+ * point is reported. Reports carry a HID scan time (100 us units).
  */
 #include <ntddk.h>
 #include <ntstrsafe.h>
@@ -41,7 +50,9 @@
 #define DEFAULT_INT_REG      0x2C     /* FTM4 HW reg: interrupt enable */
 #define INT_ENABLE_VALUE     0x41
 #define POLL_FAST_MS         12
-#define JITTER_UNITS         12       /* ~1.2 mm on the 720 x 1280 grid */
+#define HOLD_RADIUS_DEFAULT  40       /* ~4.3 mm on the 720 x 1280 grid (9.4 units/mm) */
+#define RELEASE_MS_DEFAULT   60       /* a leave this short followed by an enter is a flicker */
+#define MERGE_RADIUS_DEFAULT 48       /* ~5 mm: re-enter under a new touch id */
 #define ABS_DIFF(a, b)       ((a) > (b) ? (ULONG)((a) - (b)) : (ULONG)((b) - (a)))
 #define POLL_SLOW_MS         250
 #define REPORT_ID_TOUCH      1
@@ -58,6 +69,7 @@ typedef struct _TOUCH_CONTACT_REPORT {
 typedef struct _TOUCH_REPORT {
     UCHAR ReportId;
     TOUCH_CONTACT_REPORT Contacts[TOUCH_MAX_CONTACTS];
+    USHORT ScanTime;        /* 100 us units, wraps */
     UCHAR ContactCount;
 } TOUCH_REPORT;
 #pragma pack(pop)
@@ -80,6 +92,10 @@ static UCHAR SwTouchReportDescriptor[] = {
     0x85, REPORT_ID_TOUCH,
     FINGER_COLLECTION, FINGER_COLLECTION, FINGER_COLLECTION, FINGER_COLLECTION, FINGER_COLLECTION,
     FINGER_COLLECTION, FINGER_COLLECTION, FINGER_COLLECTION, FINGER_COLLECTION, FINGER_COLLECTION,
+    /* Scan time: 16 bits, seconds x 10^-4. */
+    0x55, 0x0C, 0x66, 0x01, 0x10, 0x47, 0xFF, 0xFF, 0x00, 0x00, 0x27, 0xFF, 0xFF, 0x00, 0x00,
+    0x75, 0x10, 0x95, 0x01, 0x05, 0x0D, 0x09, 0x56, 0x81, 0x02,
+    0x45, 0x00, 0x55, 0x00, 0x65, 0x00,
     0x05, 0x0D, 0x09, 0x54, 0x15, 0x00, 0x25, TOUCH_MAX_CONTACTS, 0x75, 0x08, 0x95, 0x01, 0x81, 0x02,
     0x85, REPORT_ID_MAX_COUNT,
     0x09, 0x55, 0x25, TOUCH_MAX_CONTACTS, 0xB1, 0x02,
@@ -90,8 +106,11 @@ typedef struct _TOUCH_CONTACT {
     BOOLEAN Active;
     BOOLEAN Released;       /* report once with tip = 0 */
     BOOLEAN Moving;         /* left the dead zone since touch-down */
+    BOOLEAN PendingUp;      /* leave seen at UpTime, still reported as down */
+    UCHAR ReportId;         /* HID contact id (stays the same across a flicker) */
     USHORT X;
     USHORT Y;
+    ULONGLONG UpTime;       /* interrupt time, 100 ns */
 } TOUCH_CONTACT;
 
 typedef struct _SWTOUCH_DEVICE {
@@ -108,6 +127,9 @@ typedef struct _SWTOUCH_DEVICE {
     ULONG InvertX;
     ULONG InvertY;
     ULONG IntReg;
+    ULONG HoldRadius;
+    ULONG ReleaseMs;
+    ULONG MergeRadius;
     LONG Irqs;
     LONG IrqsAtLastPoll;
     LONG Polls;
@@ -115,6 +137,9 @@ typedef struct _SWTOUCH_DEVICE {
     LONG Reports;
     LONG Errors;
     LONG Held;              /* motion events swallowed by the jitter dead zone */
+    LONG Flickers;          /* leave + enter on the same id, kept as one contact */
+    LONG Merges;            /* leave + enter on another id nearby, kept as one contact */
+    LONG Releases;          /* leaves reported to Windows */
 } SWTOUCH_DEVICE, *PSWTOUCH_DEVICE;
 WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(SWTOUCH_DEVICE, SwTouchGetDevice)
 
@@ -232,9 +257,31 @@ static USHORT SwTouchScale(ULONG Raw, ULONG RealMax, ULONG Size)
     return (USHORT)((Raw >= Size) ? Size - 1 : Raw);
 }
 
-static BOOLEAN SwTouchParse(PSWTOUCH_DEVICE Dev, const UCHAR *Ev)
+/* A HID contact id no other contact uses; the touch id itself if it is free. */
+static UCHAR SwTouchFreeReportId(PSWTOUCH_DEVICE Dev, ULONG Self)
 {
-    ULONG Type = Ev[0] & 0x0F, Id = Ev[0] >> 4;
+    ULONG Want, K;
+
+    for (Want = 0; Want <= TOUCH_MAX_CONTACTS; ++Want) {
+        UCHAR Candidate = (UCHAR)(Want == 0 ? Self : Want - 1);
+        BOOLEAN Used = FALSE;
+        for (K = 0; K < TOUCH_MAX_CONTACTS; ++K) {
+            TOUCH_CONTACT *O = &Dev->Contacts[K];
+            if (K != Self && (O->Active || O->Released) && O->ReportId == Candidate) {
+                Used = TRUE;
+                break;
+            }
+        }
+        if (!Used) {
+            return Candidate;
+        }
+    }
+    return (UCHAR)Self;
+}
+
+static BOOLEAN SwTouchParse(PSWTOUCH_DEVICE Dev, const UCHAR *Ev, ULONGLONG Now)
+{
+    ULONG Type = Ev[0] & 0x0F, Id = Ev[0] >> 4, K;
     USHORT Lx, Ly, X, Y;
     TOUCH_CONTACT *C;
 
@@ -243,35 +290,90 @@ static BOOLEAN SwTouchParse(PSWTOUCH_DEVICE Dev, const UCHAR *Ev)
     }
     C = &Dev->Contacts[Id];
     if (Type == EV_LEAVE) {
-        if (C->Active) {
+        if (!C->Active || C->PendingUp) {
+            return FALSE;
+        }
+        if (Dev->ReleaseMs == 0) {
             C->Active = FALSE;
             C->Released = TRUE;
+            InterlockedIncrement(&Dev->Releases);
+            return TRUE;
         }
-        return TRUE;
+        /* Keep reporting the contact as down; SwTouchExpire lifts it. */
+        C->PendingUp = TRUE;
+        C->UpTime = Now;
+        return FALSE;
     }
     Lx = SwTouchScale(((ULONG)Ev[1] << 4) | (Ev[3] >> 4), X_REAL_MAX, TOUCH_HEIGHT);
     Ly = SwTouchScale(((ULONG)Ev[2] << 4) | (Ev[3] & 0x0F), Y_REAL_MAX, TOUCH_WIDTH);
     X = Dev->InvertX ? (USHORT)(TOUCH_WIDTH - 1 - Ly) : Ly;
     Y = Dev->InvertY ? (USHORT)(TOUCH_HEIGHT - 1 - Lx) : Lx;
+    SwTouchTrace(L"LastLandscapeX", Lx);
+    SwTouchTrace(L"LastLandscapeY", Ly);
+
+    if (C->Active && C->PendingUp) {
+        /* Same id back within CfgReleaseMs: one contact, Windows never saw the lift. */
+        C->PendingUp = FALSE;
+        InterlockedIncrement(&Dev->Flickers);
+    } else if (!C->Active) {
+        TOUCH_CONTACT *P = NULL;
+        for (K = 0; K < TOUCH_MAX_CONTACTS; ++K) {
+            TOUCH_CONTACT *O = &Dev->Contacts[K];
+            if (K != Id && O->Active && O->PendingUp &&
+                ABS_DIFF(X, O->X) <= Dev->MergeRadius && ABS_DIFF(Y, O->Y) <= Dev->MergeRadius) {
+                P = O;
+                break;
+            }
+        }
+        if (P != NULL) {
+            /* The controller came back with a new touch id: carry the contact over. */
+            *C = *P;
+            C->PendingUp = FALSE;
+            RtlZeroMemory(P, sizeof(*P));
+            InterlockedIncrement(&Dev->Merges);
+        } else {
+            C->Active = TRUE;
+            C->Released = FALSE;
+            C->Moving = FALSE;
+            C->PendingUp = FALSE;
+            C->ReportId = SwTouchFreeReportId(Dev, Id);
+            C->X = X;
+            C->Y = Y;
+            return TRUE;
+        }
+    }
     /* A resting finger still jitters, and Windows cancels press-and-hold on
-     * any movement: keep the touch-down point until the finger really moves. */
-    if (C->Active && !C->Moving) {
-        if (ABS_DIFF(X, C->X) <= JITTER_UNITS && ABS_DIFF(Y, C->Y) <= JITTER_UNITS) {
+     * movement: keep the touch-down point until the finger really moves. */
+    if (!C->Moving) {
+        if (ABS_DIFF(X, C->X) <= Dev->HoldRadius && ABS_DIFF(Y, C->Y) <= Dev->HoldRadius) {
             InterlockedIncrement(&Dev->Held);
             return FALSE;
         }
         C->Moving = TRUE;
     }
-    if (!C->Active || Type == EV_ENTER) {
-        C->Moving = FALSE;
-    }
     C->X = X;
     C->Y = Y;
-    C->Active = TRUE;
     C->Released = FALSE;
-    SwTouchTrace(L"LastLandscapeX", Lx);
-    SwTouchTrace(L"LastLandscapeY", Ly);
     return TRUE;
+}
+
+/* Lift the contacts whose leave is older than CfgReleaseMs. Lock held. */
+static BOOLEAN SwTouchExpire(PSWTOUCH_DEVICE Dev, ULONGLONG Now)
+{
+    ULONG Id;
+    BOOLEAN Changed = FALSE;
+
+    for (Id = 0; Id < TOUCH_MAX_CONTACTS; ++Id) {
+        TOUCH_CONTACT *C = &Dev->Contacts[Id];
+        if (C->Active && C->PendingUp && Now - C->UpTime >= (ULONGLONG)Dev->ReleaseMs * 10000) {
+            C->Active = FALSE;
+            C->PendingUp = FALSE;
+            C->Released = TRUE;
+            InterlockedIncrement(&Dev->Releases);
+            Changed = TRUE;
+        }
+    }
+    return Changed;
 }
 
 static VOID SwTouchSendReport(PSWTOUCH_DEVICE Dev)
@@ -288,7 +390,7 @@ static VOID SwTouchSendReport(PSWTOUCH_DEVICE Dev)
             continue;
         }
         Dev->Report.Contacts[Count].Flags = C->Active ? 0x03 : 0x00;
-        Dev->Report.Contacts[Count].Id = (UCHAR)Id;
+        Dev->Report.Contacts[Count].Id = C->ReportId;
         Dev->Report.Contacts[Count].X = C->X;
         Dev->Report.Contacts[Count].Y = C->Y;
         C->Released = FALSE;
@@ -298,6 +400,7 @@ static VOID SwTouchSendReport(PSWTOUCH_DEVICE Dev)
         return;
     }
     Dev->Report.ContactCount = (UCHAR)Count;
+    Dev->Report.ScanTime = (USHORT)(KeQueryInterruptTime() / 1000);
     Packet.reportBuffer = (PUCHAR)&Dev->Report;
     Packet.reportBufferLen = sizeof(Dev->Report);
     Packet.reportId = REPORT_ID_TOUCH;
@@ -337,9 +440,12 @@ static VOID SwTouchService(PSWTOUCH_DEVICE Dev)
             break;
         }
         InterlockedIncrement(&Dev->Events);
-        if (SwTouchParse(Dev, Ev)) {
+        if (SwTouchParse(Dev, Ev, KeQueryInterruptTime())) {
             Changed = TRUE;
         }
+    }
+    if (SwTouchExpire(Dev, KeQueryInterruptTime())) {
+        Changed = TRUE;
     }
     if (Changed) {
         SwTouchSendReport(Dev);
@@ -385,6 +491,9 @@ VOID SwTouchEvtTimer(WDFTIMER Timer)
         SwTouchTrace(L"Reports", (ULONG)Dev->Reports);
         SwTouchTrace(L"Errors", (ULONG)Dev->Errors);
         SwTouchTrace(L"Held", (ULONG)Dev->Held);
+        SwTouchTrace(L"Flickers", (ULONG)Dev->Flickers);
+        SwTouchTrace(L"Merges", (ULONG)Dev->Merges);
+        SwTouchTrace(L"Releases", (ULONG)Dev->Releases);
     }
     if (!Dev->Stopping) {
         WdfTimerStart(Timer, WDF_REL_TIMEOUT_IN_MS((Irqs != 0 && !Touching) ? POLL_SLOW_MS : POLL_FAST_MS));
@@ -431,6 +540,12 @@ NTSTATUS SwTouchEvtPrepareHardware(WDFDEVICE Device, WDFCMRESLIST Raw, WDFCMRESL
     Dev->InvertX = SwTouchConfig(L"CfgInvertX", 0);
     Dev->InvertY = SwTouchConfig(L"CfgInvertY", 1);   /* confirmed on hardware: top/bottom flipped otherwise */
     Dev->IntReg = SwTouchConfig(L"CfgIntReg", DEFAULT_INT_REG);
+    Dev->HoldRadius = SwTouchConfig(L"CfgHoldRadius", HOLD_RADIUS_DEFAULT);
+    Dev->ReleaseMs = SwTouchConfig(L"CfgReleaseMs", RELEASE_MS_DEFAULT);
+    Dev->MergeRadius = SwTouchConfig(L"CfgMergeRadius", MERGE_RADIUS_DEFAULT);
+    if (Dev->ReleaseMs > 500) {
+        Dev->ReleaseMs = 500;
+    }
 
     /* Opened here so the (level) interrupt can always drain the controller. */
     Status = SwTouchOpenTarget(Device, Dev->I2cId, &Dev->I2c);
@@ -458,6 +573,9 @@ NTSTATUS SwTouchEvtPrepareHardware(WDFDEVICE Device, WDFCMRESLIST Raw, WDFCMRESL
     }
     SwTouchTrace(L"CfgInvertX", Dev->InvertX);
     SwTouchTrace(L"CfgInvertY", Dev->InvertY);
+    SwTouchTrace(L"UsedHoldRadius", Dev->HoldRadius);
+    SwTouchTrace(L"UsedReleaseMs", Dev->ReleaseMs);
+    SwTouchTrace(L"UsedMergeRadius", Dev->MergeRadius);
     return STATUS_SUCCESS;
 }
 
@@ -584,7 +702,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
         RtlCopyMemory(&SwTouchParamsPath[RegistryPath->Length / sizeof(WCHAR)], L"\\Parameters", sizeof(L"\\Parameters"));
         (VOID)RtlCreateRegistryKey(RTL_REGISTRY_ABSOLUTE, SwTouchParamsPath);
     }
-    SwTouchTrace(L"DriverVersion", 4);
+    SwTouchTrace(L"DriverVersion", 6);
     WDF_DRIVER_CONFIG_INIT(&Config, SwTouchEvtDeviceAdd);
     return WdfDriverCreate(DriverObject, RegistryPath, WDF_NO_OBJECT_ATTRIBUTES, &Config, WDF_NO_HANDLE);
 }
