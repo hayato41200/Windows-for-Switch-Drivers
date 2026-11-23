@@ -39,7 +39,7 @@
 #include <wdf.h>
 #include <spb.h>
 
-#define SWGPU_VERSION      0x00000449u   /* 0.4.73 */
+#define SWGPU_VERSION      0x0000044Cu   /* 0.4.76 */
 
 #define CAR_PHYS           0x60006000ull
 #define CAR_LEN            0x1000u
@@ -1095,6 +1095,8 @@ static VOID ProbeB2a(PSWGPU_DEVICE Dev)
 #define GR_VM_ATTRIB_OFF   0x050000u
 #define GR_VM_ZCULL_OFF    0x098000u
 #define GR_VM_PM_OFF       0x0A9000u
+#define GR_VM_PATCH_OFF    0x0AA000u /* channel FECS patch-context backing */
+#define GR_VM_PATCH_BYTES  PAGE_SIZE
 #define GR_VM_PRIV_OFF     0x100000u
 #define GR_VM_GPU_PGD_OFF  0x180000u
 #define GR_VM_GPU_PGT_OFF  0x190000u
@@ -1129,6 +1131,9 @@ typedef struct _GR_VM_STATE {
     ULONG SmmuPteFirst;
     ULONG SmmuPdeIndex;
     ULONG OldSmmuPde;
+    ULONG GoldenBytes;
+    ULONG ZcullBytes;
+    ULONG PmBytes;
     ULONG OldSmmuPtes[GR_VM_PAGE_COUNT];
     BOOLEAN PtbChanged;
     BOOLEAN SharedSmmuPt;
@@ -2710,6 +2715,8 @@ static ULONG B3cPrepareGrContext(PSWGPU_DEVICE Dev, ULONG goldenBytes,
     Trace(L"B3cC2dPmAligned", pmAligned);
     if (attribBytes != 0x48000u || bundleBytes != 0x1800u || pagepoolBytes != 0x8000u ||
         GR_VM_PM_OFF + pmAligned > GR_VM_ARENA_SIZE ||
+        GR_VM_PM_OFF + pmAligned > GR_VM_PATCH_OFF ||
+        GR_VM_PATCH_OFF + GR_VM_PATCH_BYTES > GR_VM_PRIV_OFF ||
         GR_VM_GPU_PGT_BAR1_OFF + PAGE_SIZE > GR_VM_INST_OFF ||
         ((BAR1_D3_LOW_VA >> 12) & 0x7FFFu) >= PAGE_SIZE / sizeof(ULONGLONG)) {
         failPoint = 3u; result = 0xE0000089u; goto done;
@@ -2727,6 +2734,9 @@ static ULONG B3cPrepareGrContext(PSWGPU_DEVICE Dev, ULONG goldenBytes,
         Trace(L"B3cC2dAllocRetry", allocRetry);
         if (g_GrVm.Arena == NULL) { failPoint = 4u; result = 0xE0000089u; goto done; }
     }
+    g_GrVm.GoldenBytes = goldenBytes;
+    g_GrVm.ZcullBytes = zcullBytes;
+    g_GrVm.PmBytes = pmBytes;
     RtlZeroMemory(g_GrVm.Arena, GR_VM_ARENA_SIZE);
     g_GrVm.Pa = MmGetPhysicalAddress(g_GrVm.Arena);
     if (g_GrVm.Pa.HighPart != 0 || (g_GrVm.Pa.LowPart & 0xFFFu) != 0 ||
@@ -2906,6 +2916,8 @@ static ULONG B3cPrepareGrContext(PSWGPU_DEVICE Dev, ULONG goldenBytes,
     Trace(L"B3cC2dChannelCtxVa", GR_VM_GPU_VA + GR_VM_CTX_OFF);
     Trace(L"B3cC2dZcullVa", GR_VM_GPU_VA + GR_VM_ZCULL_OFF);
     Trace(L"B3cC2dPmVa", GR_VM_GPU_VA + GR_VM_PM_OFF);
+    Trace(L"B3cC2dPatchVa", GR_VM_GPU_VA + GR_VM_PATCH_OFF);
+    Trace(L"B3cC2dPatchBytes", GR_VM_PATCH_BYTES);
 
     /* The whole arena was zeroed. Read both edges of each backing allocation
      * so the next run distinguishes a valid mapped allocation from only a
@@ -4501,6 +4513,269 @@ static BOOLEAN B3cD2Write(volatile UCHAR *B, ULONG writeTable[64][4],
     return TRUE;
 }
 
+/* Capture the FECS/GPCCS and channel-context state when a host context switch
+ * stalls. ICD trace-index writes are routed through B3cD2Write so each write
+ * is recorded and checked by the priv-ring handler. Addresses/fields follow
+ * the GM20B nvgpu hw_gr_gm20b.h names. */
+static VOID B3cD4CaptureCtxswDiag(volatile UCHAR *B, PUCHAR ctxHeader,
+                                  ULONG writes[64][4], ULONG *writeCount,
+                                  BOOLEAN cleanup)
+{
+    static const ULONG fecsRegs[13] = {
+        0x00409100u, 0x00409008u, 0x0040900Cu, 0x00409400u,
+        0x00409C00u, 0x00409B04u, 0x00409B00u, 0x00409A10u,
+        0x00409A0Cu, 0x00409C18u, 0x00502C04u, 0x00502C00u,
+        0x00002A0Cu
+    };
+    static const PCWSTR fecsNames[2][13] = {
+        { L"B3cD4FecsCpuctl", L"B3cD4FecsIrqstat", L"B3cD4FecsIrqmask",
+          L"B3cD4FecsCtxswStatus1", L"B3cD4FecsCtxswStatusFe0",
+          L"B3cD4FecsNewCtx", L"B3cD4FecsCurrentCtx", L"B3cD4FecsArbCtxAdr",
+          L"B3cD4FecsArbCtxCmd", L"B3cD4FecsHostIntStatus",
+          L"B3cD4GpccsGpcCtxswStatus0", L"B3cD4GpccsGpcCtxswStatus1",
+          L"B3cD4FifoEngCtxswTimeout" },
+        { L"B3cD4CleanupFecsCpuctl", L"B3cD4CleanupFecsIrqstat",
+          L"B3cD4CleanupFecsIrqmask", L"B3cD4CleanupFecsCtxswStatus1",
+          L"B3cD4CleanupFecsCtxswStatusFe0", L"B3cD4CleanupFecsNewCtx",
+          L"B3cD4CleanupFecsCurrentCtx", L"B3cD4CleanupFecsArbCtxAdr",
+          L"B3cD4CleanupFecsArbCtxCmd", L"B3cD4CleanupFecsHostIntStatus",
+          L"B3cD4CleanupGpccsGpcCtxswStatus0",
+          L"B3cD4CleanupGpccsGpcCtxswStatus1",
+          L"B3cD4CleanupFifoEngCtxswTimeout" }
+    };
+    static const PCWSTR fecsMailboxNames[2][8] = {
+        { L"B3cD4FecsMailbox0", L"B3cD4FecsMailbox1", L"B3cD4FecsMailbox2",
+          L"B3cD4FecsMailbox3", L"B3cD4FecsMailbox4", L"B3cD4FecsMailbox5",
+          L"B3cD4FecsMailbox6", L"B3cD4FecsMailbox7" },
+        { L"B3cD4CleanupFecsMailbox0", L"B3cD4CleanupFecsMailbox1",
+          L"B3cD4CleanupFecsMailbox2", L"B3cD4CleanupFecsMailbox3",
+          L"B3cD4CleanupFecsMailbox4", L"B3cD4CleanupFecsMailbox5",
+          L"B3cD4CleanupFecsMailbox6", L"B3cD4CleanupFecsMailbox7" }
+    };
+    PCWSTR fecsTraceIdxName = cleanup ? L"B3cD4CleanupFecsTraceIdx" : L"B3cD4FecsTraceIdx";
+    PCWSTR fecsTraceCountName = cleanup ? L"B3cD4CleanupFecsTraceCount" : L"B3cD4FecsTraceCount";
+    PCWSTR fecsTracePcName = cleanup ? L"B3cD4CleanupFecsPcTrace" : L"B3cD4FecsPcTrace";
+    PCWSTR fecsTraceWriteErrorName = cleanup ? L"B3cD4CleanupFecsTraceWriteError" : L"B3cD4FecsTraceWriteError";
+    PCWSTR gpccsCpuctlName = cleanup ? L"B3cD4CleanupGpccsCpuctl" : L"B3cD4GpccsCpuctl";
+    PCWSTR gpccsTraceIdxName = cleanup ? L"B3cD4CleanupGpccsTraceIdx" : L"B3cD4GpccsTraceIdx";
+    PCWSTR gpccsTraceCountName = cleanup ? L"B3cD4CleanupGpccsTraceCount" : L"B3cD4GpccsTraceCount";
+    PCWSTR gpccsTracePcName = cleanup ? L"B3cD4CleanupGpccsPcTrace" : L"B3cD4GpccsPcTrace";
+    PCWSTR gpccsTraceWriteErrorName = cleanup ? L"B3cD4CleanupGpccsTraceWriteError" : L"B3cD4GpccsTraceWriteError";
+    PCWSTR ctxHeaderName = cleanup ? L"B3cD4CleanupCtxHdr" : L"B3cD4CtxHdr";
+    ULONG values[RTL_NUMBER_OF(fecsRegs)];
+    ULONG mailbox[8] = { 0u }, tracePc[8] = { 0u };
+    ULONG traceIdx, traceCount, i, traceWriteError = 0u;
+    ULONG nameSet = cleanup ? 1u : 0u;
+
+    for (i = 0u; i < RTL_NUMBER_OF(fecsRegs); ++i) {
+        values[i] = Rd(B, fecsRegs[i]);
+        Trace(fecsNames[nameSet][i], values[i]);
+    }
+    for (i = 0u; i < RTL_NUMBER_OF(mailbox); ++i) {
+        mailbox[i] = Rd(B, 0x00409800u + i * 4u);
+        Trace(fecsMailboxNames[nameSet][i], mailbox[i]);
+    }
+    TraceBin(cleanup ? L"B3cD4CleanupFecsMailboxWords" : L"B3cD4FecsMailboxWords",
+             mailbox, sizeof(mailbox));
+    traceIdx = Rd(B, 0x00409148u);
+    traceCount = (traceIdx >> 16) & 0xFFu;
+    if (traceCount > RTL_NUMBER_OF(tracePc)) traceCount = RTL_NUMBER_OF(tracePc);
+    Trace(fecsTraceIdxName, traceIdx);
+    Trace(fecsTraceCountName, traceCount);
+    for (i = 0u; i < traceCount; ++i) {
+        if (!B3cD2Write(B, writes, writeCount, 0x00409148u, i)) {
+            traceWriteError = 1u;
+            break;
+        }
+        tracePc[i] = Rd(B, 0x0040914Cu);
+    }
+    Trace(fecsTraceWriteErrorName, traceWriteError);
+    TraceBin(fecsTracePcName, tracePc, i * sizeof(ULONG));
+
+    Trace(gpccsCpuctlName, Rd(B, 0x0041A100u));
+    traceIdx = Rd(B, 0x0041A148u);
+    traceCount = (traceIdx >> 16) & 0xFFu;
+    if (traceCount > RTL_NUMBER_OF(tracePc)) traceCount = RTL_NUMBER_OF(tracePc);
+    Trace(gpccsTraceIdxName, traceIdx);
+    Trace(gpccsTraceCountName, traceCount);
+    RtlZeroMemory(tracePc, sizeof(tracePc));
+    for (i = 0u; i < traceCount; ++i) {
+        if (!B3cD2Write(B, writes, writeCount, 0x0041A148u, i)) {
+            traceWriteError = 1u;
+            break;
+        }
+        tracePc[i] = Rd(B, 0x0041A14Cu);
+    }
+    Trace(gpccsTraceWriteErrorName, traceWriteError);
+    TraceBin(gpccsTracePcName, tracePc, i * sizeof(ULONG));
+    if (ctxHeader != NULL) TraceBin(ctxHeaderName, ctxHeader, 0x100u);
+    TraceBin(cleanup ? L"B3cD4CleanupDiagWrites" : L"B3cD4DiagWrites",
+             writes, (*writeCount) * sizeof(writes[0]));
+}
+
+/* Mirror the per-channel half of nvgpu gr_gk20a_load_golden_ctx_image().
+ * C2e saved the golden image at GLOBAL_OFF; D2's instance block points to
+ * CTX_OFF, so copy the image there and populate its ctxsw header before the
+ * first host-driven GR context switch. */
+static ULONG B3cPrepareD4ChannelContext(PSWGPU_DEVICE Dev)
+{
+    volatile UCHAR *B = Dev->Bar0;
+    PUCHAR golden, channelCtx;
+    PULONG header, patch;
+    ULONG result = 0u, writes[64][4] = { { 0u } }, writeCount = 0u;
+    ULONG l2FlushPolls = 0u, l2InvalidatePolls = 0u, l2Status = 0u;
+    ULONG patchZeroOk = 1u, copyMatch = 0u, pmHeader = 0u;
+    ULONG i, mismatch = 0u, pmcEnable = 0u;
+    ULONG watchdogMailboxAfter = 0u, ctxswMailboxAfter = 0u;
+    ULONG ctxswPolls = 0u, ctxswLast = 0u, ctxswStartOk = 0u;
+
+    Step(107);
+    pmcEnable = Rd(B, NV_PMC_ENABLE);
+    if (!g_GrVm.Active || g_GrVm.Arena == NULL ||
+        g_GrVm.GoldenBytes == 0u || g_GrVm.GoldenBytes > 0x20000u ||
+        g_GrVm.GoldenBytes > GR_VM_GLOBAL_OFF ||
+        GR_VM_CTX_OFF + g_GrVm.GoldenBytes > GR_VM_GLOBAL_OFF ||
+        GR_VM_PATCH_OFF + GR_VM_PATCH_BYTES > GR_VM_PRIV_OFF ||
+        (pmcEnable & (1u << 12)) == 0u) {
+        result = 0xE00000A3u;
+        goto done;
+    }
+    if (!B3cPrivRingDrainBeforeWrites(B) ||
+        !B3cD2Write(B, writes, &writeCount, 0x00070010u, 1u)) {
+        result = 0xE00000A3u;
+        goto done;
+    }
+    for (l2FlushPolls = 0u; l2FlushPolls < 2000u; ++l2FlushPolls) {
+        l2Status = Rd(B, 0x00070010u);
+        if ((l2Status & 3u) == 0u) break;
+        Us(5u);
+    }
+    if (l2FlushPolls == 2000u ||
+        !B3cD2Write(B, writes, &writeCount, 0x00070004u, 1u)) {
+        result = 0xE00000A3u;
+        goto done;
+    }
+    for (l2InvalidatePolls = 0u; l2InvalidatePolls < 2000u; ++l2InvalidatePolls) {
+        l2Status = Rd(B, 0x00070004u);
+        if ((l2Status & 3u) == 0u) break;
+        Us(5u);
+    }
+    if (l2InvalidatePolls == 2000u) {
+        result = 0xE00000A3u;
+        goto done;
+    }
+
+    golden = (PUCHAR)g_GrVm.Arena + GR_VM_GLOBAL_OFF;
+    channelCtx = (PUCHAR)g_GrVm.Arena + GR_VM_CTX_OFF;
+    header = (PULONG)channelCtx;
+    patch = (PULONG)((PUCHAR)g_GrVm.Arena + GR_VM_PATCH_OFF);
+    RtlCopyMemory(channelCtx, golden, g_GrVm.GoldenBytes);
+    copyMatch = RtlCompareMemory(channelCtx, golden, g_GrVm.GoldenBytes) == g_GrVm.GoldenBytes ? 1u : 0u;
+    RtlZeroMemory(patch, GR_VM_PATCH_BYTES);
+
+    /* ctxsw_prog_main_image_* offsets verified in hw_ctxsw_prog_gm20b.h:
+     * zero save/restore patch ops; point patch access at this channel's
+     * bounded patch page; use allow-all because the diagnostic context has no
+     * nvgpu-generated access whitelist; retain no-ctxsw ZCULL/PM modes. */
+    header[0x10u / 4u] = 0u; /* patch_count */
+    header[0x14u / 4u] = (ULONG)((GR_VM_GPU_VA + GR_VM_PATCH_OFF) & 0xFFFFFFFFu);
+    header[0x18u / 4u] = (ULONG)(((ULONGLONG)GR_VM_GPU_VA + GR_VM_PATCH_OFF) >> 32);
+    header[0x1Cu / 4u] = 1u; /* zcull_mode_no_ctxsw */
+    header[0x20u / 4u] = 0u; /* zcull pointer */
+    pmHeader = header[0x28u / 4u] & ~0x7u;
+    header[0x28u / 4u] = pmHeader; /* pm_mode_no_ctxsw */
+    header[0x2Cu / 4u] = 0u; /* PM pointer */
+    header[0x3Cu / 4u] &= ~0x8u; /* verification features disabled */
+    header[0xA0u / 4u] = 0u; /* priv access map mode allow_all */
+    header[0xA4u / 4u] = GR_VM_GPU_VA + GR_VM_PRIV_OFF;
+    header[0xA8u / 4u] = 0u;
+    header[0xF4u / 4u] = 0u; /* num_save_ops */
+    header[0xF8u / 4u] = 0u; /* num_restore_ops */
+    KeMemoryBarrier();
+    /* Claude 0.4.75: the CPU just rewrote the channel ctx image; flush and
+     * invalidate GPU L2 so FECS does not load stale lines from C2. */
+    {
+        ULONG postCopyL2[4] = { 0 };
+        ULONG postCopyOk = B3cC2eL2Flush(Dev->Bar0, postCopyL2) ? 1u : 0u;
+        Trace(L"B3cD4PostCopyL2Ok", postCopyOk);
+        Trace(L"B3cD4PostCopyL2InvalidatePolls", postCopyL2[2]);
+        if (!postCopyOk) result = 0xE00000A3u;
+    }
+
+    for (i = 0u; i < GR_VM_PATCH_BYTES / sizeof(ULONG); ++i) {
+        if (patch[i] != 0u) { patchZeroOk = 0u; break; }
+    }
+    if (!copyMatch || !patchZeroOk || header[0xFCu / 4u] != 0x600DC0DEu ||
+        header[0x10u / 4u] != 0u || header[0x14u / 4u] != GR_VM_GPU_VA + GR_VM_PATCH_OFF ||
+        header[0x18u / 4u] != 0u || header[0x1Cu / 4u] != 1u ||
+        header[0x20u / 4u] != 0u || header[0x28u / 4u] != 0u ||
+        header[0x2Cu / 4u] != 0u || header[0xA0u / 4u] != 0u ||
+        header[0xA4u / 4u] != GR_VM_GPU_VA + GR_VM_PRIV_OFF ||
+        header[0xA8u / 4u] != 0u || header[0xF4u / 4u] != 0u ||
+        header[0xF8u / 4u] != 0u || (header[0x3Cu / 4u] & 0x8u) != 0u)
+        mismatch = 1u;
+    if (mismatch) result = 0xE00000A3u;
+    if (result == 0u) {
+        /* Match gr_gk20a_init_ctx_state(): set FECS watchdog timeout through
+         * its method interface. The reference pushes this method without a
+         * mailbox wait. Then match gr_gk20a_enable_ctxsw()/gr_gk20a_ctrl_ctxsw
+         * and wait for the documented mailbox-1 PASS/FAIL response. */
+        if (!B3cD2Write(B, writes, &writeCount, 0x00409840u, 0xFFFFFFFFu) ||
+            !B3cD2Write(B, writes, &writeCount, 0x00409500u, 0x7FFFFFFFu) ||
+            !B3cD2Write(B, writes, &writeCount, 0x00409504u, 0x00000021u)) {
+            result = 0xE00000A3u;
+        }
+        watchdogMailboxAfter = Rd(B, 0x00409800u);
+        if (result == 0u &&
+            (!B3cD2Write(B, writes, &writeCount, 0x00409844u, 0xFFFFFFFFu) ||
+             !B3cD2Write(B, writes, &writeCount, 0x00409500u, 0xFFFFFFFFu) ||
+             !B3cD2Write(B, writes, &writeCount, 0x00409504u, 0x00000039u))) {
+            result = 0xE00000A3u;
+        }
+        if (result == 0u) {
+            for (ctxswPolls = 0u; ctxswPolls < 2000u; ++ctxswPolls) {
+                ctxswLast = Rd(B, 0x00409804u);
+                if (ctxswLast == 1u || ctxswLast == 2u) break;
+                Us(1u);
+            }
+            ctxswMailboxAfter = Rd(B, 0x00409804u);
+            ctxswStartOk = ctxswMailboxAfter == 1u ? 1u : 0u;
+            if (ctxswPolls == 2000u || ctxswMailboxAfter != 1u)
+                result = 0xE00000A3u;
+        }
+    }
+
+done:
+    Trace(L"B3cD4CtxImageBytes", g_GrVm.GoldenBytes);
+    Trace(L"B3cD4CtxPmcEnable", pmcEnable);
+    Trace(L"B3cD4CtxCopyMatch", copyMatch);
+    Trace(L"B3cD4PatchVa", GR_VM_GPU_VA + GR_VM_PATCH_OFF);
+    Trace(L"B3cD4PatchBytes", GR_VM_PATCH_BYTES);
+    Trace(L"B3cD4PatchZeroOk", patchZeroOk);
+    Trace(L"B3cD4L2FlushPolls", l2FlushPolls);
+    Trace(L"B3cD4L2InvalidatePolls", l2InvalidatePolls);
+    Trace(L"B3cD4L2Status", l2Status);
+    Trace(L"B3cD4HeaderMismatch", mismatch);
+    Trace(L"B3cD4WatchdogMethodData", 0x7FFFFFFFu);
+    Trace(L"B3cD4WatchdogMethodPush", 0x00000021u);
+    Trace(L"B3cD4WatchdogMailboxAfter", watchdogMailboxAfter);
+    Trace(L"B3cD4StartCtxswMethodData", 0xFFFFFFFFu);
+    Trace(L"B3cD4StartCtxswMethodPush", 0x00000039u);
+    Trace(L"B3cD4StartCtxswMailboxAfter", ctxswMailboxAfter);
+    Trace(L"B3cD4StartCtxswPolls", ctxswPolls);
+    Trace(L"B3cD4StartCtxswOk", ctxswStartOk);
+    if (g_GrVm.Arena != NULL) {
+        TraceBin(L"B3cD4CtxHdr", (PUCHAR)g_GrVm.Arena + GR_VM_CTX_OFF, 0x100u);
+        Trace(L"B3cD4GoldenMagic", *(volatile ULONG *)((PUCHAR)g_GrVm.Arena + GR_VM_CTX_OFF + 0xFCu));
+    }
+    TraceBin(L"B3cD4CtxPrepWrites", writes, sizeof(writes));
+    B3cPrivRingTraceWriteLog(L"B3cD4CtxPrepPrivWriteErrorCount",
+        L"B3cD4CtxPrepPrivWriteErrorDropped", L"B3cD4CtxPrepPrivAckTimeouts",
+        L"B3cD4CtxPrepPrivWriteErrors");
+    TraceDurable(L"B3cD4CtxPrepResult", result);
+    return result;
+}
+
 /* One host-only Kepler+ submission: SET_REFERENCE followed by SEMAPHORE
  * RELEASE. Method encodings are checked against NVIDIA's public GM20B/PBDMA
  * definitions. The semaphore occupies the final 16 bytes of this mapped PB
@@ -4662,6 +4937,234 @@ done:
     return result;
 }
 
+/* D4 submits a second GPFIFO packet on the channel that passed D3.  The
+ * Maxwell B 3D class header (NVIDIA open-gpu-doc classes/3d/clb197.h) defines
+ * SET_OBJECT=0x0000 and NO_OPERATION=0x0100.  After selecting class 0xB197,
+ * issue that harmless GR method and an engine-ordered host semaphore release
+ * (WFI enabled).  L2 maintenance writes use the same priv-ring checked table
+ * as the D2 register writes. */
+static ULONG B3cRunD4(PSWGPU_DEVICE Dev, PULONG userd, PULONG gpfifo,
+                      PULONG pushbuffer, ULONGLONG pushbufferGpuVa)
+{
+    volatile UCHAR *B = Dev->Bar0;
+    volatile ULONG *bar1GpPut = NULL;
+    volatile ULONG *semSlot = NULL;
+    PULONG instWords = NULL;
+    ULONGLONG semGpuVa = (ULONGLONG)GR_VM_GPU_VA + GR_VM_D2_PUSHBUF_OFF + PAGE_SIZE - 32u;
+    ULONG result = 0u, grEnabled = 0u, polls = 0u;
+    ULONG expectedCtxLo = ((ULONG)GR_VM_GPU_VA + GR_VM_CTX_OFF) | 4u;
+    ULONG expectedCtxHi = 0u, goldenMagic = 0u, ctxPointerOk = 0u;
+    ULONG userdGpGet = 0u, bar1GpPutReadback = 0u;
+    ULONG pbGpGet = 0u, pbGet = 0u, pbPut = 0u;
+    ULONG semValue = 0u, refCount = 0u, pbIntr0 = 0u, pbIntr1 = 0u;
+    ULONG pbMethod0 = 0u, pbData0 = 0u, fifoIntr0 = 0u, mmuFault = 0u;
+    ULONG grIntr = 0u, grException = 0u, grStatus = 0u, feHwwEsr = 0u;
+    ULONG fecsCurrentCtx = 0u, fecsMailbox0 = 0u, engineStatus = 0u;
+    ULONG gpWords[2] = { 0u, 0u };
+    ULONG pushWords[9] = { 0u };
+    ULONG reportWords[4] = { 0u, 0u, 0u, 0u };
+    ULONG writes[64][4] = { { 0u } };
+    ULONG writeCount = 0u, l2FlushPolls = 0u, l2InvalidatePolls = 0u;
+    ULONG l2Status = 0u, pbdmaStatus = 0u, diagCaptured = 0u;
+    ULONG i;
+
+    Step(108);
+    grEnabled = Rd(B, NV_PMC_ENABLE);
+    if (g_GrVm.Arena != NULL) {
+        instWords = (PULONG)((PUCHAR)g_GrVm.Arena + GR_VM_INST_OFF);
+        goldenMagic = *(volatile ULONG *)((PUCHAR)g_GrVm.Arena + GR_VM_CTX_OFF + 0xFCu);
+        ctxPointerOk = (instWords[132] == expectedCtxLo &&
+                        instWords[133] == expectedCtxHi &&
+                        goldenMagic == 0x600DC0DEu) ? 1u : 0u;
+    }
+    Trace(L"B3cD4InstCtxExpectedLo", expectedCtxLo);
+    Trace(L"B3cD4InstCtxExpectedHi", expectedCtxHi);
+    Trace(L"B3cD4InstCtxActualLo", instWords != NULL ? instWords[132] : 0u);
+    Trace(L"B3cD4InstCtxActualHi", instWords != NULL ? instWords[133] : 0u);
+    Trace(L"B3cD4GoldenMagic", goldenMagic);
+    Trace(L"B3cD4ContextValid", ctxPointerOk);
+    if ((grEnabled & (1u << 12)) == 0u || userd == NULL || gpfifo == NULL ||
+        pushbuffer == NULL || pushbufferGpuVa == 0u || Dev->Bar1Cpu == NULL ||
+        Dev->Bar1MapLen < BAR1_D3_MAP_LEN || !g_GrVm.Active ||
+        instWords == NULL || ctxPointerOk == 0u ||
+        semGpuVa + sizeof(reportWords) >
+            (ULONGLONG)GR_VM_GPU_VA + GR_VM_ARENA_SIZE) {
+        result = 0xE00000A2u;
+        goto done;
+    }
+    bar1GpPut = (volatile ULONG *)(Dev->Bar1Cpu + BAR1_D3_LOW_VA + 0x8Cu);
+    semSlot = (volatile ULONG *)((PUCHAR)pushbuffer + PAGE_SIZE - 32u);
+
+    /* SET_OBJECT(class B197), B197_NO_OPERATION, then host SEMAPHORE RELEASE.
+     * Header lengths are in dwords; GPFIFO entry 1 is the second 8-byte slot. */
+    pushWords[0] = 0x20010000u; /* INC, count 1, subch 0, SET_OBJECT */
+    pushWords[1] = 0x0000B197u;
+    pushWords[2] = 0x20010040u; /* INC, count 1, subch 0, NO_OPERATION 0x100 */
+    pushWords[3] = 0u;
+    pushWords[4] = 0x20040004u; /* INC, count 4, subch 0, SEMAPHOREA 0x10 */
+    pushWords[5] = (ULONG)(semGpuVa >> 32);
+    pushWords[6] = (ULONG)semGpuVa;
+    pushWords[7] = 0xD4D4D4D4u;
+    pushWords[8] = 0x01000002u; /* RELEASE, four-word payload, release_wfi enabled */
+    for (i = 0u; i < RTL_NUMBER_OF(pushWords); ++i) pushbuffer[i] = pushWords[i];
+    for (i = 0u; i < RTL_NUMBER_OF(reportWords); ++i) semSlot[i] = 0u;
+    gpWords[0] = (ULONG)pushbufferGpuVa & ~3u;
+    gpWords[1] = (ULONG)((pushbufferGpuVa >> 32) & 0xFFu) | (9u << 10);
+    gpfifo[2] = gpWords[0];
+    gpfifo[3] = gpWords[1];
+    KeMemoryBarrier();
+
+    if (!B3cPrivRingDrainBeforeWrites(B)) {
+        result = 0xE00000A2u;
+        goto done;
+    }
+    *bar1GpPut = 2u;
+    KeMemoryBarrier();
+    bar1GpPutReadback = *bar1GpPut;
+    if (bar1GpPutReadback != 2u || Rd(B, 0x00002A30u) != 0u ||
+        (Rd(B, 0x00002100u) & 0x10000000u) != 0u) {
+        result = 0xE00000A2u;
+        goto done;
+    }
+
+    for (polls = 0u; polls < 2000u; ++polls) {
+        userdGpGet = *(volatile ULONG *)(Dev->Bar1Cpu + BAR1_D3_LOW_VA + 0x88u);
+        pbGpGet = Rd(B, 0x00040014u);
+        if (userdGpGet == 2u && pbGpGet == 2u) break;
+        Us(1u);
+    }
+    userdGpGet = *(volatile ULONG *)(Dev->Bar1Cpu + BAR1_D3_LOW_VA + 0x88u);
+    pbGpGet = Rd(B, 0x00040014u);
+    if (userdGpGet != 2u || pbGpGet != 2u) {
+        result = 0xE00000A2u;
+        goto done;
+    }
+
+    /* Keep L2 maintenance bounded and record each register write through the
+     * common write/priv-ring trace. */
+    if (!B3cD2Write(B, writes, &writeCount, 0x00070010u, 1u)) {
+        result = 0xE00000A2u;
+        goto done;
+    }
+    for (l2FlushPolls = 0u; l2FlushPolls < 2000u; ++l2FlushPolls) {
+        l2Status = Rd(B, 0x00070010u);
+        if ((l2Status & 3u) == 0u) break;
+        Us(5u);
+    }
+    if (l2FlushPolls == 2000u ||
+        !B3cD2Write(B, writes, &writeCount, 0x00070004u, 1u)) {
+        result = 0xE00000A2u;
+        goto done;
+    }
+    for (l2InvalidatePolls = 0u; l2InvalidatePolls < 2000u; ++l2InvalidatePolls) {
+        l2Status = Rd(B, 0x00070004u);
+        if ((l2Status & 3u) == 0u) break;
+        Us(5u);
+    }
+    if (l2InvalidatePolls == 2000u) {
+        result = 0xE00000A2u;
+        goto done;
+    }
+    KeMemoryBarrier();
+    semValue = semSlot[0];
+    /* Claude 0.4.76: GP_GET == 2 only means the entry was fetched. The WFI
+     * release is written after GR finishes the ctx load and the methods, so
+     * 0.4.75 read too early (all slots 0 while GR was already idle at the
+     * diag dump). Poll the slot with an L2 flush/invalidate per round,
+     * bounded at 2000 rounds x 10 us plus the flush polls. */
+    {
+        ULONG semPolls, l2Fails = 0u;
+        for (semPolls = 0u; semPolls < 2000u && semValue != 0xD4D4D4D4u; ++semPolls) {
+            ULONG l2Round[4] = { 0 };
+            if (!B3cC2eL2Flush(B, l2Round)) ++l2Fails;
+            KeMemoryBarrier();
+            semValue = semSlot[0];
+            if (semValue == 0xD4D4D4D4u) break;
+            Us(10u);
+        }
+        Trace(L"B3cD4SemPolls", semPolls);
+        Trace(L"B3cD4SemL2Fails", l2Fails);
+        Trace(L"B3cD4SemEngineStatusAfterPoll", Rd(B, 0x00002640u));
+        Trace(L"B3cD4SemGrStatusAfterPoll", Rd(B, 0x00400700u));
+    }
+    refCount = *(volatile ULONG *)(Dev->Bar1Cpu + BAR1_D3_LOW_VA + 0x48u);
+    if (semValue != 0xD4D4D4D4u || userdGpGet != 2u || pbGpGet != 2u) {
+        result = 0xE00000A2u;
+        B3cD4CaptureCtxswDiag(B, (PUCHAR)g_GrVm.Arena + GR_VM_CTX_OFF,
+                              writes, &writeCount, FALSE);
+        diagCaptured = 1u;
+    }
+
+done:
+    if (result != 0u && userdGpGet == 2u && !diagCaptured && g_GrVm.Arena != NULL) {
+        B3cD4CaptureCtxswDiag(B, (PUCHAR)g_GrVm.Arena + GR_VM_CTX_OFF,
+                              writes, &writeCount, FALSE);
+        diagCaptured = 1u;
+    }
+    if (Dev->Bar1Cpu != NULL && Dev->Bar1MapLen >= BAR1_D3_MAP_LEN) {
+        if (bar1GpPut == NULL)
+            bar1GpPut = (volatile ULONG *)(Dev->Bar1Cpu + BAR1_D3_LOW_VA + 0x8Cu);
+        bar1GpPutReadback = *bar1GpPut;
+        userdGpGet = *(volatile ULONG *)(Dev->Bar1Cpu + BAR1_D3_LOW_VA + 0x88u);
+        refCount = *(volatile ULONG *)(Dev->Bar1Cpu + BAR1_D3_LOW_VA + 0x48u);
+    }
+    pbGet = Rd(B, 0x00040018u);
+    pbPut = Rd(B, 0x0004005Cu);
+    pbIntr0 = Rd(B, 0x00040108u);
+    pbIntr1 = Rd(B, 0x00040148u);
+    pbdmaStatus = Rd(B, 0x00003080u);
+    pbMethod0 = Rd(B, 0x000400C0u);
+    pbData0 = Rd(B, 0x000400C4u);
+    fifoIntr0 = Rd(B, 0x00002100u);
+    mmuFault = Rd(B, 0x00002A30u);
+    grIntr = (grEnabled & (1u << 12)) ? Rd(B, 0x00400100u) : 0u;
+    grException = (grEnabled & (1u << 12)) ? Rd(B, 0x00400108u) : 0u;
+    grStatus = (grEnabled & (1u << 12)) ? Rd(B, 0x00400700u) : 0u;
+    feHwwEsr = (grEnabled & (1u << 12)) ? Rd(B, 0x00404000u) : 0u;
+    fecsCurrentCtx = (grEnabled & (1u << 12)) ? Rd(B, 0x00409B00u) : 0u;
+    fecsMailbox0 = (grEnabled & (1u << 12)) ? Rd(B, 0x00409800u) : 0u;
+    engineStatus = Rd(B, 0x00002640u);
+    if (semSlot != NULL) {
+        for (i = 0u; i < RTL_NUMBER_OF(reportWords); ++i) reportWords[i] = semSlot[i];
+        semValue = reportWords[0];
+    }
+    Trace(L"B3cD4GpGet", userdGpGet);
+    Trace(L"B3cD4GpPut", bar1GpPutReadback);
+    Trace(L"B3cD4PbGet", pbGet);
+    Trace(L"B3cD4PbPut", pbPut);
+    Trace(L"B3cD4PbdmaGpGet", pbGpGet);
+    Trace(L"B3cD4SemWfi", pushWords[8] == 0x01000002u ? 1u : 0u);
+    TraceBin(L"B3cD4ReportSem", reportWords, sizeof(reportWords));
+    Trace(L"B3cD4PbIntr0", pbIntr0);
+    Trace(L"B3cD4PbIntr1", pbIntr1);
+    Trace(L"B3cD4PbMethod0", pbMethod0);
+    Trace(L"B3cD4PbData0", pbData0);
+    Trace(L"B3cD4FifoIntr0", fifoIntr0);
+    Trace(L"B3cD4MmuFault", mmuFault);
+    Trace(L"B3cD4GrIntr", grIntr);
+    Trace(L"B3cD4GrException", grException);
+    Trace(L"B3cD4GrStatus", grStatus);
+    Trace(L"B3cD4FeHwwEsr", feHwwEsr);
+    Trace(L"B3cD4FecsCurrentCtx", fecsCurrentCtx);
+    Trace(L"B3cD4FecsMailbox0", fecsMailbox0);
+    Trace(L"B3cD4EngineStatus", engineStatus);
+    Trace(L"B3cD4GpGetPolls", polls);
+    Trace(L"B3cD4L2FlushPolls", l2FlushPolls);
+    Trace(L"B3cD4L2InvalidatePolls", l2InvalidatePolls);
+    Trace(L"B3cD4L2Status", l2Status);
+    Trace(L"B3cD4PbdmaStatus", pbdmaStatus);
+    TraceBin(L"B3cD4PushbufferWords", pushWords, sizeof(pushWords));
+    TraceBin(L"B3cD4GpfifoEntry", gpWords, sizeof(gpWords));
+    TraceBin(L"B3cD4Writes", writes, sizeof(writes));
+    Trace(L"B3cD4RefCount", refCount);
+    if (grIntr != 0u) {
+        ULONG grDump[B3C_GR_STATUS_DUMP_REGS * 2u] = { 0u };
+        B3cCaptureGrStatusDump(B, L"B3cD4GrStatusDump", grDump);
+    }
+    TraceDurable(L"B3cD4Result", result);
+    return result;
+}
+
 /* Claude 0.4.61: 0.4.60 bind error code 0x2 = SNOOP_WITHOUT_BAR1 (name from
  * nouveau's bind-reason table).  Bind BAR1 to the GR instance block
  * (bus_bar1_block 0x1704, virtual mode, sys_mem_ncoh) before the channel
@@ -4675,7 +5178,6 @@ static ULONG g_D2Bar1Bound = 0u;
 static ULONG g_D2UserdBar1Before = 0u;
 static ULONG g_D2UserdBar1Set = 0u;
 static ULONG g_D2PbdmaInten0Before = 0u;
-static ULONG g_D2PbdmaStallBefore = 0u;
 static ULONG g_D2PbdmaMasksSaved = 0u;
 
 static ULONG B3cInitFifoD2(PSWGPU_DEVICE Dev)
@@ -4709,8 +5211,9 @@ static ULONG B3cInitFifoD2(PSWGPU_DEVICE Dev)
     ULONG privBound = 0, channelEnableIssued = 0, runlistSubmitted = 0;
     ULONG cleanupError = 0, writeCount = 0, disableValue = 0, i;
     ULONG pbdmaInten0Before = 0u, pbdmaStallBefore = 0u;
-    ULONG pbdmaInten0Masked = 0u, pbdmaStallMasked = 0u;
-    ULONG d3Result = 0u;
+    ULONG pbdmaInten0Init = 0u;
+    ULONG d3Result = 0u, d4Result = 0u, d4Run = 0u;
+    ULONG diagWrites[64][4] = { { 0u } }, diagWriteCount = 0u;
     ULONGLONG userdIova = 0, runlistIova = 0;
     ULONGLONG instIova = 0, gpfifoGpuVa = 0;
     ULONG ramfcValues[15][2] = { 0 };
@@ -4916,19 +5419,13 @@ static ULONG B3cInitFifoD2(PSWGPU_DEVICE Dev)
     if ((writes[writeCount - 1u][3] & 0x000F0000u) != (runlistId << 16)) {
         result = 0xE00000A0u; stage = 10u; goto done;
     }
-    /* Claude 0.4.65: 0.4.64 showed PBDMA0 intr_0 bit 24 latched once the
-     * channel was loaded and a write-1 clear did not remove it; the preempt
-     * then never finished.  nouveau gk104_runq_init() initialises each PBDMA
-     * before use: clear stall-mask bits 0x10000010 in 0x4013C, clear intr_0 /
-     * intr_1 (0x40108 / 0x40148), enable intr_0 = 0xFFFFFEFF (0x4010C) and
-     * intr_1 = 0xFFFFFFFF (0x4014C).  Do the same here (PBDMA0 only); MC
-     * routing stays untouched so the CPU still gets no interrupt. */
+    /* PBDMA INTR_0 bit 24 was ENG_RESET, caused by CE2 remaining in reset.
+     * D1 now releases CE2 with PFIFO. Keep the hardware stall mask untouched
+     * and use Nouveau gk104_runq_init()'s INTEN0 value; do not mask bit 24. */
     {
         pbdmaStallBefore = Rd(B, 0x0004013Cu);
         pbdmaInten0Before = Rd(B, 0x0004010Cu);
-        pbdmaStallMasked = pbdmaStallBefore & ~0x11000010u;
-        pbdmaInten0Masked = 0xFEFFFEFFu; /* existing enable mask, with bit 24 masked */
-        g_D2PbdmaStallBefore = pbdmaStallBefore;
+        pbdmaInten0Init = 0xFFFFFEFFu;
         g_D2PbdmaInten0Before = pbdmaInten0Before;
         g_D2PbdmaMasksSaved = 1u;
         Trace(L"B3cD2PbIntrStallBefore", pbdmaStallBefore);
@@ -4936,10 +5433,9 @@ static ULONG B3cInitFifoD2(PSWGPU_DEVICE Dev)
         Trace(L"B3cD2PbIntrEn1Before", Rd(B, 0x0004014Cu));
         Trace(L"B3cD3PbdmaStallBefore", pbdmaStallBefore);
         Trace(L"B3cD3PbdmaInten0Before", pbdmaInten0Before);
-        if (!B3cD2Write(B, writes, &writeCount, 0x0004013Cu, pbdmaStallMasked) ||
-            !B3cD2Write(B, writes, &writeCount, 0x00040108u, 0xFFFFFFFFu) ||
+        if (!B3cD2Write(B, writes, &writeCount, 0x00040108u, 0xFFFFFFFFu) ||
             !B3cD2Write(B, writes, &writeCount, 0x00040148u, 0xFFFFFFFFu) ||
-            !B3cD2Write(B, writes, &writeCount, 0x0004010Cu, pbdmaInten0Masked) ||
+            !B3cD2Write(B, writes, &writeCount, 0x0004010Cu, pbdmaInten0Init) ||
             !B3cD2Write(B, writes, &writeCount, 0x0004014Cu, 0xFFFFFFFFu)) {
             result = 0xE00000A0u; stage = 30u; goto done;
         }
@@ -4948,8 +5444,7 @@ static ULONG B3cInitFifoD2(PSWGPU_DEVICE Dev)
         Trace(L"B3cD2PbIntr0AfterInit", Rd(B, 0x00040108u));
         Trace(L"B3cD3PbdmaStallAfter", Rd(B, 0x0004013Cu));
         Trace(L"B3cD3PbdmaInten0After", Rd(B, 0x0004010Cu));
-        Trace(L"B3cD3Bit24Masked", ((Rd(B, 0x0004013Cu) & 0x01000000u) == 0u &&
-                                      (Rd(B, 0x0004010Cu) & 0x01000000u) == 0u) ? 1u : 0u);
+        Trace(L"B3cD3Bit24Enabled", ((Rd(B, 0x0004010Cu) & 0x01000000u) != 0u) ? 1u : 0u);
     }
     /* Claude 0.4.60: find which write raises PFIFO BIND_ERROR.  Record
      * fifo_intr_0 and fifo_intr_bind_error (0x252C, read only) before the
@@ -5208,6 +5703,18 @@ static ULONG B3cInitFifoD2(PSWGPU_DEVICE Dev)
                         (ULONGLONG)GR_VM_GPU_VA + GR_VM_D2_PUSHBUF_OFF);
     Trace(L"B3cD2D3Result", d3Result);
     if (d3Result != 0u) { result = d3Result; stage = 18u; }
+    else {
+        ULONG ctxPrepResult = B3cPrepareD4ChannelContext(Dev);
+        Trace(L"B3cD2D4CtxPrepResult", ctxPrepResult);
+        if (ctxPrepResult != 0u) { result = ctxPrepResult; stage = 19u; }
+        else {
+            d4Run = 1u;
+            d4Result = B3cRunD4(Dev, userd, gpfifo, pushbuffer,
+                                (ULONGLONG)GR_VM_GPU_VA + GR_VM_D2_PUSHBUF_OFF);
+            Trace(L"B3cD2D4Result", d4Result);
+            if (d4Result != 0u) { result = d4Result; stage = 20u; }
+        }
+    }
 
 done:
     /* Always tear down any channel state published by this one-shot probe.
@@ -5244,7 +5751,13 @@ done:
             if ((preemptLast & 0x00100000u) == 0u) break;
             Us(1000u);
         }
-        if (preemptPolls == 2000u) cleanupError |= 4u;
+        if (preemptPolls == 2000u) {
+            cleanupError |= 4u;
+            if (d4Run && g_GrVm.Arena != NULL)
+                B3cD4CaptureCtxswDiag(B,
+                    (PUCHAR)g_GrVm.Arena + GR_VM_CTX_OFF,
+                    diagWrites, &diagWriteCount, TRUE);
+        }
         Trace(L"B3cD2PreemptPbdmaIntr0", Rd(B, pbdmaIntrReg));
     Trace(L"B3cD2PreemptPbdmaStatusReg", Rd(B, pbdmaStatusReg));
     Trace(L"B3cD2PreemptCcsrChannel", Rd(B, ccsrChannelReg));
@@ -5268,10 +5781,8 @@ done:
     if (g_D2PbdmaMasksSaved) {
         if (!B3cD2Write(B, writes, &writeCount, 0x0004010Cu, g_D2PbdmaInten0Before))
             cleanupError |= 1024u;
-        if (!B3cD2Write(B, writes, &writeCount, 0x0004013Cu, g_D2PbdmaStallBefore))
-            cleanupError |= 1024u;
         Trace(L"B3cD3PbdmaInten0Restored", Rd(B, 0x0004010Cu));
-        Trace(L"B3cD3PbdmaStallRestored", Rd(B, 0x0004013Cu));
+        Trace(L"B3cD3PbdmaStallUnchanged", Rd(B, 0x0004013Cu));
         g_D2PbdmaMasksSaved = 0u;
     }
     if (g_D2UserdBar1Set) {

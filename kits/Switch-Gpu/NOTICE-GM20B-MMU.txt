@@ -435,3 +435,18 @@ with the referenced source and headers.
 
 
 0.4.70 BAR1 USERD doorbell and alias translation were checked against MIT nvgpu GM20B/GK20A FIFO and BAR1 setup (gk20a_bar1_writel(), gk20a_init_fifo_setup_hw()) and the unmodified GM20B GPU page-table register definitions. Only register/method values and flow were used as reference; no third-party source code was copied.
+
+0.4.74 D4 class and method identifiers were checked against NVIDIA's MIT
+open-gpu-doc classes/3d/clb197.h (MAXWELL_B 0xB197,
+NVB197_SET_OBJECT 0x0000, NVB197_NO_OPERATION 0x0100). These public class
+values are used as data only; no third-party source code was copied. The
+header's MIT notice remains with the referenced source.
+
+0.4.75 per-channel context image loading and header fields were compared
+against MIT Switchroot nvgpu 1ae0167d functions gr_gk20a_load_golden_ctx_image(),
+gk20a_gr_init_ctxsw_hdr_data(), gr_gk20a_commit_inst(),
+gr_gk20a_alloc_channel_patch_ctx(), gr_gk20a_init_ctx_state(),
+gr_gk20a_set_fecs_watchdog_timeout(), gr_gk20a_enable_ctxsw(), and
+gr_gk20a_ctrl_ctxsw(), plus hw_ctxsw_prog_gm20b.h and hw_gr_gm20b.h.
+Function order and register/header values are used as data; no third-party
+source code was copied or adapted.
