@@ -43,6 +43,13 @@ namespace SwitchCenter
         readonly Label perfStatus = new Label { Dock = DockStyle.Top, Height = 56 };
         readonly List<RadioButton> profileButtons = new List<RadioButton>();
         bool updatingRadios;
+        // 0.9.2: manual fan (switchfan 1.0.0.3). The driver keeps it until the next boot only.
+        readonly CheckBox fanManual = new CheckBox { Dock = DockStyle.Top, Height = 40 };
+        readonly Label fanLabel = new Label { Dock = DockStyle.Top, Height = 30 };
+        readonly TrackBar fanBar = new TrackBar { Minimum = 0, Maximum = 100, TickFrequency = 10, LargeChange = 10, SmallChange = 5, Dock = DockStyle.Top, Height = 50 };
+        readonly Label fanState = new Label { Dock = DockStyle.Top, Height = 30 };
+        readonly Timer fanApply = new Timer { Interval = 150 };
+        bool updatingFan;
 
         // Display
         readonly TrackBar brightnessBar = new TrackBar { Minimum = 3, Maximum = 100, TickFrequency = 10, LargeChange = 10, SmallChange = 5, Dock = DockStyle.Top, Height = 60 };
@@ -204,8 +211,77 @@ namespace SwitchCenter
             };
             page.Controls.Add(profilePanel);
             page.Controls.Add(perfStatus);
+            page.Controls.Add(BuildFanBox());
             page.Controls.Add(note);
             return page;
+        }
+
+        GroupBox BuildFanBox()
+        {
+            var box = new GroupBox { Text = T("ファン", "Fan"), Dock = DockStyle.Bottom, Height = 250, Padding = new Padding(10) };
+            var fanNote = new Label
+            {
+                Dock = DockStyle.Top, Height = 60,
+                Text = T("・68℃ 以上になると、手動でもファンを 100% にします（65℃ 未満で戻ります）。\n" +
+                         "・Windows を再起動すると、自動に戻ります。",
+                         "- At 68℃ or more the fan runs at 100% even when manual (released below 65℃).\n" +
+                         "- Restarting Windows goes back to automatic."),
+            };
+            fanManual.Text = T("ファンの強さを手動で決める", "Set the fan speed by hand");
+            fanBar.Enabled = false;
+            fanLabel.Text = T("手動の強さ: ", "Manual speed: ") + $"{fanBar.Value}%";
+            fanManual.CheckedChanged += (_, _) =>
+            {
+                fanBar.Enabled = fanManual.Checked;
+                if (!updatingFan) ApplyFan();
+            };
+            fanBar.ValueChanged += (_, _) =>
+            {
+                fanLabel.Text = T("手動の強さ: ", "Manual speed: ") + $"{fanBar.Value}%";
+                if (!updatingFan && fanManual.Checked) { fanApply.Stop(); fanApply.Start(); }
+            };
+            fanApply.Tick += (_, _) => { fanApply.Stop(); ApplyFan(); };
+            box.Controls.Add(fanNote);
+            box.Controls.Add(fanState);
+            box.Controls.Add(fanBar);
+            box.Controls.Add(fanLabel);
+            box.Controls.Add(fanManual);
+            return box;
+        }
+
+        void ApplyFan()
+        {
+            try
+            {
+                if (fanManual.Checked) FanControl.SetManual(fanBar.Value);
+                else FanControl.SetAuto();
+            }
+            catch (Win32Exception e) { fanState.Text = T("ファンを変えられませんでした: ", "Could not change the fan: ") + e.Message; }
+        }
+
+        void RefreshFan(FanControl.Status fan)
+        {
+            if (fan == null)
+            {
+                fanState.Text = T("手動の調整には、ファンのドライバー 1.0.0.3 以降が必要です。", "Manual control needs fan driver 1.0.0.3 or later.");
+                fanManual.Enabled = fanBar.Enabled = false;
+                return;
+            }
+            fanManual.Enabled = true;
+            if (!fanApply.Enabled && !fanBar.Capture)
+            {
+                updatingFan = true;
+                fanManual.Checked = fan.Manual;
+                fanBar.Value = Math.Clamp(fan.Manual ? fan.ManualPercent : fan.Percent, fanBar.Minimum, fanBar.Maximum);
+                fanBar.Enabled = fan.Manual;
+                fanLabel.Text = T("手動の強さ: ", "Manual speed: ") + $"{fanBar.Value}%";
+                updatingFan = false;
+            }
+            string why = fan.Failsafe ? T("（温度が読めないため 65% 以上）", " (temperature unreadable: 65% or more)")
+                       : fan.Guard ? T("（68℃ 以上のため 100%）", " (68℃ or more: 100%)")
+                       : fan.Manual ? T("（手動）", " (manual)") : T("（自動）", " (automatic)");
+            fanState.Text = T("今: ", "Now: ") + $"{fan.Percent}%" + why +
+                            (fan.TempValid ? T("    温度: ", "    Temperature: ") + fan.Temp + "℃" : "");
         }
 
         void BuildProfileButtons(CpuClock.Profile[] profiles, Func<CpuClock.Profile, string> label)
@@ -764,6 +840,10 @@ namespace SwitchCenter
             try { light = Backlight.Get(); } catch (Win32Exception) { }
             BatteryInfo battery = BatteryInfo.Read();
             int? fan = FanInfo.Percent;
+            FanControl.Status fanStatus = null;
+            try { fanStatus = FanControl.Get(); } catch (Win32Exception) { }
+            if (fanStatus != null) fan = fanStatus.Percent;
+            RefreshFan(fanStatus);
 
             cpuValue.Text = cpu != null ? $"{cpu.Khz / 1000.0:0} MHz" : "—";
             tempValue.Text = cpu is { TempValid: true } ? $"{cpu.TempSoC}℃" : "—";
@@ -779,7 +859,8 @@ namespace SwitchCenter
                 T("コアごとの使用率: ", "Usage per core: ") + cores + "\n" +
                 T("CPU の電圧: ", "CPU voltage: ") + (cpu != null ? cpu.Mv + " mV" : "—") + "\n" +
                 T("基板の温度: ", "Board temperature: ") + (cpu is { TempValid: true } ? cpu.TempBoard + "℃" : "—") +
-                T("    ファン: ", "    Fan: ") + (fan is int f ? f + "%" : "—") + "\n" +
+                T("    ファン: ", "    Fan: ") + (fan is int f ? f + "%" : "—") +
+                (fanStatus is { Manual: true } ? T("（手動）", " (manual)") : "") + "\n" +
                 T("電源: ", "Power: ") + battery.PowerText +
                 T("    バッテリーの電圧: ", "    Battery voltage: ") + (battery.Millivolts is int mv ? mv + " mV" : "—") + "\n" +
                 "USB-C: " + battery.UsbcText + "\n" +
@@ -833,6 +914,7 @@ namespace SwitchCenter
             {
                 timer.Dispose();
                 brightnessApply.Dispose();
+                fanApply.Dispose();
                 sensorTimer.Dispose();
                 tileValueFont.Dispose();
                 tileTitleFont.Dispose();
