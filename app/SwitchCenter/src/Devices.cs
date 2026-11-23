@@ -98,6 +98,43 @@ namespace SwitchCenter
         public static int LevelToPercent(int level) => level * 100 / Max;
     }
 
+    /// <summary>switchfan.sys v3 (same \\.\SwitchBacklight device): automatic or manual fan.
+    /// Manual lasts until the next boot; at 68℃ or more the driver runs the fan at 100 % anyway.</summary>
+    static class FanControl
+    {
+        const string Device = @"\\.\SwitchBacklight";
+        const uint GetCode = 0x00226048, SetCode = 0x0022A04C;
+        public const int MaxDuty = 236;
+
+        public sealed class Status
+        {
+            public bool Manual, TempValid, Guard, Failsafe;
+            public int ManualPercent, Duty, Temp;
+            public int Percent => Duty * 100 / MaxDuty;
+        }
+
+        public static Status Get()
+        {
+            byte[] b = Native.Ioctl(Device, GetCode, null, 32);
+            return new Status
+            {
+                Manual = Native.I32(b, 1) == 1, ManualPercent = Native.I32(b, 2), Duty = Native.I32(b, 3),
+                Temp = Native.I32(b, 4), TempValid = Native.I32(b, 5) != 0, Guard = Native.I32(b, 6) != 0, Failsafe = Native.I32(b, 7) != 0,
+            };
+        }
+
+        public static void SetAuto() => Set(0, 0);
+        public static void SetManual(int percent) => Set(1, Math.Clamp(percent, 0, 100));
+
+        static void Set(int mode, int percent)
+        {
+            byte[] input = new byte[8];
+            BitConverter.GetBytes(mode).CopyTo(input, 0);
+            BitConverter.GetBytes(percent).CopyTo(input, 4);
+            Native.Ioctl(Device, SetCode, input, 0);
+        }
+    }
+
     /// <summary>switchsensor.sys (\\.\SwitchSensor, UEFI R379+): light in lux and acceleration in mg.</summary>
     static class Sensors
     {

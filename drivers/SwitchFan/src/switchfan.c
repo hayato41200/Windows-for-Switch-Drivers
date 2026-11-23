@@ -21,6 +21,12 @@
  * 255; this driver restores the saved brightness, follows the console display
  * state (off = 0, dimmed = 1/3) and takes brightness changes from the tray app
  * through \\.\SwitchBacklight. Without R376 the CSR_0 writes do nothing.
+ *
+ * v3: manual fan control from the control center (IOCTL_SWFAN_SET on the
+ * same device). Manual is kept in memory only, so every boot (and every
+ * driver start) is automatic again. At 68 C or more the fan runs at 100 %
+ * whatever the manual setting (released below 65 C). Sensor failures still go
+ * to the 65 % failsafe, or to the manual duty if that is higher.
  */
 #include <ntddk.h>
 #include <ntstrsafe.h>
@@ -44,6 +50,27 @@ typedef struct _SWBL_STATUS {
     ULONG DisplayState;     /* 0 off, 1 on, 2 dimmed */
 } SWBL_STATUS;
 
+#define IOCTL_SWFAN_GET  CTL_CODE(FILE_DEVICE_UNKNOWN, 0x812, METHOD_BUFFERED, FILE_READ_ACCESS)    /* 0x00226048 */
+#define IOCTL_SWFAN_SET  CTL_CODE(FILE_DEVICE_UNKNOWN, 0x813, METHOD_BUFFERED, FILE_WRITE_ACCESS)   /* 0x0022A04C */
+#define SWFAN_MODE_AUTO   0u
+#define SWFAN_MODE_MANUAL 1u
+
+typedef struct _SWFAN_STATUS {
+    ULONG Version;          /* 3 */
+    ULONG Mode;             /* SWFAN_MODE_AUTO / SWFAN_MODE_MANUAL */
+    ULONG ManualPercent;    /* 0..100, what was asked for */
+    ULONG Duty;             /* 0..236, what the fan runs at now */
+    ULONG Temp;             /* higher of SoC and board, C */
+    ULONG TempValid;        /* 0 while the sensor is failing */
+    ULONG Guard;            /* 1 while 68 C forces 100 % */
+    ULONG Failsafe;         /* 1 while the sensor failsafe is active */
+} SWFAN_STATUS;
+
+typedef struct _SWFAN_SET {
+    ULONG Mode;
+    ULONG Percent;          /* used in manual mode, 0..100 */
+} SWFAN_SET;
+
 #define PWM_CSR_1        0x10
 #define PWM_CSR_EN       (1u << 31)
 #define PWM_DUTY_MAX     236u
@@ -52,6 +79,8 @@ typedef struct _SWBL_STATUS {
 #define TMP451_REMOTE    0x01
 #define POLL_MS          2000
 #define FAILSAFE_DUTY    153u
+#define GUARD_ON_C       68u
+#define GUARD_OFF_C      65u     /* the guard is released below this */
 
 typedef struct _SWFAN_DEVICE {
     volatile UCHAR *Pwm;
@@ -63,6 +92,12 @@ typedef struct _SWFAN_DEVICE {
     ULONG Duty;
     ULONG Failures;
     LONG Runs;
+    WDFWAITLOCK FanLock;    /* timer and IOCTL: everything below */
+    ULONG AutoDuty;         /* what the temperature steps ask for (keeps the hysteresis) */
+    BOOLEAN Manual;
+    ULONG ManualPercent;
+    BOOLEAN Guard;
+    ULONG Temp;
     WDFWAITLOCK BacklightLock;
     PVOID DisplayCallback;
     ULONG Brightness;
@@ -170,6 +205,26 @@ static ULONG SwFanDutyForTemp(ULONG Temp, ULONG Previous)
     return (Previous > 51) ? 51 : Previous;    /* 40-41 C: hold (at most the 42 C step) */
 }
 
+/* Duty from the mode, the guard and the sensor state. Caller holds FanLock. */
+static VOID SwFanApply(PSWFAN_DEVICE Dev)
+{
+    ULONG ManualDuty = Dev->ManualPercent * PWM_DUTY_MAX / 100;
+    ULONG Duty;
+
+    if (Dev->Failures >= 3) {
+        Duty = (Dev->Manual && ManualDuty > FAILSAFE_DUTY) ? ManualDuty : FAILSAFE_DUTY;
+    } else if (Dev->Guard) {
+        Duty = PWM_DUTY_MAX;
+    } else if (Dev->Manual) {
+        Duty = ManualDuty;
+    } else {
+        Duty = Dev->AutoDuty;
+    }
+    if (Dev->Pwm != NULL) {
+        SwFanSetDuty(Dev, Duty);
+    }
+}
+
 VOID SwFanEvtTimer(WDFTIMER Timer)
 {
     PSWFAN_DEVICE Dev = SwFanGetDevice(SwFanGetTimer(Timer)->Device);
@@ -180,19 +235,30 @@ VOID SwFanEvtTimer(WDFTIMER Timer)
     if (NT_SUCCESS(Status)) {
         Status = SwFanReadReg(Dev->Sensor, TMP451_LOCAL, &Local);
     }
+    WdfWaitLockAcquire(Dev->FanLock, NULL);
     if (NT_SUCCESS(Status)) {
         ULONG Temp = (Remote > Local) ? Remote : Local;
         Dev->Failures = 0;
-        SwFanSetDuty(Dev, SwFanDutyForTemp(Temp, Dev->Duty));
+        Dev->Temp = Temp;
+        Dev->AutoDuty = SwFanDutyForTemp(Temp, Dev->AutoDuty);
+        if (Temp >= GUARD_ON_C) {
+            Dev->Guard = TRUE;
+        } else if (Temp < GUARD_OFF_C) {
+            Dev->Guard = FALSE;
+        }
+    } else if (Dev->Failures < 3) {
+        ++Dev->Failures;
+    }
+    SwFanApply(Dev);
+    WdfWaitLockRelease(Dev->FanLock);
+    if (NT_SUCCESS(Status)) {
         SwFanTrace(L"TempSoC", Remote);
         SwFanTrace(L"TempBoard", Local);
     } else {
         SwFanTrace(L"LastSensorError", (ULONG)Status);
-        if (++Dev->Failures >= 3) {
-            SwFanSetDuty(Dev, FAILSAFE_DUTY);
-        }
     }
     SwFanTrace(L"Duty", Dev->Duty);
+    SwFanTrace(L"FanGuard", Dev->Guard);
     SwFanTrace(L"Runs", (ULONG)InterlockedIncrement(&Dev->Runs));
     if (!Dev->Stopping) {
         WdfTimerStart(Timer, WDF_REL_TIMEOUT_IN_MS(POLL_MS));    /* one-shot passive timer, re-armed */
@@ -256,6 +322,44 @@ VOID SwFanEvtIoDeviceControl(WDFQUEUE Queue, WDFREQUEST Request, size_t OutLengt
     ULONG_PTR Info = 0;
     UNREFERENCED_PARAMETER(OutLength);
     UNREFERENCED_PARAMETER(InLength);
+
+    if (Code == IOCTL_SWFAN_GET || Code == IOCTL_SWFAN_SET) {
+        WdfWaitLockAcquire(Dev->FanLock, NULL);
+        if (Code == IOCTL_SWFAN_GET) {
+            SWFAN_STATUS *Out;
+            Status = WdfRequestRetrieveOutputBuffer(Request, sizeof(*Out), (PVOID *)&Out, NULL);
+            if (NT_SUCCESS(Status)) {
+                Out->Version = 3;
+                Out->Mode = Dev->Manual ? SWFAN_MODE_MANUAL : SWFAN_MODE_AUTO;
+                Out->ManualPercent = Dev->ManualPercent;
+                Out->Duty = Dev->Duty;
+                Out->Temp = Dev->Temp;
+                Out->TempValid = (Dev->Failures == 0 && Dev->Temp != 0) ? 1 : 0;
+                Out->Guard = Dev->Guard ? 1 : 0;
+                Out->Failsafe = (Dev->Failures >= 3) ? 1 : 0;
+                Info = sizeof(*Out);
+            }
+        } else {
+            SWFAN_SET *In;
+            Status = WdfRequestRetrieveInputBuffer(Request, sizeof(*In), (PVOID *)&In, NULL);
+            if (NT_SUCCESS(Status) && In->Mode != SWFAN_MODE_AUTO && In->Mode != SWFAN_MODE_MANUAL) {
+                Status = STATUS_INVALID_PARAMETER;
+            }
+            if (NT_SUCCESS(Status)) {
+                Dev->Manual = (In->Mode == SWFAN_MODE_MANUAL);
+                Dev->ManualPercent = (In->Percent > 100) ? 100 : In->Percent;
+                SwFanApply(Dev);     /* at once; the guard uses the last reading */
+            }
+        }
+        WdfWaitLockRelease(Dev->FanLock);
+        if (Code == IOCTL_SWFAN_SET && NT_SUCCESS(Status)) {
+            SwFanTrace(L"FanMode", Dev->Manual ? SWFAN_MODE_MANUAL : SWFAN_MODE_AUTO);    /* record only, not restored */
+            SwFanTrace(L"FanManualPercent", Dev->ManualPercent);
+            SwFanTrace(L"Duty", Dev->Duty);
+        }
+        WdfRequestCompleteWithInformation(Request, Status, Info);
+        return;
+    }
 
     WdfWaitLockAcquire(Dev->BacklightLock, NULL);
     if (Code == IOCTL_SWBL_GET) {
@@ -364,7 +468,16 @@ NTSTATUS SwFanEvtSelfManagedIoInit(WDFDEVICE Device)
         SwFanSetDuty(Dev, FAILSAFE_DUTY);
         return Status;
     }
+    WdfWaitLockAcquire(Dev->FanLock, NULL);
     Dev->Duty = 76;                 /* what UEFI R366+ set */
+    Dev->AutoDuty = 76;
+    Dev->Manual = FALSE;            /* every start is automatic */
+    Dev->ManualPercent = 0;
+    Dev->Guard = FALSE;
+    Dev->Failures = 0;
+    Dev->Temp = 0;
+    WdfWaitLockRelease(Dev->FanLock);
+    SwFanTrace(L"FanMode", SWFAN_MODE_AUTO);
     if (Dev->Timer == NULL) {
         WDF_TIMER_CONFIG TimerConfig;
         WDF_OBJECT_ATTRIBUTES Attributes;
@@ -433,6 +546,10 @@ NTSTATUS SwFanEvtDeviceAdd(WDFDRIVER Driver, PWDFDEVICE_INIT DeviceInit)
     if (!NT_SUCCESS(Status)) {
         return Status;
     }
+    Status = WdfWaitLockCreate(WDF_NO_OBJECT_ATTRIBUTES, &SwFanGetDevice(Device)->FanLock);
+    if (!NT_SUCCESS(Status)) {
+        return Status;
+    }
     Status = WdfDeviceCreateSymbolicLink(Device, &LinkName);
     SwFanTrace(L"SymbolicLinkStatus", (ULONG)Status);
     if (!NT_SUCCESS(Status)) {
@@ -454,7 +571,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
         RtlCopyMemory(&SwFanParamsPath[RegistryPath->Length / sizeof(WCHAR)], L"\\Parameters", sizeof(L"\\Parameters"));
         (VOID)RtlCreateRegistryKey(RTL_REGISTRY_ABSOLUTE, SwFanParamsPath);
     }
-    SwFanTrace(L"DriverVersion", 2);
+    SwFanTrace(L"DriverVersion", 3);
     WDF_DRIVER_CONFIG_INIT(&Config, SwFanEvtDeviceAdd);
     return WdfDriverCreate(DriverObject, RegistryPath, WDF_NO_OBJECT_ATTRIBUTES, &Config, WDF_NO_HANDLE);
 }
