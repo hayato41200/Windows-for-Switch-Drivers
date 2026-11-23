@@ -28,7 +28,10 @@
  * enter on the same id, or on another id within CfgMergeRadius, continues the
  * same contact (same HID contact id, same touch-down point). Until the finger
  * moves more than CfgHoldRadius from where it touched down, the touch-down
- * point is reported. Reports carry a HID scan time (100 us units).
+ * point is reported.
+ * 1.0.0.7: no HID scan time any more (1.0.0.5/6 sent one; it wraps every
+ * 6.5 s, and single taps then came out as double taps). QuickRetaps counts a
+ * new touch near the last lift within 400 ms (a bouncing tap).
  */
 #include <ntddk.h>
 #include <ntstrsafe.h>
@@ -69,7 +72,6 @@ typedef struct _TOUCH_CONTACT_REPORT {
 typedef struct _TOUCH_REPORT {
     UCHAR ReportId;
     TOUCH_CONTACT_REPORT Contacts[TOUCH_MAX_CONTACTS];
-    USHORT ScanTime;        /* 100 us units, wraps */
     UCHAR ContactCount;
 } TOUCH_REPORT;
 #pragma pack(pop)
@@ -92,10 +94,6 @@ static UCHAR SwTouchReportDescriptor[] = {
     0x85, REPORT_ID_TOUCH,
     FINGER_COLLECTION, FINGER_COLLECTION, FINGER_COLLECTION, FINGER_COLLECTION, FINGER_COLLECTION,
     FINGER_COLLECTION, FINGER_COLLECTION, FINGER_COLLECTION, FINGER_COLLECTION, FINGER_COLLECTION,
-    /* Scan time: 16 bits, seconds x 10^-4. */
-    0x55, 0x0C, 0x66, 0x01, 0x10, 0x47, 0xFF, 0xFF, 0x00, 0x00, 0x27, 0xFF, 0xFF, 0x00, 0x00,
-    0x75, 0x10, 0x95, 0x01, 0x05, 0x0D, 0x09, 0x56, 0x81, 0x02,
-    0x45, 0x00, 0x55, 0x00, 0x65, 0x00,
     0x05, 0x0D, 0x09, 0x54, 0x15, 0x00, 0x25, TOUCH_MAX_CONTACTS, 0x75, 0x08, 0x95, 0x01, 0x81, 0x02,
     0x85, REPORT_ID_MAX_COUNT,
     0x09, 0x55, 0x25, TOUCH_MAX_CONTACTS, 0xB1, 0x02,
@@ -140,6 +138,11 @@ typedef struct _SWTOUCH_DEVICE {
     LONG Flickers;          /* leave + enter on the same id, kept as one contact */
     LONG Merges;            /* leave + enter on another id nearby, kept as one contact */
     LONG Releases;          /* leaves reported to Windows */
+    LONG QuickRetaps;       /* new touch near the last lift within 400 ms */
+    ULONG LastRetapMs;      /* lift to new touch, for the last QuickRetap */
+    ULONGLONG LastLiftTime; /* when the last lifted contact left (0 = none) */
+    USHORT LastLiftX;
+    USHORT LastLiftY;
 } SWTOUCH_DEVICE, *PSWTOUCH_DEVICE;
 WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(SWTOUCH_DEVICE, SwTouchGetDevice)
 
@@ -279,6 +282,28 @@ static UCHAR SwTouchFreeReportId(PSWTOUCH_DEVICE Dev, ULONG Self)
     return (UCHAR)Self;
 }
 
+static VOID SwTouchNoteLift(PSWTOUCH_DEVICE Dev, const TOUCH_CONTACT *C, ULONGLONG When)
+{
+    Dev->LastLiftTime = When;
+    Dev->LastLiftX = C->X;
+    Dev->LastLiftY = C->Y;
+}
+
+/* A new contact soon after a lift at the same place: the tap bounced (diagnostic). */
+static VOID SwTouchNoteNewTouch(PSWTOUCH_DEVICE Dev, USHORT X, USHORT Y, ULONGLONG Now)
+{
+    ULONGLONG Gap;
+
+    if (Dev->LastLiftTime == 0 || Now < Dev->LastLiftTime) {
+        return;
+    }
+    Gap = (Now - Dev->LastLiftTime) / 10000;
+    if (Gap < 400 && ABS_DIFF(X, Dev->LastLiftX) <= Dev->MergeRadius && ABS_DIFF(Y, Dev->LastLiftY) <= Dev->MergeRadius) {
+        InterlockedIncrement(&Dev->QuickRetaps);
+        Dev->LastRetapMs = (ULONG)Gap;
+    }
+}
+
 static BOOLEAN SwTouchParse(PSWTOUCH_DEVICE Dev, const UCHAR *Ev, ULONGLONG Now)
 {
     ULONG Type = Ev[0] & 0x0F, Id = Ev[0] >> 4, K;
@@ -297,6 +322,7 @@ static BOOLEAN SwTouchParse(PSWTOUCH_DEVICE Dev, const UCHAR *Ev, ULONGLONG Now)
             C->Active = FALSE;
             C->Released = TRUE;
             InterlockedIncrement(&Dev->Releases);
+            SwTouchNoteLift(Dev, C, Now);
             return TRUE;
         }
         /* Keep reporting the contact as down; SwTouchExpire lifts it. */
@@ -337,6 +363,7 @@ static BOOLEAN SwTouchParse(PSWTOUCH_DEVICE Dev, const UCHAR *Ev, ULONGLONG Now)
             C->Moving = FALSE;
             C->PendingUp = FALSE;
             C->ReportId = SwTouchFreeReportId(Dev, Id);
+            SwTouchNoteNewTouch(Dev, X, Y, Now);
             C->X = X;
             C->Y = Y;
             return TRUE;
@@ -370,6 +397,7 @@ static BOOLEAN SwTouchExpire(PSWTOUCH_DEVICE Dev, ULONGLONG Now)
             C->PendingUp = FALSE;
             C->Released = TRUE;
             InterlockedIncrement(&Dev->Releases);
+            SwTouchNoteLift(Dev, C, C->UpTime);
             Changed = TRUE;
         }
     }
@@ -400,7 +428,6 @@ static VOID SwTouchSendReport(PSWTOUCH_DEVICE Dev)
         return;
     }
     Dev->Report.ContactCount = (UCHAR)Count;
-    Dev->Report.ScanTime = (USHORT)(KeQueryInterruptTime() / 1000);
     Packet.reportBuffer = (PUCHAR)&Dev->Report;
     Packet.reportBufferLen = sizeof(Dev->Report);
     Packet.reportId = REPORT_ID_TOUCH;
@@ -494,6 +521,8 @@ VOID SwTouchEvtTimer(WDFTIMER Timer)
         SwTouchTrace(L"Flickers", (ULONG)Dev->Flickers);
         SwTouchTrace(L"Merges", (ULONG)Dev->Merges);
         SwTouchTrace(L"Releases", (ULONG)Dev->Releases);
+        SwTouchTrace(L"QuickRetaps", (ULONG)Dev->QuickRetaps);
+        SwTouchTrace(L"LastRetapMs", Dev->LastRetapMs);
     }
     if (!Dev->Stopping) {
         WdfTimerStart(Timer, WDF_REL_TIMEOUT_IN_MS((Irqs != 0 && !Touching) ? POLL_SLOW_MS : POLL_FAST_MS));
@@ -702,7 +731,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
         RtlCopyMemory(&SwTouchParamsPath[RegistryPath->Length / sizeof(WCHAR)], L"\\Parameters", sizeof(L"\\Parameters"));
         (VOID)RtlCreateRegistryKey(RTL_REGISTRY_ABSOLUTE, SwTouchParamsPath);
     }
-    SwTouchTrace(L"DriverVersion", 6);
+    SwTouchTrace(L"DriverVersion", 7);
     WDF_DRIVER_CONFIG_INIT(&Config, SwTouchEvtDeviceAdd);
     return WdfDriverCreate(DriverObject, RegistryPath, WDF_NO_OBJECT_ATTRIBUTES, &Config, WDF_NO_HANDLE);
 }
