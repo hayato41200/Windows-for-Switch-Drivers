@@ -73,7 +73,7 @@
 #include <stdarg.h>
 #include "../../SwitchGpu/src/swgpu-blit.h"
 
-#define SWD_VERSION        0x00010701u   /* 1.7.1 */
+#define SWD_VERSION        0x00010704u   /* 1.7.4 */
 #define SWD_NOSRC          0xFFu         /* target not in the topology */
 #define SWD_TAG            'DwsS'
 
@@ -381,6 +381,10 @@ static VOID GuardThread(PVOID Context)
         if (st == STATUS_WAIT_1) {
             DpHandle(ctx);
             FlushCounters(ctx);             /* 1.4.1: the 5 s notes kept the timeout from firing */
+            /* Claude 1.7.3: with the TV attached the DP notes never let the
+             * timeout fire, so 1.7.2 never connected to the GPU (connected 0).
+             * Connect here too; it returns at once once connected. */
+            if (ctx->GpuPresent) SwdGpuConnect(ctx);
             continue;
         }
         FlushCounters(ctx);

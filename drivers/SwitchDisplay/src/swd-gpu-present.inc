@@ -1,6 +1,11 @@
 /* Optional identity-only path. Discovery and registry publication run on
  * the existing guard thread. Present only calls an already-open endpoint. */
 static volatile LONG gGpuDisabled;
+static volatile LONG gGpuNotReady;          /* Claude 1.7.2: not-ready answers (not failures) */
+static volatile LONG gGpuSmall;             /* Claude 1.7.4: presents left on the CPU as too small */
+static volatile LONG gGpuNoDst;             /* Claude 1.7.4: no GPU destination MDL for that target */
+#define SWD_GPU_MIN_BYTES (512u * 1024u)
+static volatile LONG64 gGpuRetryAfter;      /* interrupt time before which the GPU is skipped */
 
 static VOID SwdGpuConnect(PSWD_CONTEXT Ctx)
 {
@@ -130,7 +135,18 @@ static NTSTATUS SwdGpuRects(PSWD_CONTEXT Ctx, const DXGKARG_PRESENT_DISPLAYONLY 
             out->RowBytes = (ULONG)(r.right - r.left) * 4u;
         }
     }
-    return req.Count == 0u ? STATUS_SUCCESS : SwdGpuSend(Ctx, &req);
+    if (req.Count == 0u) return STATUS_SUCCESS;
+    {
+        /* Claude 1.7.4: hardware F3 showed GPU 978 us vs CPU 506 us average
+         * per present: the GPU has ~0.9 ms fixed cost (map, L2, fence) and
+         * only wins above ~600 KB (CPU into write-combined ~600 MB/s, CE
+         * ~5 GB/s at 460.8 MHz). Small updates stay on the CPU. */
+        ULONGLONG total = 0u;
+        for (i = 0u; i < req.Count; ++i)
+            total += (ULONGLONG)req.Rect[i].Rows * req.Rect[i].RowBytes;
+        if (total < SWD_GPU_MIN_BYTES) return STATUS_NOT_SUPPORTED;
+    }
+    return SwdGpuSend(Ctx, &req);
 }
 
 static BOOLEAN SwdGpuTry(PSWD_CONTEXT Ctx, const DXGKARG_PRESENT_DISPLAYONLY *Present,
@@ -144,15 +160,32 @@ static BOOLEAN SwdGpuTry(PSWD_CONTEXT Ctx, const DXGKARG_PRESENT_DISPLAYONLY *Pr
     if (!Ctx->GpuPresent || gGpuDisabled) return FALSE;
     /* The guard thread may still be discovering the GPU after boot. */
     if (Ctx->GpuTarget == NULL) return FALSE;
+    /* Claude 1.7.2: after a "not ready/busy" answer, leave the GPU alone for
+     * 1 s (the GPU becomes resident ~2 s after the display starts). */
+    if ((LONGLONG)KeQueryInterruptTime() < InterlockedCompareExchange64(&gGpuRetryAfter, 0, 0))
+        return FALSE;
+    /* Claude 1.7.4: no destination MDL (e.g. the panel FbMdl) is not a GPU
+     * problem: 1.7.3 reported it as NOT_READY and its 1 s back-off then kept
+     * the TV off the GPU too. Just use the CPU for that target. */
+    if (Dst == NULL) { InterlockedIncrement(&gGpuNoDst); return FALSE; }
     start = KeQueryPerformanceCounter(&freq);
     status = SwdGpuRects(Ctx, Present, Src, Dst, Top, Bottom, Width, Pitch);
     us = SwdGpuUs(start, freq);
+    if (status == STATUS_NOT_SUPPORTED) { InterlockedIncrement(&gGpuSmall); return FALSE; }
     InterlockedExchange(&Ctx->GpuLastStatus, (LONG)status);
     if (NT_SUCCESS(status)) {
         *GpuSuccess = TRUE;
         *GpuUs += us;
         InterlockedExchange(&Ctx->GpuStreak, 0);
         return TRUE;
+    }
+    if (status == STATUS_DEVICE_NOT_READY || status == STATUS_DEVICE_BUSY) {
+        /* Claude 1.7.2: 1.7.1 counted "GPU not resident yet" at boot as
+         * failures and disabled the GPU path after 3. Not a failure: fall
+         * back to the CPU and retry after 1 s (10,000,000 x 100 ns). */
+        InterlockedIncrement(&gGpuNotReady);
+        InterlockedExchange64(&gGpuRetryAfter, (LONGLONG)KeQueryInterruptTime() + 10000000LL);
+        return FALSE;
     }
     InterlockedIncrement(&Ctx->GpuFailures);
     if (status == SWGPU_BLIT_DMA_UNSAFE) {
@@ -181,5 +214,8 @@ static VOID SwdGpuFlushCounters(PSWD_CONTEXT Ctx)
     RegPutDword(L"GpuCpuAverageUs", cpu > 0 ? (ULONG)(cpuUs / cpu) : 0u);
     RegPutDword(L"GpuLastStatus", (ULONG)Ctx->GpuLastStatus);
     RegPutDword(L"GpuDisabled", (ULONG)gGpuDisabled);
+    RegPutDword(L"GpuNotReady", (ULONG)gGpuNotReady);
+    RegPutDword(L"GpuSmall", (ULONG)gGpuSmall);
+    RegPutDword(L"GpuNoDst", (ULONG)gGpuNoDst);
     RegPutDword(L"GpuConnected", Ctx->GpuTarget != NULL);
 }
