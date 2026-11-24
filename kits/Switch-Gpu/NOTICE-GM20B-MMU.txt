@@ -473,3 +473,23 @@ GM20B register headers hw_mc_gm20b.h, hw_fifo_gm20b.h, and hw_gr_gm20b.h.
 The NON_STALL_INT method definition was checked against NVIDIA open-gpu-doc
 dev_pbdma.ref and class B06F method definitions. Register and method values
 are used as data; no third-party source code was copied or adapted.
+
+0.10.0 F1 copy-engine references (hardware facts and method values only):
+- Linux Nouveau nvkm/engine/device/base.c (GM20B registers CE instance 2),
+  nvkm/engine/ce/gm200.c (MAXWELL_DMA_COPY_A), ce/gk104.c (CE interrupt mask,
+  status and launch error), and nvkm/engine/fifo/gk104.c (TOP runlist routing).
+  Nouveau CE sources: Copyright 2012/2015 Red Hat Inc., MIT.
+  https://github.com/torvalds/linux/tree/v6.12/drivers/gpu/drm/nouveau/nvkm/engine
+- NVIDIA nvgpu gk20a/fifo_gk20a.h (GR copy engine identification) and
+  hw_ce2_gm20b.h (CE2 interrupt status), consulted for facts only.
+  https://android.googlesource.com/kernel/tegra/+/android-tegra-3.10/drivers/gpu/nvgpu/gk20a/fifo_gk20a.h
+- devkitPro/deko3d source/dk_queue.cpp and source/maxwell/gpu_base.cpp
+  (Copy and 3D on the Switch GPU channel), source/maxwell/helpers.h
+  (subchannel 4 and class-only non-incrementing SET_OBJECT), engine_copy.def
+  and gpu_transfer.cpp (linear copy flags and byte length).
+  https://github.com/devkitPro/deko3d/tree/master/source/maxwell
+- NVIDIA open-gpu-doc clb0b5.h and clb06f.h (CE launch/fence and host
+  acquire/release/nonstall methods), Copyright (c) 2019/2020 NVIDIA
+  Corporation, MIT.
+  https://github.com/NVIDIA/open-gpu-doc/blob/master/classes/dma-copy/clb0b5.h
+  https://github.com/NVIDIA/open-gpu-doc/blob/master/classes/host/clb06f.h

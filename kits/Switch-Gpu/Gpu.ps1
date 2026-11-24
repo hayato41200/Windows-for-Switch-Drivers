@@ -11,6 +11,7 @@
   -Mode Submit : submit repeated 3D clears on the resident channel (E2); no power-up.
   -Mode Irq    : run 64 interrupt-driven clears on the resident channel (E3);
                  requires UEFI R447H or later and does not power up the GPU.
+  -Mode Copy   : run 16 CE2 buffer copies on the resident channel.
   -Mode Cycle  : five Resident / 8-clear / Stop cycles using one DMA pool.
   -Mode VerboseOn / VerboseOff : change driver logging at the next device start.
 
@@ -20,7 +21,7 @@
 param(
   [Parameter(Mandatory = $true)]
   [ValidateSet('Install', 'Status', 'Resident', 'ResidentStatus', 'ResidentStop',
-               'Submit', 'Irq', 'Cycle', 'Remove', 'VerboseOn', 'VerboseOff')]
+               'Submit', 'Irq', 'Copy', 'Cycle', 'Remove', 'VerboseOn', 'VerboseOff')]
   [string]$Mode,
   [switch]$Detail
 )
@@ -138,8 +139,26 @@ public static class SwGpuResidentControl {
       UInt32 size = (UInt32)Marshal.SizeOf(typeof(CycleResult));
       if (!DeviceIoControlCycle(h, 0x22E010u, IntPtr.Zero, 0, out r, size, out got, IntPtr.Zero))
         throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
-      if (got != size || r.Version != 0x900u)
+      if (got != size || r.Version != 0xA00u)
         throw new InvalidOperationException("Unexpected SwitchGpu Cycle response");
+      return r;
+    });
+  }
+  [StructLayout(LayoutKind.Sequential)] public struct CopyResult {
+    public UInt32 Version, Result, Rounds, BytesCopied, FailRound, LastSize;
+    public UInt32 MismatchOffset, Expected, Actual, MaxWaitUs, MaxPolls, IrqWakes, IrqTimeouts;
+    public UInt32 Pending, CeIntr, CeLaunchError, FifoIntr, FaultId, PbdmaIntr, GrIntr;
+  }
+  [DllImport("kernel32.dll", EntryPoint="DeviceIoControl", SetLastError=true)]
+  static extern bool DeviceIoControlCopy(SafeFileHandle h, UInt32 code, IntPtr input, UInt32 inSize, out CopyResult output, UInt32 outSize, out UInt32 returned, IntPtr overlapped);
+  public static CopyResult RunCopy() {
+    return WithDevice<CopyResult>(delegate(SafeFileHandle h) {
+      CopyResult r; UInt32 got;
+      UInt32 size = (UInt32)Marshal.SizeOf(typeof(CopyResult));
+      if (!DeviceIoControlCopy(h, 0x22E014u, IntPtr.Zero, 0, out r, size, out got, IntPtr.Zero))
+        throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+      if (got != size || r.Version != 0xA00u)
+        throw new InvalidOperationException("Unexpected SwitchGpu Copy response");
       return r;
     });
   }
@@ -303,6 +322,14 @@ public static class SwGpuIrqControl {
     (Hex $r.ResultCode), $irqText, $r.Rounds, $r.Waits, $r.NonstallCount, $r.StallCount, (Hex $r.StallUnits), $r.MaxWaitUs, $r.TotalUs, $r.Timeouts, (Hex $r.FirstMcIntr0), (Hex $r.FirstMcIntr1), (Hex $r.LastMcIntr0), (Hex $r.LastMcIntr1), (Hex $r.Semaphore), (Hex $r.PixelFirst), (Hex $r.PixelMiddle), (Hex $r.PixelLast))
 }
 
+function Show-F1Copy($c) {
+  Sum ('F1 copy result {0}; rounds {1}/16; bytes {2}; max wait us {3}; max polls {4}; nonstall wakes/timeouts {5}/{6}' -f (Hex $c.Result), $c.Rounds, $c.BytesCopied, $c.MaxWaitUs, $c.MaxPolls, $c.IrqWakes, $c.IrqTimeouts)
+  if ($c.Result -ne 0) {
+    Sum ('F1 failure round {0}; size {1}; first mismatch offset/expected/actual {2}/{3}/{4}; pending {5}' -f $c.FailRound, $c.LastSize, (Hex $c.MismatchOffset), (Hex $c.Expected), (Hex $c.Actual), $c.Pending)
+    Sum ('F1 CE2 intr/launch error {0}/{1}; FIFO intr/fault id {2}/{3}; PBDMA intr {4}; GR intr {5}' -f (Hex $c.CeIntr), (Hex $c.CeLaunchError), (Hex $c.FifoIntr), (Hex $c.FaultId), (Hex $c.PbdmaIntr), (Hex $c.GrIntr))
+  }
+}
+
 function Show-E4Pool($p) {
   if ($null -ne $p.E4PoolResult) {
     Sum ('E4 pool result {0}; reserved/peak/in-use bytes {1}/{2}/{3}; checkouts/returns {4}/{5}; fallbacks {6}; failures {7}' -f (Hex $p.E4PoolResult), $p.E4PoolBytes, $p.E4PoolUsedPeak, $p.E4PoolUsed, $p.E4PoolAllocs, $p.E4PoolFrees, $p.E4PoolFallbacks, $p.E4PoolFailures)
@@ -396,6 +423,16 @@ switch ($Mode) {
     try { Invoke-ResidentControl ($Mode -eq 'ResidentStop') }
     catch { Sum ('resident IOCTL failed: {0}' -f $_.Exception.Message) }
     Show-Device; Log ''; Show-Trace
+  }
+  'Copy' {
+    try {
+      Initialize-ResidentControl
+      Show-F1Copy ([SwGpuResidentControl]::RunCopy())
+    } catch {
+      Sum ('F1 copy result: IOCTL failed (resident channel required): {0}' -f $_.Exception.Message)
+    }
+    Show-Device
+    if ($Detail) { Show-Trace }
   }
   'Cycle' {
     if (Import-GpuFirmware) { Invoke-ResidentCycle }

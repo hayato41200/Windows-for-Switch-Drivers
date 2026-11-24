@@ -38,7 +38,7 @@
 #include <wdf.h>
 #include <spb.h>
 
-#define SWGPU_VERSION      0x00000900u   /* 0.9.0 */
+#define SWGPU_VERSION      0x00000A00u   /* 0.10.0 */
 
 #define CAR_PHYS           0x60006000ull
 #define CAR_LEN            0x1000u
@@ -146,6 +146,7 @@ static const GUID GUID_DEVINTERFACE_SWGPU_RESIDENT =
 #define IOCTL_SWGPU_SUBMIT_TEST     CTL_CODE(FILE_DEVICE_UNKNOWN, 0x802, METHOD_BUFFERED, FILE_READ_ACCESS | FILE_WRITE_ACCESS)
 #define IOCTL_SWGPU_IRQ_TEST        CTL_CODE(FILE_DEVICE_UNKNOWN, 0x803, METHOD_BUFFERED, FILE_READ_ACCESS | FILE_WRITE_ACCESS)
 #define IOCTL_SWGPU_CYCLE_TEST      CTL_CODE(FILE_DEVICE_UNKNOWN, 0x804, METHOD_BUFFERED, FILE_READ_ACCESS | FILE_WRITE_ACCESS)
+#define IOCTL_SWGPU_COPY_TEST       CTL_CODE(FILE_DEVICE_UNKNOWN, 0x805, METHOD_BUFFERED, FILE_READ_ACCESS | FILE_WRITE_ACCESS)
 
 /* GM20B NV_PMC / PFIFO interrupt source registers (nvgpu hw_mc_gm20b.h). */
 #define PMC_INTR_STATUS_STALL       0x00000100u
@@ -206,6 +207,12 @@ typedef struct _SWGPU_E4_RESULT {
     ULONG PoolResult, PoolBytes, PoolUsedPeak, PoolFallbacks, PoolAllocs;
     ULONG PoolFrees, PoolFailures, PoolUsed;
 } SWGPU_E4_RESULT, *PSWGPU_E4_RESULT;
+
+typedef struct _SWGPU_F1_RESULT {
+    ULONG Version, Result, Rounds, BytesCopied, FailRound, LastSize;
+    ULONG MismatchOffset, Expected, Actual, MaxWaitUs, MaxPolls, IrqWakes, IrqTimeouts;
+    ULONG Pending, CeIntr, CeLaunchError, FifoIntr, FaultId, PbdmaIntr, GrIntr;
+} SWGPU_F1_RESULT, *PSWGPU_F1_RESULT;
 
 typedef enum _SWGPU_POOL_REGION {
     SwGpuPoolGr, SwGpuPoolAcr, SwGpuPoolWpr, SwGpuPoolRegionCount
@@ -269,6 +276,7 @@ typedef struct _SWGPU_DEVICE {
     volatile LONG  E3LastMcIntr1;
     volatile LONG  E3FirstSet;
     KEVENT         E3Event;
+    BOOLEAN        CopyInFlight;
     ULONG          ResidentRunlistEmptyValue;
     ULONG          ResidentChannelId;
     ULONG          ResidentShutdownResult;
@@ -675,9 +683,18 @@ static BOOLEAN PmuBindInst(volatile UCHAR *B, ULONGLONG instAddress,
 #define GR_VM_D2_RUNLIST_OFF 0x1D4000u
 #define GR_VM_D2_PUSHBUF_OFF 0x1D5000u
 #define GR_VM_D2_RT_OFF      0x1D6000u /* D5 pitch-linear 64x64x4 render target */
+#define GR_VM_F1_PUSH_OFF    0x1DA000u /* Dedicated copy pushbuffer and completion words */
+#define GR_VM_F1_SRC_OFF     0x1E0000u /* 64 KiB, mapped by the existing arena PTEs */
+#define GR_VM_F1_DST_OFF     0x1F0000u /* 64 KiB, ends at the end of the arena */
+#define GR_VM_F1_BYTES       0x10000u
 #define GR_VM_GPU_PGT_BAR1_OFF 0x1A0000u /* spare 64 KiB-aligned segment within the PGT backing */
 #define GR_VM_GPU_VA       0x18000000u
 #define GR_VM_PAGE_COUNT   (GR_VM_ARENA_SIZE >> 12)
+
+C_ASSERT(GR_VM_D2_RT_OFF + 64u * 64u * sizeof(ULONG) <= GR_VM_F1_PUSH_OFF);
+C_ASSERT(GR_VM_F1_PUSH_OFF + PAGE_SIZE <= GR_VM_F1_SRC_OFF);
+C_ASSERT(GR_VM_F1_SRC_OFF + GR_VM_F1_BYTES <= GR_VM_F1_DST_OFF);
+C_ASSERT(GR_VM_F1_DST_OFF + GR_VM_F1_BYTES <= GR_VM_ARENA_SIZE);
 
 /* E4 DMA allocation inventory (Resident, Submit and Irq):
  * - GR: 2 MiB, page aligned, below 4 GiB, within one 4 MiB window,
@@ -7476,6 +7493,279 @@ done:
     return result;
 }
 
+/* F1: Maxwell CE2/GR copy on the existing GR runlist. Nouveau's GM20B
+ * device table selects gm200_ce for CE2. On the Switch, deko3d binds Copy
+ * and 3D on one GPU channel. Use a spare subchannel, with no RAMFC changes. */
+#define F1_CE_ENABLE         (1u << 21)
+#define F1_CE_INTR_ENABLE    0x00106904u
+#define F1_CE_INTR_STATUS    0x00106908u
+#define F1_CE_LAUNCH_ERROR   0x00106F14u
+#define F1_COPY_SUBCHANNEL   4u
+#define F1_COPY_ERROR        0xE00000AAu
+
+static ULONG F1Method(ULONG Subchannel, ULONG MethodBytes, ULONG Count)
+{
+    return 0x20000000u | (Count << 16) | (Subchannel << 13) | (MethodBytes >> 2);
+}
+
+static UCHAR F1Pattern(ULONG Round, ULONG Offset)
+{
+    return (UCHAR)((Offset * 73u) ^ (Offset >> 8) ^ (Round * 29u + 1u));
+}
+
+/* BAR1 GP_PUT is a USERD doorbell. Log the BAR1-relative offset separately
+ * from the BAR0 L2 writes, and check the priv ring just as for BAR0. */
+static BOOLEAN F1Publish(PSWGPU_DEVICE Dev, ULONG NewPut, ULONG (*write)[4])
+{
+    const ULONG putOffset = BAR1_D3_LOW_VA + 0x8Cu;
+    BOOLEAN ok;
+    (*write)[0] = putOffset;
+    (*write)[1] = Rd(Dev->Bar1Cpu, putOffset);
+    (*write)[2] = NewPut;
+    Dev->CopyInFlight = TRUE;
+    KeMemoryBarrier();
+    Wr(Dev->Bar1Cpu, putOffset, NewPut);
+    KeMemoryBarrier();
+    (*write)[3] = Rd(Dev->Bar1Cpu, putOffset);
+    ok = B3cPrivRingAfterGrWrite(Dev->Bar0, putOffset, NewPut);
+    return ok && (*write)[3] == NewPut;
+}
+
+static VOID F1CaptureFailure(volatile UCHAR *B, PSWGPU_F1_RESULT Out)
+{
+    ULONG records[8][5], count = 0u, unit, word;
+    ULONG enable = Rd(B, NV_PMC_ENABLE);
+    if ((enable & F1_CE_ENABLE) != 0u) {
+        Out->CeIntr = Rd(B, F1_CE_INTR_STATUS);
+        Out->CeLaunchError = Rd(B, F1_CE_LAUNCH_ERROR);
+        Trace(L"F1CeIntrEnable", Rd(B, F1_CE_INTR_ENABLE));
+    }
+    Out->FifoIntr = Rd(B, FIFO_INTR_0);
+    Out->FaultId = Rd(B, 0x0000259Cu);
+    Out->PbdmaIntr = Rd(B, 0x00040108u);
+    if ((enable & PMC_INTR_PGRAPH_PENDING) != 0u) {
+        Out->GrIntr = Rd(B, 0x00400100u);
+        Trace(L"F1GrException", Rd(B, 0x00400108u));
+        Trace(L"F1GrClassError", Rd(B, 0x00400110u));
+        Trace(L"F1GrTrappedAddr", Rd(B, 0x00400704u));
+        Trace(L"F1GrTrappedData", Rd(B, 0x00400708u));
+    }
+    for (unit = 0u; unit < 32u && count < RTL_NUMBER_OF(records); ++unit) {
+        if ((Out->FaultId & (1u << unit)) == 0u) continue;
+        records[count][0] = unit;
+        for (word = 0u; word < 4u; ++word)
+            records[count][1u + word] = Rd(B, 0x00002800u + unit * 16u + word * 4u);
+        ++count;
+    }
+    if (count != 0u) TraceErrorBin(L"F1FaultRecords", records, count * sizeof(records[0]));
+    Trace(L"F1PmcEnable", enable);
+    Trace(L"F1PmcIntr0", Rd(B, PMC_INTR_STATUS_STALL));
+    Trace(L"F1PmcIntr1", Rd(B, PMC_INTR_STATUS_NONSTALL));
+    Trace(L"F1MmuFaultStatus", Rd(B, 0x00002A30u));
+    Trace(L"F1PbdmaIntr1", Rd(B, 0x00040148u));
+    Trace(L"F1FifoEngine0", Rd(B, 0x00002640u));
+    Trace(L"F1FifoEngine1", Rd(B, 0x00002644u));
+}
+
+static VOID F1CopyTest(PSWGPU_DEVICE Dev, PSWGPU_F1_RESULT Out)
+{
+    static const ULONG sizes[16] = {
+        0x1000u, 0x1040u, 0x2000u, 0x3000u, 0x4000u, 0x5040u, 0x6000u, 0x7000u,
+        0x8000u, 0x9000u, 0xA000u, 0xB000u, 0xC000u, 0xD040u, 0xE000u, 0x10000u
+    };
+    const ULONG pushVa = GR_VM_GPU_VA + GR_VM_F1_PUSH_OFF;
+    const ULONG ceSemVa = pushVa + PAGE_SIZE - 32u, hostSemVa = ceSemVa + 16u;
+    const ULONG ringEntries = PAGE_SIZE / 8u;
+    const ULONG putOffset = BAR1_D3_LOW_VA + 0x8Cu, getOffset = BAR1_D3_LOW_VA + 0x88u;
+    volatile UCHAR *B = Dev->Bar0;
+    volatile ULONG *semaphores;
+    PULONG ring, push;
+    PUCHAR src, dst;
+    ULONG writes[2][4] = { { 0u } }, doorbellWrite[4] = { 0u };
+    ULONG l2State[4] = { 0u }, writeCount = 0u, stage = 1u, get = 0u, put = 0u;
+    ULONG round, i, polls, ceSeen = 0u, hostSeen = 0u;
+    ULONG flushMax = 0u, invalidateMax = 0u;
+    LARGE_INTEGER frequency, waitLimit;
+
+    RtlZeroMemory(Out, sizeof(*Out));
+    Out->Version = SWGPU_VERSION;
+    Out->Result = F1_COPY_ERROR;
+    Out->MismatchOffset = MAXULONG;
+    B3cPrivRingResetWriteLog();
+    Step(115);
+    if (B == NULL || Dev->CopyInFlight || Dev->Bar1Cpu == NULL ||
+        Dev->Bar1MapLen < BAR1_D3_MAP_LEN || !Dev->ResidentChannelEnabled ||
+        !Dev->ResidentRunlistSubmitted || !Dev->ResidentInstBound ||
+        !g_AcrVm.PtbChanged || !g_GrVm.PtbChanged || !g_GrVm.Active || g_GrVm.Arena == NULL ||
+        (Rd(B, NV_PMC_ENABLE) & F1_CE_ENABLE) == 0u)
+        goto done;
+    ring = (PULONG)((PUCHAR)g_GrVm.Arena + GR_VM_D2_GPFIFO_OFF);
+    push = (PULONG)((PUCHAR)g_GrVm.Arena + GR_VM_F1_PUSH_OFF);
+    semaphores = (volatile ULONG *)((PUCHAR)push + PAGE_SIZE - 32u);
+    src = (PUCHAR)g_GrVm.Arena + GR_VM_F1_SRC_OFF;
+    dst = (PUCHAR)g_GrVm.Arena + GR_VM_F1_DST_OFF;
+    put = Rd(Dev->Bar1Cpu, putOffset);
+    get = Rd(Dev->Bar1Cpu, getOffset);
+    stage = 2u;
+    if (put >= ringEntries || get != put || Rd(B, 0x00002A30u) != 0u ||
+        (Rd(B, FIFO_INTR_0) & 0x10000000u) != 0u)
+        goto done;
+    (VOID)KeQueryPerformanceCounter(&frequency);
+    waitLimit.QuadPart = -1000000LL; /* 100 ms for nonstall event. */
+
+    for (round = 0u; round < RTL_NUMBER_OF(sizes); ++round) {
+        ULONG size = sizes[round];
+        ULONG cePayload = 0xF1000000u | (round + 1u);
+        ULONG hostPayload = 0xF1FF0000u | (round + 1u);
+        ULONG cursor = 0u, newPut = (put + 1u) % ringEntries;
+        LARGE_INTEGER started, now;
+        ULONGLONG elapsedUs;
+        BOOLEAN complete = FALSE, flushOk = TRUE, useIrq;
+
+        Out->FailRound = round + 1u;
+        Out->LastSize = size;
+        useIrq = Dev->InterruptSourcesEnabled &&
+            (Rd(B, PMC_INTR_EN_NONSTALL) & 1u) != 0u &&
+            (Rd(B, FIFO_INTR_EN_1) & FIFO_INTR_0_CHANNEL_INTR) != 0u;
+        for (i = 0u; i < GR_VM_F1_BYTES; ++i) src[i] = F1Pattern(round, i);
+        RtlZeroMemory(dst, GR_VM_F1_BYTES);
+        semaphores[0] = 0u;
+        semaphores[4] = 0u;
+
+        if (round == 0u) {
+            /* Non-incrementing single-word SET_OBJECT, as on Switch in
+             * deko3d's BindEngine(Copy). The payload is the class alone. */
+            push[cursor++] = 0x60010000u | (F1_COPY_SUBCHANNEL << 13);
+            push[cursor++] = 0xB0B5u; /* MAXWELL_DMA_COPY_A */
+        }
+        /* NVIDIA clb0b5: virtual input/output, 1D pitch copy. LINE_COUNT
+         * is 1, and pitch fields are ignored with MULTI_LINE_ENABLE clear. */
+        push[cursor++] = F1Method(F1_COPY_SUBCHANNEL, 0x0400u, 8u);
+        push[cursor++] = 0u; /* OFFSET_IN_UPPER */
+        push[cursor++] = GR_VM_GPU_VA + GR_VM_F1_SRC_OFF;
+        push[cursor++] = 0u; /* OFFSET_OUT_UPPER */
+        push[cursor++] = GR_VM_GPU_VA + GR_VM_F1_DST_OFF;
+        push[cursor++] = size; /* PITCH_IN */
+        push[cursor++] = size; /* PITCH_OUT */
+        push[cursor++] = size; /* LINE_LENGTH_IN, bytes */
+        push[cursor++] = 1u; /* LINE_COUNT */
+        push[cursor++] = F1Method(F1_COPY_SUBCHANNEL, 0x0240u, 3u); /* CE SET_SEMAPHORE_A/B/PAYLOAD */
+        push[cursor++] = 0u;
+        push[cursor++] = ceSemVa;
+        push[cursor++] = cePayload;
+        push[cursor++] = F1Method(F1_COPY_SUBCHANNEL, 0x0300u, 1u); /* LAUNCH_DMA */
+        push[cursor++] = 0x18Eu; /* nonpipelined, flush, 1-word CE release, pitch/pitch */
+
+        /* Host semaphore acquire must observe CE completion before the
+         * trailing host release and interrupt. NVB06F host methods are on
+         * subchannel 0 and do not require a SET_OBJECT for B06F. */
+        push[cursor++] = F1Method(0u, 0x0010u, 4u);
+        push[cursor++] = 0u;
+        push[cursor++] = ceSemVa;
+        push[cursor++] = cePayload;
+        push[cursor++] = 1u; /* ACQUIRE equality */
+        push[cursor++] = F1Method(0u, 0x0010u, 4u);
+        push[cursor++] = 0u;
+        push[cursor++] = hostSemVa;
+        push[cursor++] = hostPayload;
+        push[cursor++] = 0x01100002u; /* 4-byte RELEASE, CE acquire already ordered it */
+        if (useIrq) {
+            push[cursor++] = 0x20010008u; /* NON_STALL_INTERRUPT */
+            push[cursor++] = 0u;
+            KeClearEvent(&Dev->E3Event);
+        }
+        ring[put * 2u] = pushVa;
+        ring[put * 2u + 1u] = cursor << 10;
+        KeMemoryBarrier();
+        stage = 3u;
+        writeCount = 0u;
+        if (!B3cD5L2Flush(B, writes, &writeCount, RTL_NUMBER_OF(writes), l2State))
+            goto done;
+        if (l2State[0] > flushMax) flushMax = l2State[0];
+        if (l2State[2] > invalidateMax) invalidateMax = l2State[2];
+        stage = 4u;
+        started = KeQueryPerformanceCounter(NULL);
+        if (!F1Publish(Dev, newPut, &doorbellWrite)) goto done;
+        if (useIrq) {
+            if (KeWaitForSingleObject(&Dev->E3Event, Executive, KernelMode, FALSE,
+                    &waitLimit) == STATUS_SUCCESS)
+                ++Out->IrqWakes;
+            else
+                ++Out->IrqTimeouts;
+        }
+        /* Verification also serves as fallback if the wake was lost or
+         * nonstall is disabled. Bound it by rounds and elapsed time. */
+        for (polls = 0u; polls < 2000u; ++polls) {
+            writeCount = 0u;
+            flushOk = B3cD5L2Flush(B, writes, &writeCount, RTL_NUMBER_OF(writes), l2State);
+            if (l2State[0] > flushMax) flushMax = l2State[0];
+            if (l2State[2] > invalidateMax) invalidateMax = l2State[2];
+            if (!flushOk) break;
+            KeMemoryBarrier();
+            ceSeen = semaphores[0];
+            hostSeen = semaphores[4];
+            get = Rd(Dev->Bar1Cpu, getOffset);
+            complete = ceSeen == cePayload && hostSeen == hostPayload && get == newPut;
+            now = KeQueryPerformanceCounter(NULL);
+            if (complete || (Rd(B, FIFO_INTR_0) & 0x10000000u) != 0u ||
+                now.QuadPart - started.QuadPart >= frequency.QuadPart / 10)
+                break;
+            Us(10u);
+        }
+        if (polls > Out->MaxPolls) Out->MaxPolls = polls;
+        now = KeQueryPerformanceCounter(NULL);
+        elapsedUs = (ULONGLONG)(now.QuadPart - started.QuadPart) * 1000000ull /
+            (ULONGLONG)frequency.QuadPart;
+        if (elapsedUs > Out->MaxWaitUs)
+            Out->MaxWaitUs = elapsedUs > MAXULONG ? MAXULONG : (ULONG)elapsedUs;
+        stage = flushOk ? 6u : 5u;
+        if (!complete) goto done;
+        Dev->CopyInFlight = FALSE;
+        stage = 7u;
+        if (Rd(B, 0x00002A30u) != 0u || (Rd(B, FIFO_INTR_0) & 0x10000000u) != 0u)
+            goto done;
+        for (i = 0u; i < GR_VM_F1_BYTES; ++i) {
+            UCHAR expected = i < size ? F1Pattern(round, i) : 0u;
+            UCHAR actual = dst[i];
+            if (actual != expected) {
+                Out->MismatchOffset = i;
+                Out->Expected = expected;
+                Out->Actual = actual;
+                stage = 8u;
+                goto done;
+            }
+        }
+        ++Out->Rounds;
+        Out->BytesCopied += size;
+        put = newPut;
+    }
+    Out->Result = 0u;
+    Out->FailRound = 0u;
+    stage = 0u;
+
+done:
+    Out->Pending = Dev->CopyInFlight ? 1u : 0u;
+    if (Out->Result != 0u && B != NULL) F1CaptureFailure(B, Out);
+#define F1_TRACE(Field) Trace(L"F1" #Field, Out->Field)
+    F1_TRACE(Rounds); F1_TRACE(BytesCopied); F1_TRACE(FailRound); F1_TRACE(LastSize);
+    F1_TRACE(MismatchOffset); F1_TRACE(Expected); F1_TRACE(Actual); F1_TRACE(MaxWaitUs);
+    F1_TRACE(MaxPolls); F1_TRACE(IrqWakes); F1_TRACE(IrqTimeouts); F1_TRACE(Pending);
+    F1_TRACE(CeIntr); F1_TRACE(CeLaunchError); F1_TRACE(FifoIntr); F1_TRACE(FaultId);
+    F1_TRACE(PbdmaIntr); F1_TRACE(GrIntr);
+#undef F1_TRACE
+    Trace(L"F1Stage", stage);
+    Trace(L"F1LastGpGet", get);
+    Trace(L"F1LastCeSemaphore", ceSeen);
+    Trace(L"F1LastHostSemaphore", hostSeen);
+    Trace(L"F1L2FlushMaxPolls", flushMax);
+    Trace(L"F1L2InvalidateMaxPolls", invalidateMax);
+    TraceBin(L"F1Bar1Doorbell", doorbellWrite, sizeof(doorbellWrite));
+    TraceBin(L"F1L2Writes", writes, writeCount * sizeof(writes[0]));
+    B3cPrivRingTraceWriteLog(L"F1PrivErrorCount", L"F1PrivErrorDropped",
+        L"F1PrivAckTimeouts", L"F1PrivErrors");
+    TraceDurable(L"F1Result", Out->Result);
+}
+
 static ULONG B3ePowerDownGpu(PSWGPU_DEVICE Dev, PSWGPU_RESIDENT_POWER Power)
 {
     ULONG i, error = 0u;
@@ -7513,6 +7803,7 @@ static ULONG B3ePowerDownGpu(PSWGPU_DEVICE Dev, PSWGPU_RESIDENT_POWER Power)
     }
     GrVmCleanupAfterGpuReset(Dev);
     AcrVmCleanupAfterGpuReset(Dev);
+    Dev->CopyInFlight = FALSE;
     E4TracePool(&Dev->DmaPool);
     Power->Valid = FALSE;
     Trace(L"B3ePowerDownError", error);
@@ -7916,6 +8207,30 @@ VOID SwGpuEvtIoDeviceControl(WDFQUEUE Queue, WDFREQUEST Request,
     PSWGPU_E3_RESULT e3Out = NULL;
     NTSTATUS status;
     UNREFERENCED_PARAMETER(InputBufferLength);
+    if (IoControlCode == IOCTL_SWGPU_COPY_TEST) {
+        PSWGPU_F1_RESULT copy = NULL;
+        if (!Dev->ResidentActive || g_ResidentOwner != Dev) {
+            WdfRequestComplete(Request, STATUS_DEVICE_NOT_READY);
+            return;
+        }
+        if (Dev->CopyInFlight) {
+            WdfRequestComplete(Request, STATUS_DEVICE_BUSY);
+            return;
+        }
+        status = WdfRequestRetrieveOutputBuffer(Request, sizeof(*copy), (PVOID *)&copy, NULL);
+        if (!NT_SUCCESS(status)) {
+            WdfRequestComplete(Request, status);
+            return;
+        }
+        F1CopyTest(Dev, copy);
+        WdfRequestCompleteWithInformation(Request, STATUS_SUCCESS, sizeof(*copy));
+        return;
+    }
+    if (Dev->CopyInFlight &&
+        (IoControlCode == IOCTL_SWGPU_SUBMIT_TEST || IoControlCode == IOCTL_SWGPU_IRQ_TEST)) {
+        WdfRequestComplete(Request, STATUS_DEVICE_BUSY);
+        return;
+    }
     if (IoControlCode == IOCTL_SWGPU_CYCLE_TEST) {
         PSWGPU_E4_RESULT cycle = NULL;
         SWGPU_E2_RESULT submit;
