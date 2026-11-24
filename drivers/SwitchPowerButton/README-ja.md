@@ -39,6 +39,7 @@ Windows はシャットダウンを最後まで終えるが、最後のファー
 | `ResetEnable` | 1(既定): ドライバーが再起動・電源オフをする。0: Windows に任せる(前と同じく止まる) |
 | `RestartMethod` | 0 自動(payload があれば R2P、なければ PSCI)、1 PMC だけ、2 PSCI `SYSTEM_RESET`、3 普通の PMC リセット、4 バックライトを消すだけ(試験用) |
 | `PowerOffMethod` | 0 PMIC(既定)、1 バックライトを消すだけ(試験用)、2 Windows に任せる |
+| `FastStartup` | 0(既定)Windows の高速スタートアップをオフにしておく(1.0.4.0 から)、1 そのままにする。高速スタートアップがオンだと「シャットダウン」が休止状態になり、電源が切れずにログオン画面に戻る |
 | `PayloadPath` | REG_SZ。payload の NT パス |
 | `RebootToId` | REG_SZ、空白なしの ASCII で 1〜7 文字(1.0.3.0 から)。再起動のあと、hekate が `hekate_ipl.ini` の `id=` がこの値の項目を自動で起動する。空(既定)なら hekate のメニュー |
 | `RebootToIndex` | DWORD(1.0.3.0 から)。`RebootToId` が空のときに使う。`hekate_ipl.ini` の N 番目の項目を自動で起動する(`[config]` の次が 1)。0 ならメニュー |

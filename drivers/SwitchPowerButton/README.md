@@ -57,6 +57,7 @@ the hekate chain).
 | `ResetEnable` | 1 (default): the driver restarts and powers off. 0: leave it to Windows (hangs, as before) |
 | `RestartMethod` | 0 auto (payload loaded: R2P; else PSCI), 1 PMC only, 2 PSCI `SYSTEM_RESET`, 3 plain PMC reset, 4 backlight off only (test) |
 | `PowerOffMethod` | 0 PMIC (default), 1 backlight off only (test), 2 leave it to Windows |
+| `FastStartup` | 0 (default) keep Windows fast startup off (since 1.0.4.0), 1 leave it alone. With fast startup on, Shut down is a hybrid hibernate: the console does not power off and comes back to the logon screen |
 | `PayloadPath` | REG_SZ, NT path of the payload |
 | `RebootToId` | REG_SZ, 1–7 printable ASCII characters, no spaces (1.0.3.0). After a restart hekate autoboots the `hekate_ipl.ini` entry whose `id=` key matches. Empty (default): the hekate menu |
 | `RebootToIndex` | DWORD (1.0.3.0), used when `RebootToId` is empty: autoboot entry N of `hekate_ipl.ini` (the first entry after `[config]` is 1). 0: the menu |
