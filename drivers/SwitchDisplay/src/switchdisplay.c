@@ -71,8 +71,9 @@
 #include <dispmprt.h>
 #include <ntstrsafe.h>
 #include <stdarg.h>
+#include "../../SwitchGpu/src/swgpu-blit.h"
 
-#define SWD_VERSION        0x00010700u   /* 1.7.0 */
+#define SWD_VERSION        0x00010701u   /* 1.7.1 */
 #define SWD_NOSRC          0xFFu         /* target not in the topology */
 #define SWD_TAG            'DwsS'
 
@@ -182,6 +183,12 @@ typedef struct _SWD_CONTEXT {
     ULONG                FbHeight;      /* native: 1280 */
     SIZE_T               FbMapSize;
     PUCHAR               FbVa;
+    BOOLEAN              GpuPresent, FbDmaUnsafe, TvDmaUnsafe;
+    PMDL                 FbMdl, TvMdl;
+    PFILE_OBJECT         GpuFile;
+    PDEVICE_OBJECT volatile GpuTarget;
+    volatile LONG        GpuPresents, GpuFailures, GpuFallbacks, GpuStreak, GpuLastStatus;
+    volatile LONG64      GpuPresentUs, GpuFallbackUs;
     PUCHAR               DsiVa;         /* DSI-A registers (stage 2) */
     PUCHAR               DcVa;          /* DC-A registers (stage 2b) */
     BOOLEAN              PanelAsleep;
@@ -305,8 +312,11 @@ static ULONG RegGetDword(PCWSTR Name, ULONG Default)
     return value;
 }
 
+#include "swd-gpu-present.inc"
+
 static VOID FlushCounters(PSWD_CONTEXT Ctx)
 {
+    if (Ctx->GpuPresent) SwdGpuFlushCounters(Ctx);
     RegPutDword(L"Presents", (ULONG)Ctx->Presents);
     RegPutDword(L"PresentErrors", (ULONG)Ctx->PresentErrors);
     RegPutDword(L"LastPresentStatus", (ULONG)Ctx->LastPresentStatus);
@@ -375,6 +385,7 @@ static VOID GuardThread(PVOID Context)
         }
         FlushCounters(ctx);
         if (st != STATUS_TIMEOUT) break;
+        if (ctx->GpuPresent) SwdGpuConnect(ctx);
         elapsed += FLUSH_SECONDS;
         if (!cleared && elapsed >= GUARD_SECONDS) {
             RegPutDword(L"StartPending", 0);
@@ -543,7 +554,7 @@ static VOID FillSourceMode(D3DKMDT_VIDPN_SOURCE_MODE *m, ULONG W, ULONG H)
 static VOID ClearFb(PSWD_CONTEXT Ctx)
 {
     ULONG y;
-    if (!Ctx->FbVa) return;
+    if (!Ctx->FbVa || Ctx->FbDmaUnsafe) return;
     for (y = 0; y < Ctx->FbHeight; y++) {
         RtlZeroMemory(Ctx->FbVa + (SIZE_T)y * Ctx->FbPitch, (SIZE_T)Ctx->FbWidth * 4);
     }
@@ -552,6 +563,8 @@ static VOID ClearFb(PSWD_CONTEXT Ctx)
 
 static VOID UnmapFb(PSWD_CONTEXT Ctx)
 {
+    if (Ctx->FbMdl != NULL && !Ctx->FbDmaUnsafe) IoFreeMdl(Ctx->FbMdl);
+    Ctx->FbMdl = NULL;
     if (Ctx->FbVa) {
         MmUnmapIoSpace(Ctx->FbVa, Ctx->FbMapSize);
         Ctx->FbVa = NULL;
@@ -745,6 +758,7 @@ static VOID TvBlt(PSWD_CONTEXT Ctx, PUCHAR SrcBase, LONG SrcTop, LONG Pitch, REC
 
 static VOID TvClear(PSWD_CONTEXT Ctx)
 {
+    if (Ctx->TvDmaUnsafe) return;
     ULONG y;
     for (y = 0; y < Ctx->TvH; y++) RtlZeroMemory(Ctx->TvVa + (SIZE_T)y * Ctx->TvPitch, Ctx->TvPitch);
 }
@@ -820,6 +834,8 @@ static VOID TvStartLocked(PSWD_CONTEXT Ctx)
         return;
     }
     Ctx->TvPhys = MmGetPhysicalAddress(Ctx->TvVa);
+    if (Ctx->GpuPresent && !gGpuDisabled)
+        Ctx->TvMdl = SwdGpuScanoutMdl(Ctx->TvVa, Ctx->TvPhys, Ctx->TvSize);
     TvClear(Ctx);
     /* Until the desktop draws: the boot image, as UEFI showed it. */
     if (Ctx->FbVa) {
@@ -881,6 +897,8 @@ static VOID TvStop(PSWD_CONTEXT Ctx)
     TvLock(Ctx);                            /* Present no longer copies to the TV after this */
     va = Ctx->TvVa;
     Ctx->TvVa = NULL;
+    if (Ctx->TvMdl != NULL && !Ctx->TvDmaUnsafe) IoFreeMdl(Ctx->TvMdl);
+    Ctx->TvMdl = NULL;
     InterlockedExchange(&Ctx->TvConnected, 0);
     TvUnlock(Ctx);
     if (Ctx->TvDc && va) {
@@ -889,8 +907,10 @@ static VOID TvStop(PSWD_CONTEXT Ctx)
         KeDelayExecutionThread(KernelMode, FALSE, &t);
     }
     if (va) {
-        MmFreeContiguousMemorySpecifyCache(va, Ctx->TvSize, MmWriteCombined);
+        if (!Ctx->TvDmaUnsafe)
+            MmFreeContiguousMemorySpecifyCache(va, Ctx->TvSize, MmWriteCombined);
     }
+    Ctx->TvDmaUnsafe = FALSE;
     if (Ctx->TvDc) {
         MmUnmapIoSpace(Ctx->TvDc, DC_MAP_SIZE);
         Ctx->TvDc = NULL;
@@ -1483,6 +1503,13 @@ NTSTATUS SwdStartDevice(IN_CONST_PVOID MiniportDeviceContext, IN_PDXGK_START_INF
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
+    ctx->GpuPresent = RegGetDword(L"GpuPresent", 0u) == 1u;
+    if (ctx->GpuPresent && !gGpuDisabled &&
+        (ULONGLONG)ctx->FbPhys.QuadPart >= SWD_FB_PHYS &&
+        (ULONGLONG)ctx->FbPhys.QuadPart < SWD_FB_PHYS + SWD_FB_RESERVED &&
+        ctx->FbMapSize <= SWD_FB_PHYS + SWD_FB_RESERVED - (ULONGLONG)ctx->FbPhys.QuadPart) {
+        ctx->FbMdl = SwdGpuScanoutMdl(ctx->FbVa, ctx->FbPhys, ctx->FbMapSize);
+    }
     ctx->Extend = RegGetDword(L"TvExtend", 1) != 0;
     RegPutDword(L"ExtendOn", ctx->Extend ? 1 : 0);
     ctx->SrcW[0] = ctx->SrcW[1] = ctx->FbWidth;
@@ -1523,6 +1550,7 @@ static VOID StopCommon(PSWD_CONTEXT Ctx)
     DpUnregister(Ctx);
     StopGuardThread(Ctx);
     FlushCounters(Ctx);
+    if (Ctx->GpuPresent) SwdGpuDisconnect(Ctx);
     TvStop(Ctx);
     DpUnmap();
     UnmapFb(Ctx);
@@ -1569,6 +1597,7 @@ NTSTATUS SwdRemoveDevice(IN_CONST_PVOID MiniportDeviceContext)
     if (ctx) {
         DpUnregister(ctx);
         StopGuardThread(ctx);
+        if (ctx->GpuPresent) SwdGpuDisconnect(ctx);
         TvStop(ctx);
         DpUnmap();
         UnmapFb(ctx);
@@ -2325,7 +2354,9 @@ NTSTATUS SwdPresentDisplayOnly(IN_CONST_HANDLE hAdapter, IN_CONST_PDXGKARG_PRESE
     KPROCESSOR_MODE mode;
     NTSTATUS st = STATUS_SUCCESS;
     D3DKMDT_VIDPN_PRESENT_PATH_ROTATION rot, srcRot;
-    BOOLEAN toPanel, toTv;
+    BOOLEAN toPanel, toTv, keepMdl = FALSE, cpuFallback = FALSE, gpuSuccess = FALSE;
+    LARGE_INTEGER cpuFreq, cpuStart;
+    ULONG cpuUs = 0u, gpuUs = 0u;
     LONG ws, hs;
 
     InterlockedIncrement(&ctx->Presents);
@@ -2374,13 +2405,20 @@ NTSTATUS SwdPresentDisplayOnly(IN_CONST_HANDLE hAdapter, IN_CONST_PDXGKARG_PRESE
     if (src) {
         /* The source already holds the final image, so a move is copied
          * from the source at its destination like a dirty rect. */
-        if (toPanel) {
-            for (i = 0; i < pPresent->NumMoves; i++) BltRect(ctx, src, top, pPresent->Pitch, pPresent->pMoves[i].DestRect, ws, hs, rot);
-            for (i = 0; i < pPresent->NumDirtyRects; i++) BltRect(ctx, src, top, pPresent->Pitch, pPresent->pDirtyRect[i], ws, hs, rot);
+        if (toPanel && !ctx->FbDmaUnsafe) {
+            BOOLEAN eligible = ctx->GpuPresent && rot == D3DKMDT_VPPR_IDENTITY &&
+                ws > 0 && hs > 0 && ws <= (LONG)ctx->FbWidth && hs <= (LONG)ctx->FbHeight;
+            if (!eligible || !SwdGpuTry(ctx, pPresent, mdl, ctx->FbMdl,
+                    top, bottom, ws, ctx->FbPitch, FALSE, &keepMdl, &gpuSuccess, &gpuUs)) {
+                if (eligible) cpuStart = KeQueryPerformanceCounter(&cpuFreq);
+                for (i = 0; i < pPresent->NumMoves; i++) BltRect(ctx, src, top, pPresent->Pitch, pPresent->pMoves[i].DestRect, ws, hs, rot);
+                for (i = 0; i < pPresent->NumDirtyRects; i++) BltRect(ctx, src, top, pPresent->Pitch, pPresent->pDirtyRect[i], ws, hs, rot);
+                if (eligible) { cpuFallback = TRUE; cpuUs += SwdGpuUs(cpuStart, cpuFreq); }
+            }
         }
         if (toTv) {
             TvLock(ctx);
-            if (ctx->TvVa) {
+            if (ctx->TvVa && !ctx->TvDmaUnsafe) {
                 /* The TV gets the picture upright: with Flags.Rotate the surface is
                  * upright already; without it the rotation is baked in (1.4.3). */
                 D3DKMDT_VIDPN_PRESENT_PATH_ROTATION baked = pPresent->Flags.Rotate ? D3DKMDT_VPPR_IDENTITY : srcRot;
@@ -2390,8 +2428,17 @@ NTSTATUS SwdPresentDisplayOnly(IN_CONST_HANDLE hAdapter, IN_CONST_PDXGKARG_PRESE
                     ctx->TvLastW = tw;
                     ctx->TvLastH = th;
                 }
-                for (i = 0; i < pPresent->NumMoves; i++) TvBlt(ctx, src, top, pPresent->Pitch, pPresent->pMoves[i].DestRect, ws, hs, baked);
-                for (i = 0; i < pPresent->NumDirtyRects; i++) TvBlt(ctx, src, top, pPresent->Pitch, pPresent->pDirtyRect[i], ws, hs, baked);
+                {
+                    BOOLEAN eligible = ctx->GpuPresent && baked == D3DKMDT_VPPR_IDENTITY &&
+                        ws > 0 && hs > 0 && ws == (LONG)ctx->TvW && hs == (LONG)ctx->TvH;
+                    if (!eligible || !SwdGpuTry(ctx, pPresent, mdl, ctx->TvMdl,
+                            top, bottom, ws, ctx->TvPitch, TRUE, &keepMdl, &gpuSuccess, &gpuUs)) {
+                        if (eligible) cpuStart = KeQueryPerformanceCounter(&cpuFreq);
+                        for (i = 0; i < pPresent->NumMoves; i++) TvBlt(ctx, src, top, pPresent->Pitch, pPresent->pMoves[i].DestRect, ws, hs, baked);
+                        for (i = 0; i < pPresent->NumDirtyRects; i++) TvBlt(ctx, src, top, pPresent->Pitch, pPresent->pDirtyRect[i], ws, hs, baked);
+                        if (eligible) { cpuFallback = TRUE; cpuUs += SwdGpuUs(cpuStart, cpuFreq); }
+                    }
+                }
                 InterlockedIncrement(&ctx->TvPresents);
                 if (!toPanel) InterlockedIncrement(&ctx->TvSrcPresents);
             }
@@ -2401,8 +2448,18 @@ NTSTATUS SwdPresentDisplayOnly(IN_CONST_HANDLE hAdapter, IN_CONST_PDXGKARG_PRESE
     } else {
         st = STATUS_INSUFFICIENT_RESOURCES;
     }
-    MmUnlockPages(mdl);
-    IoFreeMdl(mdl);
+    if (gpuSuccess) {
+        InterlockedIncrement(&ctx->GpuPresents);
+        InterlockedAdd64(&ctx->GpuPresentUs, gpuUs);
+    }
+    if (cpuFallback) {
+        InterlockedIncrement(&ctx->GpuFallbacks);
+        InterlockedAdd64(&ctx->GpuFallbackUs, cpuUs);
+    }
+    if (!keepMdl) {
+        MmUnlockPages(mdl);
+        IoFreeMdl(mdl);
+    }
 
 out:
     if (!NT_SUCCESS(st)) {
@@ -2432,7 +2489,7 @@ VOID SwdSystemDisplayWrite(PVOID MiniportDeviceContext, PVOID Source, UINT Sourc
 {
     PSWD_CONTEXT ctx = (PSWD_CONTEXT)MiniportDeviceContext;
     UINT y, w, h;
-    if (!ctx->FbVa || !Source || PositionX >= ctx->FbWidth || PositionY >= ctx->FbHeight) return;
+    if (!ctx->FbVa || ctx->FbDmaUnsafe || !Source || PositionX >= ctx->FbWidth || PositionY >= ctx->FbHeight) return;
     w = SourceWidth;  if (w > ctx->FbWidth - PositionX) w = ctx->FbWidth - PositionX;
     h = SourceHeight; if (h > ctx->FbHeight - PositionY) h = ctx->FbHeight - PositionY;
     for (y = 0; y < h; y++) {
