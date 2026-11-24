@@ -328,7 +328,13 @@ function Show-Trace([string]$AlreadyPrinted) {
   if (-not $p) { Sum 'switchgpu trace: (no Parameters key: driver never started)'; return }
   Sum ('switchgpu {0}.{1}.{2}; starts {3}; I2C VDD/PMIC {4}/{5}; resources mem/I2C/IRQ {6}/{7}/{8}' -f ($p.Version -shr 16), (($p.Version -shr 8) -band 0xFF), ($p.Version -band 0xFF), $p.StartCount, (Hex $p.OpenVddStatus), (Hex $p.OpenPmicStatus), $p.ResMem, $p.ResI2c, $p.E3InterruptResourceCount)
   if ($null -ne $p.Step) { Sum ('Step {0}; result {1}; startup us {2}' -f $p.Step, (Hex $p.Result), $p.TestUs) }
-  if ($null -ne $p.E5PtimerNsPer1ms) { Sum ('E5 PTIMER delta over 1 ms: {0} ns (raw)' -f $p.E5PtimerNsPer1ms) }
+  if ($null -ne $p.E5PtimerNsPer1ms) {
+    # Tegra PTIMER runs from the 19.2 MHz oscillator but counts 32 ns per tick
+    # (614400 per wall ms). nouveau gk20a also leaves it unprogrammed; the
+    # driver uses it only for this display, never for timeouts.
+    $rate = [double]$p.E5PtimerNsPer1ms / 1000000.0
+    Sum ('E5 PTIMER delta over 1 ms: {0} ns (raw) = {1:N3} x wall clock; expected 614400 (19.2 MHz source in 32 ns steps); display only, not used for timeouts' -f $p.E5PtimerNsPer1ms, $rate)
+  }
   if ($null -ne $p.E1Result -or $null -ne $p.B3eResidentActive) {
     $e1Why = ''; if ((Key32 $p.E1Result) -eq 'E00000A5') { $e1Why = 'resident state was not published' }
     Sum ('E1 resident result {0} {1}; active {2}; idle reference {3}; shutdown {4}; power-down {5}; PTIMER delta {6}; FECS mailbox0 {7}; channel {8}' -f (Hex $p.E1Result), $e1Why, (Hex $p.B3eResidentActive), (Hex $p.B3eIdleRefStatus), (Hex $p.B3eShutdownResult), (Hex $p.B3ePowerDownResult), (Hex $p.B3eStatusPtimerDelta), (Hex $p.B3eStatusFecsMailbox0), (Hex $p.B3eStatusCcsrChannel))
@@ -345,7 +351,18 @@ function Show-Trace([string]$AlreadyPrinted) {
   }
   $errors = @($p.PSObject.Properties | Where-Object { $_.Name -match 'Priv.*(?:ErrorCount|ErrorDropped|AckTimeouts)$' -and $_.Value -ne 0 })
   if ($errors.Count) {
-    Sum ('priv-ring errors: ' + (($errors | ForEach-Object { '{0}={1}' -f $_.Name, $_.Value }) -join ' '))
+    $note = ''
+    # Records: 16 DWORDs each, word 0 = rejected write address.
+    $addrs = @()
+    $blob = $p.B3cC2bPrivWriteErrors
+    if ($blob -is [byte[]]) {
+      for ($o = 0; $o + 4 -le $blob.Length; $o += 64) { $addrs += ('{0:X8}' -f [BitConverter]::ToUInt32($blob, $o)) }
+    }
+    if ($addrs.Count) { $note = ' (C2b rejected: ' + ($addrs -join ', ') + ')' }
+    if ($errors.Count -eq 1 -and $errors[0].Name -eq 'B3cC2bPrivWriteErrorCount' -and (($addrs | Sort-Object) -join ',') -eq '00419DEC,00419DF4') {
+      $note = ' (known: the sw_nonctx netlist writes 0 to 0x419DEC and 0x419DF4 and this GPC rejects them; same since 0.4.x, harmless)'
+    }
+    Sum ('priv-ring errors: ' + (($errors | ForEach-Object { '{0}={1}' -f $_.Name, $_.Value }) -join ' ') + $note)
   }
   if ($Detail -or ($p.Verbose -eq 1 -and $p.E5VerboseActive -eq 1)) {
     Log ('Detailed registry trace (driver verbose active: {0})' -f $p.E5VerboseActive)
