@@ -9,5 +9,5 @@ if errorlevel 1 (
   )
   exit /b
 )
-powershell -ExecutionPolicy Bypass -File "%~dp0Gpu.ps1" -Mode AcrTest
+powershell -ExecutionPolicy Bypass -File "%~dp0Gpu.ps1" -Mode VerboseOff
 pause

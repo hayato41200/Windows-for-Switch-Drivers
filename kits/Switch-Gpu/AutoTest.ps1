@@ -1,8 +1,8 @@
-# AutoTest.ps1 - one double-click for the whole E-stage test (Claude, 0.7.3).
+# AutoTest.ps1 - one double-click for the whole E-stage test (0.9.0).
 # Stage Install (default): Gpu.ps1 -Mode Install, register a one-shot logon task,
 #   then restart Windows (the new driver needs a restart: Code 14).
 # Stage After (run by the task after the next logon): remove the task first
-#   (so a hang never repeats), then Resident -> Irq -> ResidentStatus -> ResidentStop -> Cycle,
+#   (so a hang never repeats), then Resident -> Irq -> Submit -> ResidentStatus -> ResidentStop -> Cycle,
 #   then print the summary lines and wait for Enter.
 # Results are appended to C:\SwitchWOA-Gpu.txt as before; console output also goes
 # to C:\SwitchWOA-GpuAutoTest.txt. ASCII only (PowerShell 5.1).
@@ -22,8 +22,10 @@ try { Start-Transcript -Path 'C:\SwitchWOA-GpuAutoTest.txt' -Append | Out-Null }
 function Run-Gpu([string]$Mode) {
     Write-Host ''
     Write-Host ('########## ' + $Mode + '  ' + (Get-Date -Format 'HH:mm:ss') + ' ##########') -ForegroundColor Cyan
-    & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $Gpu -Mode $Mode
-    Write-Host ('---------- ' + $Mode + ' done (exit ' + $LASTEXITCODE + ') ----------')
+    & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $Gpu -Mode $Mode | Out-Host
+    $code = $LASTEXITCODE
+    Write-Host ('---------- ' + $Mode + ' done (exit ' + $code + ') ----------')
+    return $code
 }
 
 function Remove-AutoTask {
@@ -43,7 +45,14 @@ if ($Stage -eq 'Cancel') {
 if ($Stage -eq 'Install') {
     Add-Content -Path $Log -Value ('=== AutoTest Install  ' + (Get-Date -Format 'yyyy-MM-dd HH:mm:ss') + '  kit ' + $Here) -Encoding UTF8
     Remove-AutoTask
-    Run-Gpu 'Install'
+    $installExit = Run-Gpu 'Install'
+    if ($installExit -ne 0) {
+        # 0.9.0 lesson: Gpu.ps1 failed before doing anything; do not restart.
+        Write-Host ('STOP: Install failed (exit ' + $installExit + '). No restart, no automatic tests.') -ForegroundColor Red
+        try { Stop-Transcript | Out-Null } catch { }
+        Read-Host 'Take a photo, then press Enter'
+        exit 1
+    }
 
     $user = [Security.Principal.WindowsIdentity]::GetCurrent().Name
     $arg = '-NoProfile -ExecutionPolicy Bypass -File "' + (Join-Path $Here 'AutoTest.ps1') + '" -Stage After'
@@ -57,7 +66,7 @@ if ($Stage -eq 'Install') {
         Write-Host "task $TaskName registered: runs once after the next sign-in ($user)"
     } catch {
         Write-Host ('STOP: could not register the logon task: ' + $_.Exception.Message) -ForegroundColor Red
-        Write-Host 'Restart by hand, then run Resident, Irq, ResidentStatus, ResidentStop, Cycle.'
+        Write-Host 'Restart by hand, then run Resident, Irq, Submit, ResidentStatus, ResidentStop, Cycle.'
         try { Stop-Transcript | Out-Null } catch { }
         Read-Host 'Press Enter'
         exit 1
@@ -81,8 +90,8 @@ for ($i = 40; $i -gt 0; $i -= 5) { Write-Host "  $i s"; Start-Sleep -Seconds 5 }
 $startLine = 0
 if (Test-Path $Log) { $startLine = (Get-Content $Log).Count }
 
-foreach ($m in 'Resident', 'Irq', 'ResidentStatus', 'ResidentStop', 'Cycle') {
-    Run-Gpu $m
+foreach ($m in 'Resident', 'Irq', 'Submit', 'ResidentStatus', 'ResidentStop', 'Cycle') {
+    $null = Run-Gpu $m
     Start-Sleep -Seconds 5
 }
 
@@ -91,7 +100,7 @@ Write-Host '================ AutoTest SUMMARY ================' -ForegroundColor
 if (Test-Path $Log) {
     $all = Get-Content $Log
     $new = $all | Select-Object -Skip $startLine
-    $new | Where-Object { $_ -match '^=== Gpu ' -or $_ -match '^E1 resident result' -or $_ -match '^E3 result' -or $_ -match '^E4 (cycle|pool) ' -or $_ -match '^resident [01];' } |
+    $new | Where-Object { $_ -match '^=== Gpu ' -or $_ -match '^E1 resident result' -or $_ -match '^E[23] result' -or $_ -match '^E4 (cycle|pool) ' -or $_ -match '^resident [01];' } |
         Select-Object -Unique | ForEach-Object { Write-Host $_ }
 }
 Write-Host '=================================================='

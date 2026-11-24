@@ -1,3 +1,8 @@
+SwitchGpu 0.9.0 retains these notices for the resident initialization and
+submission paths. Version numbers below identify when the referenced code
+or register definitions entered the driver. The standalone power, topology,
+physical DMA and firmware experiment entry points were removed.
+
 The 4K small-page PDE encoding in switchgpu.c is adapted from
 Linux nouveau v6.12, nvkm/subdev/mmu/vmmgf100.c, gf100_vmm_pgd_pde.
 https://github.com/torvalds/linux/blob/v6.12/drivers/gpu/drm/nouveau/nvkm/subdev/mmu/vmmgf100.c
