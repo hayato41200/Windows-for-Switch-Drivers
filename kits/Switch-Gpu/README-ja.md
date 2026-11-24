@@ -18,6 +18,8 @@ GM20B の GPU に Windows から電源とクロックを入れ、GPU が応答�
 | `FwTest.cmd` | 段階 B3a。自分の linux-firmware の ACR のファームウェアを読み、署名を当てた像をメモリーに作り、ACR のブートローダーを PMU の IMEM と DMEM に直接(PIO)書いて読み返す。ファルコンは起動しない |
 | `AcrTest.cmd` | 段階 B3c。GPU の WPR 保護領域と SMMU の範囲を確認し、署名付き ACR を一度だけ起動した後、LS PMU と FECS の bootstrap を試す。待ちは上限付きで、必ず GPU をリセットしてから一時メモリーと変換表を戻す |
 | `Remove.cmd` | switchgpu を外す |
+| `AutoTest.cmd` | 0.7.3 から。Install → 30 秒後に自動で再起動 → サインインすると自動で Resident → Irq → ResidentStatus → ResidentStop を順に実行し、最後に要約を出す。1 回きり(始まった時点で予約を消すので、固まっても繰り返さない) |
+| `AutoTestCancel.cmd` | AutoTest の再起動と自動実行の予約を取り消す |
 
 どれもダブルクリックで動く(0.4.78 から)。UAC の確認が出たら「はい」を押す。右クリックの「管理者として実行」でもよい。最後の `SUMMARY` を写真に撮る。記録は `C:\SwitchWOA-Gpu.txt` に追記される。
 
@@ -522,6 +524,7 @@ Nouveau MIT `gk104.c:gk104_chan_ramfc_write()` の RAMFC fields、`gk104_chan_bi
 | --- | --- | --- | --- |
 | 0.5.0 | E1: Resident | Step 110 / `E00000A5` + 各段階の既存エラー | PowerTest mode 6 で A から D5 までを実行します。成功時は GPU、PMU/FECS/GPCCS、SMMU/GR のマッピング、BAR1、channel、arena を維持します。失敗時は mode 5 と同じ GPU reset と cleanup を行います。 |
 | 0.5.1 | E1: Resident(実機 OK) | Step 110〜112、結果 0 | 0.5.0 はデバイスが作れなかった(Code 31、0xC0000079)。管理者だけの制限を INF の `Security` に移して解決。実機で Resident、ResidentStatus 2 回、ResidentStop がすべて成功(エラー、fault なし)。 |
+| 0.7.0 | E3: resident channel 割り込み | Step 114 / `E00000A7`〜`E00000A9` | UEFI R447H 以降が必要です。64 回の 3D clear 後に PBDMA `NON_STALL_INT` を発行し、nonstall ISR/DPC のイベントで待ちます。旧 UEFI で割り込みリソースがない場合は E3 を `E00000A7` と記録し、既存の Resident/Submit 動作を保ちます。失敗時も GPU は resident のままなので ResidentStop で停止します。 |
 
 `Resident.cmd` は E1 を一度だけ開始します。PowerTest は実行前に 0 へ戻します。`ResidentStatus.cmd` は読み取り専用の管理者向け device-interface IOCTL を使い、PnP restart を行いません。`ResidentStop.cmd` は別の IOCTL で channel disable、bounded preempt、空 runlist、unbind、BAR1 復元、GPU reset/power-off、arena/SMMU cleanup を順に実行します。PnP restart は ReleaseHardware を呼んで resident GPU を停止するため、状態確認と停止には使いません。resident 中は WDF idle reference を保持し、最終的な device removal/shutdown では同じ idempotent teardown を呼びます。
 
@@ -534,3 +537,9 @@ E1 は実験段階です。停止処理前に強制電源断、bugcheck、device
 | 0.6.0 | E2: GPFIFO ring wraparound | Step 113 / `E00000A6` | Submit IOCTL は ResidentActive 中だけ動作し、電源投入や teardown を行いません。512-entry ring に 2 x entries + 3 回の clear を順番に投稿し、毎回 BAR1 GP_PUT/GP_GET、WFI semaphore、64x64 RT の先頭・中央・末尾 pixel を bounded wait で確認します。失敗時も GPU を resident のまま残し、ResidentStop で停止します。 |
 
 Submit.cmd は E1 で起動済みの resident channel に Submit IOCTL を送り、device restart はしません。失敗時は round、GET/PUT、semaphore、channel/PBDMA/GR/MMU、CLASS_ERROR/trap を記録します。E2 の反復負荷、ring wrap、失敗後の停止手順は実機で確認してください。
+
+### 0.7.0 E3: resident channel interrupt
+
+`Irq.cmd` は resident GPU が動作中のときだけ IOCTL `0x22E00C` を送り、64 回の既知 3D clear、WFI semaphore release、`NVB06F` host `NON_STALL_INT` を実行します。各回は 100 ms の bounded `KEVENT` wait で完了を待ち、イベント後に semaphore と RT pixel を確認します。待ち timeout 時は L2 flush 後に semaphore を一度だけ読み、GPU 処理完了と割り込み欠落を区別します。実行後に GPU の電源投入や teardown はしません。
+
+UEFI R447H は stall GSIV 189 / nonstall GSIV 190 を提供します。割り込みリソースがない R445H 以前ではドライバを読み込み、0.6.0 相当の動作を保ちますが、E3 は `E00000A7` (no interrupt resource) です。GPU 内 PMC の `INTR_MASK_0/1` と `INTR_EN_0/1` は resident 成功時だけ設定し、shutdown 冒頭で割り込み源を止めてから channel teardown と reset を始めます。Tegra MC の割り込みルーティングは変更しません。実機で GSIV の割当、nonstall status/ACK、ISR/DPC 回数、全 64 回の semaphore/pixel readback、ResidentStop を確認してください。

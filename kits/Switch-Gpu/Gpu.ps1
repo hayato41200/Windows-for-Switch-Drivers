@@ -38,12 +38,14 @@
   -Mode ResidentStatus : query safe resident registers through a read-only IOCTL.
   -Mode ResidentStop : stop the channel and power down through a bounded IOCTL.
   -Mode Submit : submit repeated 3D clears on the resident channel (E2); no power-up.
+  -Mode Irq    : run 64 interrupt-driven clears on the resident channel (E3);
+                 requires UEFI R447H or later and does not power up the GPU.
   -Mode Remove    : removes the driver package.
 
   Log: C:\SwitchWOA-Gpu.txt
   This file must stay ASCII: Windows PowerShell 5.1 reads it as the ANSI code page.
 #>
-param([Parameter(Mandatory = $true)][ValidateSet('Install', 'Status', 'PowerTest', 'ProbeTest', 'DmaTest', 'FwTest', 'AcrTest', 'Resident', 'ResidentStatus', 'ResidentStop', 'Submit', 'Remove')][string]$Mode)
+param([Parameter(Mandatory = $true)][ValidateSet('Install', 'Status', 'PowerTest', 'ProbeTest', 'DmaTest', 'FwTest', 'AcrTest', 'Resident', 'ResidentStatus', 'ResidentStop', 'Submit', 'Irq', 'Remove')][string]$Mode)
 
 $ErrorActionPreference = 'Continue'
 $Sys = Join-Path $env:windir 'Sysnative'
@@ -228,6 +230,62 @@ public static class SwGpuSubmitControl {
   }
 }
 
+function Invoke-ResidentIrq {
+  $src = @'
+using System;
+using System.Runtime.InteropServices;
+using Microsoft.Win32.SafeHandles;
+public static class SwGpuIrqControl {
+  [StructLayout(LayoutKind.Sequential)] public struct Result {
+    public UInt32 Version, ResultCode, Rounds, Waits, NonstallCount, StallCount, StallUnits;
+    public UInt32 MaxWaitUs, TotalUs, Timeouts, HaveInterrupts;
+    public UInt32 FirstMcIntr0, FirstMcIntr1, LastMcIntr0, LastMcIntr1;
+    public UInt32 GpGet, GpPut, Semaphore, PixelFirst, PixelMiddle, PixelLast;
+    public UInt32 Channel, PbdmaStatus, PbdmaIntr0, FifoIntr0, GrIntr, GrStatus, MmuFault;
+  }
+  [StructLayout(LayoutKind.Sequential)] struct IfData { public Int32 cbSize; public Guid guid; public Int32 flags; public IntPtr reserved; }
+  [DllImport("setupapi.dll", CharSet=CharSet.Unicode, SetLastError=true)] static extern IntPtr SetupDiGetClassDevs(ref Guid g, IntPtr e, IntPtr w, UInt32 f);
+  [DllImport("setupapi.dll", SetLastError=true)] static extern bool SetupDiEnumDeviceInterfaces(IntPtr s, IntPtr d, ref Guid g, UInt32 i, ref IfData data);
+  [DllImport("setupapi.dll", CharSet=CharSet.Unicode, SetLastError=true)] static extern bool SetupDiGetDeviceInterfaceDetail(IntPtr s, ref IfData data, IntPtr detail, UInt32 size, out UInt32 required, IntPtr devinfo);
+  [DllImport("setupapi.dll", SetLastError=true)] static extern bool SetupDiDestroyDeviceInfoList(IntPtr s);
+  [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)] static extern SafeFileHandle CreateFile(string n, UInt32 a, UInt32 share, IntPtr sec, UInt32 disp, UInt32 flags, IntPtr template);
+  [DllImport("kernel32.dll", SetLastError=true)] static extern bool DeviceIoControl(SafeFileHandle h, UInt32 code, IntPtr input, UInt32 inSize, out Result output, UInt32 outSize, out UInt32 returned, IntPtr overlapped);
+  public static Result Run() {
+    Guid g = new Guid("2cc9cb4d-6412-4f31-a781-5d781e094b63");
+    IntPtr set = SetupDiGetClassDevs(ref g, IntPtr.Zero, IntPtr.Zero, 0x12);
+    if (set == new IntPtr(-1)) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+    try {
+      for (UInt32 i=0; i<32; ++i) {
+        IfData d = new IfData(); d.cbSize = Marshal.SizeOf(typeof(IfData));
+        if (!SetupDiEnumDeviceInterfaces(set, IntPtr.Zero, ref g, i, ref d)) break;
+        UInt32 need; SetupDiGetDeviceInterfaceDetail(set, ref d, IntPtr.Zero, 0, out need, IntPtr.Zero);
+        if (need < 8) continue;
+        IntPtr b = Marshal.AllocHGlobal((int)need);
+        try {
+          Marshal.WriteInt32(b, IntPtr.Size == 8 ? 8 : 6);
+          if (!SetupDiGetDeviceInterfaceDetail(set, ref d, b, need, out need, IntPtr.Zero)) continue;
+          string path = Marshal.PtrToStringUni(IntPtr.Add(b, 4));
+          using (SafeFileHandle h = CreateFile(path, 0xC0000000, 3, IntPtr.Zero, 3, 0, IntPtr.Zero)) {
+            if (h.IsInvalid) continue;
+            Result r; UInt32 got;
+            if (!DeviceIoControl(h, 0x22E00Cu, IntPtr.Zero, 0, out r, (UInt32)Marshal.SizeOf(typeof(Result)), out got, IntPtr.Zero))
+              throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+            return r;
+          }
+        } finally { Marshal.FreeHGlobal(b); }
+      }
+      throw new InvalidOperationException("SwitchGpu resident interface was not found");
+    } finally { SetupDiDestroyDeviceInfoList(set); }
+  }
+}
+'@
+  if (-not ('SwGpuIrqControl' -as [type])) { Add-Type -TypeDefinition $src -Language CSharp }
+  $r = [SwGpuIrqControl]::Run()
+  $irqText = 'interrupt resources present'; if ($r.HaveInterrupts -eq 0) { $irqText = 'no interrupt objects (R447H+ resources missing, or WdfInterruptCreate failed: see E3InterruptCreateStatus)' }
+  Sum ('E3 result {0}; {1}; rounds {2}/64; waits {3}; nonstall/stall {4}/{5}; stall units {6}; max wait us {7}; total us {8}; timeouts {9}; MC first {10}/{11}, last {12}/{13}; semaphore {14}; pixels {15}/{16}/{17}' -f `
+    (Hex $r.ResultCode), $irqText, $r.Rounds, $r.Waits, $r.NonstallCount, $r.StallCount, (Hex $r.StallUnits), $r.MaxWaitUs, $r.TotalUs, $r.Timeouts, (Hex $r.FirstMcIntr0), (Hex $r.FirstMcIntr1), (Hex $r.LastMcIntr0), (Hex $r.LastMcIntr1), (Hex $r.Semaphore), (Hex $r.PixelFirst), (Hex $r.PixelMiddle), (Hex $r.PixelLast))
+}
+
 function Show-Trace {
   $p = Get-ItemProperty $Key -ErrorAction SilentlyContinue
   if (-not $p) { Sum 'switchgpu trace: (no Parameters key: driver never started)'; return }
@@ -256,6 +314,10 @@ function Show-Trace {
       foreach ($ehr in $ehRows) { Add-Content -Path $Log -Value ('  ' + $ehr) -Encoding UTF8 }
       Sum ('E2 poll history: {0} records; max GP_GET/semaphore polls {1}/{2} (full rows in log)' -f $en, $egp, $esem)
     }
+  }
+  if ($null -ne $p.E3Result) {
+    $e3Why = 'OK'; if ((Key32 $p.E3Result) -eq 'E00000A7') { $e3Why = 'no interrupt resources; use UEFI R447H or later' } elseif ((Key32 $p.E3Result) -eq 'E00000A8') { $e3Why = 'round timeout or clear/readback failure; GPU remains resident' } elseif ((Key32 $p.E3Result) -eq 'E00000A9') { $e3Why = 'interrupt setup/write failure' }
+    Sum ('E3 result {0} ({1}); interrupts {2}; rounds {3}/64; waits {4}; nonstall/stall {5}/{6}; stall units {7}; max wait us {8}; total us {9}; timeouts {10}; MC first {11}/{12}, last {13}/{14}' -f (Hex $p.E3Result), $e3Why, (Hex $p.E3HaveInterrupts), (Hex $p.E3Rounds), (Hex $p.E3Waits), (Hex $p.E3NonstallCount), (Hex $p.E3StallCount), (Hex $p.E3StallUnits), (Hex $p.E3MaxWaitUs), (Hex $p.E3TotalUs), (Hex $p.E3Timeouts), (Hex $p.E3FirstMcIntr0), (Hex $p.E3FirstMcIntr1), (Hex $p.E3LastMcIntr0), (Hex $p.E3LastMcIntr1))
   }
   if ($p.TestRuns) {
     $steps = @{ 1 = 'read the regulator'; 2 = 'VDD_GPU on'; 3 = 'clocks on'; 4 = 'reset assert'; 5 = 'clamp off'; 6 = 'reset deassert'; 7 = 'MC flush'; 8 = 'first BAR0 read (BOOT_0)'; 9 = 'PTIMER and WPR reads'; 20 = 'B1: topology read'; 21 = 'B1: PMU falcon read'; 22 = 'B1: DMEM test'; 23 = 'B1: priv ring init'; 29 = 'B2a: priv ring init'; 40 = 'B3a: firmware from registry'; 41 = 'B3a: bl.bin header'; 42 = 'B3a: ucode_load.bin headers'; 43 = 'B3a: signed image'; 44 = 'B3a: PMU reset + IMEM PIO'; 45 = 'B3a: DMEM descriptor'; 46 = 'B3b: CPU-side image (user code)'; 47 = 'B3c: read hardware WPR range'; 48 = 'B3c: build bounded WPR image'; 49 = 'B3c: prepare SMMU and PMU VM'; 50 = 'B3c: bind PMU instance block'; 51 = 'B3c: write ACR DMA descriptors'; 52 = 'B3c: legacy ACR step'; 53 = 'B3c: priv ring init'; 62 = 'B3c: snapshot and clear old PFIFO MMU faults'; 54 = 'B3c: invalidate selected PMU PDB'; 55 = 'B3c: invalidate all PMU PDBs'; 56 = 'B3c: one-shot ACR boot'; 57 = 'B3c: select per-instance PDB page size'; 58 = 'B3c: write advertised PMU argv and start LS PMU'; 59 = 'B3c: wait for and inspect PMU INIT'; 60 = 'B3c: read PMU post-wait diagnostics'; 61 = 'B3c: snapshot LS loader IMEM, DMA, FBIF, bind and faults'; 63 = 'B3c: snapshot DMACTL before LS start'; 64 = 'B3c: build PMU loader DMA bases from WPR address'; 65 = 'B3c: parse PMU INIT and validate command queues'; 66 = 'B3c: send INIT_WPR_REGION and wait for reply'; 67 = 'B3c: enable GR and snapshot FECS mailbox'; 68 = 'B3c: post FECS bootstrap command'; 69 = 'B3c: sample PMU and HPQ while waiting'; 70 = 'B3c: read final FECS, GPCCS and PMU state'; 71 = 'B3c: PMU checkpoint before FECS bootstrap (stop if halted)'; 72 = 'B3c: PMU state right after FECS bootstrap post'; 30 = 'B2a: SMMU check'; 31 = 'B2a: DMA setup'; 32 = 'B2a: DMA memory -> DMEM'; 33 = 'B2a: DMA DMEM -> memory'; 34 = 'B2a: DMA setup restore'; 35 = 'B2a: memory path read'; 36 = 'B2a: DMA try 1'; 37 = 'B2a: DMA try 2 (after PMU reset)'; 38 = 'B2a: DMA try 3 (after PMU reset)'; 39 = 'B2a: PMU instance bind'; 10 = 'power down'; 11 = 'done'; 100 = 'done, GPU left on (KeepOn)' }
@@ -299,6 +361,7 @@ function Show-Trace {
     $steps[111] = 'E1: disable channel, preempt, unbind, reset, and free mappings'
     $steps[112] = 'E1: safe resident status IOCTL'
     $steps[113] = 'E2: repeated 3D clears with resident GPFIFO wraparound'
+    $steps[114] = 'E3: resident interrupt-driven clear and nonstall event wait'
     Sum ('power test runs {0}: last step {1} ({2})  result {3}  took {4} us' -f $p.TestRuns, $p.Step, $steps[[int]$p.Step], (Hex $p.Result), $p.TestUs)
     if ($null -ne $p.McHotStatAfterReset) {
       $pts = @(@('GPU off', $p.McHotStatAtStart), @('after reset', $p.McHotStatAfterReset), @('after flush', $p.McHotStatAfterFlush), @('after BAR0 reads', $p.McHotStatAfterBar0), @('B2a start', $p.McHotStatB2aStart), @('before DMA', $p.McHotStatBeforeDma), @('after DMA', $p.McHotStatAfterDma))
@@ -854,6 +917,17 @@ switch ($Mode) {
     }
     try { Invoke-ResidentSubmit }
     catch { Sum ('E2 IOCTL failed (resident channel required): {0}' -f $_.Exception.Message) }
+    Log ''; Show-Trace
+  }
+  'Irq' {
+    $oldE3 = Get-ItemProperty $Key -ErrorAction SilentlyContinue
+    if ($oldE3) {
+      foreach ($n in @($oldE3.PSObject.Properties | Where-Object { $_.Name -match '^E3' } | ForEach-Object { $_.Name })) {
+        Remove-ItemProperty -Path $Key -Name $n -ErrorAction SilentlyContinue
+      }
+    }
+    try { Invoke-ResidentIrq }
+    catch { Sum ('E3 IOCTL failed (resident channel and R447H+ interrupts required): {0}' -f $_.Exception.Message) }
     Log ''; Show-Trace
   }
   { $_ -eq 'PowerTest' -or $_ -eq 'ProbeTest' -or $_ -eq 'DmaTest' -or $_ -eq 'FwTest' -or $_ -eq 'AcrTest' -or $_ -eq 'Resident' } {

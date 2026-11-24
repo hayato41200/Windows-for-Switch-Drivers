@@ -459,3 +459,12 @@ MIT Mesa Nouveau source src/nouveau/vulkan/nvk_cmd_clear.c, functions
 emit_clear_rects() and nvk_CmdClearAttachments(). These definitions and
 method values are used as data; no third-party source code was copied or
 adapted. Original MIT notices remain with the referenced files.
+
+0.7.0 E3 interrupt source selection and acknowledgement flow were cross-checked
+against MIT nvgpu L4T 1ae0167d functions gk20a_intr_isr_stall(),
+gk20a_intr_isr_nonstall(), gk20a_intr_thread_nonstall(),
+gk20a_fifo_nonstall_isr(), and gr_gk20a_handle_nonstall(), plus the MIT
+GM20B register headers hw_mc_gm20b.h, hw_fifo_gm20b.h, and hw_gr_gm20b.h.
+The NON_STALL_INT method definition was checked against NVIDIA open-gpu-doc
+dev_pbdma.ref and class B06F method definitions. Register and method values
+are used as data; no third-party source code was copied or adapted.

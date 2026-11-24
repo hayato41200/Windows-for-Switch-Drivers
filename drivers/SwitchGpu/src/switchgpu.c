@@ -39,7 +39,7 @@
 #include <wdf.h>
 #include <spb.h>
 
-#define SWGPU_VERSION      0x00000600u   /* 0.6.0 */
+#define SWGPU_VERSION      0x00000703u   /* 0.7.3 */
 
 #define CAR_PHYS           0x60006000ull
 #define CAR_LEN            0x1000u
@@ -158,6 +158,22 @@ static const GUID GUID_DEVINTERFACE_SWGPU_RESIDENT =
 #define IOCTL_SWGPU_RESIDENT_STATUS CTL_CODE(FILE_DEVICE_UNKNOWN, 0x800, METHOD_BUFFERED, FILE_READ_ACCESS | FILE_WRITE_ACCESS)
 #define IOCTL_SWGPU_RESIDENT_STOP   CTL_CODE(FILE_DEVICE_UNKNOWN, 0x801, METHOD_BUFFERED, FILE_READ_ACCESS | FILE_WRITE_ACCESS)
 #define IOCTL_SWGPU_SUBMIT_TEST     CTL_CODE(FILE_DEVICE_UNKNOWN, 0x802, METHOD_BUFFERED, FILE_READ_ACCESS | FILE_WRITE_ACCESS)
+#define IOCTL_SWGPU_IRQ_TEST        CTL_CODE(FILE_DEVICE_UNKNOWN, 0x803, METHOD_BUFFERED, FILE_READ_ACCESS | FILE_WRITE_ACCESS)
+
+/* GM20B NV_PMC / PFIFO interrupt source registers (nvgpu hw_mc_gm20b.h). */
+#define PMC_INTR_STATUS_STALL       0x00000100u
+#define PMC_INTR_STATUS_NONSTALL    0x00000104u
+#define PMC_INTR_MASK_STALL         0x00000640u
+#define PMC_INTR_MASK_NONSTALL      0x00000644u
+#define PMC_INTR_EN_STALL           0x00000140u
+#define PMC_INTR_EN_NONSTALL        0x00000144u
+#define PMC_INTR_PFIFO_PENDING      0x00000100u
+#define PMC_INTR_PGRAPH_PENDING     0x00001000u /* Claude 0.7.0: GR intr id 12 from this GPU's top_device_info (8006183E: intr 12, reset 12); 0x200000 was wrong */
+#define FIFO_INTR_0                 0x00002100u
+#define FIFO_INTR_0_CHANNEL_INTR    0x80000000u
+#define FIFO_INTR_EN_1              0x00002528u /* Claude 0.7.3: nonstall routing (nvgpu fifo_intr_en_1 = CHANNEL_INTR) */
+#define GR_INTR_NONSTALL            0x00400120u
+#define GR_INTR_NONSTALL_TRAP       0x00000002u
 
 typedef struct _SWGPU_RESIDENT_STATUS {
     ULONG Version;
@@ -189,6 +205,14 @@ typedef struct _SWGPU_E2_RESULT {
     ULONG GrIntr, GrException, GrStatus, MmuFault, ClassError, TrappedAddr;
     ULONG TrappedDataLo, TrappedDataHi, PixelFirst, PixelMiddle, PixelLast;
 } SWGPU_E2_RESULT, *PSWGPU_E2_RESULT;
+
+typedef struct _SWGPU_E3_RESULT {
+    ULONG Version, Result, Rounds, Waits, NonstallCount, StallCount, StallUnits;
+    ULONG MaxWaitUs, TotalUs, Timeouts, HaveInterrupts;
+    ULONG FirstMcIntr0, FirstMcIntr1, LastMcIntr0, LastMcIntr1;
+    ULONG GpGet, GpPut, Semaphore, PixelFirst, PixelMiddle, PixelLast;
+    ULONG Channel, PbdmaStatus, PbdmaIntr0, FifoIntr0, GrIntr, GrStatus, MmuFault;
+} SWGPU_E3_RESULT, *PSWGPU_E3_RESULT;
 
 typedef struct _SWGPU_RESIDENT_POWER {
     UCHAR Vout;
@@ -227,6 +251,21 @@ typedef struct _SWGPU_DEVICE {
     BOOLEAN        ResidentRunlistSubmitted;
     BOOLEAN        ResidentInstBound;
     BOOLEAN        ResidentIdleRefHeld;
+    WDFINTERRUPT   StallInterrupt;
+    WDFINTERRUPT   NonstallInterrupt;
+    BOOLEAN        HaveInterruptResources;
+    BOOLEAN        InterruptSourcesEnabled;
+    ULONG          InterruptResourceCount;
+    volatile LONG  E3IsrActive;
+    volatile LONG  E3NonstallCount;
+    volatile LONG  E3StallCount;
+    volatile LONG  E3StallUnits;
+    volatile LONG  E3FirstMcIntr0;
+    volatile LONG  E3FirstMcIntr1;
+    volatile LONG  E3LastMcIntr0;
+    volatile LONG  E3LastMcIntr1;
+    volatile LONG  E3FirstSet;
+    KEVENT         E3Event;
     ULONG          ResidentRunlistEmptyValue;
     ULONG          ResidentChannelId;
     ULONG          ResidentShutdownResult;
@@ -249,8 +288,13 @@ EVT_WDF_DEVICE_RELEASE_HARDWARE SwGpuEvtReleaseHardware;
 EVT_WDF_DEVICE_SELF_MANAGED_IO_INIT SwGpuEvtSelfManagedIoInit;
 EVT_WDF_DEVICE_D0_EXIT SwGpuEvtD0Exit;
 EVT_WDF_IO_QUEUE_IO_DEVICE_CONTROL SwGpuEvtIoDeviceControl;
+EVT_WDF_INTERRUPT_ISR SwGpuEvtStallInterruptIsr;
+EVT_WDF_INTERRUPT_ISR SwGpuEvtNonstallInterruptIsr;
+EVT_WDF_INTERRUPT_DPC SwGpuEvtInterruptDpc;
 
 static WCHAR SwGpuParamsPath[256];
+static ULONG B3eResidentShutdown(PSWGPU_DEVICE Dev);
+static ULONG B3eEnableInterruptSources(PSWGPU_DEVICE Dev);
 
 /* ---------------------------------------------------------------- trace */
 
@@ -336,6 +380,104 @@ static VOID TraceBin(PCWSTR Name, PVOID Data, ULONG Length)
 
 static ULONG Rd(volatile UCHAR *Base, ULONG Off) { return READ_REGISTER_ULONG((volatile ULONG *)(Base + Off)); }
 static VOID Wr(volatile UCHAR *Base, ULONG Off, ULONG V) { WRITE_REGISTER_ULONG((volatile ULONG *)(Base + Off), V); }
+
+/* The resident gate is checked before any BAR0 access. This keeps an asserted
+ * level vector harmless while the GPU is off or during a non-resident run. */
+static BOOLEAN B3eRecordMcInterrupt(PSWGPU_DEVICE Dev, ULONG Intr0, ULONG Intr1,
+                                   BOOLEAN Stall)
+{
+    if (InterlockedCompareExchange(&Dev->E3FirstSet, 1, 0) == 0) {
+        InterlockedExchange(&Dev->E3FirstMcIntr0, (LONG)Intr0);
+        InterlockedExchange(&Dev->E3FirstMcIntr1, (LONG)Intr1);
+    }
+    InterlockedExchange(&Dev->E3LastMcIntr0, (LONG)Intr0);
+    InterlockedExchange(&Dev->E3LastMcIntr1, (LONG)Intr1);
+    if (Stall) {
+        InterlockedIncrement(&Dev->E3StallCount);
+        InterlockedOr(&Dev->E3StallUnits, (LONG)Intr0);
+    } else {
+        InterlockedIncrement(&Dev->E3NonstallCount);
+    }
+    return TRUE;
+}
+
+static BOOLEAN B3eInterruptIsr(WDFINTERRUPT Interrupt, BOOLEAN Stall)
+{
+    WDFDEVICE Device = WdfInterruptGetDevice(Interrupt);
+    PSWGPU_DEVICE Dev = SwGpuGetDevice(Device);
+    volatile UCHAR *B;
+    ULONG intr0, intr1, fifoIntr, grIntr, grAck;
+    BOOLEAN handled = FALSE;
+
+    if (Dev == NULL || InterlockedCompareExchange(&Dev->E3IsrActive, 0, 0) == 0 ||
+        !Dev->ResidentActive || Dev->Bar0 == NULL)
+        return FALSE;
+    B = Dev->Bar0;
+    intr0 = Rd(B, PMC_INTR_STATUS_STALL);
+    intr1 = Rd(B, PMC_INTR_STATUS_NONSTALL);
+    if (Stall) {
+        if (intr0 == 0u) return FALSE;
+        (VOID)B3eRecordMcInterrupt(Dev, intr0, intr1, TRUE);
+        /* ISR direct-write allowlist only: PMC INTR_EN_0 (0x140) masks stall;
+         * PFIFO INTR_0 (0x2100) W1C-acks CHANNEL_INTR; GR INTR_NONSTALL
+         * (0x400120) W1C-acks the nonstall trap; PMC INTR_EN_1 (0x144) masks an
+         * unacked nonstall source (Claude 0.7.0). No other ISR writes. */
+        Wr(B, PMC_INTR_EN_STALL, 0u);
+        (VOID)Rd(B, PMC_INTR_EN_STALL);
+        return TRUE;
+    }
+
+    if ((intr1 & PMC_INTR_PFIFO_PENDING) != 0u) {
+        fifoIntr = Rd(B, FIFO_INTR_0);
+        if ((fifoIntr & FIFO_INTR_0_CHANNEL_INTR) != 0u) {
+            /* PFIFO CHANNEL_INTR is W1C (nvgpu fifo_nonstall_isr path). */
+            Wr(B, FIFO_INTR_0, FIFO_INTR_0_CHANNEL_INTR);
+            handled = TRUE;
+        }
+    }
+    if ((intr1 & PMC_INTR_PGRAPH_PENDING) != 0u) {
+        grIntr = Rd(B, GR_INTR_NONSTALL);
+        grAck = grIntr & GR_INTR_NONSTALL_TRAP;
+        if (grAck != 0u) {
+            /* GR nonstall trap is W1C, as gr_gk20a_handle_nonstall(). */
+            Wr(B, GR_INTR_NONSTALL, grAck);
+            handled = TRUE;
+        }
+    }
+    if (!handled) {
+        /* Claude 0.7.0: a level line with a pending source we do not ack would
+         * storm. Mask INTR_EN_1 (allowlisted write) and claim it; E3 then times
+         * out and the recorded status shows which bit it was. */
+        if (intr1 == 0u) return FALSE;
+        (VOID)B3eRecordMcInterrupt(Dev, intr0, intr1, FALSE);
+        Wr(B, PMC_INTR_EN_NONSTALL, 0u);
+        (VOID)Rd(B, PMC_INTR_EN_NONSTALL);
+        return TRUE;
+    }
+    (VOID)B3eRecordMcInterrupt(Dev, intr0, intr1, FALSE);
+    (VOID)WdfInterruptQueueDpcForIsr(Interrupt);
+    return TRUE;
+}
+
+BOOLEAN SwGpuEvtStallInterruptIsr(WDFINTERRUPT Interrupt, ULONG MessageId)
+{
+    UNREFERENCED_PARAMETER(MessageId);
+    return B3eInterruptIsr(Interrupt, TRUE);
+}
+
+BOOLEAN SwGpuEvtNonstallInterruptIsr(WDFINTERRUPT Interrupt, ULONG MessageId)
+{
+    UNREFERENCED_PARAMETER(MessageId);
+    return B3eInterruptIsr(Interrupt, FALSE);
+}
+
+VOID SwGpuEvtInterruptDpc(WDFINTERRUPT Interrupt, WDFOBJECT AssociatedObject)
+{
+    WDFDEVICE Device = (WDFDEVICE)AssociatedObject;
+    PSWGPU_DEVICE Dev = SwGpuGetDevice(Device);
+    UNREFERENCED_PARAMETER(Interrupt);
+    if (Dev != NULL) KeSetEvent(&Dev->E3Event, IO_NO_INCREMENT, FALSE);
+}
 static VOID Us(ULONG Microseconds) { KeStallExecutionProcessor(Microseconds); }
 
 static VOID Ms(ULONG Milliseconds)
@@ -7651,6 +7793,244 @@ out:
     if (uc != NULL) ExFreePoolWithTag(uc, SWGPU_TAG);
 }
 
+static ULONG B3eResidentIrqTest(PSWGPU_DEVICE Dev, PSWGPU_E3_RESULT Out)
+{
+    volatile UCHAR *B = Dev != NULL ? Dev->Bar0 : NULL;
+    volatile ULONG *bar1GpPut, *bar1GpGet, *semSlot;
+    PULONG ring, push, pixels;
+    ULONG (*writes)[4] = NULL;
+    ULONG writeCapacity = 512u, writeCount = 0u;
+    ULONG rounds = 64u, ringEntries = PAGE_SIZE / 8u;
+    ULONG round = 0u, cursor, colorIndex, color, semaphore, put, newPut, get;
+    ULONG l2State[4] = { 0u }, gotSemaphore = 0u, pixelFirst = 0u, pixelMiddle = 0u, pixelLast = 0u;
+    ULONG result = 0u, failureStage = 0u, completed = 0u, timeoutCount = 0u, waitCount = 0u;
+    ULONG timeoutWorkDone = 0u;
+    ULONG i, e3Result;
+    LARGE_INTEGER totalStart, totalEnd, waitStart, waitEnd, frequency, waitLimit;
+    ULONGLONG totalTicks, waitTicks, totalUs, waitUs, maxWaitUs = 0u;
+
+    if (Out == NULL) return STATUS_INVALID_PARAMETER;
+    RtlZeroMemory(Out, sizeof(*Out));
+    Out->Version = SWGPU_VERSION;
+    Out->HaveInterrupts = (Dev != NULL && Dev->HaveInterruptResources &&
+                           Dev->InterruptSourcesEnabled) ? 1u : 0u;
+    if (Dev == NULL || !Dev->ResidentActive || g_ResidentOwner != Dev ||
+        !Dev->ResidentChannelEnabled || !Dev->ResidentRunlistSubmitted ||
+        !Dev->ResidentInstBound || B == NULL || Dev->Bar1Cpu == NULL ||
+        Dev->Bar1MapLen < BAR1_D3_MAP_LEN || !g_GrVm.Active || g_GrVm.Arena == NULL) {
+        result = STATUS_DEVICE_NOT_READY;
+        goto done;
+    }
+    Step(114);
+    if (!Dev->HaveInterruptResources || !Dev->InterruptSourcesEnabled) {
+        /* No descriptors is the supported pre-R447H case. If descriptors
+         * exist but WDF could not create both interrupt objects, report setup
+         * failure separately so a broken R447H resource map is visible. */
+        result = (Dev->InterruptResourceCount == 0u) ? 0xE00000A7u : 0xE00000A9u;
+        goto done;
+    }
+    B3cPrivRingResetWriteLog();
+    if ((Rd(B, NV_PMC_ENABLE) & (1u << 12)) == 0u || ringEntries == 0u ||
+        GR_VM_D2_PUSHBUF_OFF + PAGE_SIZE > GR_VM_ARENA_SIZE ||
+        GR_VM_D2_GPFIFO_OFF + PAGE_SIZE > GR_VM_ARENA_SIZE ||
+        GR_VM_D2_RT_OFF + 64u * 64u * sizeof(ULONG) > GR_VM_ARENA_SIZE) {
+        result = 0xE00000A8u; failureStage = 1u; goto done;
+    }
+    ring = (PULONG)((PUCHAR)g_GrVm.Arena + GR_VM_D2_GPFIFO_OFF);
+    push = (PULONG)((PUCHAR)g_GrVm.Arena + GR_VM_D2_PUSHBUF_OFF);
+    pixels = (PULONG)((PUCHAR)g_GrVm.Arena + GR_VM_D2_RT_OFF);
+    semSlot = (volatile ULONG *)((PUCHAR)push + PAGE_SIZE - 64u);
+    bar1GpPut = (volatile ULONG *)(Dev->Bar1Cpu + BAR1_D3_LOW_VA + 0x8Cu);
+    bar1GpGet = (volatile ULONG *)(Dev->Bar1Cpu + BAR1_D3_LOW_VA + 0x88u);
+    writes = (ULONG (*)[4])ExAllocatePool2(POOL_FLAG_NON_PAGED,
+        writeCapacity * sizeof(writes[0]), SWGPU_TAG);
+    if (writes == NULL) { result = 0xE00000A8u; failureStage = 2u; goto done; }
+    RtlZeroMemory(writes, writeCapacity * sizeof(writes[0]));
+    put = *bar1GpPut;
+    if (put >= ringEntries) { result = 0xE00000A8u; failureStage = 3u; goto done; }
+    InterlockedExchange(&Dev->E3NonstallCount, 0);
+    InterlockedExchange(&Dev->E3StallCount, 0);
+    InterlockedExchange(&Dev->E3StallUnits, 0);
+    InterlockedExchange(&Dev->E3FirstMcIntr0, 0);
+    InterlockedExchange(&Dev->E3FirstMcIntr1, 0);
+    InterlockedExchange(&Dev->E3LastMcIntr0, 0);
+    InterlockedExchange(&Dev->E3LastMcIntr1, 0);
+    InterlockedExchange(&Dev->E3FirstSet, 0);
+    totalStart = KeQueryPerformanceCounter(&frequency);
+    waitLimit.QuadPart = -1000000LL; /* 100 ms, relative, one bounded wait per round. */
+
+    for (round = 0u; round < rounds; ++round) {
+        cursor = 0u;
+        colorIndex = round & 7u;
+        color = 0xFF000000u |
+            ((colorIndex & 1u) ? 0x00FF0000u : 0u) |
+            ((colorIndex & 2u) ? 0x0000FF00u : 0u) |
+            ((colorIndex & 4u) ? 0x000000FFu : 0u);
+        semaphore = 0xE3000000u | (round + 1u);
+        for (i = 0u; i < 4096u; ++i) pixels[i] = 0x11111111u;
+        for (i = 0u; i < 4u; ++i) semSlot[i] = 0u;
+#define E3_METHOD(method, value) do { \
+        if (cursor + 2u >= PAGE_SIZE / sizeof(ULONG) - 16u) { failureStage = 4u; goto e3_round_fail; } \
+        push[cursor++] = 0x20010000u | ((ULONG)(method) >> 2); \
+        push[cursor++] = (ULONG)(value); \
+    } while (0)
+        /* D5 known-good MAXWELL_B 3D clear methods (clb197.h). */
+        E3_METHOD(0x0000u, 0x0000B197u);
+        E3_METHOD(0x121Cu, 1u); E3_METHOD(0x0800u, 0u);
+        E3_METHOD(0x0804u, (ULONG)((ULONGLONG)GR_VM_GPU_VA + GR_VM_D2_RT_OFF));
+        E3_METHOD(0x0808u, 256u); E3_METHOD(0x080Cu, 64u);
+        E3_METHOD(0x0810u, 0xCFu); E3_METHOD(0x0814u, 0x1000u);
+        E3_METHOD(0x0818u, 1u); E3_METHOD(0x081Cu, 0u); E3_METHOD(0x0820u, 0u);
+        E3_METHOD(0x0FE0u, 0u); E3_METHOD(0x0FE4u, 0u);
+        E3_METHOD(0x1538u, 0u); E3_METHOD(0x0FF4u, 0x00400000u);
+        E3_METHOD(0x0FF8u, 0x00400000u); E3_METHOD(0x0DF8u, 0u);
+        E3_METHOD(0x0DFCu, 0u); E3_METHOD(0x0E00u, 0u);
+        E3_METHOD(0x10F8u, 0x10u); E3_METHOD(0x0D6Cu, 0x00400000u);
+        E3_METHOD(0x0D70u, 0x00400000u);
+        E3_METHOD(0x0D80u, (colorIndex & 1u) ? 0x3F800000u : 0u);
+        E3_METHOD(0x0D84u, (colorIndex & 2u) ? 0x3F800000u : 0u);
+        E3_METHOD(0x0D88u, (colorIndex & 4u) ? 0x3F800000u : 0u);
+        E3_METHOD(0x0D8Cu, 0x3F800000u);
+        E3_METHOD(0x19D0u, 0x3Cu);
+#undef E3_METHOD
+        if (cursor + 8u >= PAGE_SIZE / sizeof(ULONG) - 16u) {
+            failureStage = 4u; goto e3_round_fail;
+        }
+        /* Host SEMAPHORE RELEASE with WFI; then NVB06F NON_STALL_INT
+         * (host method 0x20, open-gpu-doc dev_pbdma.ref). */
+        push[cursor++] = 0x20040004u;
+        push[cursor++] = 0u;
+        push[cursor++] = (ULONG)((ULONGLONG)GR_VM_GPU_VA + GR_VM_D2_PUSHBUF_OFF + PAGE_SIZE - 64u);
+        push[cursor++] = semaphore;
+        push[cursor++] = 0x01000002u;
+        /* Claude 0.7.3: no SET_OBJECT B06F on subchannel 1 (0.7.2 hardware: GR_INTR exception
+         * 0x200000 as a stall interrupt). NON_STALL_INT is a host method; subchannel 0. */
+        push[cursor++] = 0x20010008u; push[cursor++] = 0u; /* NON_STALL_INT, method 0x20 */
+        KeMemoryBarrier();
+        ring[put * 2u] = (ULONG)((ULONGLONG)GR_VM_GPU_VA + GR_VM_D2_PUSHBUF_OFF) & ~3u;
+        ring[put * 2u + 1u] = cursor << 10;
+        KeMemoryBarrier();
+        writeCount = 0u; l2State[0] = l2State[1] = l2State[2] = l2State[3] = 0u;
+        if (!B3cD5L2Flush(B, writes, &writeCount, writeCapacity, l2State)) {
+            failureStage = 5u; goto e3_round_fail;
+        }
+        newPut = (put + 1u) % ringEntries;
+        KeClearEvent(&Dev->E3Event);
+        KeMemoryBarrier();
+        *bar1GpPut = newPut;
+        KeMemoryBarrier();
+        if (*bar1GpPut != newPut || Rd(B, 0x00002A30u) != 0u ||
+            (Rd(B, 0x00002100u) & 0x10000000u) != 0u) {
+            failureStage = 6u; goto e3_round_fail;
+        }
+        ++waitCount;
+        waitStart = KeQueryPerformanceCounter(NULL);
+        e3Result = (ULONG)KeWaitForSingleObject(&Dev->E3Event, Executive,
+                                                 KernelMode, FALSE, &waitLimit);
+        waitEnd = KeQueryPerformanceCounter(NULL);
+        waitTicks = (ULONGLONG)(waitEnd.QuadPart - waitStart.QuadPart);
+        waitUs = frequency.QuadPart > 0 ? (waitTicks * 1000000ull) / (ULONGLONG)frequency.QuadPart : 0u;
+        if (waitUs > maxWaitUs) maxWaitUs = waitUs;
+        if (e3Result != STATUS_SUCCESS) {
+            ++timeoutCount;
+            /* Timeout diagnosis intentionally reads the semaphore only once. */
+            writeCount = 0u;
+            if (B3cD5L2Flush(B, writes, &writeCount, writeCapacity, l2State)) {
+                KeMemoryBarrier(); gotSemaphore = semSlot[0];
+            } else gotSemaphore = semSlot[0];
+            timeoutWorkDone = (gotSemaphore == semaphore) ? 1u : 0u;
+            failureStage = 7u;
+            goto e3_round_fail;
+        }
+        writeCount = 0u;
+        if (!B3cD5L2Flush(B, writes, &writeCount, writeCapacity, l2State)) {
+            failureStage = 8u; goto e3_round_fail;
+        }
+        KeMemoryBarrier();
+        gotSemaphore = semSlot[0];
+        pixelFirst = pixels[0]; pixelMiddle = pixels[2048]; pixelLast = pixels[4095];
+        get = *bar1GpGet;
+        if (get != newPut || gotSemaphore != semaphore || pixelFirst != color ||
+            pixelMiddle != color || pixelLast != color) {
+            failureStage = 9u; goto e3_round_fail;
+        }
+        ++completed;
+        put = newPut;
+        continue;
+
+e3_round_fail:
+        result = 0xE00000A8u;
+        Out->Timeouts = timeoutCount;
+        Trace(L"E3FailRound", round + 1u);
+        break;
+    }
+    totalEnd = KeQueryPerformanceCounter(NULL);
+    totalTicks = (ULONGLONG)(totalEnd.QuadPart - totalStart.QuadPart);
+    totalUs = frequency.QuadPart > 0 ? (totalTicks * 1000000ull) / (ULONGLONG)frequency.QuadPart : 0u;
+    Out->TotalUs = (ULONG)(totalUs > 0xFFFFFFFFull ? 0xFFFFFFFFu : totalUs);
+    Out->MaxWaitUs = (ULONG)(maxWaitUs > 0xFFFFFFFFull ? 0xFFFFFFFFu : maxWaitUs);
+    Out->Rounds = completed; Out->Waits = waitCount; Out->Timeouts = timeoutCount;
+    Out->GpPut = *bar1GpPut; Out->GpGet = *bar1GpGet;
+    Out->Semaphore = gotSemaphore;
+    Out->PixelFirst = pixelFirst; Out->PixelMiddle = pixelMiddle; Out->PixelLast = pixelLast;
+    if (round == rounds) result = 0u;
+
+done:
+    Out->Result = result;
+    Out->HaveInterrupts = (Dev != NULL && Dev->HaveInterruptResources && Dev->InterruptSourcesEnabled) ? 1u : 0u;
+    if (Dev != NULL) {
+        Out->NonstallCount = (ULONG)InterlockedCompareExchange(&Dev->E3NonstallCount, 0, 0);
+        Out->StallCount = (ULONG)InterlockedCompareExchange(&Dev->E3StallCount, 0, 0);
+        Out->StallUnits = (ULONG)InterlockedCompareExchange(&Dev->E3StallUnits, 0, 0);
+        Out->FirstMcIntr0 = (ULONG)InterlockedCompareExchange(&Dev->E3FirstMcIntr0, 0, 0);
+        Out->FirstMcIntr1 = (ULONG)InterlockedCompareExchange(&Dev->E3FirstMcIntr1, 0, 0);
+        Out->LastMcIntr0 = (ULONG)InterlockedCompareExchange(&Dev->E3LastMcIntr0, 0, 0);
+        Out->LastMcIntr1 = (ULONG)InterlockedCompareExchange(&Dev->E3LastMcIntr1, 0, 0);
+        if (B != NULL && Dev->ResidentActive) {
+            Out->Channel = Rd(B, 0x00800004u); Out->PbdmaStatus = Rd(B, 0x00003080u);
+            Out->PbdmaIntr0 = Rd(B, 0x00040108u); Out->FifoIntr0 = Rd(B, FIFO_INTR_0);
+            Out->MmuFault = Rd(B, 0x00002A30u);
+            if (Rd(B, NV_PMC_ENABLE) & (1u << 12)) {
+                Out->GrIntr = Rd(B, 0x00400100u); Out->GrStatus = Rd(B, 0x00400700u);
+                /* Claude 0.7.3: read-only GR error detail (exception, class error, trapped addr/data). */
+                Trace(L"E3GrException", Rd(B, 0x00400108u));
+                Trace(L"E3GrClassError", Rd(B, 0x00400110u));
+                Trace(L"E3GrTrappedAddr", Rd(B, 0x00400704u));
+                Trace(L"E3GrTrappedDataLo", Rd(B, 0x00400708u));
+            }
+            Trace(L"E3PmcIntr0AtEnd", Rd(B, PMC_INTR_STATUS_STALL));
+            Trace(L"E3PmcIntr1AtEnd", Rd(B, PMC_INTR_STATUS_NONSTALL));
+            Trace(L"E3FifoIntrEn1AtEnd", Rd(B, FIFO_INTR_EN_1));
+        }
+    }
+    TraceDurable(L"E3Result", result); Trace(L"E3Rounds", Out->Rounds);
+    Trace(L"E3Waits", Out->Waits);
+    Trace(L"E3NonstallCount", Out->NonstallCount); Trace(L"E3StallCount", Out->StallCount);
+    Trace(L"E3StallUnits", Out->StallUnits); Trace(L"E3MaxWaitUs", Out->MaxWaitUs);
+    Trace(L"E3TotalUs", Out->TotalUs); Trace(L"E3Timeouts", Out->Timeouts);
+    Trace(L"E3HaveInterrupts", Out->HaveInterrupts);
+    Trace(L"E3FirstMcIntr0", Out->FirstMcIntr0); Trace(L"E3FirstMcIntr1", Out->FirstMcIntr1);
+    Trace(L"E3LastMcIntr0", Out->LastMcIntr0); Trace(L"E3LastMcIntr1", Out->LastMcIntr1);
+    Trace(L"E3GpGet", Out->GpGet); Trace(L"E3GpPut", Out->GpPut);
+    Trace(L"E3Semaphore", Out->Semaphore); Trace(L"E3PixelFirst", Out->PixelFirst);
+    Trace(L"E3PixelMiddle", Out->PixelMiddle); Trace(L"E3PixelLast", Out->PixelLast);
+    Trace(L"E3FailureStage", failureStage); Trace(L"E3Channel", Out->Channel);
+    Trace(L"E3TimeoutWorkDone", timeoutWorkDone);
+    Trace(L"E3PbdmaStatus", Out->PbdmaStatus); Trace(L"E3PbdmaIntr0", Out->PbdmaIntr0);
+    Trace(L"E3FifoIntr0", Out->FifoIntr0); Trace(L"E3GrIntr", Out->GrIntr);
+    Trace(L"E3GrStatus", Out->GrStatus); Trace(L"E3MmuFault", Out->MmuFault);
+    if (result != 0u && B != NULL && Dev != NULL && Dev->ResidentActive &&
+        (Rd(B, NV_PMC_ENABLE) & (1u << 12)) != 0u) {
+        ULONG dump[B3C_GR_STATUS_DUMP_REGS * 2u] = { 0u };
+        B3cCaptureGrStatusDump(B, L"E3GrStatusDump", dump);
+    }
+    if (writes != NULL) TraceBin(L"E3PrivWrites", writes, writeCount * sizeof(writes[0]));
+    B3cPrivRingTraceWriteLog(L"E3PrivErrorCount", L"E3PrivErrorDropped",
+        L"E3PrivAckTimeouts", L"E3PrivErrors");
+    if (writes != NULL) ExFreePoolWithTag(writes, SWGPU_TAG);
+    return result;
+}
+
 static ULONG B3ePowerDownGpu(PSWGPU_DEVICE Dev, PSWGPU_RESIDENT_POWER Power)
 {
     ULONG i, error = 0u;
@@ -7693,6 +8073,98 @@ static ULONG B3ePowerDownGpu(PSWGPU_DEVICE Dev, PSWGPU_RESIDENT_POWER Power)
     Trace(L"B3ePowerDownError", error);
     TraceDurable(L"B3ePowerDownDone", 1u);
     return error;
+}
+
+/* Source selection follows nvgpu gk20a_pm_finalize_poweron(): PFIFO/PGRAPH
+ * on nonstall, and PGRAPH/PFIFO/PRIV_RING/LTC/PBUS on stall. Only PMC BAR0
+ * registers are used; the Tegra MC block/routing is never touched here. */
+static ULONG B3eEnableInterruptSources(PSWGPU_DEVICE Dev)
+{
+    volatile UCHAR *B = Dev != NULL ? Dev->Bar0 : NULL;
+    ULONG writes[12][4] = { { 0u } }, writeCount = 0u;
+    ULONG result = 0u;
+    if (Dev == NULL || B == NULL || !Dev->HaveInterruptResources ||
+        Dev->StallInterrupt == NULL || Dev->NonstallInterrupt == NULL)
+        return 0u;
+    InterlockedExchange(&Dev->E3NonstallCount, 0);
+    InterlockedExchange(&Dev->E3StallCount, 0);
+    InterlockedExchange(&Dev->E3StallUnits, 0);
+    InterlockedExchange(&Dev->E3FirstMcIntr0, 0);
+    InterlockedExchange(&Dev->E3FirstMcIntr1, 0);
+    InterlockedExchange(&Dev->E3LastMcIntr0, 0);
+    InterlockedExchange(&Dev->E3LastMcIntr1, 0);
+    InterlockedExchange(&Dev->E3FirstSet, 0);
+    KeClearEvent(&Dev->E3Event);
+    B3cPrivRingResetWriteLog();
+    /* Claude 0.7.3: PFIFO CHANNEL_INTR reaches PMC INTR_1 only with FIFO_INTR_EN_1 bit 31
+     * (0.7.2 hardware: FIFO_INTR_0 0x80000000 latched while PMC INTR_1 stayed 0).
+     * Clear the stale latch (W1C) first, then route it. */
+    if (!B3cD5Write(B, writes, &writeCount, RTL_NUMBER_OF(writes), FIFO_INTR_0, FIFO_INTR_0_CHANNEL_INTR) ||
+        !B3cD5Write(B, writes, &writeCount, RTL_NUMBER_OF(writes), FIFO_INTR_EN_1, FIFO_INTR_0_CHANNEL_INTR)) {
+        result = 0xE00000A9u;
+        (VOID)B3cD5Write(B, writes, &writeCount, RTL_NUMBER_OF(writes), FIFO_INTR_EN_1, 0u);
+        goto done;
+    }
+    if (!B3cD5Write(B, writes, &writeCount, RTL_NUMBER_OF(writes),
+                    PMC_INTR_MASK_STALL,
+                    PMC_INTR_PFIFO_PENDING | PMC_INTR_PGRAPH_PENDING |
+                    0x40000000u | 0x02000000u | 0x10000000u) ||
+        !B3cD5Write(B, writes, &writeCount, RTL_NUMBER_OF(writes),
+                    PMC_INTR_MASK_NONSTALL,
+                    PMC_INTR_PFIFO_PENDING | PMC_INTR_PGRAPH_PENDING)) {
+        result = 0xE00000A9u;
+        (VOID)B3cD5Write(B, writes, &writeCount, RTL_NUMBER_OF(writes), PMC_INTR_EN_STALL, 0u);
+        (VOID)B3cD5Write(B, writes, &writeCount, RTL_NUMBER_OF(writes), PMC_INTR_EN_NONSTALL, 0u);
+        (VOID)B3cD5Write(B, writes, &writeCount, RTL_NUMBER_OF(writes), PMC_INTR_MASK_STALL, 0u);
+        (VOID)B3cD5Write(B, writes, &writeCount, RTL_NUMBER_OF(writes), PMC_INTR_MASK_NONSTALL, 0u);
+        goto done;
+    }
+    InterlockedExchange(&Dev->E3IsrActive, 1);
+    if (!B3cD5Write(B, writes, &writeCount, RTL_NUMBER_OF(writes), PMC_INTR_EN_STALL, 1u) ||
+        !B3cD5Write(B, writes, &writeCount, RTL_NUMBER_OF(writes), PMC_INTR_EN_NONSTALL, 1u)) {
+        InterlockedExchange(&Dev->E3IsrActive, 0);
+        (VOID)WdfInterruptDisable(Dev->StallInterrupt);
+        (VOID)WdfInterruptDisable(Dev->NonstallInterrupt);
+        (VOID)B3cD5Write(B, writes, &writeCount, RTL_NUMBER_OF(writes), PMC_INTR_MASK_STALL, 0u);
+        (VOID)B3cD5Write(B, writes, &writeCount, RTL_NUMBER_OF(writes), PMC_INTR_MASK_NONSTALL, 0u);
+        (VOID)B3cD5Write(B, writes, &writeCount, RTL_NUMBER_OF(writes), PMC_INTR_EN_STALL, 0u);
+        (VOID)B3cD5Write(B, writes, &writeCount, RTL_NUMBER_OF(writes), PMC_INTR_EN_NONSTALL, 0u);
+        result = 0xE00000A9u;
+        goto done;
+    }
+    Dev->InterruptSourcesEnabled = TRUE;
+done:
+    Trace(L"E3InterruptSourceResult", result);
+    Trace(L"E3HaveInterrupts", Dev->HaveInterruptResources ? 1u : 0u);
+    TraceBin(L"E3InterruptWrites", writes, writeCount * sizeof(writes[0]));
+    B3cPrivRingTraceWriteLog(L"E3PrivErrorCount", L"E3PrivErrorDropped",
+        L"E3PrivAckTimeouts", L"E3PrivErrors");
+    return result;
+}
+
+static ULONG B3eDisableInterruptSources(PSWGPU_DEVICE Dev)
+{
+    volatile UCHAR *B = Dev != NULL ? Dev->Bar0 : NULL;
+    ULONG writes[8][4] = { { 0u } }, writeCount = 0u;
+    ULONG result = 0u;
+    if (Dev == NULL) return STATUS_INVALID_PARAMETER;
+    if (Dev->StallInterrupt != NULL) (VOID)WdfInterruptDisable(Dev->StallInterrupt);
+    if (Dev->NonstallInterrupt != NULL) (VOID)WdfInterruptDisable(Dev->NonstallInterrupt);
+    InterlockedExchange(&Dev->E3IsrActive, 0);
+    if (B != NULL) {
+        B3cPrivRingResetWriteLog();
+        if (!B3cD5Write(B, writes, &writeCount, RTL_NUMBER_OF(writes), PMC_INTR_EN_STALL, 0u)) result = 0xE00000A9u;
+        if (!B3cD5Write(B, writes, &writeCount, RTL_NUMBER_OF(writes), PMC_INTR_EN_NONSTALL, 0u)) result = 0xE00000A9u;
+        if (!B3cD5Write(B, writes, &writeCount, RTL_NUMBER_OF(writes), PMC_INTR_MASK_STALL, 0u)) result = 0xE00000A9u;
+        if (!B3cD5Write(B, writes, &writeCount, RTL_NUMBER_OF(writes), PMC_INTR_MASK_NONSTALL, 0u)) result = 0xE00000A9u;
+        if (!B3cD5Write(B, writes, &writeCount, RTL_NUMBER_OF(writes), FIFO_INTR_EN_1, 0u)) result = 0xE00000A9u;
+    }
+    Dev->InterruptSourcesEnabled = FALSE;
+    Trace(L"E3InterruptDisableResult", result);
+    TraceBin(L"E3InterruptDisableWrites", writes, writeCount * sizeof(writes[0]));
+    B3cPrivRingTraceWriteLog(L"E3ShutdownPrivErrorCount", L"E3ShutdownPrivErrorDropped",
+        L"E3ShutdownPrivAckTimeouts", L"E3ShutdownPrivErrors");
+    return result;
 }
 
 static NTSTATUS PowerTest(PSWGPU_DEVICE Dev, BOOLEAN KeepOn, ULONG Mode)
@@ -7857,6 +8329,13 @@ static NTSTATUS PowerTest(PSWGPU_DEVICE Dev, BOOLEAN KeepOn, ULONG Mode)
     }
     if (Mode == 6 && NT_SUCCESS(st) && Dev->ResidentActive) {
         Dev->ResidentRequested = FALSE;
+        {
+            /* Claude 0.7.0: enable the GPU interrupt sources only once the GPU is
+             * resident. A failure leaves them off (E3 then reports it); the
+             * resident GPU itself stays usable as in 0.6.0. */
+            ULONG irqResult = B3eEnableInterruptSources(Dev);
+            TraceDurable(L"E3IrqEnableResult", irqResult);
+        }
         TraceDurable(L"E1Result", 0u);
         TraceDurable(L"B3eResidentActive", 1u);
         Step(110);
@@ -7905,6 +8384,9 @@ static ULONG B3eResidentShutdown(PSWGPU_DEVICE Dev)
     }
     TraceDurable(L"B3eShutdownBegin", 1u);
     Step(111);
+    /* Disable the OS vectors, then GPU PMC interrupt generation, before any
+     * channel preempt, reset, clock gate, or rail-off operation. */
+    (VOID)B3eDisableInterruptSources(Dev);
     error = B3cD2CleanupPublishedState(Dev, writes, &writeCount,
         Dev->ResidentChannelEnabled, Dev->ResidentRunlistSubmitted,
         Dev->ResidentInstBound, Dev->ResidentChannelId,
@@ -7993,8 +8475,25 @@ VOID SwGpuEvtIoDeviceControl(WDFQUEUE Queue, WDFREQUEST Request,
     PSWGPU_DEVICE Dev = SwGpuGetDevice(Device);
     PSWGPU_RESIDENT_STATUS out = NULL;
     PSWGPU_E2_RESULT e2Out = NULL;
+    PSWGPU_E3_RESULT e3Out = NULL;
     NTSTATUS status;
     UNREFERENCED_PARAMETER(InputBufferLength);
+    if (IoControlCode == IOCTL_SWGPU_IRQ_TEST) {
+        if (!Dev->ResidentActive || g_ResidentOwner != Dev) {
+            Trace(L"E3IoctlNotReady", STATUS_DEVICE_NOT_READY);
+            WdfRequestComplete(Request, STATUS_DEVICE_NOT_READY); return;
+        }
+        if (OutputBufferLength < sizeof(SWGPU_E3_RESULT)) {
+            WdfRequestComplete(Request, STATUS_BUFFER_TOO_SMALL); return;
+        }
+        status = WdfRequestRetrieveOutputBuffer(Request, sizeof(SWGPU_E3_RESULT),
+            (PVOID *)&e3Out, NULL);
+        if (!NT_SUCCESS(status)) { WdfRequestComplete(Request, status); return; }
+        TraceDurable(L"B3eControlMode", 10u);
+        (VOID)B3eResidentIrqTest(Dev, e3Out);
+        WdfRequestCompleteWithInformation(Request, STATUS_SUCCESS, sizeof(*e3Out));
+        return;
+    }
     if (IoControlCode == IOCTL_SWGPU_SUBMIT_TEST) {
         if (!Dev->ResidentActive || g_ResidentOwner != Dev) {
             Trace(L"E2IoctlNotReady", STATUS_DEVICE_NOT_READY);
@@ -8047,7 +8546,10 @@ NTSTATUS SwGpuEvtPrepareHardware(WDFDEVICE Device, WDFCMRESLIST Raw, WDFCMRESLIS
     PSWGPU_DEVICE Dev = SwGpuGetDevice(Device);
     ULONG Count = WdfCmResourceListGetCount(Translated), Index, Mem = 0, I2c = 0;
     PHYSICAL_ADDRESS Pa;
-    UNREFERENCED_PARAMETER(Raw);
+    PCM_PARTIAL_RESOURCE_DESCRIPTOR irqRaw[2] = { NULL, NULL };
+    PCM_PARTIAL_RESOURCE_DESCRIPTOR irqTranslated[2] = { NULL, NULL };
+    ULONG interruptCount = 0u;
+    NTSTATUS interruptStatus = STATUS_SUCCESS;
 
     for (Index = 0; Index < Count; ++Index) {
         PCM_PARTIAL_RESOURCE_DESCRIPTOR Desc = WdfCmResourceListGetDescriptor(Translated, Index);
@@ -8062,6 +8564,14 @@ NTSTATUS SwGpuEvtPrepareHardware(WDFDEVICE Device, WDFCMRESLIST Raw, WDFCMRESLIS
             LARGE_INTEGER *Id = (I2c == 0) ? &Dev->VddId : &Dev->PmicId;    /* DSDT order */
             if (I2c < 2) { Id->LowPart = Desc->u.Connection.IdLowPart; Id->HighPart = (LONG)Desc->u.Connection.IdHighPart; }
             ++I2c;
+        } else if (Desc->Type == CmResourceTypeInterrupt) {
+            PCM_PARTIAL_RESOURCE_DESCRIPTOR rawDesc =
+                Index < WdfCmResourceListGetCount(Raw) ? WdfCmResourceListGetDescriptor(Raw, Index) : NULL;
+            if (interruptCount < RTL_NUMBER_OF(irqTranslated)) {
+                irqRaw[interruptCount] = rawDesc;
+                irqTranslated[interruptCount] = Desc;
+            }
+            ++interruptCount;
         }
     }
     Trace(L"ResMem", Mem);
@@ -8085,6 +8595,49 @@ NTSTATUS SwGpuEvtPrepareHardware(WDFDEVICE Device, WDFCMRESLIST Raw, WDFCMRESLIS
     Dev->Mc = (volatile UCHAR *)MmMapIoSpaceEx(Pa, MC_LEN, PAGE_READWRITE | PAGE_NOCACHE);
     if (!Dev->Bar0 || !Dev->Bar1Cpu || !Dev->Car || !Dev->Pmc || !Dev->Mc)
         return STATUS_INSUFFICIENT_RESOURCES;
+    Dev->HaveInterruptResources = FALSE;
+    Dev->InterruptSourcesEnabled = FALSE;
+    Dev->InterruptResourceCount = 0u;
+    InterlockedExchange(&Dev->E3IsrActive, 0);
+    Dev->StallInterrupt = NULL;
+    Dev->NonstallInterrupt = NULL;
+    Trace(L"E3InterruptResourceCount", interruptCount);
+    Dev->InterruptResourceCount = interruptCount;
+    if (interruptCount >= 2u && irqRaw[0] != NULL && irqRaw[1] != NULL) {
+        WDF_INTERRUPT_CONFIG interruptConfig;
+        WDF_OBJECT_ATTRIBUTES interruptAttributes;
+        WDF_INTERRUPT_CONFIG_INIT(&interruptConfig, SwGpuEvtStallInterruptIsr, NULL);
+        interruptConfig.EvtInterruptDpc = SwGpuEvtInterruptDpc;
+        interruptConfig.InterruptRaw = irqRaw[0];
+        interruptConfig.InterruptTranslated = irqTranslated[0];
+        /* Claude 0.7.2: ShareVector stays WdfUseDefault; in PrepareHardware anything else is
+           STATUS_INVALID_DEVICE_STATE (0xC0000184). The framework uses the resource's share disposition. */
+        interruptConfig.AutomaticSerialization = FALSE;
+        /* Claude 0.7.1: no ParentObject (0xC020020F STATUS_WDF_PARENT_ASSIGNMENT_NOT_ALLOWED);
+           an interrupt's parent is always its device. */
+        WDF_OBJECT_ATTRIBUTES_INIT(&interruptAttributes);
+        interruptStatus = WdfInterruptCreate(Device, &interruptConfig,
+                                              &interruptAttributes, &Dev->StallInterrupt);
+        if (NT_SUCCESS(interruptStatus)) {
+            WDF_INTERRUPT_CONFIG_INIT(&interruptConfig, SwGpuEvtNonstallInterruptIsr, NULL);
+            interruptConfig.EvtInterruptDpc = SwGpuEvtInterruptDpc;
+            interruptConfig.InterruptRaw = irqRaw[1];
+            interruptConfig.InterruptTranslated = irqTranslated[1];
+            /* Claude 0.7.2: ShareVector stays WdfUseDefault; in PrepareHardware anything else is
+           STATUS_INVALID_DEVICE_STATE (0xC0000184). The framework uses the resource's share disposition. */
+            interruptConfig.AutomaticSerialization = FALSE;
+            interruptStatus = WdfInterruptCreate(Device, &interruptConfig,
+                                                  &interruptAttributes, &Dev->NonstallInterrupt);
+        }
+        if (NT_SUCCESS(interruptStatus)) {
+            Dev->HaveInterruptResources = TRUE;
+        } else {
+            if (Dev->StallInterrupt != NULL) { WdfObjectDelete(Dev->StallInterrupt); Dev->StallInterrupt = NULL; }
+            if (Dev->NonstallInterrupt != NULL) { WdfObjectDelete(Dev->NonstallInterrupt); Dev->NonstallInterrupt = NULL; }
+        }
+    }
+    Trace(L"E3InterruptCreateStatus", (ULONG)interruptStatus);
+    Trace(L"E3HaveInterrupts", Dev->HaveInterruptResources ? 1u : 0u);
     return STATUS_SUCCESS;
 }
 
@@ -8093,6 +8646,9 @@ NTSTATUS SwGpuEvtReleaseHardware(WDFDEVICE Device, WDFCMRESLIST Translated)
     PSWGPU_DEVICE Dev = SwGpuGetDevice(Device);
     UNREFERENCED_PARAMETER(Translated);
     (VOID)B3eResidentShutdown(Dev);
+    if (Dev->StallInterrupt != NULL) { WdfObjectDelete(Dev->StallInterrupt); Dev->StallInterrupt = NULL; }
+    if (Dev->NonstallInterrupt != NULL) { WdfObjectDelete(Dev->NonstallInterrupt); Dev->NonstallInterrupt = NULL; }
+    Dev->HaveInterruptResources = FALSE;
     if (Dev->Bar0) { MmUnmapIoSpace((PVOID)Dev->Bar0, BAR0_MAP_LEN); Dev->Bar0 = NULL; }
     if (Dev->Bar1Cpu) { MmUnmapIoSpace((PVOID)Dev->Bar1Cpu, Dev->Bar1MapLen); Dev->Bar1Cpu = NULL; }
     if (Dev->Car)  { MmUnmapIoSpace((PVOID)Dev->Car, CAR_LEN);       Dev->Car = NULL; }
@@ -8163,13 +8719,17 @@ NTSTATUS SwGpuEvtDeviceAdd(WDFDRIVER Driver, PWDFDEVICE_INIT DeviceInit)
     Status = WdfDeviceCreate(&DeviceInit, &Attributes, &Device);
     if (!NT_SUCCESS(Status)) return Status;
     SwGpuGetDevice(Device)->Device = Device;
+    KeInitializeEvent(&SwGpuGetDevice(Device)->E3Event, SynchronizationEvent, FALSE);
     Status = WdfDeviceCreateDeviceInterface(Device, &GUID_DEVINTERFACE_SWGPU_RESIDENT, NULL);
     if (!NT_SUCCESS(Status)) return Status;
     {
         WDF_IO_QUEUE_CONFIG QueueConfig;
+        WDF_OBJECT_ATTRIBUTES QueueAttributes;
         WDF_IO_QUEUE_CONFIG_INIT_DEFAULT_QUEUE(&QueueConfig, WdfIoQueueDispatchSequential);
         QueueConfig.EvtIoDeviceControl = SwGpuEvtIoDeviceControl;
-        Status = WdfIoQueueCreate(Device, &QueueConfig, WDF_NO_OBJECT_ATTRIBUTES, WDF_NO_HANDLE);
+        WDF_OBJECT_ATTRIBUTES_INIT(&QueueAttributes);
+        QueueAttributes.ExecutionLevel = WdfExecutionLevelPassive;
+        Status = WdfIoQueueCreate(Device, &QueueConfig, &QueueAttributes, WDF_NO_HANDLE);
         if (!NT_SUCCESS(Status)) return Status;
     }
     return STATUS_SUCCESS;
