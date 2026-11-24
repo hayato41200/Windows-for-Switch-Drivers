@@ -10,13 +10,18 @@
   -Mode Enable   : ResetEnable=1 (default)
   -Mode Disable  : ResetEnable=0 (restart and shut down are left to Windows again)
   -Mode Path     : -Payload <path on partition 1, e.g. \payload.bin>
+  -Mode FastStartup : -Value On|Off. Off (default since driver 1.0.4.0): the driver keeps
+                   Windows fast startup off, so Shut down is a real S5 and powers off.
+                   On: FastStartup=1 and HiberbootEnabled=1 (test only: Shut down then
+                   comes back to the logon screen instead of powering off)
   -Mode RebootTo : where hekate goes after a restart. -Id SWOAHKT = autoboot the hekate_ipl.ini
                    entry with id=SWOAHKT; -Index 2 = autoboot entry 2; neither = the hekate menu
 
   Log: C:\SwitchWOA-Reset.txt
 #>
 param(
-  [Parameter(Mandatory = $true)][ValidateSet('Install', 'Status', 'Method', 'Enable', 'Disable', 'Path', 'RebootTo')][string]$Mode,
+  [Parameter(Mandatory = $true)][ValidateSet('Install', 'Status', 'Method', 'Enable', 'Disable', 'Path', 'RebootTo', 'FastStartup')][string]$Mode,
+  [ValidateSet('On', 'Off')][string]$Value = 'Off',
   [ValidateSet('Auto', 'Pmc', 'Psci', 'Plain', 'Marker')][string]$Restart = 'Auto',
   [ValidateSet('Pmic', 'Marker', 'Windows')][string]$PowerOff = 'Pmic',
   [string]$Payload = '\bootloader\update.bin',
@@ -32,6 +37,7 @@ $Pnputil = Join-Path $Sys 'pnputil.exe'
 $Here = Split-Path -Parent $MyInvocation.MyCommand.Path
 $Log = 'C:\SwitchWOA-Reset.txt'
 $Key = 'HKLM:\SYSTEM\CurrentControlSet\Services\switchpwrbtn\Parameters'
+$PowerKey = 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Power'
 function Log([string]$s) { Write-Host $s; Add-Content -Path $Log -Value $s -Encoding UTF8 }
 $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 if (-not $isAdmin) { Write-Host 'Run this from an elevated (Administrator) prompt (right click - Run as administrator).'; exit 1 }
@@ -91,6 +97,11 @@ function Show-Status {
     $auto = if ([int]$p.CfgRestartMethod -ne 0) { $rm[[int]$p.CfgRestartMethod] } elseif ($st -eq 0 -and $p.PayloadSize -gt 0 -and $p.Erista -eq 1) { 'R2P from Windows (payload in IRAM, PMC reset)' } else { 'PSCI SYSTEM_RESET (bl31)' }
     Log "restart will use: $auto"
   }
+  $hb = (Get-ItemProperty $PowerKey -Name HiberbootEnabled -ErrorAction SilentlyContinue).HiberbootEnabled
+  Log ("fast startup: HiberbootEnabled={0}  driver FastStartup={1} (0 = driver keeps it off)  fixes={2} was={3}" -f $(if ($null -eq $hb) { 'missing(on)' } else { $hb }), $p.CfgFastStartup, $p.FastStartupFixes, $p.FastStartupWas)
+  if ($null -eq $hb -or $hb -ne 0) { Log '  -> fast startup is ON: Shut down becomes a hybrid hibernate and the console does not power off' }
+  $act = @{ 0 = 'None'; 2 = 'Sleep'; 3 = 'Hibernate (or fast startup)'; 4 = 'Shutdown'; 5 = 'Restart'; 6 = 'ShutdownOff'; 7 = 'WarmEject' }
+  if ($null -ne $p.LastD0ExitAction) { Log ("last power-down the driver left to Windows: action={0} target D-state={1}" -f $act[[int]$p.LastD0ExitAction], $p.LastD0ExitTarget) }
   Log ("i2c: OpenI2cStatus=0x{0:X} FirstReadStatus=0x{1:X} Failures={2} (count at the last error; 0 is not written back) LastI2cError=0x{3:X8}" -f (U32 $p.OpenI2cStatus), (U32 $p.FirstReadStatus), $p.Failures, (U32 $p.LastI2cError))
 }
 
@@ -118,6 +129,17 @@ switch ($Mode) {
   }
   'Enable' { Set-Dword 'ResetEnable' 1; Log 'ResetEnable=1'; Start-Sleep -Seconds 11; Show-Status }
   'Disable' { Set-Dword 'ResetEnable' 0; Log 'ResetEnable=0 (Windows handles restart/shut down again)'; Start-Sleep -Seconds 11; Show-Status }
+  'FastStartup' {
+    if ($Value -eq 'On') {
+      Set-Dword 'FastStartup' 1
+      New-ItemProperty -Path $PowerKey -Name HiberbootEnabled -PropertyType DWord -Value 1 -Force | Out-Null
+      Log 'FastStartup=1, HiberbootEnabled=1 (test: Shut down will not power off)'
+    } else {
+      Set-Dword 'FastStartup' 0
+      Log 'FastStartup=0 (the driver turns fast startup off within 10 s)'
+    }
+    Start-Sleep -Seconds 12; Show-Status
+  }
   'Path' { Set-PayloadPath $Payload; Start-Sleep -Seconds 12; Show-Status }
   'RebootTo' {
     Ensure-Key

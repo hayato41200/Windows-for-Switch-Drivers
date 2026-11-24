@@ -45,6 +45,18 @@
  *   directly in packet mode, as drivers/Tegra210I2c does. tegra210i2c has no
  *   D0Exit, so the controller is still clocked and configured.
  *
+ * Fast startup: with it on, Start > Shut down is a hybrid shutdown (S4 with
+ * the hibernation file), so the action above is PowerActionHibernate and the
+ * driver must not power off: the hibernation file is written after the
+ * devices are in D3. Windows then ends with PSCI SYSTEM_OFF, which the Switch
+ * bl31 does not handle (it panics and the console resets), so the console
+ * comes back up and resumes to the logon screen instead of powering off.
+ * While this driver powers the console off (ResetEnable 1, PowerOffMethod 0),
+ * it keeps fast startup off: HKLM\SYSTEM\CurrentControlSet\Control\Session
+ * Manager\Power HiberbootEnabled = 0, checked at start and every 10 s. Shut
+ * down is then a real S5 and reaches the PMIC power-off. FastStartup = 1 in
+ * Parameters leaves the setting alone.
+ *
  * Before acting, the backlight PWM (0x7000A000 CSR_0) is switched off, so a
  * console that stays black with the backlight off shows the driver got there.
  *
@@ -54,6 +66,7 @@
  *                  payload, plain reset without), 2 PSCI SYSTEM_RESET,
  *                  3 plain PMC reset, 4 backlight off only (test)
  *   PowerOffMethod 0 PMIC (default), 1 backlight off only (test), 2 Windows
+ *   FastStartup    0 (default) keep Windows fast startup off / 1 leave it alone
  *   PayloadPath    REG_SZ, default \Device\Harddisk0\Partition1\bootloader\update.bin
  *   RebootToId     REG_SZ, up to 7 printable ASCII characters: after a restart hekate
  *                  autoboots the hekate_ipl.ini entry with this id= key (hekate
@@ -78,7 +91,7 @@
 #define ONOFFIRQ_EN0_R       0x08
 #define POLL_MS              50
 #define REPORT_ID_SYSTEM     1
-#define DRIVER_VERSION       3
+#define DRIVER_VERSION       4
 
 /* MAX77620 power-off (Linux include/linux/mfd/max77620.h) */
 #define MAX77620_I2C_ADDR    0x3C
@@ -175,7 +188,8 @@ typedef struct _SWPWR_DEVICE {
     volatile UCHAR *Car, *Pmc, *Iram, *Pwm, *I2c5;
     ULONG Hidrev;
     BOOLEAN Erista;
-    ULONG ResetEnable, RestartMethod, PowerOffMethod;
+    ULONG ResetEnable, RestartMethod, PowerOffMethod, FastStartup;
+    ULONG FastStartupFixes;
     WCHAR PayloadPath[PAYLOAD_PATH_CHARS];
     PUCHAR Payload;
     ULONG PayloadSize;        /* bytes in the file */
@@ -432,11 +446,47 @@ static VOID SwPwrFreePayload(PSWPWR_DEVICE Dev)
     Dev->PayloadSize = 0;
 }
 
+/*
+ * Keep Windows fast startup off (see the top of the file): a hybrid shutdown
+ * never reaches the PMIC power-off. PASSIVE_LEVEL.
+ */
+static VOID SwPwrKeepFastStartupOff(PSWPWR_DEVICE Dev)
+{
+    DECLARE_CONST_UNICODE_STRING(KeyPath, L"\\Registry\\Machine\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Power");
+    DECLARE_CONST_UNICODE_STRING(Name, L"HiberbootEnabled");
+    OBJECT_ATTRIBUTES Attributes;
+    UCHAR Buffer[sizeof(KEY_VALUE_PARTIAL_INFORMATION) + sizeof(ULONG)];
+    PKEY_VALUE_PARTIAL_INFORMATION Info = (PKEY_VALUE_PARTIAL_INFORMATION)Buffer;
+    HANDLE Key;
+    ULONG Length, Value = 1, Zero = 0;
+    NTSTATUS Status;
+
+    InitializeObjectAttributes(&Attributes, (PUNICODE_STRING)&KeyPath, OBJ_KERNEL_HANDLE | OBJ_CASE_INSENSITIVE, NULL, NULL);
+    Status = ZwOpenKey(&Key, KEY_QUERY_VALUE | KEY_SET_VALUE, &Attributes);
+    if (!NT_SUCCESS(Status)) {
+        SwPwrTrace(L"FastStartupStatus", (ULONG)Status);
+        return;
+    }
+    Status = ZwQueryValueKey(Key, (PUNICODE_STRING)&Name, KeyValuePartialInformation, Info, sizeof(Buffer), &Length);
+    if (NT_SUCCESS(Status) && Info->Type == REG_DWORD && Info->DataLength == sizeof(ULONG)) {
+        Value = *(PULONG)Info->Data;
+    }
+    /* A missing value means on (the Windows default). */
+    if (Value != 0) {
+        Status = ZwSetValueKey(Key, (PUNICODE_STRING)&Name, 0, REG_DWORD, &Zero, sizeof(Zero));
+        SwPwrTrace(L"FastStartupStatus", (ULONG)Status);
+        SwPwrTrace(L"FastStartupWas", Value);
+        SwPwrTrace(L"FastStartupFixes", ++Dev->FastStartupFixes);
+    }
+    ZwClose(Key);
+}
+
 static VOID SwPwrReadConfig(PSWPWR_DEVICE Dev)
 {
     DECLARE_CONST_UNICODE_STRING(NameEnable, L"ResetEnable");
     DECLARE_CONST_UNICODE_STRING(NameRestart, L"RestartMethod");
     DECLARE_CONST_UNICODE_STRING(NamePowerOff, L"PowerOffMethod");
+    DECLARE_CONST_UNICODE_STRING(NameFastStartup, L"FastStartup");
     DECLARE_CONST_UNICODE_STRING(NamePath, L"PayloadPath");
     DECLARE_CONST_UNICODE_STRING(NameId, L"RebootToId");
     DECLARE_CONST_UNICODE_STRING(NameIndex, L"RebootToIndex");
@@ -454,6 +504,7 @@ static VOID SwPwrReadConfig(PSWPWR_DEVICE Dev)
     Dev->ResetEnable = 1;
     Dev->RestartMethod = RESTART_AUTO;
     Dev->PowerOffMethod = POWEROFF_PMIC;
+    Dev->FastStartup = 0;
     RtlZeroMemory(Buffer, sizeof(Buffer));
     RtlCopyMemory(Buffer, SwPwrDefaultPayloadPath, sizeof(SwPwrDefaultPayloadPath));
     if (NT_SUCCESS(WdfDriverOpenParametersRegistryKey(WdfGetDriver(), KEY_READ, WDF_NO_OBJECT_ATTRIBUTES, &Key))) {
@@ -465,6 +516,9 @@ static VOID SwPwrReadConfig(PSWPWR_DEVICE Dev)
         }
         if (NT_SUCCESS(WdfRegistryQueryULong(Key, &NamePowerOff, &Value))) {
             Dev->PowerOffMethod = Value;
+        }
+        if (NT_SUCCESS(WdfRegistryQueryULong(Key, &NameFastStartup, &Value))) {
+            Dev->FastStartup = Value;
         }
         /* Where hekate goes after a restart: an ini entry by its id= key, or by index, or the menu. */
         RtlInitEmptyUnicodeString(&IdString, IdBuffer, sizeof(IdBuffer) - sizeof(WCHAR));
@@ -505,6 +559,10 @@ static VOID SwPwrReadConfig(PSWPWR_DEVICE Dev)
     SwPwrTrace(L"CfgPowerOffMethod", Dev->PowerOffMethod);
     SwPwrTrace(L"CfgBootCfg", *(PULONG)&BootCfg[0]);       /* boot_cfg, autoboot, list, extra */
     SwPwrTrace(L"CfgBootIdOk", IdOk);
+    SwPwrTrace(L"CfgFastStartup", Dev->FastStartup);
+    if (Dev->ResetEnable != 0 && Dev->PowerOffMethod == POWEROFF_PMIC && Dev->FastStartup == 0) {
+        SwPwrKeepFastStartupOff(Dev);
+    }
 }
 
 /* Read the payload into nonpaged memory. PASSIVE_LEVEL, while the system runs. */
@@ -682,8 +740,12 @@ NTSTATUS SwPwrEvtD0Exit(WDFDEVICE Device, WDF_POWER_DEVICE_STATE TargetState)
     }
     Action = WdfDeviceGetSystemPowerAction(Device);
     if (Dev->ResetEnable == 0 ||
-        (Action != PowerActionShutdownReset && Action != PowerActionShutdown && Action != PowerActionShutdownOff)) {
-        return STATUS_SUCCESS;          /* device removal, driver update, hibernate */
+        (Action != PowerActionShutdownReset && Action != PowerActionShutdownOff && Action != PowerActionShutdown)) {
+        /* device removal, driver update, hibernate (also fast startup): the registry is
+           still open, and for S4 the value is kept in the hibernation image. */
+        SwPwrTrace(L"LastD0ExitAction", (ULONG)Action);
+        SwPwrTrace(L"LastD0ExitTarget", (ULONG)TargetState);
+        return STATUS_SUCCESS;
     }
     /* The registry is closed by now: no traces from here on. */
     Dev->Stopping = TRUE;
