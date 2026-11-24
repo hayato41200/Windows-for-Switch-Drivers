@@ -543,3 +543,12 @@ Submit.cmd は E1 で起動済みの resident channel に Submit IOCTL を送り
 `Irq.cmd` は resident GPU が動作中のときだけ IOCTL `0x22E00C` を送り、64 回の既知 3D clear、WFI semaphore release、`NVB06F` host `NON_STALL_INT` を実行します。各回は 100 ms の bounded `KEVENT` wait で完了を待ち、イベント後に semaphore と RT pixel を確認します。待ち timeout 時は L2 flush 後に semaphore を一度だけ読み、GPU 処理完了と割り込み欠落を区別します。実行後に GPU の電源投入や teardown はしません。
 
 UEFI R447H は stall GSIV 189 / nonstall GSIV 190 を提供します。割り込みリソースがない R445H 以前ではドライバを読み込み、0.6.0 相当の動作を保ちますが、E3 は `E00000A7` (no interrupt resource) です。GPU 内 PMC の `INTR_MASK_0/1` と `INTR_EN_0/1` は resident 成功時だけ設定し、shutdown 冒頭で割り込み源を止めてから channel teardown と reset を始めます。Tegra MC の割り込みルーティングは変更しません。実機で GSIV の割当、nonstall status/ACK、ISR/DPC 回数、全 64 回の semaphore/pixel readback、ResidentStop を確認してください。
+### 0.8.0 E4 デバイス寿命の DMA プール
+
+| バージョン | 段階 | 実機で確認すること |
+| --- | --- | --- |
+| 0.8.0 | E4: 連続メモリの早期予約 | `Cycle.cmd` で、起動 → E2 の 3D clear 8 回 → 停止を最大 5 周実行します。各周の起動・描画・停止結果と `E4 pool` の統計を表示します。AutoTest の Stage After では従来の ResidentStop の後に実行します。 |
+
+ドライバーは PrepareHardware で GR arena (2 MiB)、ACR arena (512 KiB)、WPR 入力 (最大 256 KiB) を個別に予約します。予約済みの領域は使用前にゼロで初期化し、停止時の GPU リセットと SMMU 復元の後でプールへ返します。予約はデバイスの ReleaseHardware まで保持されます。予約に失敗した領域は従来どおり実行時に確保します。
+
+`E4 pool result` の bit 0/1/2 は GR/ACR/WPR の予約失敗です。全領域の予約に成功すると reserved は 2,883,584 バイトです。同じデバイスで各周を実行するため、成功時は各周で checkouts と returns が 3 ずつ増え、停止後の in-use は 0、fallbacks は増えません。Cycle は管理者向け IOCTL `0x22E010` を使います。

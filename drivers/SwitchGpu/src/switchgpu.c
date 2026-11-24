@@ -39,7 +39,7 @@
 #include <wdf.h>
 #include <spb.h>
 
-#define SWGPU_VERSION      0x00000703u   /* 0.7.3 */
+#define SWGPU_VERSION      0x00000800u   /* 0.8.0 */
 
 #define CAR_PHYS           0x60006000ull
 #define CAR_LEN            0x1000u
@@ -159,6 +159,7 @@ static const GUID GUID_DEVINTERFACE_SWGPU_RESIDENT =
 #define IOCTL_SWGPU_RESIDENT_STOP   CTL_CODE(FILE_DEVICE_UNKNOWN, 0x801, METHOD_BUFFERED, FILE_READ_ACCESS | FILE_WRITE_ACCESS)
 #define IOCTL_SWGPU_SUBMIT_TEST     CTL_CODE(FILE_DEVICE_UNKNOWN, 0x802, METHOD_BUFFERED, FILE_READ_ACCESS | FILE_WRITE_ACCESS)
 #define IOCTL_SWGPU_IRQ_TEST        CTL_CODE(FILE_DEVICE_UNKNOWN, 0x803, METHOD_BUFFERED, FILE_READ_ACCESS | FILE_WRITE_ACCESS)
+#define IOCTL_SWGPU_CYCLE_TEST      CTL_CODE(FILE_DEVICE_UNKNOWN, 0x804, METHOD_BUFFERED, FILE_READ_ACCESS | FILE_WRITE_ACCESS)
 
 /* GM20B NV_PMC / PFIFO interrupt source registers (nvgpu hw_mc_gm20b.h). */
 #define PMC_INTR_STATUS_STALL       0x00000100u
@@ -214,6 +215,22 @@ typedef struct _SWGPU_E3_RESULT {
     ULONG Channel, PbdmaStatus, PbdmaIntr0, FifoIntr0, GrIntr, GrStatus, MmuFault;
 } SWGPU_E3_RESULT, *PSWGPU_E3_RESULT;
 
+typedef struct _SWGPU_E4_RESULT {
+    ULONG Version, StartResult, SubmitResult, StopResult, Rounds, MaxPolls;
+    ULONG PoolResult, PoolBytes, PoolUsedPeak, PoolFallbacks, PoolAllocs;
+    ULONG PoolFrees, PoolFailures, PoolUsed;
+} SWGPU_E4_RESULT, *PSWGPU_E4_RESULT;
+
+typedef enum _SWGPU_POOL_REGION {
+    SwGpuPoolGr, SwGpuPoolAcr, SwGpuPoolWpr, SwGpuPoolRegionCount
+} SWGPU_POOL_REGION;
+
+typedef struct _SWGPU_DMA_POOL {
+    PVOID Block[SwGpuPoolRegionCount];
+    BOOLEAN InUse[SwGpuPoolRegionCount];
+    ULONG Result, Bytes, Used, UsedPeak, Fallbacks, Allocs, Frees, Failures;
+} SWGPU_DMA_POOL;
+
 typedef struct _SWGPU_RESIDENT_POWER {
     UCHAR Vout;
     UCHAR VoutDvs;
@@ -255,6 +272,7 @@ typedef struct _SWGPU_DEVICE {
     WDFINTERRUPT   NonstallInterrupt;
     BOOLEAN        HaveInterruptResources;
     BOOLEAN        InterruptSourcesEnabled;
+    SWGPU_DMA_POOL DmaPool;
     ULONG          InterruptResourceCount;
     volatile LONG  E3IsrActive;
     volatile LONG  E3NonstallCount;
@@ -293,7 +311,7 @@ EVT_WDF_INTERRUPT_ISR SwGpuEvtNonstallInterruptIsr;
 EVT_WDF_INTERRUPT_DPC SwGpuEvtInterruptDpc;
 
 static WCHAR SwGpuParamsPath[256];
-static ULONG B3eResidentShutdown(PSWGPU_DEVICE Dev);
+static ULONG B3eResidentShutdown(PSWGPU_DEVICE Dev, BOOLEAN DrainIsrs);
 static ULONG B3eEnableInterruptSources(PSWGPU_DEVICE Dev);
 
 /* ---------------------------------------------------------------- trace */
@@ -1325,6 +1343,132 @@ static VOID ProbeB2a(PSWGPU_DEVICE Dev)
 #define GR_VM_GPU_VA       0x18000000u
 #define GR_VM_PAGE_COUNT   (GR_VM_ARENA_SIZE >> 12)
 
+/* E4 DMA allocation inventory (Resident, Submit and Irq):
+ * - GR: 2 MiB, page aligned, below 4 GiB, within one 4 MiB window,
+ *   MmNonCached. Contains GR/SMMU/BAR1 tables, instances, channel and golden
+ *   contexts, global buffers, USERD, GPFIFO, runlist, pushbuffer/semaphores
+ *   and the 16 KiB render target at the GR_VM_* offsets above.
+ * - ACR: 512 KiB, same constraints. Contains SMMU/GPU tables, PMU instance
+ *   and HS ACR image. The other Falcon uploads use the existing WPR/PIO paths.
+ * - WPR input: wprUsed (at most 256 KiB), page aligned, below 4 GiB,
+ *   MmNonCached, no boundary requirement. Holds the PMU/FECS LS images.
+ * Firmware assembly, registry blobs and diagnostic arrays use ordinary
+ * ExAllocatePool2 memory and are not DMA backing. Submit/Irq allocate no
+ * additional contiguous memory. Legacy physical DMA ProbeB2a (mode 3 only)
+ * owns separate pages and never checks out these regions.
+ *
+ * Fixed regions are reserved independently at PrepareHardware so a failed
+ * reservation leaves the others usable. PnP and the sequential IOCTL queue
+ * serialize checkouts/returns. Return DMA backing only after GPU reset and
+ * restoration of the SMMU mappings, before ReleaseHardware frees the regions.
+ */
+static const ULONG g_DmaPoolRegionBytes[SwGpuPoolRegionCount] = {
+    GR_VM_ARENA_SIZE, ACR_VM_ARENA_SIZE, ACR_WPR_BYTES
+};
+
+static VOID E4TracePool(const SWGPU_DMA_POOL *Pool)
+{
+    Trace(L"E4PoolResult", Pool->Result);
+    Trace(L"E4PoolBytes", Pool->Bytes);
+    Trace(L"E4PoolUsedPeak", Pool->UsedPeak);
+    Trace(L"E4PoolFallbacks", Pool->Fallbacks);
+    Trace(L"E4PoolAllocs", Pool->Allocs);
+    Trace(L"E4PoolFrees", Pool->Frees);
+    Trace(L"E4PoolFailures", Pool->Failures);
+    Trace(L"E4PoolUsed", Pool->Used);
+}
+
+static PVOID E4AllocateContiguous(SWGPU_POOL_REGION Region, ULONG Bytes)
+{
+    PHYSICAL_ADDRESS low, high, boundary;
+    low.QuadPart = 0;
+    high.QuadPart = 0xFFFFFFFFll;
+    boundary.QuadPart = Region == SwGpuPoolWpr ? 0 : ACR_SMMU_WINDOW;
+    return MmAllocateContiguousMemorySpecifyCache(Bytes, low, high, boundary, MmNonCached);
+}
+
+static VOID E4ReservePool(PSWGPU_DEVICE Dev)
+{
+    SWGPU_DMA_POOL *pool = &Dev->DmaPool;
+    SWGPU_POOL_REGION region;
+    RtlZeroMemory(pool, sizeof(*pool));
+    for (region = SwGpuPoolGr; region < SwGpuPoolRegionCount; ++region) {
+        ULONG bytes = g_DmaPoolRegionBytes[region];
+        pool->Block[region] = E4AllocateContiguous(region, bytes);
+        if (pool->Block[region] != NULL && region != SwGpuPoolWpr &&
+            MmGetPhysicalAddress(pool->Block[region]).QuadPart > 0xFFFFFFFFll - bytes) {
+            /* The existing arena range checks require a 32-bit exclusive end. */
+            MmFreeContiguousMemorySpecifyCache(pool->Block[region], bytes, MmNonCached);
+            pool->Block[region] = NULL;
+        }
+        if (pool->Block[region] == NULL) {
+            pool->Result |= 1u << region;
+            ++pool->Failures;
+        } else {
+            pool->Bytes += bytes;
+        }
+    }
+    E4TracePool(pool);
+}
+
+static PVOID E4Checkout(PSWGPU_DEVICE Dev, SWGPU_POOL_REGION Region, ULONG Bytes)
+{
+    SWGPU_DMA_POOL *pool = &Dev->DmaPool;
+    PVOID block;
+    if (Bytes == 0 || Bytes > g_DmaPoolRegionBytes[Region] || pool->InUse[Region]) {
+        ++pool->Failures;
+        return NULL;
+    }
+    block = pool->Block[Region];
+    if (block != NULL) {
+        pool->InUse[Region] = TRUE;
+        pool->Used += g_DmaPoolRegionBytes[Region];
+        if (pool->Used > pool->UsedPeak) pool->UsedPeak = pool->Used;
+        ++pool->Allocs;
+        RtlZeroMemory(block, g_DmaPoolRegionBytes[Region]);
+    } else {
+        ++pool->Fallbacks;
+        block = E4AllocateContiguous(Region, Bytes);
+        if (block != NULL) {
+            pool->InUse[Region] = TRUE;
+            RtlZeroMemory(block, Bytes);
+        } else {
+            ++pool->Failures;
+        }
+    }
+    return block;
+}
+
+static VOID E4Return(PSWGPU_DEVICE Dev, SWGPU_POOL_REGION Region, PVOID Block, ULONG Bytes)
+{
+    SWGPU_DMA_POOL *pool = &Dev->DmaPool;
+    if (Block == NULL) return;
+    pool->InUse[Region] = FALSE;
+    if (Block == pool->Block[Region]) {
+        pool->Used -= g_DmaPoolRegionBytes[Region];
+        ++pool->Frees;
+    } else {
+        MmFreeContiguousMemorySpecifyCache(Block, Bytes, MmNonCached);
+    }
+}
+
+static VOID E4ReleasePool(PSWGPU_DEVICE Dev)
+{
+    SWGPU_DMA_POOL *pool = &Dev->DmaPool;
+    SWGPU_POOL_REGION region;
+    for (region = SwGpuPoolGr; region < SwGpuPoolRegionCount; ++region) {
+        if (pool->InUse[region]) {
+            Trace(L"E4PoolReleaseBorrowed", pool->Used);
+            continue;
+        }
+        if (pool->Block[region] != NULL) {
+            MmFreeContiguousMemorySpecifyCache(pool->Block[region],
+                g_DmaPoolRegionBytes[region], MmNonCached);
+            pool->Block[region] = NULL;
+        }
+    }
+}
+
 typedef struct _ACR_VM_STATE {
     PVOID Arena;
     PVOID WprBuffer;
@@ -1392,7 +1536,7 @@ static BOOLEAN AcrTraceSmmuPte(volatile ULONG *Pt, ULONG Win, ULONG Pa,
 static BOOLEAN AcrVmPrepare(PSWGPU_DEVICE Dev, ULONG WprBytes, ULONGLONG *ArenaIovaOut,
                             ULONGLONG *InstIovaOut)
 {
-    PHYSICAL_ADDRESS lo, hi, boundary, arenaPa;
+    PHYSICAL_ADDRESS arenaPa;
     volatile ULONG *smmuPd, *smmuPt;
     ULONGLONG *gpuPgd, *gpuPgt, *inst;
     ULONG win, arenaFirst, arenaPages;
@@ -1405,25 +1549,17 @@ static BOOLEAN AcrVmPrepare(PSWGPU_DEVICE Dev, ULONG WprBytes, ULONGLONG *ArenaI
     BOOLEAN smmuReadbackOk;
 
     RtlZeroMemory(&g_AcrVm, sizeof(g_AcrVm));
-    lo.QuadPart = 0;
-    hi.QuadPart = 0xFFFFFFFFll;
-    boundary.QuadPart = 0;
     g_AcrVm.WprBytes = WprBytes;
-    g_AcrVm.WprBuffer = MmAllocateContiguousMemorySpecifyCache(
-        WprBytes, lo, hi, boundary, MmNonCached);
+    g_AcrVm.WprBuffer = E4Checkout(Dev, SwGpuPoolWpr, WprBytes);
     if (g_AcrVm.WprBuffer == NULL) return FALSE;
-    RtlZeroMemory(g_AcrVm.WprBuffer, WprBytes);
     g_AcrVm.WprPa = MmGetPhysicalAddress(g_AcrVm.WprBuffer);
     if (g_AcrVm.WprPa.HighPart != 0 || (g_AcrVm.WprPa.LowPart & 0xFFFu) != 0) return FALSE;
     Trace(L"AcrWprBufferPaLo", g_AcrVm.WprPa.LowPart);
     Trace(L"AcrWprBufferPaHi", (ULONG)g_AcrVm.WprPa.HighPart);
     Trace(L"AcrWprBufferBytes", WprBytes);
 
-    boundary.QuadPart = ACR_SMMU_WINDOW;
-    g_AcrVm.Arena = MmAllocateContiguousMemorySpecifyCache(
-        ACR_VM_ARENA_SIZE, lo, hi, boundary, MmNonCached);
+    g_AcrVm.Arena = E4Checkout(Dev, SwGpuPoolAcr, ACR_VM_ARENA_SIZE);
     if (g_AcrVm.Arena == NULL) return FALSE;
-    RtlZeroMemory(g_AcrVm.Arena, ACR_VM_ARENA_SIZE);
     arenaPa = MmGetPhysicalAddress(g_AcrVm.Arena);
     Trace(L"AcrArenaPa", arenaPa.LowPart);
     if (arenaPa.HighPart != 0 || (arenaPa.LowPart & 0xFFFu) != 0 ||
@@ -1694,10 +1830,8 @@ static VOID AcrVmCleanupAfterGpuReset(PSWGPU_DEVICE Dev)
     } else {
         TraceDurable(L"AcrSmmuRestored", 1u); /* no SMMU page-table change */
     }
-    if (g_AcrVm.WprBuffer != NULL)
-        MmFreeContiguousMemorySpecifyCache(g_AcrVm.WprBuffer, g_AcrVm.WprBytes, MmNonCached);
-    if (g_AcrVm.Arena != NULL)
-        MmFreeContiguousMemorySpecifyCache(g_AcrVm.Arena, ACR_VM_ARENA_SIZE, MmNonCached);
+    E4Return(Dev, SwGpuPoolWpr, g_AcrVm.WprBuffer, g_AcrVm.WprBytes);
+    E4Return(Dev, SwGpuPoolAcr, g_AcrVm.Arena, ACR_VM_ARENA_SIZE);
     RtlZeroMemory(&g_AcrVm, sizeof(g_AcrVm));
 }
 #define SWGPU_TAG          'uGwS'
@@ -2875,7 +3009,7 @@ done:
 static ULONG B3cPrepareGrContext(PSWGPU_DEVICE Dev, ULONG goldenBytes,
                                  ULONG zcullBytes, ULONG pmBytes)
 {
-    PHYSICAL_ADDRESS low, high, boundary, acrArenaPa, smmuPtPa;
+    PHYSICAL_ADDRESS acrArenaPa, smmuPtPa;
     volatile UCHAR *B = Dev->Bar0;
     volatile ULONG *smmuPd = NULL, *smmuPt = NULL;
     ULONGLONG *gpuPgd, *gpuPgt, *bar1GpuPgt, *inst;
@@ -2937,22 +3071,16 @@ static ULONG B3cPrepareGrContext(PSWGPU_DEVICE Dev, ULONG goldenBytes,
         failPoint = 3u; result = 0xE0000089u; goto done;
     }
 
-    low.QuadPart = 0;
-    high.QuadPart = 0xFFFFFFFFll;
-    boundary.QuadPart = ACR_SMMU_WINDOW;
-    g_GrVm.Arena = MmAllocateContiguousMemorySpecifyCache(
-        GR_VM_ARENA_SIZE, low, high, boundary, MmNonCached);
+    g_GrVm.Arena = E4Checkout(Dev, SwGpuPoolGr, GR_VM_ARENA_SIZE);
     if (g_GrVm.Arena == NULL) {
         allocRetry = 1u;
-        g_GrVm.Arena = MmAllocateContiguousMemorySpecifyCache(
-            GR_VM_ARENA_SIZE, low, high, boundary, MmNonCached);
+        g_GrVm.Arena = E4Checkout(Dev, SwGpuPoolGr, GR_VM_ARENA_SIZE);
         Trace(L"B3cC2dAllocRetry", allocRetry);
         if (g_GrVm.Arena == NULL) { failPoint = 4u; result = 0xE0000089u; goto done; }
     }
     g_GrVm.GoldenBytes = goldenBytes;
     g_GrVm.ZcullBytes = zcullBytes;
     g_GrVm.PmBytes = pmBytes;
-    RtlZeroMemory(g_GrVm.Arena, GR_VM_ARENA_SIZE);
     g_GrVm.Pa = MmGetPhysicalAddress(g_GrVm.Arena);
     if (g_GrVm.Pa.HighPart != 0 || (g_GrVm.Pa.LowPart & 0xFFFu) != 0 ||
         g_GrVm.Pa.LowPart > 0xFFFFFFFFu - GR_VM_ARENA_SIZE) {
@@ -5718,7 +5846,7 @@ done:
  * mapped pushbuffer/RT pages is safe because each round waits for GP_GET and
  * the WFI semaphore before overwriting them. Ring size is the 4 KiB GPFIFO
  * page (512 8-byte entries), and GP_PUT is advanced modulo that size. */
-static ULONG B3eResidentSubmitTest(PSWGPU_DEVICE Dev, PSWGPU_E2_RESULT Out)
+static ULONG B3eResidentSubmitTest(PSWGPU_DEVICE Dev, PSWGPU_E2_RESULT Out, BOOLEAN Quick)
 {
     volatile UCHAR *B = Dev != NULL ? Dev->Bar0 : NULL;
     volatile ULONG *bar1GpPut;
@@ -5730,7 +5858,7 @@ static ULONG B3eResidentSubmitTest(PSWGPU_DEVICE Dev, PSWGPU_E2_RESULT Out)
     ULONG (*writes)[4] = NULL;
     ULONG (*history)[4] = NULL;
     ULONG writeCount = 0u, writeCapacity = 16u;
-    ULONG ringEntries = PAGE_SIZE / 8u, rounds = 2u * (PAGE_SIZE / 8u) + 3u;
+    ULONG ringEntries = PAGE_SIZE / 8u, rounds = Quick ? 8u : 2u * (PAGE_SIZE / 8u) + 3u;
     ULONG put = 0u, newPut = 0u, gpGet = 0u, pbGpGet = 0u;
     ULONG round = 0u, doneRounds = 0u, wraps = 0u, maxPolls = 0u;
     ULONG gpPolls = 0u, semPolls = 0u, l2State[4] = { 0u };
@@ -6725,8 +6853,7 @@ static VOID GrVmCleanupAfterGpuReset(PSWGPU_DEVICE Dev)
     } else {
         TraceDurable(L"B3cC2dOuterMapRestored", 1u);
     }
-    if (g_GrVm.Arena != NULL)
-        MmFreeContiguousMemorySpecifyCache(g_GrVm.Arena, GR_VM_ARENA_SIZE, MmNonCached);
+    E4Return(Dev, SwGpuPoolGr, g_GrVm.Arena, GR_VM_ARENA_SIZE);
     RtlZeroMemory(&g_GrVm, sizeof(g_GrVm));
 }
 
@@ -8069,6 +8196,7 @@ static ULONG B3ePowerDownGpu(PSWGPU_DEVICE Dev, PSWGPU_RESIDENT_POWER Power)
     FreeB2aPagesAfterGpuReset();
     GrVmCleanupAfterGpuReset(Dev);
     AcrVmCleanupAfterGpuReset(Dev);
+    E4TracePool(&Dev->DmaPool);
     Power->Valid = FALSE;
     Trace(L"B3ePowerDownError", error);
     TraceDurable(L"B3ePowerDownDone", 1u);
@@ -8123,8 +8251,6 @@ static ULONG B3eEnableInterruptSources(PSWGPU_DEVICE Dev)
     if (!B3cD5Write(B, writes, &writeCount, RTL_NUMBER_OF(writes), PMC_INTR_EN_STALL, 1u) ||
         !B3cD5Write(B, writes, &writeCount, RTL_NUMBER_OF(writes), PMC_INTR_EN_NONSTALL, 1u)) {
         InterlockedExchange(&Dev->E3IsrActive, 0);
-        (VOID)WdfInterruptDisable(Dev->StallInterrupt);
-        (VOID)WdfInterruptDisable(Dev->NonstallInterrupt);
         (VOID)B3cD5Write(B, writes, &writeCount, RTL_NUMBER_OF(writes), PMC_INTR_MASK_STALL, 0u);
         (VOID)B3cD5Write(B, writes, &writeCount, RTL_NUMBER_OF(writes), PMC_INTR_MASK_NONSTALL, 0u);
         (VOID)B3cD5Write(B, writes, &writeCount, RTL_NUMBER_OF(writes), PMC_INTR_EN_STALL, 0u);
@@ -8142,15 +8268,19 @@ done:
     return result;
 }
 
-static ULONG B3eDisableInterruptSources(PSWGPU_DEVICE Dev)
+static BOOLEAN B3eIrqDrainBarrier(WDFINTERRUPT Interrupt, WDFCONTEXT Context)
+{
+    UNREFERENCED_PARAMETER(Interrupt);
+    UNREFERENCED_PARAMETER(Context);
+    return TRUE;
+}
+
+static ULONG B3eDisableInterruptSources(PSWGPU_DEVICE Dev, BOOLEAN DrainIsrs)
 {
     volatile UCHAR *B = Dev != NULL ? Dev->Bar0 : NULL;
     ULONG writes[8][4] = { { 0u } }, writeCount = 0u;
     ULONG result = 0u;
     if (Dev == NULL) return STATUS_INVALID_PARAMETER;
-    if (Dev->StallInterrupt != NULL) (VOID)WdfInterruptDisable(Dev->StallInterrupt);
-    if (Dev->NonstallInterrupt != NULL) (VOID)WdfInterruptDisable(Dev->NonstallInterrupt);
-    InterlockedExchange(&Dev->E3IsrActive, 0);
     if (B != NULL) {
         B3cPrivRingResetWriteLog();
         if (!B3cD5Write(B, writes, &writeCount, RTL_NUMBER_OF(writes), PMC_INTR_EN_STALL, 0u)) result = 0xE00000A9u;
@@ -8158,6 +8288,16 @@ static ULONG B3eDisableInterruptSources(PSWGPU_DEVICE Dev)
         if (!B3cD5Write(B, writes, &writeCount, RTL_NUMBER_OF(writes), PMC_INTR_MASK_STALL, 0u)) result = 0xE00000A9u;
         if (!B3cD5Write(B, writes, &writeCount, RTL_NUMBER_OF(writes), PMC_INTR_MASK_NONSTALL, 0u)) result = 0xE00000A9u;
         if (!B3cD5Write(B, writes, &writeCount, RTL_NUMBER_OF(writes), FIFO_INTR_EN_1, 0u)) result = 0xE00000A9u;
+    }
+    InterlockedExchange(&Dev->E3IsrActive, 0);
+    /* During a live IOCTL, drain any ISR that passed the gate before reset.
+     * KMDF manages the vectors across D0 transitions. This keeps them usable
+     * for another Resident start in the same hardware lifetime. */
+    if (DrainIsrs) {
+        if (Dev->StallInterrupt != NULL)
+            (VOID)WdfInterruptSynchronize(Dev->StallInterrupt, B3eIrqDrainBarrier, NULL);
+        if (Dev->NonstallInterrupt != NULL)
+            (VOID)WdfInterruptSynchronize(Dev->NonstallInterrupt, B3eIrqDrainBarrier, NULL);
     }
     Dev->InterruptSourcesEnabled = FALSE;
     Trace(L"E3InterruptDisableResult", result);
@@ -8338,6 +8478,7 @@ static NTSTATUS PowerTest(PSWGPU_DEVICE Dev, BOOLEAN KeepOn, ULONG Mode)
         }
         TraceDurable(L"E1Result", 0u);
         TraceDurable(L"B3eResidentActive", 1u);
+        E4TracePool(&Dev->DmaPool);
         Step(110);
         return st;
     }
@@ -8369,7 +8510,7 @@ down:
 
 /* ------------------------------------------------------------------- PnP */
 
-static ULONG B3eResidentShutdown(PSWGPU_DEVICE Dev)
+static ULONG B3eResidentShutdown(PSWGPU_DEVICE Dev, BOOLEAN DrainIsrs)
 {
     ULONG writes[64][4] = { { 0u } }, diagWrites[64][4] = { { 0u } };
     ULONG writeCount = 0u, diagWriteCount = 0u, error = 0u;
@@ -8384,9 +8525,8 @@ static ULONG B3eResidentShutdown(PSWGPU_DEVICE Dev)
     }
     TraceDurable(L"B3eShutdownBegin", 1u);
     Step(111);
-    /* Disable the OS vectors, then GPU PMC interrupt generation, before any
-     * channel preempt, reset, clock gate, or rail-off operation. */
-    (VOID)B3eDisableInterruptSources(Dev);
+    /* Stop GPU interrupt generation and drain ISR access before reset. */
+    (VOID)B3eDisableInterruptSources(Dev, DrainIsrs);
     error = B3cD2CleanupPublishedState(Dev, writes, &writeCount,
         Dev->ResidentChannelEnabled, Dev->ResidentRunlistSubmitted,
         Dev->ResidentInstBound, Dev->ResidentChannelId,
@@ -8478,6 +8618,53 @@ VOID SwGpuEvtIoDeviceControl(WDFQUEUE Queue, WDFREQUEST Request,
     PSWGPU_E3_RESULT e3Out = NULL;
     NTSTATUS status;
     UNREFERENCED_PARAMETER(InputBufferLength);
+    if (IoControlCode == IOCTL_SWGPU_CYCLE_TEST) {
+        PSWGPU_E4_RESULT cycle = NULL;
+        SWGPU_E2_RESULT submit;
+        const SWGPU_DMA_POOL *pool = &Dev->DmaPool;
+
+        if (Dev->ResidentActive || g_ResidentOwner != NULL) {
+            WdfRequestComplete(Request, STATUS_DEVICE_BUSY);
+            return;
+        }
+        status = WdfRequestRetrieveOutputBuffer(Request, sizeof(*cycle),
+            (PVOID *)&cycle, NULL);
+        if (!NT_SUCCESS(status)) {
+            WdfRequestComplete(Request, status);
+            return;
+        }
+        RtlZeroMemory(cycle, sizeof(*cycle));
+        cycle->Version = SWGPU_VERSION;
+        cycle->SubmitResult = STATUS_DEVICE_NOT_READY;
+        cycle->StopResult = STATUS_DEVICE_NOT_READY;
+        /* The power-managed sequential queue holds D0 through start, test
+         * and stop. Keep all three in one request so other IOCTLs cannot
+         * interleave with the temporary resident session. */
+        status = PowerTest(Dev, FALSE, 6u);
+        cycle->StartResult = NT_SUCCESS(status) ? 0u : ReadParam(L"E1Result", (ULONG)status);
+        if (NT_SUCCESS(status) && Dev->ResidentActive) {
+            cycle->SubmitResult = B3eResidentSubmitTest(Dev, &submit, TRUE);
+            cycle->Rounds = submit.Rounds;
+            cycle->MaxPolls = submit.MaxPolls;
+        }
+        if (Dev->ResidentActive)
+            cycle->StopResult = B3eResidentShutdown(Dev, TRUE);
+        cycle->PoolResult = pool->Result;
+        cycle->PoolBytes = pool->Bytes;
+        cycle->PoolUsedPeak = pool->UsedPeak;
+        cycle->PoolFallbacks = pool->Fallbacks;
+        cycle->PoolAllocs = pool->Allocs;
+        cycle->PoolFrees = pool->Frees;
+        cycle->PoolFailures = pool->Failures;
+        cycle->PoolUsed = pool->Used;
+        Trace(L"E4CycleStartResult", cycle->StartResult);
+        Trace(L"E4CycleSubmitResult", cycle->SubmitResult);
+        Trace(L"E4CycleStopResult", cycle->StopResult);
+        Trace(L"E4CycleRounds", cycle->Rounds);
+        Trace(L"E4CycleMaxPolls", cycle->MaxPolls);
+        WdfRequestCompleteWithInformation(Request, STATUS_SUCCESS, sizeof(*cycle));
+        return;
+    }
     if (IoControlCode == IOCTL_SWGPU_IRQ_TEST) {
         if (!Dev->ResidentActive || g_ResidentOwner != Dev) {
             Trace(L"E3IoctlNotReady", STATUS_DEVICE_NOT_READY);
@@ -8506,7 +8693,7 @@ VOID SwGpuEvtIoDeviceControl(WDFQUEUE Queue, WDFREQUEST Request,
             (PVOID *)&e2Out, NULL);
         if (!NT_SUCCESS(status)) { WdfRequestComplete(Request, status); return; }
         TraceDurable(L"B3eControlMode", 9u);
-        (VOID)B3eResidentSubmitTest(Dev, e2Out);
+        (VOID)B3eResidentSubmitTest(Dev, e2Out, FALSE);
         WdfRequestCompleteWithInformation(Request, STATUS_SUCCESS, sizeof(*e2Out));
         return;
     }
@@ -8523,7 +8710,7 @@ VOID SwGpuEvtIoDeviceControl(WDFQUEUE Queue, WDFREQUEST Request,
     if (IoControlCode == IOCTL_SWGPU_RESIDENT_STOP) {
         TraceDurable(L"B3eControlMode", 8u);
         B3eResidentStatus(Dev, out);
-        out->ShutdownResult = B3eResidentShutdown(Dev);
+        out->ShutdownResult = B3eResidentShutdown(Dev, TRUE);
         Trace(L"B3eStatusShutdownResult", out->ShutdownResult);
     } else {
         Step(112);
@@ -8537,7 +8724,7 @@ NTSTATUS SwGpuEvtD0Exit(WDFDEVICE Device, WDF_POWER_DEVICE_STATE TargetState)
 {
     PSWGPU_DEVICE Dev = SwGpuGetDevice(Device);
     if (TargetState == WdfPowerDeviceD3Final && Dev->ResidentActive)
-        (VOID)B3eResidentShutdown(Dev);
+        (VOID)B3eResidentShutdown(Dev, FALSE);
     return STATUS_SUCCESS;
 }
 
@@ -8638,6 +8825,7 @@ NTSTATUS SwGpuEvtPrepareHardware(WDFDEVICE Device, WDFCMRESLIST Raw, WDFCMRESLIS
     }
     Trace(L"E3InterruptCreateStatus", (ULONG)interruptStatus);
     Trace(L"E3HaveInterrupts", Dev->HaveInterruptResources ? 1u : 0u);
+    E4ReservePool(Dev);
     return STATUS_SUCCESS;
 }
 
@@ -8645,7 +8833,8 @@ NTSTATUS SwGpuEvtReleaseHardware(WDFDEVICE Device, WDFCMRESLIST Translated)
 {
     PSWGPU_DEVICE Dev = SwGpuGetDevice(Device);
     UNREFERENCED_PARAMETER(Translated);
-    (VOID)B3eResidentShutdown(Dev);
+    (VOID)B3eResidentShutdown(Dev, FALSE);
+    E4ReleasePool(Dev);
     if (Dev->StallInterrupt != NULL) { WdfObjectDelete(Dev->StallInterrupt); Dev->StallInterrupt = NULL; }
     if (Dev->NonstallInterrupt != NULL) { WdfObjectDelete(Dev->NonstallInterrupt); Dev->NonstallInterrupt = NULL; }
     Dev->HaveInterruptResources = FALSE;
@@ -8689,7 +8878,7 @@ NTSTATUS SwGpuEvtSelfManagedIoInit(WDFDEVICE Device)
             if (NT_SUCCESS(idleStatus)) Dev->ResidentIdleRefHeld = TRUE;
             else {
                 TraceDurable(L"E1Result", (ULONG)idleStatus);
-                (VOID)B3eResidentShutdown(Dev);
+                (VOID)B3eResidentShutdown(Dev, TRUE);
             }
         }
         Snapshot(Dev, TRUE);
@@ -8726,6 +8915,7 @@ NTSTATUS SwGpuEvtDeviceAdd(WDFDRIVER Driver, PWDFDEVICE_INIT DeviceInit)
         WDF_IO_QUEUE_CONFIG QueueConfig;
         WDF_OBJECT_ATTRIBUTES QueueAttributes;
         WDF_IO_QUEUE_CONFIG_INIT_DEFAULT_QUEUE(&QueueConfig, WdfIoQueueDispatchSequential);
+        QueueConfig.PowerManaged = WdfTrue;
         QueueConfig.EvtIoDeviceControl = SwGpuEvtIoDeviceControl;
         WDF_OBJECT_ATTRIBUTES_INIT(&QueueAttributes);
         QueueAttributes.ExecutionLevel = WdfExecutionLevelPassive;

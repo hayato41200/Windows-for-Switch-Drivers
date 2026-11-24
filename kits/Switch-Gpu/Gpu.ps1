@@ -40,12 +40,13 @@
   -Mode Submit : submit repeated 3D clears on the resident channel (E2); no power-up.
   -Mode Irq    : run 64 interrupt-driven clears on the resident channel (E3);
                  requires UEFI R447H or later and does not power up the GPU.
+  -Mode Cycle  : five Resident / 8-clear / Stop cycles using one DMA pool.
   -Mode Remove    : removes the driver package.
 
   Log: C:\SwitchWOA-Gpu.txt
   This file must stay ASCII: Windows PowerShell 5.1 reads it as the ANSI code page.
 #>
-param([Parameter(Mandatory = $true)][ValidateSet('Install', 'Status', 'PowerTest', 'ProbeTest', 'DmaTest', 'FwTest', 'AcrTest', 'Resident', 'ResidentStatus', 'ResidentStop', 'Submit', 'Irq', 'Remove')][string]$Mode)
+param([Parameter(Mandatory = $true)][ValidateSet('Install', 'Status', 'PowerTest', 'ProbeTest', 'DmaTest', 'FwTest', 'AcrTest', 'Resident', 'ResidentStatus', 'ResidentStop', 'Submit', 'Irq', 'Cycle', 'Remove')][string]$Mode)
 
 $ErrorActionPreference = 'Continue'
 $Sys = Join-Path $env:windir 'Sysnative'
@@ -105,6 +106,54 @@ function Words($v) {
   return ($out -join ' ')
 }
 
+function Import-GpuFirmware {
+  New-Item -Path $Key -Force | Out-Null
+  # The firmware is the user's own linux-firmware copy; the kit never ships it.
+  # Where to look, in order: inside the kit, then fixed places on C:.
+  # If none has it, reuse what an earlier FwTest left in the registry.
+  $fwPlaces = @((Join-Path $Here 'firmware\nvidia\gm20b'), (Join-Path $Here 'firmware\gm20b'), (Join-Path $Here 'firmware'),
+                'C:\SwitchWOA\firmware\nvidia\gm20b', 'C:\firmware\nvidia\gm20b', 'C:\lib\firmware\nvidia\gm20b')
+  $fwDir = $null
+  foreach ($c in $fwPlaces) {
+    if (Test-Path (Join-Path $c 'acr\bl.bin')) { $fwDir = $c; break }
+  }
+  $fwList = @(@('acr\bl.bin', 'FwAcrBl', 832), @('acr\ucode_load.bin', 'FwAcrUcodeLoad', 18592),
+                   @('pmu\desc.bin', 'FwPmuDesc', 652), @('pmu\image.bin', 'FwPmuImage', 47872), @('pmu\sig.bin', 'FwPmuSig', 76),
+                   @('gr\fecs_bl.bin', 'FwFecsBl', 576), @('gr\fecs_inst.bin', 'FwFecsInst', 17021), @('gr\fecs_data.bin', 'FwFecsData', 1964), @('gr\fecs_sig.bin', 'FwFecsSig', 76),
+                   @('gr\gpccs_inst.bin', 'FwGpccsInst', 0), @('gr\gpccs_data.bin', 'FwGpccsData', 0),
+                   @('gr\sw_ctx.bin', 'FwGrSwCtx', 0), @('gr\sw_nonctx.bin', 'FwGrSwNonctx', 0), @('gr\sw_bundle_init.bin', 'FwGrSwBundleInit', 0))
+  $fwOk = $true
+  if (-not $fwDir) {
+    $have = Get-ItemProperty $Key -ErrorAction SilentlyContinue
+    $missing = @($fwList | Where-Object { -not ($have -and ($have.PSObject.Properties.Name -contains $_[1])) })
+    if ($missing.Count) {
+      Sum ('firmware not found. Put your own linux-firmware nvidia\gm20b folder in one of: ' + ($fwPlaces -join ' ; '))
+      return $false
+    }
+    Sum 'firmware folder not found: using the copy an earlier FwTest left in the registry'
+    foreach ($f in $fwList) {
+      $bytes = [byte[]]$have.($f[1])
+      $sha = [BitConverter]::ToString([Security.Cryptography.SHA256]::Create().ComputeHash($bytes)).Replace('-', '')
+      Sum ('firmware {0} (registry): {1} bytes  SHA256 {2}' -f $f[0], $bytes.Length, $sha)
+    }
+  }
+  else { Sum "firmware folder: $fwDir" }
+  if ($fwDir) {
+    Remove-ItemProperty -Path $Key -Name FwGrSwCtx, FwGrSwNonctx, FwGrSwBundleInit -ErrorAction SilentlyContinue
+  }
+  foreach ($f in $fwList) {
+    if (-not $fwDir) { break }
+    $fp = Join-Path $fwDir $f[0]
+    if (-not (Test-Path $fp)) { Sum "missing: $fp"; $fwOk = $false; break }
+    $bytes = [IO.File]::ReadAllBytes($fp)
+    $sha = (Get-FileHash $fp -Algorithm SHA256).Hash
+    $note = ''; if ($f[2] -gt 0 -and $bytes.Length -ne $f[2]) { $note = (' (expected {0} bytes)' -f $f[2]) }
+    Sum ('firmware {0}: {1} bytes{2}  SHA256 {3}' -f $f[0], $bytes.Length, $note, $sha)
+    Set-ItemProperty -Path $Key -Name $f[1] -Value $bytes -Type Binary
+  }
+  return $fwOk
+}
+
 function Show-Device {
   $found = $false
   foreach ($i in @(Get-ChildItem 'HKLM:\SYSTEM\CurrentControlSet\Enum\ACPI\SWOA0F01' -ErrorAction SilentlyContinue)) {
@@ -116,7 +165,7 @@ function Show-Device {
   (& $Pnputil /enum-devices /instanceid 'ACPI\SWOA0F01\0' 2>&1) | ForEach-Object { Log "  $_" }
 }
 
-function Invoke-ResidentControl([bool]$Stop) {
+function Initialize-ResidentControl {
   $src = @'
 using System;
 using System.Runtime.InteropServices;
@@ -134,7 +183,34 @@ public static class SwGpuResidentControl {
   [DllImport("setupapi.dll", SetLastError=true)] static extern bool SetupDiDestroyDeviceInfoList(IntPtr s);
   [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)] static extern SafeFileHandle CreateFile(string n, UInt32 a, UInt32 share, IntPtr sec, UInt32 disp, UInt32 flags, IntPtr template);
   [DllImport("kernel32.dll", SetLastError=true)] static extern bool DeviceIoControl(SafeFileHandle h, UInt32 code, IntPtr input, UInt32 inSize, out Status output, UInt32 outSize, out UInt32 returned, IntPtr overlapped);
+  [StructLayout(LayoutKind.Sequential)] public struct CycleResult {
+    public UInt32 Version, StartResult, SubmitResult, StopResult, Rounds, MaxPolls;
+    public UInt32 E4PoolResult, E4PoolBytes, E4PoolUsedPeak, E4PoolFallbacks, E4PoolAllocs;
+    public UInt32 E4PoolFrees, E4PoolFailures, E4PoolUsed;
+  }
+  [DllImport("kernel32.dll", EntryPoint="DeviceIoControl", SetLastError=true)]
+  static extern bool DeviceIoControlCycle(SafeFileHandle h, UInt32 code, IntPtr input, UInt32 inSize, out CycleResult output, UInt32 outSize, out UInt32 returned, IntPtr overlapped);
+  public static CycleResult RunCycle() {
+    return WithDevice<CycleResult>(delegate(SafeFileHandle h) {
+      CycleResult r; UInt32 got;
+      UInt32 size = (UInt32)Marshal.SizeOf(typeof(CycleResult));
+      if (!DeviceIoControlCycle(h, 0x22E010u, IntPtr.Zero, 0, out r, size, out got, IntPtr.Zero))
+        throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+      if (got != size || r.Version != 0x800u)
+        throw new InvalidOperationException("Unexpected SwitchGpu Cycle response");
+      return r;
+    });
+  }
   public static Status Run(bool stop) {
+    return WithDevice<Status>(delegate(SafeFileHandle h) {
+      Status s; UInt32 got;
+      UInt32 code = stop ? 0x22E004u : 0x22E000u;
+      if (!DeviceIoControl(h, code, IntPtr.Zero, 0, out s, (UInt32)Marshal.SizeOf(typeof(Status)), out got, IntPtr.Zero))
+        throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+      return s;
+    });
+  }
+  static T WithDevice<T>(Func<SafeFileHandle, T> action) {
     Guid g = new Guid("2cc9cb4d-6412-4f31-a781-5d781e094b63");
     IntPtr set = SetupDiGetClassDevs(ref g, IntPtr.Zero, IntPtr.Zero, 0x12);
     if (set == new IntPtr(-1)) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
@@ -151,11 +227,7 @@ public static class SwGpuResidentControl {
           string path = Marshal.PtrToStringUni(IntPtr.Add(b, 4));
           using (SafeFileHandle h = CreateFile(path, 0xC0000000, 3, IntPtr.Zero, 3, 0, IntPtr.Zero)) {
             if (h.IsInvalid) continue;
-            Status s; UInt32 got;
-            UInt32 code = stop ? 0x22E004u : 0x22E000u;
-            if (!DeviceIoControl(h, code, IntPtr.Zero, 0, out s, (UInt32)Marshal.SizeOf(typeof(Status)), out got, IntPtr.Zero))
-              throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
-            return s;
+            return action(h);
           }
         } finally { Marshal.FreeHGlobal(b); }
       }
@@ -165,6 +237,9 @@ public static class SwGpuResidentControl {
 }
 '@
   if (-not ('SwGpuResidentControl' -as [type])) { Add-Type -TypeDefinition $src -Language CSharp }
+}
+function Invoke-ResidentControl([bool]$Stop) {
+  Initialize-ResidentControl
   $s = [SwGpuResidentControl]::Run($Stop)
   $channelStatus = ([uint32]$s.CcsrChannel -shr 24) -band 0xF
   Sum ('resident {0}; PTIMER {1}:{2} -> {3} delta {4}; FECS mailbox0 {5}; channel raw/status {6}/{7}; PBDMA status/intr {8}/{9}; GR intr/status {10}/{11}; MMU fault {12}; shutdown {13}' -f `
@@ -286,6 +361,26 @@ public static class SwGpuIrqControl {
     (Hex $r.ResultCode), $irqText, $r.Rounds, $r.Waits, $r.NonstallCount, $r.StallCount, (Hex $r.StallUnits), $r.MaxWaitUs, $r.TotalUs, $r.Timeouts, (Hex $r.FirstMcIntr0), (Hex $r.FirstMcIntr1), (Hex $r.LastMcIntr0), (Hex $r.LastMcIntr1), (Hex $r.Semaphore), (Hex $r.PixelFirst), (Hex $r.PixelMiddle), (Hex $r.PixelLast))
 }
 
+function Show-E4Pool($p) {
+  if ($null -ne $p.E4PoolResult) {
+    Sum ('E4 pool result {0}; reserved/peak/in-use bytes {1}/{2}/{3}; checkouts/returns {4}/{5}; fallbacks {6}; failures {7}' -f (Hex $p.E4PoolResult), $p.E4PoolBytes, $p.E4PoolUsedPeak, $p.E4PoolUsed, $p.E4PoolAllocs, $p.E4PoolFrees, $p.E4PoolFallbacks, $p.E4PoolFailures)
+  }
+}
+
+function Invoke-ResidentCycle {
+  Initialize-ResidentControl
+  $passed = 0
+  for ($i = 1; $i -le 5; $i++) {
+    try { $r = [SwGpuResidentControl]::RunCycle() }
+    catch { Sum ('E4 cycle {0}/5 IOCTL failed: {1}' -f $i, $_.Exception.Message); break }
+    Sum ('E4 cycle {0}/5 start/submit/stop {1}/{2}/{3}; rounds {4}/8; max polls {5}' -f $i, (Hex $r.StartResult), (Hex $r.SubmitResult), (Hex $r.StopResult), $r.Rounds, $r.MaxPolls)
+    Show-E4Pool $r
+    if ($r.StartResult -ne 0 -or $r.SubmitResult -ne 0 -or $r.StopResult -ne 0 -or $r.Rounds -ne 8 -or $r.E4PoolUsed -ne 0) { break }
+    $passed++
+  }
+  Sum ('E4 cycle completed {0}/5' -f $passed)
+}
+
 function Show-Trace {
   $p = Get-ItemProperty $Key -ErrorAction SilentlyContinue
   if (-not $p) { Sum 'switchgpu trace: (no Parameters key: driver never started)'; return }
@@ -315,6 +410,7 @@ function Show-Trace {
       Sum ('E2 poll history: {0} records; max GP_GET/semaphore polls {1}/{2} (full rows in log)' -f $en, $egp, $esem)
     }
   }
+  Show-E4Pool $p
   if ($null -ne $p.E3Result) {
     $e3Why = 'OK'; if ((Key32 $p.E3Result) -eq 'E00000A7') { $e3Why = 'no interrupt resources; use UEFI R447H or later' } elseif ((Key32 $p.E3Result) -eq 'E00000A8') { $e3Why = 'round timeout or clear/readback failure; GPU remains resident' } elseif ((Key32 $p.E3Result) -eq 'E00000A9') { $e3Why = 'interrupt setup/write failure' }
     Sum ('E3 result {0} ({1}); interrupts {2}; rounds {3}/64; waits {4}; nonstall/stall {5}/{6}; stall units {7}; max wait us {8}; total us {9}; timeouts {10}; MC first {11}/{12}, last {13}/{14}' -f (Hex $p.E3Result), $e3Why, (Hex $p.E3HaveInterrupts), (Hex $p.E3Rounds), (Hex $p.E3Waits), (Hex $p.E3NonstallCount), (Hex $p.E3StallCount), (Hex $p.E3StallUnits), (Hex $p.E3MaxWaitUs), (Hex $p.E3TotalUs), (Hex $p.E3Timeouts), (Hex $p.E3FirstMcIntr0), (Hex $p.E3FirstMcIntr1), (Hex $p.E3LastMcIntr0), (Hex $p.E3LastMcIntr1))
@@ -908,6 +1004,9 @@ switch ($Mode) {
     catch { Sum ('resident IOCTL failed: {0}' -f $_.Exception.Message) }
     Show-Device; Log ''; Show-Trace
   }
+  'Cycle' {
+    if (Import-GpuFirmware) { Invoke-ResidentCycle }
+  }
   'Submit' {
     $oldE2 = Get-ItemProperty $Key -ErrorAction SilentlyContinue
     if ($oldE2) {
@@ -940,50 +1039,7 @@ switch ($Mode) {
       }
     }
     if ($Mode -eq 'FwTest' -or $Mode -eq 'AcrTest' -or $Mode -eq 'Resident') {
-      # The firmware is the user's own linux-firmware copy; the kit never ships it.
-      # Where to look, in order: inside the kit, then fixed places on C:.
-      # If none has it, reuse what an earlier FwTest left in the registry.
-      $fwPlaces = @((Join-Path $Here 'firmware\nvidia\gm20b'), (Join-Path $Here 'firmware\gm20b'), (Join-Path $Here 'firmware'),
-                    'C:\SwitchWOA\firmware\nvidia\gm20b', 'C:\firmware\nvidia\gm20b', 'C:\lib\firmware\nvidia\gm20b')
-      $fwDir = $null
-      foreach ($c in $fwPlaces) {
-        if (Test-Path (Join-Path $c 'acr\bl.bin')) { $fwDir = $c; break }
-      }
-      $fwList = @(@('acr\bl.bin', 'FwAcrBl', 832), @('acr\ucode_load.bin', 'FwAcrUcodeLoad', 18592),
-                       @('pmu\desc.bin', 'FwPmuDesc', 652), @('pmu\image.bin', 'FwPmuImage', 47872), @('pmu\sig.bin', 'FwPmuSig', 76),
-                       @('gr\fecs_bl.bin', 'FwFecsBl', 576), @('gr\fecs_inst.bin', 'FwFecsInst', 17021), @('gr\fecs_data.bin', 'FwFecsData', 1964), @('gr\fecs_sig.bin', 'FwFecsSig', 76),
-                       @('gr\gpccs_inst.bin', 'FwGpccsInst', 0), @('gr\gpccs_data.bin', 'FwGpccsData', 0),
-                       @('gr\sw_ctx.bin', 'FwGrSwCtx', 0), @('gr\sw_nonctx.bin', 'FwGrSwNonctx', 0), @('gr\sw_bundle_init.bin', 'FwGrSwBundleInit', 0))
-      $fwOk = $true
-      if (-not $fwDir) {
-        $have = Get-ItemProperty $Key -ErrorAction SilentlyContinue
-        $missing = @($fwList | Where-Object { -not ($have -and ($have.PSObject.Properties.Name -contains $_[1])) })
-        if ($missing.Count) {
-          Sum ('firmware not found. Put your own linux-firmware nvidia\gm20b folder in one of: ' + ($fwPlaces -join ' ; '))
-          break
-        }
-        Sum 'firmware folder not found: using the copy an earlier FwTest left in the registry'
-        foreach ($f in $fwList) {
-          $bytes = [byte[]]$have.($f[1])
-          $sha = [BitConverter]::ToString([Security.Cryptography.SHA256]::Create().ComputeHash($bytes)).Replace('-', '')
-          Sum ('firmware {0} (registry): {1} bytes  SHA256 {2}' -f $f[0], $bytes.Length, $sha)
-        }
-      }
-      else { Sum "firmware folder: $fwDir" }
-      if ($fwDir) {
-        Remove-ItemProperty -Path $Key -Name FwGrSwCtx, FwGrSwNonctx, FwGrSwBundleInit -ErrorAction SilentlyContinue
-      }
-      foreach ($f in $fwList) {
-        if (-not $fwDir) { break }
-        $fp = Join-Path $fwDir $f[0]
-        if (-not (Test-Path $fp)) { Sum "missing: $fp"; $fwOk = $false; break }
-        $bytes = [IO.File]::ReadAllBytes($fp)
-        $sha = (Get-FileHash $fp -Algorithm SHA256).Hash
-        $note = ''; if ($f[2] -gt 0 -and $bytes.Length -ne $f[2]) { $note = (' (expected {0} bytes)' -f $f[2]) }
-        Sum ('firmware {0}: {1} bytes{2}  SHA256 {3}' -f $f[0], $bytes.Length, $note, $sha)
-        Set-ItemProperty -Path $Key -Name $f[1] -Value $bytes -Type Binary
-      }
-      if (-not $fwOk) { break }
+      if (-not (Import-GpuFirmware)) { break }
     }
     Remove-ItemProperty -Path $Key -Name E1Result -ErrorAction SilentlyContinue
     Set-ItemProperty -Path $Key -Name PowerTest -Value $tv -Type DWord

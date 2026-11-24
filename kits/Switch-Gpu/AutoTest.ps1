@@ -2,7 +2,7 @@
 # Stage Install (default): Gpu.ps1 -Mode Install, register a one-shot logon task,
 #   then restart Windows (the new driver needs a restart: Code 14).
 # Stage After (run by the task after the next logon): remove the task first
-#   (so a hang never repeats), then Resident -> Irq -> ResidentStatus -> ResidentStop,
+#   (so a hang never repeats), then Resident -> Irq -> ResidentStatus -> ResidentStop -> Cycle,
 #   then print the summary lines and wait for Enter.
 # Results are appended to C:\SwitchWOA-Gpu.txt as before; console output also goes
 # to C:\SwitchWOA-GpuAutoTest.txt. ASCII only (PowerShell 5.1).
@@ -57,7 +57,7 @@ if ($Stage -eq 'Install') {
         Write-Host "task $TaskName registered: runs once after the next sign-in ($user)"
     } catch {
         Write-Host ('STOP: could not register the logon task: ' + $_.Exception.Message) -ForegroundColor Red
-        Write-Host 'Restart by hand, then run Resident, Irq, ResidentStatus, ResidentStop.'
+        Write-Host 'Restart by hand, then run Resident, Irq, ResidentStatus, ResidentStop, Cycle.'
         try { Stop-Transcript | Out-Null } catch { }
         Read-Host 'Press Enter'
         exit 1
@@ -81,7 +81,7 @@ for ($i = 40; $i -gt 0; $i -= 5) { Write-Host "  $i s"; Start-Sleep -Seconds 5 }
 $startLine = 0
 if (Test-Path $Log) { $startLine = (Get-Content $Log).Count }
 
-foreach ($m in 'Resident', 'Irq', 'ResidentStatus', 'ResidentStop') {
+foreach ($m in 'Resident', 'Irq', 'ResidentStatus', 'ResidentStop', 'Cycle') {
     Run-Gpu $m
     Start-Sleep -Seconds 5
 }
@@ -91,7 +91,7 @@ Write-Host '================ AutoTest SUMMARY ================' -ForegroundColor
 if (Test-Path $Log) {
     $all = Get-Content $Log
     $new = $all | Select-Object -Skip $startLine
-    $new | Where-Object { $_ -match '^=== Gpu ' -or $_ -match '^E1 resident result' -or $_ -match '^E3 result' -or $_ -match '^resident [01];' } |
+    $new | Where-Object { $_ -match '^=== Gpu ' -or $_ -match '^E1 resident result' -or $_ -match '^E3 result' -or $_ -match '^E4 (cycle|pool) ' -or $_ -match '^resident [01];' } |
         Select-Object -Unique | ForEach-Object { Write-Host $_ }
 }
 Write-Host '=================================================='
