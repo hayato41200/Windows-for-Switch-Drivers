@@ -14,6 +14,7 @@
   -Mode Copy   : run 16 CE2 buffer copies on the resident channel.
   -Mode Blit   : verify pitched rectangles and benchmark GPU vs CPU.
   -Mode InstallDisplay / F3On / F3Off / F3Status : optional display test.
+  -Mode F4On / F4Off : choose display double buffering after restart.
   -Mode Cycle  : five Resident / 8-clear / Stop cycles using one DMA pool.
   -Mode VerboseOn / VerboseOff : change driver logging at the next device start.
 
@@ -24,7 +25,7 @@ param(
   [Parameter(Mandatory = $true)]
   [ValidateSet('Install', 'Status', 'Resident', 'ResidentStatus', 'ResidentStop',
                'Submit', 'Irq', 'Copy', 'Blit', 'Cycle', 'InstallDisplay',
-               'F3On', 'F3Off', 'F3Status', 'Remove', 'VerboseOn', 'VerboseOff')]
+               'F3On', 'F3Off', 'F3Status', 'F4On', 'F4Off', 'Remove', 'VerboseOn', 'VerboseOff')]
   [string]$Mode,
   [switch]$Detail
 )
@@ -529,6 +530,15 @@ switch ($Mode) {
     New-ItemProperty -Path $Key -Name AutoResidentGuardTripped -PropertyType DWord -Value 0 -Force -ErrorAction Stop | Out-Null
     Sum ('F3 AutoResident / GpuPresent = {0}; GpcKhz = {1}. Restart Windows to apply.' -f $enable, $khz)
   }
+  { $_ -eq 'F4On' -or $_ -eq 'F4Off' } {
+    $enable = [int]($Mode -eq 'F4On')
+    $displayKey = 'HKLM:\SYSTEM\CurrentControlSet\Services\switchdisplay\Parameters'
+    if (-not (Test-Path -LiteralPath $displayKey)) {
+      New-Item -Path $displayKey -ErrorAction Stop | Out-Null
+    }
+    New-ItemProperty -LiteralPath $displayKey -Name DoubleBuffer -PropertyType DWord -Value $enable -Force -ErrorAction Stop | Out-Null
+    Sum ('F4 DoubleBuffer = {0}. Restart Windows to apply.' -f $enable)
+  }
   'F3Status' {
     $gpu = Get-ItemProperty $Key -ErrorAction SilentlyContinue
     $d = Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Services\switchdisplay\Parameters' -ErrorAction SilentlyContinue
@@ -537,6 +547,11 @@ switch ($Mode) {
     Sum ('F3 GPU clock requested {0} kHz; resident clock result {1}; CVB {2} mV; resident active {3}; boot guard tripped {4}' -f $gpu.GpcKhz, (Hex $gpu.F2cResidentClockResult), $gpu.F2cResidentClockCvbMv, $gpu.B3eResidentActive, $gpu.AutoResidentGuardTripped)
     Sum ('F3 boot start: E1 result {0}; step {1}; retry {2} -> {3}; firmware read fail stage {4} status {5} need/max {6}/{7}; firmware in registry: {8}' -f (Hex $gpu.E1Result), $gpu.Step, $gpu.AutoResidentRetry, (Hex $gpu.AutoResidentRetryResult), $gpu.FwReadFailStage, (Hex $gpu.FwReadFailStatus), $gpu.FwReadFailNeed, $gpu.FwReadFailMax, ((@('FwAcrBl','FwAcrUcodeLoad','FwPmuImage','FwFecsInst') | ForEach-Object { '{0}={1}' -f $_, $(if ($gpu -and $null -ne $gpu.$_) { ([byte[]]$gpu.$_).Length } else { 'missing' }) }) -join ' '))
     Sum ('F3 GPU presents {0}; CPU fallbacks {1}; failures {2}; not-ready {6}; too small for GPU {7}; no GPU destination {8}; average GPU/CPU us {3}/{4}; last status {5}' -f $d.GpuPresents, $d.GpuFallbacks, $d.GpuFailures, $d.GpuAverageUs, $d.GpuCpuAverageUs, (Hex $d.GpuLastStatus), $d.GpuNotReady, $d.GpuSmall, $d.GpuNoDst)
+    Sum ('F4 DoubleBuffer {0}; active {1}; lock timeouts {2}; panel primary PA {3}; primary MDL {4}' -f $d.DoubleBuffer, $d.F4Active, $d.F4LockTimeouts, (Hex $d.F4PanelPrimaryLo), $d.F4PanelPrimaryMdl)
+    foreach ($target in @('Panel','Tv')) {
+      $prefix = 'F4' + $target
+      Sum ('F4 {0} enabled/front {1}/{2}; flips {3}; timeouts {4}; max wait {5} us; last polls {6}; forward GPU/CPU {7}/{8}; fallbacks {9}; retained {10}; last status {11}' -f $target, $d.($prefix + 'Enabled'), $d.($prefix + 'Front'), $d.($prefix + 'Flips'), $d.($prefix + 'Timeouts'), $d.($prefix + 'MaxUs'), $d.($prefix + 'Polls'), $d.($prefix + 'GpuForward'), $d.($prefix + 'CpuForward'), $d.($prefix + 'Fallbacks'), $d.($prefix + 'Retained'), (Hex $d.($prefix + 'Status')))
+    }
   }
   'Copy' {
     try {

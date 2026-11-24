@@ -524,3 +524,9 @@ are used as data; no third-party source code was copied or adapted.
   reference window); Tegra210 fuse-tegra30.c and speedo-tegra210.c
   (read-only shadow address and silicon revision conversions).
   GPL sources were used for hardware facts only.
+
+SwitchDisplay 1.8.0 F4: the DC flip reuses SwitchDisplay's own
+TvWriteWindow sequence. Tegra DRM dc.h (READ_MUX, ACT_REQ, WIN_A error
+bits) and dc.c (tegra_dc_finish_page_flip, active address readback) were
+consulted for hardware facts only. No third-party code was copied.
+https://github.com/torvalds/linux/tree/v6.12/drivers/gpu/drm/tegra

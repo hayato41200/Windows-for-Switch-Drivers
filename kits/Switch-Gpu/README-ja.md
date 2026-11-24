@@ -1,4 +1,4 @@
-# SwitchGpu 0.12.0 実機テストキット
+# SwitchGpu 0.12.6 実機テストキット
 
 Nintendo Switch（Erista）の GM20B を Windows ARM64 で起動し、描画、割り込み、停止を確認するキットです。UEFI の GPU0（`ACPI\SWOA0F01`）が必要です。E3 の割り込み試験は **R447H 以降**で実行できます。
 
@@ -14,9 +14,16 @@ Nintendo Switch（Erista）の GM20B を Windows ARM64 で起動し、描画、�
 | F2b (0.11.1) | `Blit.cmd` | 常駐時の GPCPLL・CAR・VDD_GPU 設定値を読み出す。CPU のキャッシュあり／WC と、GPU の個別投入・一括投入・行単位投入・WC を比較する。 |
 | F2c (0.12.0) | `Blit.cmd` | バイパスで基準を測り、153.6、307.2、460.8、614.4 MHz のうち CVB 電圧が 1000 mV 以下の点を試す。各段で矩形4種を照合し、全画面20回をキャッシュあり／WC の宛先で計測する。 |
 | F3 | `InstallDisplay.cmd` → `F3On.cmd` → 再起動 | 既定は無効。R447H 以降で等倍・回転なしの TV とパネルだけを GPU へ渡す。`F3Status.cmd` で件数と平均時間を確認し、`F3Off.cmd` と再起動で無効に戻す。 |
+| F4 (SwitchDisplay 1.8.0) | `InstallDisplay.cmd` → `F4On.cmd` → 再起動 | パネル・TV ごとにバックバッファへ描画し、垂直帰線で切り替える。`F3Status.cmd` に両出力のフリップ、最大待ち時間、GPU／CPU の差分コピー、フォールバック件数を表示する。 |
 | E1 停止 | `ResidentStop.cmd` | 停止結果 0。GPU をリセットし、SMMU を復元してメモリをプールに返す。 |
 | E4 | `Cycle.cmd` | 停止状態から起動・クリア8回・停止を5周。全領域が予約できた場合、各周で貸出・返却が3ずつ増え、停止後の使用中バイト数は0。 |
 | E5 | `Status.cmd` | デバイス状態、結果、直近の Step、プール統計を表示。ResidentStatus は PTIMER が実時間1 msで進んだ量も記録する。 |
+
+F4 の `DoubleBuffer` は既定で 0 です。`F4Off.cmd` と再起動で従来の単一バッファに戻ります。パネルの標準画面は1枚 3,686,400 バイトで、4.5 MiB の予約領域には2枚入らないため、2枚目を 4 GiB 未満の物理連続 WC メモリに確保します。TV は現在のラスタと同じサイズの WC バッファを追加します。1080p では1枚 8,294,400 バイトです。確保に失敗した出力は単一バッファで動作します。
+
+DC-A／DC-B の Window A を選び、assembly バンクに開始アドレスを書き、GENERAL／WIN_A の UPDATE、ACT_REQ を順に発行します。ACT_REQ の解除と active バンクの開始アドレスを最大約50 ms確認します。タイムアウト時は両バッファを最新画像にそろえてフリップを打ち切り、走査が残り得るバッファは解放しません。通常終了では元の走査アドレスを確認して解放します。
+
+UEFI のパネル先頭アドレスが既知の予約範囲外なら、そのバッファの GPU 用 MDL は作りません。ドライバーが確保した2枚目は GPU からアクセスでき、従来のバッファを GPU で安全に扱えない向きや回転・拡大縮小では CPU を使います。F4 と F3 は個別に切り替えられます。
 
 `AutoTest.cmd` はインストールと Windows 再起動を行い、サインイン後に Resident → Irq → Submit → Copy → Blit → ResidentStatus → ResidentStop → Cycle を一度だけ実行します。表示ドライバーの導入と F3 の有効化は手動です。`AutoTestCancel.cmd` は予約と再起動を取り消し、`Remove.cmd` は GPU ドライバーを削除します。
 

@@ -73,7 +73,7 @@
 #include <stdarg.h>
 #include "../../SwitchGpu/src/swgpu-blit.h"
 
-#define SWD_VERSION        0x00010704u   /* 1.7.4 */
+#define SWD_VERSION        0x00010800u   /* 1.8.0 */
 #define SWD_NOSRC          0xFFu         /* target not in the topology */
 #define SWD_TAG            'DwsS'
 
@@ -91,7 +91,7 @@
 #define SWD_WIDTH_MM       77u
 #define SWD_HEIGHT_MM      137u
 
-/* DC-A (read only) */
+/* DC-A (panel) */
 #define DC_A_PHYS          0x54200000ull
 #define DC_MAP_SIZE        0x3000u
 #define DC_WINDOW_HEADER   (0x42u * 4u)
@@ -171,6 +171,16 @@
 #define GUARD_SECONDS      60
 #define FLUSH_SECONDS      10
 
+typedef struct _SWD_FLIP {
+    PUCHAR Second;
+    PHYSICAL_ADDRESS Phys;
+    PMDL Mdl;
+    SIZE_T Bytes;
+    BOOLEAN Mapped, Enabled;
+    volatile LONG Front, Pending;
+    ULONG Flips, Timeouts, MaxUs, Polls, GpuForward, CpuForward, Fallbacks, Retained, Status;
+} SWD_FLIP;
+
 typedef struct _SWD_CONTEXT {
     PDEVICE_OBJECT       Pdo;
     DXGKRNL_INTERFACE    Dxgk;
@@ -185,6 +195,10 @@ typedef struct _SWD_CONTEXT {
     PUCHAR               FbVa;
     BOOLEAN              GpuPresent, FbDmaUnsafe, TvDmaUnsafe;
     PMDL                 FbMdl, TvMdl;
+    BOOLEAN              DoubleBuffer;
+    volatile LONG        F4LockTimeouts;
+    KEVENT               FbLock;
+    SWD_FLIP             FbFlip, TvFlip;
     PFILE_OBJECT         GpuFile;
     PDEVICE_OBJECT volatile GpuTarget;
     volatile LONG        GpuPresents, GpuFailures, GpuFallbacks, GpuStreak, GpuLastStatus;
@@ -245,6 +259,7 @@ typedef struct _SWD_CONTEXT {
     volatile LONG        TvIndicateSt;
     ULONG                TvSaved[TV_REGS];
     LONG                 TvLastW, TvLastH;
+    D3DKMDT_VIDPN_PRESENT_PATH_ROTATION TvLastBaked;
     volatile LONG        TvPresents;
     KEVENT               TvLock;        /* 1.4.0: a mutex (synchronization event) for TvVa */
 
@@ -313,10 +328,12 @@ static ULONG RegGetDword(PCWSTR Name, ULONG Default)
 }
 
 #include "swd-gpu-present.inc"
+#include "swd-flip.inc"
 
 static VOID FlushCounters(PSWD_CONTEXT Ctx)
 {
     if (Ctx->GpuPresent) SwdGpuFlushCounters(Ctx);
+    if (Ctx->DoubleBuffer) SwdFlipFlush(Ctx);
     RegPutDword(L"Presents", (ULONG)Ctx->Presents);
     RegPutDword(L"PresentErrors", (ULONG)Ctx->PresentErrors);
     RegPutDword(L"LastPresentStatus", (ULONG)Ctx->LastPresentStatus);
@@ -559,6 +576,13 @@ static VOID ClearFb(PSWD_CONTEXT Ctx)
 {
     ULONG y;
     if (!Ctx->FbVa || Ctx->FbDmaUnsafe) return;
+    if (Ctx->DoubleBuffer && Ctx->FbFlip.Second) {
+        if (SwdFlipLock(&Ctx->FbLock)) {
+            SwdFlipClear(Ctx, FALSE);
+            SwdFlipUnlock(&Ctx->FbLock);
+        } else InterlockedIncrement(&Ctx->F4LockTimeouts);
+        return;
+    }
     for (y = 0; y < Ctx->FbHeight; y++) {
         RtlZeroMemory(Ctx->FbVa + (SIZE_T)y * Ctx->FbPitch, (SIZE_T)Ctx->FbWidth * 4);
     }
@@ -567,6 +591,8 @@ static VOID ClearFb(PSWD_CONTEXT Ctx)
 
 static VOID UnmapFb(PSWD_CONTEXT Ctx)
 {
+    if (Ctx->DoubleBuffer && Ctx->FbFlip.Second)
+        SwdFlipFree(&Ctx->FbFlip, !Ctx->FbDmaUnsafe && SwdPanelPrimary(Ctx));
     if (Ctx->FbMdl != NULL && !Ctx->FbDmaUnsafe) IoFreeMdl(Ctx->FbMdl);
     Ctx->FbMdl = NULL;
     if (Ctx->FbVa) {
@@ -603,13 +629,13 @@ static VOID ReadDcTrace(VOID)
 
 /* Copies source rect [l,r)x[t,b) (source coordinates) to the framebuffer with
  * the current rotation. Row is a function giving the source row pointer. */
-static VOID BltRect(PSWD_CONTEXT Ctx, PUCHAR SrcBase, LONG SrcTop, LONG Pitch, RECT Rc,
+static VOID BltRect(PSWD_CONTEXT Ctx, PUCHAR Dest, PUCHAR Forward, PUCHAR SrcBase, LONG SrcTop, LONG Pitch, RECT Rc,
                     LONG Ws, LONG Hs, D3DKMDT_VIDPN_PRESENT_PATH_ROTATION Rot)
 {
     LONG Fw = (LONG)Ctx->FbWidth, Fh = (LONG)Ctx->FbHeight;
     LONG dl, dr, dt, db, dx, dy;
 #define SRCPX(x, y) (((const ULONG *)(SrcBase + (SIZE_T)((y) - SrcTop) * (SIZE_T)Pitch))[(x)])
-#define DSTROW(y)   ((ULONG *)(Ctx->FbVa + (SIZE_T)(y) * Ctx->FbPitch))
+#define DSTROW(y)   ((ULONG *)(Dest + (SIZE_T)(y) * Ctx->FbPitch))
 
     if (Rc.left < 0) Rc.left = 0;
     if (Rc.top < 0) Rc.top = 0;
@@ -621,6 +647,10 @@ static VOID BltRect(PSWD_CONTEXT Ctx, PUCHAR SrcBase, LONG SrcTop, LONG Pitch, R
     case D3DKMDT_VPPR_ROTATE90:     /* dst(x', y') = (Hs-1-y, x) */
         dl = Hs - Rc.bottom; dr = Hs - Rc.top; dt = Rc.left; db = Rc.right;
         if (dr > Fw) dr = Fw; if (db > Fh) db = Fh;
+        if (Forward) {
+            SwdCopyRows(Dest, Forward, Ctx->FbPitch, dl, dt, dr, db);
+            break;
+        }
         for (dy = dt; dy < db; dy++) {
             ULONG *d = DSTROW(dy);
             for (dx = dl; dx < dr; dx++) d[dx] = SRCPX(dy, Hs - 1 - dx);
@@ -629,6 +659,10 @@ static VOID BltRect(PSWD_CONTEXT Ctx, PUCHAR SrcBase, LONG SrcTop, LONG Pitch, R
     case D3DKMDT_VPPR_ROTATE180:    /* dst = (Ws-1-x, Hs-1-y) */
         dl = Ws - Rc.right; dr = Ws - Rc.left; dt = Hs - Rc.bottom; db = Hs - Rc.top;
         if (dr > Fw) dr = Fw; if (db > Fh) db = Fh;
+        if (Forward) {
+            SwdCopyRows(Dest, Forward, Ctx->FbPitch, dl, dt, dr, db);
+            break;
+        }
         for (dy = dt; dy < db; dy++) {
             ULONG *d = DSTROW(dy);
             for (dx = dl; dx < dr; dx++) d[dx] = SRCPX(Ws - 1 - dx, Hs - 1 - dy);
@@ -637,6 +671,10 @@ static VOID BltRect(PSWD_CONTEXT Ctx, PUCHAR SrcBase, LONG SrcTop, LONG Pitch, R
     case D3DKMDT_VPPR_ROTATE270:    /* dst = (y, Ws-1-x) */
         dl = Rc.top; dr = Rc.bottom; dt = Ws - Rc.right; db = Ws - Rc.left;
         if (dr > Fw) dr = Fw; if (db > Fh) db = Fh;
+        if (Forward) {
+            SwdCopyRows(Dest, Forward, Ctx->FbPitch, dl, dt, dr, db);
+            break;
+        }
         for (dy = dt; dy < db; dy++) {
             ULONG *d = DSTROW(dy);
             for (dx = dl; dx < dr; dx++) d[dx] = SRCPX(Ws - 1 - dy, dx);
@@ -646,6 +684,10 @@ static VOID BltRect(PSWD_CONTEXT Ctx, PUCHAR SrcBase, LONG SrcTop, LONG Pitch, R
         if (Rc.right > Fw) Rc.right = Fw;
         if (Rc.bottom > Fh) Rc.bottom = Fh;
         if (Rc.left >= Rc.right) break;
+        if (Forward) {
+            SwdCopyRows(Dest, Forward, Ctx->FbPitch, Rc.left, Rc.top, Rc.right, Rc.bottom);
+            break;
+        }
         for (dy = Rc.top; dy < Rc.bottom; dy++) {
             RtlCopyMemory(DSTROW(dy) + Rc.left, &SRCPX(Rc.left, dy), (SIZE_T)(Rc.right - Rc.left) * 4);
         }
@@ -685,13 +727,13 @@ static VOID TvWriteWindow(PSWD_CONTEXT Ctx, const ULONG *Values)
  * the TV). The upright picture goes 1:1 when it is 1280x720, otherwise
  * point-sampled to fit, centred. Only rows of Rc are read from the source
  * (the caller locked just those). The inverse mappings follow BltRect. */
-static VOID TvBlt(PSWD_CONTEXT Ctx, PUCHAR SrcBase, LONG SrcTop, LONG Pitch, RECT Rc, LONG Ws, LONG Hs,
+static VOID TvBlt(PSWD_CONTEXT Ctx, PUCHAR Dest, PUCHAR Forward, PUCHAR SrcBase, LONG SrcTop, LONG Pitch, RECT Rc, LONG Ws, LONG Hs,
                   D3DKMDT_VIDPN_PRESENT_PATH_ROTATION Baked)
 {
     LONG uw, uh, outW, outH, x0, y0, dy, dx, dys, dye, dxs, dxe;
     RECT u;
 #define TSRC(x, y) (((const ULONG *)(SrcBase + (SIZE_T)((y) - SrcTop) * (SIZE_T)Pitch))[(x)])
-#define TDST(y)    ((ULONG *)(Ctx->TvVa + (SIZE_T)(y) * Ctx->TvPitch))
+#define TDST(y)    ((ULONG *)(Dest + (SIZE_T)(y) * Ctx->TvPitch))
 
     if (Rc.left < 0) Rc.left = 0;
     if (Rc.top < 0) Rc.top = 0;
@@ -727,6 +769,10 @@ static VOID TvBlt(PSWD_CONTEXT Ctx, PUCHAR SrcBase, LONG SrcTop, LONG Pitch, REC
                     Baked == D3DKMDT_VPPR_ROTATE180 ? TSRC(Ws - 1 - (a), Hs - 1 - (b)) : TSRC((a), (b)))
 
     if (uw == (LONG)Ctx->TvW && uh == (LONG)Ctx->TvH) {
+        if (Forward) {
+            SwdCopyRows(Dest, Forward, Ctx->TvPitch, u.left, u.top, u.right, u.bottom);
+            return;
+        }
         for (dy = u.top; dy < u.bottom; dy++) {
             ULONG *d = TDST(dy);
             if (Baked == D3DKMDT_VPPR_IDENTITY) {
@@ -750,6 +796,10 @@ static VOID TvBlt(PSWD_CONTEXT Ctx, PUCHAR SrcBase, LONG SrcTop, LONG Pitch, REC
     dxe = x0 + (u.right * outW + uw - 1) / uw;
     if (dye > y0 + outH) dye = y0 + outH;
     if (dxe > x0 + outW) dxe = x0 + outW;
+    if (Forward) {
+        SwdCopyRows(Dest, Forward, Ctx->TvPitch, dxs, dys, dxe, dye);
+        return;
+    }
     for (dy = dys; dy < dye; dy++) {
         LONG sb = (dy - y0) * uh / outH;
         ULONG *d = TDST(dy);
@@ -775,7 +825,9 @@ static VOID TvUnlock(PSWD_CONTEXT Ctx) { KeSetEvent(&Ctx->TvLock, IO_NO_INCREMEN
 
 static VOID TvStart(PSWD_CONTEXT Ctx)
 {
-    TvLock(Ctx);
+    if (Ctx->DoubleBuffer) {
+        if (!SwdFlipLock(&Ctx->TvLock)) { InterlockedIncrement(&Ctx->F4LockTimeouts); return; }
+    } else TvLock(Ctx);
     if (!Ctx->TvVa) TvStartLocked(Ctx);
     TvUnlock(Ctx);
 }
@@ -838,14 +890,20 @@ static VOID TvStartLocked(PSWD_CONTEXT Ctx)
         return;
     }
     Ctx->TvPhys = MmGetPhysicalAddress(Ctx->TvVa);
-    if (Ctx->GpuPresent && !gGpuDisabled)
+    if (Ctx->DoubleBuffer) Ctx->TvMdl = SwdOwnedScanoutMdl(Ctx->TvVa, Ctx->TvSize);
+    else if (Ctx->GpuPresent && !gGpuDisabled)
         Ctx->TvMdl = SwdGpuScanoutMdl(Ctx->TvVa, Ctx->TvPhys, Ctx->TvSize);
     TvClear(Ctx);
     /* Until the desktop draws: the boot image, as UEFI showed it. */
     if (Ctx->FbVa) {
         RECT all;
         all.left = 0; all.top = 0; all.right = (LONG)Ctx->FbWidth; all.bottom = (LONG)Ctx->FbHeight;
-        TvBlt(Ctx, Ctx->FbVa, 0, (LONG)Ctx->FbPitch, all, (LONG)Ctx->FbWidth, (LONG)Ctx->FbHeight, D3DKMDT_VPPR_IDENTITY);
+        if (!Ctx->DoubleBuffer || SwdFlipLock(&Ctx->FbLock)) {
+            PUCHAR panel = SwdFlipVa(Ctx, FALSE, Ctx->FbFlip.Front);
+            if (!Ctx->DoubleBuffer || !Ctx->FbDmaUnsafe)
+                TvBlt(Ctx, Ctx->TvVa, NULL, panel, 0, (LONG)Ctx->FbPitch, all, (LONG)Ctx->FbWidth, (LONG)Ctx->FbHeight, D3DKMDT_VPPR_IDENTITY);
+            if (Ctx->DoubleBuffer) SwdFlipUnlock(&Ctx->FbLock);
+        } else InterlockedIncrement(&Ctx->F4LockTimeouts);
     }
     Ctx->TvLastW = 0;
     Ctx->TvLastH = 0;
@@ -882,6 +940,7 @@ static VOID TvStartLocked(PSWD_CONTEXT Ctx)
     v[16] = DC_WIN_ENABLE;
     if (Ctx->TvW != (act & 0xFFFFu) && RegGetDword(L"TvFilter", 0) != 0) v[16] |= DC_WIN_H_FILTER | DC_WIN_V_FILTER;
     TvWriteWindow(Ctx, v);
+    if (Ctx->DoubleBuffer) SwdFlipAllocate(Ctx, TRUE);
     RegPutDword(L"TvSavedStart", Ctx->TvSaved[11]);
     RegPutDword(L"TvBufLo", Ctx->TvPhys.LowPart);
     RegPutDword(L"TvBufHi", (ULONG)Ctx->TvPhys.HighPart);
@@ -894,10 +953,42 @@ static VOID TvStartLocked(PSWD_CONTEXT Ctx)
 
 /* Stop: give window A back to what UEFI set (the boot framebuffer), wait for
  * DC-B to latch it, then free the buffer. */
-static VOID TvStop(PSWD_CONTEXT Ctx)
+static BOOLEAN TvStop(PSWD_CONTEXT Ctx)
 {
     LARGE_INTEGER t;
     PUCHAR va;
+    if (Ctx->DoubleBuffer) {
+        BOOLEAN safe = Ctx->TvVa == NULL;
+        SWD_FLIP *flip = &Ctx->TvFlip;
+        if (!SwdFlipLock(&Ctx->TvLock)) {
+            InterlockedIncrement(&Ctx->F4LockTimeouts);
+            return FALSE;
+        }
+        if (Ctx->TvDc && Ctx->TvVa) {
+            ULONGLONG saved = ((ULONGLONG)Ctx->TvSaved[12] << 32) | Ctx->TvSaved[11];
+            if (flip->Second && !Ctx->TvDmaUnsafe) (VOID)SwdFlipRequest(Ctx, TRUE, 0);
+            TvWriteWindow(Ctx, Ctx->TvSaved);
+            /* Confirm that neither owned buffer can still be scanned. */
+            safe = SwdFlipWait(Ctx->TvDc, saved, flip) && !Ctx->TvDmaUnsafe &&
+                saved != (ULONGLONG)Ctx->TvPhys.QuadPart &&
+                (!flip->Second || saved != (ULONGLONG)flip->Phys.QuadPart);
+        }
+        SwdFlipFree(flip, safe);
+        if (safe) {
+            if (Ctx->TvMdl) IoFreeMdl(Ctx->TvMdl);
+            if (Ctx->TvVa) MmFreeContiguousMemorySpecifyCache(Ctx->TvVa, Ctx->TvSize, MmWriteCombined);
+        }
+        Ctx->TvVa = NULL;
+        Ctx->TvMdl = NULL;
+        Ctx->TvDmaUnsafe = FALSE;
+        InterlockedExchange(&Ctx->TvConnected, 0);
+        if (Ctx->TvDc) {
+            MmUnmapIoSpace(Ctx->TvDc, DC_MAP_SIZE);
+            Ctx->TvDc = NULL;
+        }
+        SwdFlipUnlock(&Ctx->TvLock);
+        return TRUE;
+    }
     TvLock(Ctx);                            /* Present no longer copies to the TV after this */
     va = Ctx->TvVa;
     Ctx->TvVa = NULL;
@@ -919,6 +1010,7 @@ static VOID TvStop(PSWD_CONTEXT Ctx)
         MmUnmapIoSpace(Ctx->TvDc, DC_MAP_SIZE);
         Ctx->TvDc = NULL;
     }
+    return TRUE;
 }
 
 #undef TVRD
@@ -1149,7 +1241,7 @@ static VOID DpTearDown(PSWD_CONTEXT Ctx)
     volatile ULONG *car;
     BOOLEAN was = Ctx->TvConnected != 0;
     TvAudioDown();
-    TvStop(Ctx);                            /* TvConnected = 0 */
+    if (!TvStop(Ctx)) return;               /* present still owns DC-B */
     if (was) TvIndicate(Ctx, FALSE);
     if (!DpMap()) return;
     car = (volatile ULONG *)gDpCar;
@@ -1344,6 +1436,7 @@ NTSTATUS SwdAddDevice(IN_CONST_PDEVICE_OBJECT PhysicalDeviceObject, OUT_PPVOID M
     KeInitializeEvent(&ctx->StopEvent, NotificationEvent, FALSE);
     KeInitializeEvent(&ctx->DpEvent, SynchronizationEvent, FALSE);
     KeInitializeEvent(&ctx->TvLock, SynchronizationEvent, TRUE);
+    KeInitializeEvent(&ctx->FbLock, SynchronizationEvent, TRUE);
     /* 1.2.1: dxgkrnl may connect the DC-A interrupt (level, UEFI R409) before
      * StartDevice. 1.2.0 masked the DC interrupts only in StartDevice, and the
      * device failed with problem 43 right after starting. Map DC-A here and
@@ -1507,12 +1600,14 @@ NTSTATUS SwdStartDevice(IN_CONST_PVOID MiniportDeviceContext, IN_PDXGK_START_INF
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
+    ctx->DoubleBuffer = RegGetDword(L"DoubleBuffer", 0u) == 1u;
     ctx->GpuPresent = RegGetDword(L"GpuPresent", 0u) == 1u;
-    if (ctx->GpuPresent && !gGpuDisabled &&
-        (ULONGLONG)ctx->FbPhys.QuadPart >= SWD_FB_PHYS &&
-        (ULONGLONG)ctx->FbPhys.QuadPart < SWD_FB_PHYS + SWD_FB_RESERVED &&
-        ctx->FbMapSize <= SWD_FB_PHYS + SWD_FB_RESERVED - (ULONGLONG)ctx->FbPhys.QuadPart) {
+    if ((ctx->DoubleBuffer || (ctx->GpuPresent && !gGpuDisabled)) && SwdPanelMdlAllowed(ctx)) {
         ctx->FbMdl = SwdGpuScanoutMdl(ctx->FbVa, ctx->FbPhys, ctx->FbMapSize);
+    }
+    if (ctx->DoubleBuffer) {
+        SwdFlipAllocate(ctx, FALSE);
+        SwdFlipFlush(ctx);
     }
     ctx->Extend = RegGetDword(L"TvExtend", 1) != 0;
     RegPutDword(L"ExtendOn", ctx->Extend ? 1 : 0);
@@ -1541,6 +1636,7 @@ NTSTATUS SwdStartDevice(IN_CONST_PVOID MiniportDeviceContext, IN_PDXGK_START_INF
     *NumberOfVideoPresentSources = ctx->Extend ? 2 : 1;
     *NumberOfChildren = ctx->Extend ? 2 : 1;
     ctx->Started = TRUE;
+    RegPutDword(L"F4Active", ctx->DoubleBuffer);
     RegPutDword(L"LastStartStatus", 0);
     UNREFERENCED_PARAMETER(DxgkStartInfo);
     return STATUS_SUCCESS;
@@ -1559,6 +1655,7 @@ static VOID StopCommon(PSWD_CONTEXT Ctx)
     DpUnmap();
     UnmapFb(Ctx);
     Ctx->Started = FALSE;
+    if (Ctx->DoubleBuffer) SwdFlipFlush(Ctx);
     Ctx->Active = FALSE;
 }
 
@@ -1580,6 +1677,12 @@ NTSTATUS SwdStopAndRelease(PVOID MiniportDeviceContext, D3DDDI_VIDEO_PRESENT_TAR
     /* Hand back the framebuffer in its native layout, with the panel awake. */
     PanelWake(ctx);
     ctx->Rotation = D3DKMDT_VPPR_IDENTITY;
+    if (ctx->DoubleBuffer && ctx->FbFlip.Second && !SwdPanelPrimary(ctx))
+        return STATUS_IO_TIMEOUT;
+    if (ctx->DoubleBuffer && ctx->FbFlip.Second) {
+        ctx->FbFlip.Enabled = FALSE;
+        ctx->FbFlip.Front = 0;
+    }
     ClearFb(ctx);
     DisplayInfo->Width = ctx->FbWidth;
     DisplayInfo->Height = ctx->FbHeight;
@@ -1801,7 +1904,12 @@ static NTSTATUS ImplSetPowerState(IN_CONST_PVOID MiniportDeviceContext, IN_ULONG
      * D1-D3 puts the panel to sleep; D0 wakes it. */
     if (DeviceUid == 0 || DeviceUid == DISPLAY_ADAPTER_HW_ID) {
         if (DeviceUid == 0) ctx->MonitorOff = (DevicePowerState != PowerDeviceD0);
+        if (ctx->DoubleBuffer && !SwdFlipLock(&ctx->FbLock)) {
+            InterlockedIncrement(&ctx->F4LockTimeouts);
+            return STATUS_DEVICE_BUSY;
+        }
         if (DevicePowerState == PowerDeviceD0) PanelWake(ctx); else PanelSleep(ctx);
+        if (ctx->DoubleBuffer) SwdFlipUnlock(&ctx->FbLock);
     }
     return STATUS_SUCCESS;
 }
@@ -2166,8 +2274,13 @@ static NTSTATUS ImplEnumVidPnCofuncModality(IN_CONST_HANDLE hAdapter,
 
 static VOID TvClearLocked(PSWD_CONTEXT Ctx)
 {
-    TvLock(Ctx);
-    if (Ctx->TvVa) TvClear(Ctx);
+    if (Ctx->DoubleBuffer) {
+        if (!SwdFlipLock(&Ctx->TvLock)) { InterlockedIncrement(&Ctx->F4LockTimeouts); return; }
+    } else TvLock(Ctx);
+    if (Ctx->TvVa) {
+        if (Ctx->DoubleBuffer && Ctx->TvFlip.Second) SwdFlipClear(Ctx, TRUE);
+        else TvClear(Ctx);
+    }
     Ctx->TvLastW = 0;
     Ctx->TvLastH = 0;
     TvUnlock(Ctx);
@@ -2346,6 +2459,58 @@ static VOID GrowBounds(LONG *Top, LONG *Bottom, const RECT *R)
     if (R->bottom > *Bottom) *Bottom = R->bottom;
 }
 
+static VOID SwdPresentForward(PSWD_CONTEXT Ctx, const DXGKARG_PRESENT_DISPLAYONLY *Present,
+                              BOOLEAN Tv, LONG Index, LONG W, LONG H,
+                              D3DKMDT_VIDPN_PRESENT_PATH_ROTATION Rotation,
+                              BOOLEAN IdentityGpu, BOOLEAN Full)
+{
+    SWD_FLIP *flip = Tv ? &Ctx->TvFlip : &Ctx->FbFlip;
+    PUCHAR from = SwdFlipVa(Ctx, Tv, Index), to = SwdFlipVa(Ctx, Tv, 1 - Index);
+    PMDL primary = Tv ? Ctx->TvMdl : Ctx->FbMdl;
+    PMDL srcMdl = Index ? flip->Mdl : primary;
+    PMDL dstMdl = Index ? primary : flip->Mdl;
+    ULONG pitch = Tv ? Ctx->TvPitch : Ctx->FbPitch;
+    ULONG pass, i;
+    KeMemoryBarrier();
+    if (!Tv && Ctx->DcStopped) {
+        RtlCopyMemory(to, from, flip->Bytes);
+        ++flip->CpuForward;
+        return;
+    }
+    if (flip->Enabled) {
+        if (!SwdFlipComplete(Ctx, Tv, Index)) return;
+    } else if (!flip->Pending) return;
+
+    if (Full) {
+        RtlCopyMemory(to, from, flip->Bytes);
+    } else if (flip->Enabled && IdentityGpu && !gGpuDisabled && Ctx->GpuTarget &&
+               srcMdl && !(srcMdl->MdlFlags & MDL_IO_SPACE) && dstMdl) {
+        DXGKARG_PRESENT_DISPLAYONLY layout = *Present;
+        NTSTATUS status;
+        layout.Pitch = pitch;
+        status = SwdGpuRects(Ctx, &layout, srcMdl, dstMdl, 0, H, W, pitch);
+        if (NT_SUCCESS(status)) { ++flip->GpuForward; return; }
+        if (status == SWGPU_BLIT_DMA_UNSAFE) {
+            if (Tv) Ctx->TvDmaUnsafe = TRUE;
+            else Ctx->FbDmaUnsafe = TRUE;
+            SwdFlipFallback(flip, (ULONG)status);
+            InterlockedExchange(&gGpuDisabled, 1);
+            return;
+        }
+    }
+    if (!Full) {
+        for (pass = 0u; pass < 2u; ++pass) {
+            ULONG count = pass == 0u ? Present->NumMoves : Present->NumDirtyRects;
+            for (i = 0u; i < count; ++i) {
+                RECT r = pass == 0u ? Present->pMoves[i].DestRect : Present->pDirtyRect[i];
+                if (Tv) TvBlt(Ctx, to, from, NULL, 0, 0, r, W, H, Rotation);
+                else BltRect(Ctx, to, from, NULL, 0, 0, r, W, H, Rotation);
+            }
+        }
+    }
+    ++flip->CpuForward;
+}
+
 DXGKDDI_PRESENTDISPLAYONLY SwdPresentDisplayOnly;
 NTSTATUS SwdPresentDisplayOnly(IN_CONST_HANDLE hAdapter, IN_CONST_PDXGKARG_PRESENT_DISPLAYONLY pPresent)
 {
@@ -2409,44 +2574,67 @@ NTSTATUS SwdPresentDisplayOnly(IN_CONST_HANDLE hAdapter, IN_CONST_PDXGKARG_PRESE
     if (src) {
         /* The source already holds the final image, so a move is copied
          * from the source at its destination like a dirty rect. */
-        if (toPanel && !ctx->FbDmaUnsafe) {
+        BOOLEAN panelLocked = toPanel && ctx->DoubleBuffer && SwdFlipLock(&ctx->FbLock);
+        if (toPanel && ctx->DoubleBuffer && !panelLocked) {
+            InterlockedIncrement(&ctx->F4LockTimeouts);
+            st = STATUS_DEVICE_BUSY;
+        }
+        if (toPanel && (!ctx->DoubleBuffer || panelLocked) && !ctx->FbDmaUnsafe) {
+            LONG index = ctx->FbFlip.Second ? SwdFlipDrawIndex(ctx, FALSE) : 0;
+            PUCHAR dest = SwdFlipVa(ctx, FALSE, index);
+            PMDL targetMdl = index ? ctx->FbFlip.Mdl : ctx->FbMdl;
             BOOLEAN eligible = ctx->GpuPresent && rot == D3DKMDT_VPPR_IDENTITY &&
                 ws > 0 && hs > 0 && ws <= (LONG)ctx->FbWidth && hs <= (LONG)ctx->FbHeight;
-            if (!eligible || !SwdGpuTry(ctx, pPresent, mdl, ctx->FbMdl,
+            if (!eligible || !SwdGpuTry(ctx, pPresent, mdl, targetMdl,
                     top, bottom, ws, ctx->FbPitch, FALSE, &keepMdl, &gpuSuccess, &gpuUs)) {
                 if (eligible) cpuStart = KeQueryPerformanceCounter(&cpuFreq);
-                for (i = 0; i < pPresent->NumMoves; i++) BltRect(ctx, src, top, pPresent->Pitch, pPresent->pMoves[i].DestRect, ws, hs, rot);
-                for (i = 0; i < pPresent->NumDirtyRects; i++) BltRect(ctx, src, top, pPresent->Pitch, pPresent->pDirtyRect[i], ws, hs, rot);
+                for (i = 0; i < pPresent->NumMoves; i++) BltRect(ctx, dest, NULL, src, top, pPresent->Pitch, pPresent->pMoves[i].DestRect, ws, hs, rot);
+                for (i = 0; i < pPresent->NumDirtyRects; i++) BltRect(ctx, dest, NULL, src, top, pPresent->Pitch, pPresent->pDirtyRect[i], ws, hs, rot);
                 if (eligible) { cpuFallback = TRUE; cpuUs += SwdGpuUs(cpuStart, cpuFreq); }
             }
+            if (ctx->FbFlip.Second && !ctx->FbDmaUnsafe)
+                SwdPresentForward(ctx, pPresent, FALSE, index, ws, hs, rot, eligible, FALSE);
         }
-        if (toTv) {
-            TvLock(ctx);
+        if (panelLocked) SwdFlipUnlock(&ctx->FbLock);
+        if (toTv && (!ctx->DoubleBuffer || SwdFlipLock(&ctx->TvLock))) {
+            if (!ctx->DoubleBuffer) TvLock(ctx);
             if (ctx->TvVa && !ctx->TvDmaUnsafe) {
                 /* The TV gets the picture upright: with Flags.Rotate the surface is
                  * upright already; without it the rotation is baked in (1.4.3). */
                 D3DKMDT_VIDPN_PRESENT_PATH_ROTATION baked = pPresent->Flags.Rotate ? D3DKMDT_VPPR_IDENTITY : srcRot;
                 LONG tw = IsRotated(baked) ? hs : ws, th = IsRotated(baked) ? ws : hs;
-                if (tw != ctx->TvLastW || th != ctx->TvLastH) {
-                    TvClear(ctx);
+                LONG index = ctx->TvFlip.Second ? SwdFlipDrawIndex(ctx, TRUE) : 0;
+                PUCHAR dest = SwdFlipVa(ctx, TRUE, index);
+                PMDL targetMdl = index ? ctx->TvFlip.Mdl : ctx->TvMdl;
+                BOOLEAN shapeChanged = tw != ctx->TvLastW || th != ctx->TvLastH ||
+                    (ctx->DoubleBuffer && baked != ctx->TvLastBaked);
+                if (shapeChanged) {
+                    if (ctx->TvFlip.Second) RtlZeroMemory(dest, ctx->TvSize);
+                    else TvClear(ctx);
                     ctx->TvLastW = tw;
                     ctx->TvLastH = th;
+                    ctx->TvLastBaked = baked;
                 }
                 {
                     BOOLEAN eligible = ctx->GpuPresent && baked == D3DKMDT_VPPR_IDENTITY &&
                         ws > 0 && hs > 0 && ws == (LONG)ctx->TvW && hs == (LONG)ctx->TvH;
-                    if (!eligible || !SwdGpuTry(ctx, pPresent, mdl, ctx->TvMdl,
+                    if (!eligible || !SwdGpuTry(ctx, pPresent, mdl, targetMdl,
                             top, bottom, ws, ctx->TvPitch, TRUE, &keepMdl, &gpuSuccess, &gpuUs)) {
                         if (eligible) cpuStart = KeQueryPerformanceCounter(&cpuFreq);
-                        for (i = 0; i < pPresent->NumMoves; i++) TvBlt(ctx, src, top, pPresent->Pitch, pPresent->pMoves[i].DestRect, ws, hs, baked);
-                        for (i = 0; i < pPresent->NumDirtyRects; i++) TvBlt(ctx, src, top, pPresent->Pitch, pPresent->pDirtyRect[i], ws, hs, baked);
+                        for (i = 0; i < pPresent->NumMoves; i++) TvBlt(ctx, dest, NULL, src, top, pPresent->Pitch, pPresent->pMoves[i].DestRect, ws, hs, baked);
+                        for (i = 0; i < pPresent->NumDirtyRects; i++) TvBlt(ctx, dest, NULL, src, top, pPresent->Pitch, pPresent->pDirtyRect[i], ws, hs, baked);
                         if (eligible) { cpuFallback = TRUE; cpuUs += SwdGpuUs(cpuStart, cpuFreq); }
                     }
+                    if (ctx->TvFlip.Second && !ctx->TvDmaUnsafe)
+                        SwdPresentForward(ctx, pPresent, TRUE, index, ws, hs, baked, eligible, shapeChanged);
                 }
                 InterlockedIncrement(&ctx->TvPresents);
                 if (!toPanel) InterlockedIncrement(&ctx->TvSrcPresents);
             }
             TvUnlock(ctx);
+        } else if (toTv) {
+            InterlockedIncrement(&ctx->F4LockTimeouts);
+            st = STATUS_DEVICE_BUSY;
         }
         KeMemoryBarrier();
     } else {
@@ -2493,12 +2681,21 @@ VOID SwdSystemDisplayWrite(PVOID MiniportDeviceContext, PVOID Source, UINT Sourc
 {
     PSWD_CONTEXT ctx = (PSWD_CONTEXT)MiniportDeviceContext;
     UINT y, w, h;
+    LONG front;
+    PUCHAR dest;
     if (!ctx->FbVa || ctx->FbDmaUnsafe || !Source || PositionX >= ctx->FbWidth || PositionY >= ctx->FbHeight) return;
+    front = ctx->FbFlip.Front;
+    dest = SwdFlipVa(ctx, FALSE, front);
     w = SourceWidth;  if (w > ctx->FbWidth - PositionX) w = ctx->FbWidth - PositionX;
     h = SourceHeight; if (h > ctx->FbHeight - PositionY) h = ctx->FbHeight - PositionY;
     for (y = 0; y < h; y++) {
-        RtlCopyMemory(ctx->FbVa + (SIZE_T)(PositionY + y) * ctx->FbPitch + (SIZE_T)PositionX * 4,
-                      (PUCHAR)Source + (SIZE_T)y * SourceStride, (SIZE_T)w * 4);
+        SIZE_T offset = (SIZE_T)(PositionY + y) * ctx->FbPitch + (SIZE_T)PositionX * 4;
+        RtlCopyMemory(dest + offset, (PUCHAR)Source + (SIZE_T)y * SourceStride, (SIZE_T)w * 4);
+        /* A bugcheck may interrupt ACT_REQ before we publish the new index.
+         * Write both candidates while that hardware latch is in flight. */
+        if (ctx->FbFlip.Pending && ctx->FbFlip.Second)
+            RtlCopyMemory(SwdFlipVa(ctx, FALSE, 1 - front) + offset,
+                          (PUCHAR)Source + (SIZE_T)y * SourceStride, (SIZE_T)w * 4);
     }
 }
 
