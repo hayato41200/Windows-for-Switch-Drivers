@@ -39,7 +39,7 @@
 #include <spb.h>
 #include "swgpu-blit.h"
 
-#define SWGPU_VERSION      0x00000C04u   /* 0.12.4 */
+#define SWGPU_VERSION      0x00000C06u   /* 0.12.6 */
 
 #define CAR_PHYS           0x60006000ull
 #define CAR_LEN            0x1000u
@@ -1207,12 +1207,26 @@ static PUCHAR ReadBinParam(PCWSTR Name, ULONG Max, PULONG Len)
     NTSTATUS st;
 
     *Len = 0;
-    if (SwGpuParamsPath[0] == L'\0') return NULL;
+    if (SwGpuParamsPath[0] == L'\0') { Trace(L"FwReadFailStage", 1u); return NULL; }
     RtlInitUnicodeString(&path, SwGpuParamsPath);
     InitializeObjectAttributes(&oa, &path, OBJ_KERNEL_HANDLE | OBJ_CASE_INSENSITIVE, NULL, NULL);
-    if (!NT_SUCCESS(ZwOpenKey(&key, KEY_READ, &oa))) return NULL;
+    st = ZwOpenKey(&key, KEY_READ, &oa);
+    if (!NT_SUCCESS(st)) {
+        /* Claude 0.12.5: F3 boot start failed with E0000041 (no ACR blobs). */
+        Trace(L"FwReadFailStage", 2u);
+        Trace(L"FwReadFailStatus", (ULONG)st);
+        return NULL;
+    }
     RtlInitUnicodeString(&name, Name);
     st = ZwQueryValueKey(key, &name, KeyValuePartialInformation, NULL, 0, &need);
+    if (!((st == STATUS_BUFFER_TOO_SMALL || st == STATUS_BUFFER_OVERFLOW) &&
+          need > 0 && need <= Max + sizeof(KEY_VALUE_PARTIAL_INFORMATION))) {
+        Trace(L"FwReadFailStage", 3u);
+        Trace(L"FwReadFailStatus", (ULONG)st);
+        Trace(L"FwReadFailNeed", need);
+        Trace(L"FwReadFailMax", Max);
+        Trace(L"FwReadFailNameLen", (ULONG)name.Length);
+    }
     if ((st == STATUS_BUFFER_TOO_SMALL || st == STATUS_BUFFER_OVERFLOW) &&
         need > 0 && need <= Max + sizeof(KEY_VALUE_PARTIAL_INFORMATION)) {
         kv = (PKEY_VALUE_PARTIAL_INFORMATION)ExAllocatePool2(POOL_FLAG_PAGED, need, SWGPU_TAG);
@@ -8436,6 +8450,13 @@ static NTSTATUS SwGpuBlitInternal(WDFDEVICE Device, PIRP Irp)
         stack->Parameters.DeviceIoControl.InputBufferLength == sizeof(SWGPU_BLIT_REQUEST) &&
         Irp->AssociatedIrp.SystemBuffer != NULL) {
         status = STATUS_DEVICE_NOT_READY;
+        if (InterlockedCompareExchange(&dev->BlitOnline, 0, 0) == 0) {
+            /* Claude 0.12.6: separate "blit path offline" from F3Present's checks. */
+            Trace(L"F3NotReadyWhy", 0x80000000u);
+            Trace(L"F3NotReadyCount", ReadParam(L"F3NotReadyCount", 0u) + 1u);
+            Trace(L"F3OfflineResident", dev->ResidentActive ? 1u : 0u);
+            Trace(L"F3OfflineIdleRef", dev->ResidentIdleRefHeld ? 1u : 0u);
+        }
         if (InterlockedCompareExchange(&dev->BlitOnline, 0, 0) != 0) {
             status = STATUS_DEVICE_BUSY;
             if (InterlockedCompareExchange(&dev->BlitGate, 1, 0) == 0) {
@@ -8639,6 +8660,15 @@ NTSTATUS SwGpuEvtSelfManagedIoInit(WDFDEVICE Device)
         TraceDetail(L"Boot0", 0);
         t0 = KeQueryPerformanceCounter(&f);
         (VOID)StartResident(Dev);
+        /* Claude 0.12.5: the first F3 boot failed at the firmware read
+         * (E0000041) although the blobs were imported. Retry once after a
+         * bounded 3 s delay; StartResident already powered the GPU down. */
+        if (autoStart && !Dev->ResidentActive && ReadParam(L"E1Result", 0u) == 0xE0000041u) {
+            TraceDurable(L"AutoResidentRetry", 1u);
+            Ms(3000);
+            (VOID)StartResident(Dev);
+            TraceDurable(L"AutoResidentRetryResult", Dev->ResidentActive ? 0u : ReadParam(L"E1Result", 0u));
+        }
         t1 = KeQueryPerformanceCounter(NULL);
         Trace(L"TestUs", (ULONG)((t1.QuadPart - t0.QuadPart) * 1000000 / (f.QuadPart ? f.QuadPart : 1)));
         if (Dev->ResidentActive) {

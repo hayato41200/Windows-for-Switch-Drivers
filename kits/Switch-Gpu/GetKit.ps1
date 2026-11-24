@@ -2,7 +2,7 @@
 # start AutoTest, so the SD card does not have to be moved (Claude, 0.10.x).
 # The PC publishes the kit to <share>\gpu\kit; AutoTest uploads the logs to
 # <share>\gpu\logs when it finishes. ASCII only (PowerShell 5.1).
-param([string]$Root = '')
+param([string]$Root = '', [switch]$NoTest)
 
 $ErrorActionPreference = 'Stop'
 $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
@@ -48,5 +48,10 @@ if (Test-Path $want) {
     Write-Host '  SHA256 matches SHA256.txt'
 }
 Write-Host ''
+if ($NoTest) {
+    Write-Host 'Kit copied to C:\SwitchWOA-Gpu-current (no AutoTest).' -ForegroundColor Yellow
+    Read-Host 'Press Enter'
+    exit 0
+}
 Write-Host 'Starting AutoTest from C:\SwitchWOA-Gpu-current ...' -ForegroundColor Yellow
 & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $dst 'AutoTest.ps1') -Stage Install

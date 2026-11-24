@@ -12,6 +12,6 @@ New-Item -ItemType Directory -Force $kit | Out-Null
 Expand-Archive $Zip -DestinationPath $kit -Force
 $hash = (Get-FileHash (Join-Path $kit 'switchgpu.sys') -Algorithm SHA256).Hash
 Set-Content -Path (Join-Path $kit 'SHA256.txt') -Value $hash -Encoding ascii
-Copy-Item (Join-Path $kit 'GetKit.cmd'), (Join-Path $kit 'GetKit.ps1') $share -Force
+Copy-Item (Join-Path $kit 'GetKit.cmd'), (Join-Path $kit 'GetKitOnly.cmd'), (Join-Path $kit 'GetKit.ps1') $share -Force
 Write-Host "published $Zip -> $kit"
 Write-Host "switchgpu.sys SHA256 $hash"

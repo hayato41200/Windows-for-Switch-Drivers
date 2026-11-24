@@ -47,7 +47,7 @@ Log "=== Gpu $Mode  $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
 function Hex($v) { if ($null -eq $v) { 'n/a' } else { '0x' + (Key32 $v) } }
 function Key32($v) { if ($null -eq $v) { return '' }; $n = [long]$v; if ($n -lt 0) { $n += 4294967296 }; '{0:X8}' -f $n }
 function Import-GpuFirmware {
-  New-Item -Path $Key -Force | Out-Null
+  if (-not (Test-Path $Key)) { New-Item -Path $Key | Out-Null }  # 0.12.6: never -Force (it wipes an existing key)
   # The firmware is the user's own linux-firmware copy; the kit never ships it.
   # Where to look, in order: inside the kit, then fixed places on C:.
   # If none has it, reuse the firmware already in the registry.
@@ -518,7 +518,7 @@ switch ($Mode) {
     $enable = [int]($Mode -eq 'F3On')
     if ($enable -and -not (Import-GpuFirmware)) { break }
     $displayKey = 'HKLM:\SYSTEM\CurrentControlSet\Services\switchdisplay\Parameters'
-    New-Item -Path $Key,$displayKey -Force -ErrorAction Stop | Out-Null
+    foreach ($rk in @($Key, $displayKey)) { if (-not (Test-Path $rk)) { New-Item -Path $rk -ErrorAction Stop | Out-Null } }  # 0.12.6: -Force wiped the firmware and F3 values
     New-ItemProperty -Path $Key -Name AutoResident -PropertyType DWord -Value $enable -Force -ErrorAction Stop | Out-Null
     New-ItemProperty -Path $displayKey -Name GpuPresent -PropertyType DWord -Value $enable -Force -ErrorAction Stop | Out-Null
     # 0.12.4: F2c hardware showed 460.8 MHz gives ~5 GB/s (CVB 950 mV, same as
@@ -533,8 +533,10 @@ switch ($Mode) {
     $gpu = Get-ItemProperty $Key -ErrorAction SilentlyContinue
     $d = Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Services\switchdisplay\Parameters' -ErrorAction SilentlyContinue
     Sum ('F3 AutoResident {0}; GpuPresent {1}; display version {2}; connected {3}; disabled {4}' -f $gpu.AutoResident, $d.GpuPresent, (Hex $d.Version), $d.GpuConnected, $d.GpuDisabled)
+    Sum ('F3 GPU not-ready why {0} (count {1}; offline resident/idle-ref {2}/{3}; bits 1=irq off 2=not resident 4=owner 8=reset 10=copy busy 20/40/80=channel/runlist/inst 100=BAR 200=ACR VM 400=GR VM 800=CE off 80000000=blit offline)' -f (Hex $gpu.F3NotReadyWhy), $gpu.F3NotReadyCount, $gpu.F3OfflineResident, $gpu.F3OfflineIdleRef)
     Sum ('F3 GPU clock requested {0} kHz; resident clock result {1}; CVB {2} mV; resident active {3}; boot guard tripped {4}' -f $gpu.GpcKhz, (Hex $gpu.F2cResidentClockResult), $gpu.F2cResidentClockCvbMv, $gpu.B3eResidentActive, $gpu.AutoResidentGuardTripped)
-    Sum ('F3 GPU presents {0}; CPU fallbacks {1}; failures {2}; average GPU/CPU us {3}/{4}; last status {5}' -f $d.GpuPresents, $d.GpuFallbacks, $d.GpuFailures, $d.GpuAverageUs, $d.GpuCpuAverageUs, (Hex $d.GpuLastStatus))
+    Sum ('F3 boot start: E1 result {0}; step {1}; retry {2} -> {3}; firmware read fail stage {4} status {5} need/max {6}/{7}; firmware in registry: {8}' -f (Hex $gpu.E1Result), $gpu.Step, $gpu.AutoResidentRetry, (Hex $gpu.AutoResidentRetryResult), $gpu.FwReadFailStage, (Hex $gpu.FwReadFailStatus), $gpu.FwReadFailNeed, $gpu.FwReadFailMax, ((@('FwAcrBl','FwAcrUcodeLoad','FwPmuImage','FwFecsInst') | ForEach-Object { '{0}={1}' -f $_, $(if ($gpu -and $null -ne $gpu.$_) { ([byte[]]$gpu.$_).Length } else { 'missing' }) }) -join ' '))
+    Sum ('F3 GPU presents {0}; CPU fallbacks {1}; failures {2}; not-ready {6}; too small for GPU {7}; no GPU destination {8}; average GPU/CPU us {3}/{4}; last status {5}' -f $d.GpuPresents, $d.GpuFallbacks, $d.GpuFailures, $d.GpuAverageUs, $d.GpuCpuAverageUs, (Hex $d.GpuLastStatus), $d.GpuNotReady, $d.GpuSmall, $d.GpuNoDst)
   }
   'Copy' {
     try {
@@ -575,7 +577,7 @@ switch ($Mode) {
     Show-Device; Show-Trace 'E3'
   }
   'Resident' {
-    New-Item -Path $Key -Force | Out-Null
+    if (-not (Test-Path $Key)) { New-Item -Path $Key | Out-Null }  # 0.12.6: never -Force (it wipes an existing key)
     $old = Get-ItemProperty $Key -ErrorAction SilentlyContinue
     if ($old) {
       foreach ($n in @($old.PSObject.Properties | Where-Object { $_.Name -match '^(Acr|E1|B3e|B2a|B3a|B3b|B3c|Smmu|Mc[IE]|McHotStat(Before|After)Dma|McHotStatAfter(Reset|Flush|Bar0)|McHotStatB2aStart|Pmu|Pfifo|Ptop|Scal|Dmem|Ring|Wpr|PmcEnable)' } | ForEach-Object { $_.Name })) {
@@ -603,7 +605,7 @@ switch ($Mode) {
     Show-Device; Log ''; Show-Trace
   }
   { $_ -eq 'VerboseOn' -or $_ -eq 'VerboseOff' } {
-    New-Item -Path $Key -Force -ErrorAction Stop | Out-Null
+    if (-not (Test-Path $Key)) { New-Item -Path $Key -ErrorAction Stop | Out-Null }  # 0.12.6: never -Force (it wipes an existing key)
     $enabled = [int]($Mode -eq 'VerboseOn')
     New-ItemProperty -Path $Key -Name Verbose -PropertyType DWord -Value $enabled -Force -ErrorAction Stop | Out-Null
     Sum ('Driver Verbose = {0}; applies on the next GPU device start.' -f $enabled)

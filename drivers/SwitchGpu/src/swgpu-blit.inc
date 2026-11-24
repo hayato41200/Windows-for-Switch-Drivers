@@ -758,7 +758,26 @@ static NTSTATUS F3Present(PSWGPU_DEVICE Dev, const SWGPU_BLIT_REQUEST *Req)
 {
     F2_RUN run = {0};
     NTSTATUS status;
-    if (!Dev->InterruptSourcesEnabled || !F2CanRun(Dev)) return STATUS_DEVICE_NOT_READY;
+    if (!Dev->InterruptSourcesEnabled || !F2CanRun(Dev)) {
+        /* Claude 0.12.6: F3 on hardware got 18 NOT_READY while resident.
+         * Record which condition failed (bit set = condition not met). */
+        ULONG why = 0u;
+        if (!Dev->InterruptSourcesEnabled) why |= 0x1u;
+        if (!Dev->ResidentActive) why |= 0x2u;
+        if (g_ResidentOwner != Dev) why |= 0x4u;
+        if (Dev->BlitReset) why |= 0x8u;
+        if (Dev->CopyInFlight) why |= 0x10u;
+        if (!Dev->ResidentChannelEnabled) why |= 0x20u;
+        if (!Dev->ResidentRunlistSubmitted) why |= 0x40u;
+        if (!Dev->ResidentInstBound) why |= 0x80u;
+        if (Dev->Bar0 == NULL || Dev->Bar1Cpu == NULL || Dev->Bar1MapLen < BAR1_D3_MAP_LEN) why |= 0x100u;
+        if (!g_AcrVm.PtbChanged || g_AcrVm.Arena == NULL) why |= 0x200u;
+        if (!g_GrVm.Active || !g_GrVm.PtbChanged || g_GrVm.Arena == NULL) why |= 0x400u;
+        if (Dev->Bar0 != NULL && (Rd(Dev->Bar0, NV_PMC_ENABLE) & F1_CE_ENABLE) == 0u) why |= 0x800u;
+        Trace(L"F3NotReadyWhy", why);
+        Trace(L"F3NotReadyCount", ReadParam(L"F3NotReadyCount", 0u) + 1u);
+        return STATUS_DEVICE_NOT_READY;
+    }
     if (Req->DstPitch > SWGPU_BLIT_WINDOW_BYTES || !F2RequestValid(Req))
         return STATUS_INVALID_PARAMETER;
     KeFlushIoBuffers(Req->Src, FALSE, TRUE);
