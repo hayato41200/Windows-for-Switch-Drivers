@@ -143,7 +143,7 @@ public static class SwGpuResidentControl {
       UInt32 size = (UInt32)Marshal.SizeOf(typeof(CycleResult));
       if (!DeviceIoControlCycle(h, 0x22E010u, IntPtr.Zero, 0, out r, size, out got, IntPtr.Zero))
         throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
-      if (got != size || (r.Version & 0xFFFFFF00u) != 0xC00u)
+      if (got != size || ((r.Version & 0xFFFFFF00u) != 0xC00u && (r.Version & 0xFFFFFF00u) != 0xD00u))
         throw new InvalidOperationException("Unexpected SwitchGpu Cycle response");
       return r;
     });
@@ -161,7 +161,7 @@ public static class SwGpuResidentControl {
       UInt32 size = (UInt32)Marshal.SizeOf(typeof(CopyResult));
       if (!DeviceIoControlCopy(h, 0x22E014u, IntPtr.Zero, 0, out r, size, out got, IntPtr.Zero))
         throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
-      if (got != size || (r.Version & 0xFFFFFF00u) != 0xC00u)
+      if (got != size || ((r.Version & 0xFFFFFF00u) != 0xC00u && (r.Version & 0xFFFFFF00u) != 0xD00u))
         throw new InvalidOperationException("Unexpected SwitchGpu Copy response");
       return r;
     });
@@ -190,7 +190,7 @@ public static class SwGpuResidentControl {
       UInt32 size = (UInt32)Marshal.SizeOf(typeof(BlitResult));
       if (!DeviceIoControlBlit(h, 0x22E018u, IntPtr.Zero, 0, out r, size, out got, IntPtr.Zero))
         throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
-      if (got != size || (r.Version & 0xFFFFFF00u) != 0xC00u)
+      if (got != size || ((r.Version & 0xFFFFFF00u) != 0xC00u && (r.Version & 0xFFFFFF00u) != 0xD00u))
         throw new InvalidOperationException("Unexpected SwitchGpu Blit response");
       return r;
     });
@@ -521,6 +521,9 @@ switch ($Mode) {
     $displayKey = 'HKLM:\SYSTEM\CurrentControlSet\Services\switchdisplay\Parameters'
     foreach ($rk in @($Key, $displayKey)) { if (-not (Test-Path $rk)) { New-Item -Path $rk -ErrorAction Stop | Out-Null } }  # 0.12.6: -Force wiped the firmware and F3 values
     New-ItemProperty -Path $Key -Name AutoResident -PropertyType DWord -Value $enable -Force -ErrorAction Stop | Out-Null
+    if ($enable -and $null -eq (Get-ItemProperty -LiteralPath $Key -Name IdlePowerOffMs -ErrorAction SilentlyContinue)) {
+      New-ItemProperty -LiteralPath $Key -Name IdlePowerOffMs -PropertyType DWord -Value 10000 -ErrorAction Stop | Out-Null
+    }
     New-ItemProperty -Path $displayKey -Name GpuPresent -PropertyType DWord -Value $enable -Force -ErrorAction Stop | Out-Null
     # 0.12.4: F2c hardware showed 460.8 MHz gives ~5 GB/s (CVB 950 mV, same as
     # 614.4 MHz which is memory bound); F3 runs the resident GPU there.
@@ -545,6 +548,8 @@ switch ($Mode) {
     Sum ('F3 AutoResident {0}; GpuPresent {1}; display version {2}; connected {3}; disabled {4}' -f $gpu.AutoResident, $d.GpuPresent, (Hex $d.Version), $d.GpuConnected, $d.GpuDisabled)
     Sum ('F3 GPU not-ready why {0} (count {1}; offline resident/idle-ref {2}/{3}; bits 1=irq off 2=not resident 4=owner 8=reset 10=copy busy 20/40/80=channel/runlist/inst 100=BAR 200=ACR VM 400=GR VM 800=CE off 80000000=blit offline)' -f (Hex $gpu.F3NotReadyWhy), $gpu.F3NotReadyCount, $gpu.F3OfflineResident, $gpu.F3OfflineIdleRef)
     Sum ('F3 GPU clock requested {0} kHz; resident clock result {1}; CVB {2} mV; resident active {3}; boot guard tripped {4}' -f $gpu.GpcKhz, (Hex $gpu.F2cResidentClockResult), $gpu.F2cResidentClockCvbMv, $gpu.B3eResidentActive, $gpu.AutoResidentGuardTripped)
+    $power = if ($null -eq $gpu.G1State) { 'n/a' } elseif ($gpu.B3eResidentActive -eq 1 -and $gpu.G1State -eq 1) { 'on' } else { 'off' }
+    Sum ('G1 {0}; policy {1}; idle threshold {2} ms; offs/ons {3}/{4}; last off after {5} ms idle; last on {6} us; on failures {7}; disabled {8}; manual stop {9}; last E1 {10}; drain {11}' -f $power, $gpu.G1Policy, $gpu.G1IdlePowerOffMs, $gpu.G1PowerOffs, $gpu.G1PowerOns, $gpu.G1LastOffMs, $gpu.G1LastOnUs, $gpu.G1OnFailures, $gpu.G1Disabled, $gpu.G1ManualStop, (Hex $gpu.E1Result), (Hex $gpu.G1DrainStatus))
     Sum ('F3 boot start: E1 result {0}; step {1}; retry {2} -> {3}; firmware read fail stage {4} status {5} need/max {6}/{7}; firmware in registry: {8}' -f (Hex $gpu.E1Result), $gpu.Step, $gpu.AutoResidentRetry, (Hex $gpu.AutoResidentRetryResult), $gpu.FwReadFailStage, (Hex $gpu.FwReadFailStatus), $gpu.FwReadFailNeed, $gpu.FwReadFailMax, ((@('FwAcrBl','FwAcrUcodeLoad','FwPmuImage','FwFecsInst') | ForEach-Object { '{0}={1}' -f $_, $(if ($gpu -and $null -ne $gpu.$_) { ([byte[]]$gpu.$_).Length } else { 'missing' }) }) -join ' '))
     Sum ('F3 GPU presents {0}; CPU fallbacks {1}; failures {2}; not-ready {6}; too small for GPU {7}; no GPU destination {8}; average GPU/CPU us {3}/{4}; last status {5}' -f $d.GpuPresents, $d.GpuFallbacks, $d.GpuFailures, $d.GpuAverageUs, $d.GpuCpuAverageUs, (Hex $d.GpuLastStatus), $d.GpuNotReady, $d.GpuSmall, $d.GpuNoDst)
     Sum ('F4 DoubleBuffer {0}; active {1}; lock timeouts {2}; panel primary PA {3}; primary MDL {4}' -f $d.DoubleBuffer, $d.F4Active, $d.F4LockTimeouts, (Hex $d.F4PanelPrimaryLo), $d.F4PanelPrimaryMdl)

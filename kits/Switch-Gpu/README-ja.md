@@ -1,4 +1,4 @@
-# SwitchGpu 0.12.6 実機テストキット
+# SwitchGpu 0.13.0 実機テストキット
 
 Nintendo Switch（Erista）の GM20B を Windows ARM64 で起動し、描画、割り込み、停止を確認するキットです。UEFI の GPU0（`ACPI\SWOA0F01`）が必要です。E3 の割り込み試験は **R447H 以降**で実行できます。
 
@@ -15,6 +15,7 @@ Nintendo Switch（Erista）の GM20B を Windows ARM64 で起動し、描画、�
 | F2c (0.12.0) | `Blit.cmd` | バイパスで基準を測り、153.6、307.2、460.8、614.4 MHz のうち CVB 電圧が 1000 mV 以下の点を試す。各段で矩形4種を照合し、全画面20回をキャッシュあり／WC の宛先で計測する。 |
 | F3 | `InstallDisplay.cmd` → `F3On.cmd` → 再起動 | 既定は無効。R447H 以降で等倍・回転なしの TV とパネルだけを GPU へ渡す。`F3Status.cmd` で件数と平均時間を確認し、`F3Off.cmd` と再起動で無効に戻す。 |
 | F4 (SwitchDisplay 1.8.0) | `InstallDisplay.cmd` → `F4On.cmd` → 再起動 | パネル・TV ごとにバックバッファへ描画し、垂直帰線で切り替える。`F3Status.cmd` に両出力のフリップ、最大待ち時間、GPU／CPU の差分コピー、フォールバック件数を表示する。 |
+| G1 (0.13.0) | `F3On.cmd` → 再起動 → `F3Status.cmd` | 最後の GPU Present 成功から既定で約10秒アイドルになると GPU を停止。次の GPU 対象 Present は CPU で描画し、バックグラウンドで GPU を起動する。 |
 | E1 停止 | `ResidentStop.cmd` | 停止結果 0。GPU をリセットし、SMMU を復元してメモリをプールに返す。 |
 | E4 | `Cycle.cmd` | 停止状態から起動・クリア8回・停止を5周。全領域が予約できた場合、各周で貸出・返却が3ずつ増え、停止後の使用中バイト数は0。 |
 | E5 | `Status.cmd` | デバイス状態、結果、直近の Step、プール統計を表示。ResidentStatus は PTIMER が実時間1 msで進んだ量も記録する。 |
@@ -26,6 +27,10 @@ DC-A／DC-B の Window A を選び、assembly バンクに開始アドレスを�
 UEFI のパネル先頭アドレスが既知の予約範囲外なら、そのバッファの GPU 用 MDL は作りません。ドライバーが確保した2枚目は GPU からアクセスでき、従来のバッファを GPU で安全に扱えない向きや回転・拡大縮小では CPU を使います。F4 と F3 は個別に切り替えられます。
 
 `AutoTest.cmd` はインストールと Windows 再起動を行い、サインイン後に Resident → Irq → Submit → Copy → Blit → ResidentStatus → ResidentStop → Cycle を一度だけ実行します。表示ドライバーの導入と F3 の有効化は手動です。`AutoTestCancel.cmd` は予約と再起動を取り消し、`Remove.cmd` は GPU ドライバーを削除します。
+
+G1 は `AutoResident=1` のときだけ有効です。`switchgpu\Parameters` の DWORD `IdlePowerOffMs` の既定値は 10000 で、0 に設定して再起動すると従来どおり常駐します。`F3On.cmd` は既存値を保持します。GPU 停止後に起動を要求できるのは、GPU に送られる Present です。回転や小さな更新など、表示側が CPU に直接回す処理は対象外です。起動中も CPU 描画を続けます。
+
+自動再起動が2回連続で失敗すると、その Windows 起動中の自動起動を止めます。`ResidentStop.cmd` による手動停止後も自動復帰を止めます。`F3Status.cmd` の G1 行で停止・起動件数、直近の起動時間、失敗数を確認できます。低クロックの中間状態は設けていません。
 
 F2/F3 の GPU VA は `0x20000000` と `0x21000000` から各16 MiBです。GR プールを `0x248000` バイトに拡張し、末尾に GPU の4 KiBページ用テーブル256 KiBと Tegra SMMU のテーブル8枚（計32 KiB）を置きます。マップと解除のたびに SMMU の PTC/TLB と GR PDB の TLB を無効化します。
 

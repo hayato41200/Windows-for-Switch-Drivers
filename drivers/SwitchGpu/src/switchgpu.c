@@ -39,7 +39,7 @@
 #include <spb.h>
 #include "swgpu-blit.h"
 
-#define SWGPU_VERSION      0x00000C06u   /* 0.12.6 */
+#define SWGPU_VERSION      0x00000D00u   /* 0.13.0 */
 
 #define CAR_PHYS           0x60006000ull
 #define CAR_LEN            0x1000u
@@ -282,6 +282,18 @@ typedef struct _SWGPU_DEVICE {
     BOOLEAN        CopyInFlight;
     volatile LONG  BlitGate;
     volatile LONG  BlitOnline;
+    /* G1 scheduler fields under PowerLock. Hardware state under BlitGate. */
+    WDFTIMER       PowerTimer;
+    WDFWORKITEM    PowerWork;
+    KSPIN_LOCK     PowerLock;
+    KEVENT         PowerWorkDone;
+    ULONG          IdlePowerOffMs;
+    BOOLEAN        PowerPolicy, PowerPaused, PowerFinal, PowerD0;
+    BOOLEAN        PowerQueued, PowerWakeWanted, PowerDisabled, PowerManualStop;
+    volatile LONG64 LastBlitTime;
+    ULONGLONG      PowerWakeStart;
+    LARGE_INTEGER  PowerWakeQpc;
+    ULONG          PowerOffs, PowerOns, LastOffMs, LastOnUs, OnFailures, OnStreak;
     BOOLEAN        BlitReset;
     BOOLEAN        BlitUnsafe;
     ULONG          BlitLastWaitUs, BlitLastPolls;
@@ -8216,6 +8228,8 @@ static ULONG B3eResidentShutdown(PSWGPU_DEVICE Dev, BOOLEAN DrainIsrs)
     return error;
 }
 
+#include "swgpu-idle.inc"
+
 static VOID B3eResidentStatus(PSWGPU_DEVICE Dev, PSWGPU_RESIDENT_STATUS Out)
 {
     volatile UCHAR *B = Dev->Bar0;
@@ -8411,7 +8425,9 @@ static VOID SwGpuDispatchIoctl(WDFQUEUE Queue, WDFREQUEST Request,
     if (IoControlCode == IOCTL_SWGPU_RESIDENT_STOP) {
         TraceDurable(L"B3eControlMode", 8u);
         B3eResidentStatus(Dev, out);
+        G1ManualStop(Dev);
         out->ShutdownResult = B3eResidentShutdown(Dev, TRUE);
+        G1TraceState(Dev);
         Trace(L"B3eStatusShutdownResult", out->ShutdownResult);
     } else {
         Step(112);
@@ -8451,18 +8467,21 @@ static NTSTATUS SwGpuBlitInternal(WDFDEVICE Device, PIRP Irp)
         Irp->AssociatedIrp.SystemBuffer != NULL) {
         status = STATUS_DEVICE_NOT_READY;
         if (InterlockedCompareExchange(&dev->BlitOnline, 0, 0) == 0) {
-            /* Claude 0.12.6: separate "blit path offline" from F3Present's checks. */
-            Trace(L"F3NotReadyWhy", 0x80000000u);
-            Trace(L"F3NotReadyCount", ReadParam(L"F3NotReadyCount", 0u) + 1u);
-            Trace(L"F3OfflineResident", dev->ResidentActive ? 1u : 0u);
-            Trace(L"F3OfflineIdleRef", dev->ResidentIdleRefHeld ? 1u : 0u);
-        }
-        if (InterlockedCompareExchange(&dev->BlitOnline, 0, 0) != 0) {
+            if (!G1RequestWake(dev)) {
+                /* Keep the offline diagnostics for the legacy policy. */
+                Trace(L"F3NotReadyWhy", 0x80000000u);
+                Trace(L"F3NotReadyCount", ReadParam(L"F3NotReadyCount", 0u) + 1u);
+                Trace(L"F3OfflineResident", dev->ResidentActive ? 1u : 0u);
+                Trace(L"F3OfflineIdleRef", dev->ResidentIdleRefHeld ? 1u : 0u);
+            }
+        } else {
             status = STATUS_DEVICE_BUSY;
             if (InterlockedCompareExchange(&dev->BlitGate, 1, 0) == 0) {
                 status = InterlockedCompareExchange(&dev->BlitOnline, 0, 0) != 0
                     ? F3Present(dev, (const SWGPU_BLIT_REQUEST *)Irp->AssociatedIrp.SystemBuffer)
                     : STATUS_DEVICE_NOT_READY;
+                if (NT_SUCCESS(status))
+                    InterlockedExchange64(&dev->LastBlitTime, (LONG64)KeQueryInterruptTime());
                 InterlockedExchange(&dev->BlitGate, 0);
             }
         }
@@ -8473,33 +8492,59 @@ static NTSTATUS SwGpuBlitInternal(WDFDEVICE Device, PIRP Irp)
     return status;
 }
 
-static BOOLEAN SwGpuDrainBlit(PSWGPU_DEVICE Dev)
+static BOOLEAN SwGpuDrainBlit(PSWGPU_DEVICE Dev, ULONG TimeoutMs)
 {
     ULONG polls;
+    BOOLEAN acquired = FALSE;
+    ULONGLONG start = KeQueryInterruptTime();
     InterlockedExchange(&Dev->BlitOnline, 0);
-    for (polls = 0u; polls < 200u; ++polls) {
-        if (InterlockedCompareExchange(&Dev->BlitGate, 1, 0) == 0) break;
-        Ms(1);
+    for (polls = 1u; ; ++polls) {
+        acquired = InterlockedCompareExchange(&Dev->BlitGate, 1, 0) == 0;
+        if (acquired || KeQueryInterruptTime() - start >= TimeoutMs * 10000ull ||
+            polls == TimeoutMs) break;
+        Ms(1u);
     }
     Trace(L"F3DrainPolls", polls);
-    return polls != 200u;
+    Trace(L"F3DrainStatus", acquired ? 0u : (ULONG)STATUS_IO_TIMEOUT);
+    return acquired;
 }
 
-static NTSTATUS SwGpuEvtD0Entry(WDFDEVICE Device, WDF_POWER_DEVICE_STATE PreviousState)
+static NTSTATUS SwGpuEvtD0Ready(WDFDEVICE Device, WDF_POWER_DEVICE_STATE PreviousState)
 {
     PSWGPU_DEVICE dev = SwGpuGetDevice(Device);
+    KIRQL oldIrql;
     UNREFERENCED_PARAMETER(PreviousState);
-    if (dev->ResidentActive && !dev->BlitReset) InterlockedExchange(&dev->BlitOnline, 1);
+    KeAcquireSpinLock(&dev->PowerLock, &oldIrql);
+    dev->PowerD0 = TRUE;
+    dev->PowerPaused = FALSE;
+    if (!dev->PowerFinal && dev->ResidentActive && !dev->BlitReset)
+        InterlockedExchange(&dev->BlitOnline, 1);
+    KeReleaseSpinLock(&dev->PowerLock, oldIrql);
+    G1ResumeScheduler(dev);
     return STATUS_SUCCESS;
+}
+
+static NTSTATUS SwGpuEvtD0Quiesce(WDFDEVICE Device, WDF_POWER_DEVICE_STATE TargetState)
+{
+    PSWGPU_DEVICE dev = SwGpuGetDevice(Device);
+    return G1Pause(dev, TargetState == WdfPowerDeviceD3Final) ?
+           STATUS_SUCCESS : STATUS_DEVICE_BUSY;
 }
 
 NTSTATUS SwGpuEvtD0Exit(WDFDEVICE Device, WDF_POWER_DEVICE_STATE TargetState)
 {
     PSWGPU_DEVICE Dev = SwGpuGetDevice(Device);
-    if (!SwGpuDrainBlit(Dev)) return STATUS_DEVICE_BUSY;
-    if (TargetState == WdfPowerDeviceD3Final && Dev->ResidentActive)
+    if (TargetState == WdfPowerDeviceD3Final && !G1Pause(Dev, TRUE))
+        return STATUS_DEVICE_BUSY;
+    if (!SwGpuDrainBlit(Dev, TargetState == WdfPowerDeviceD3Final ? G1_DRAIN_MS : 200u))
+        return STATUS_DEVICE_BUSY;
+    if (TargetState == WdfPowerDeviceD3Final) {
         (VOID)B3eResidentShutdown(Dev, FALSE);
+        G1ReleaseIdleIfOff(Dev);
+        G1TraceState(Dev);
+    }
     InterlockedExchange(&Dev->BlitGate, 0);
+    if (TargetState != WdfPowerDeviceD3Final) G1ResumeScheduler(Dev);
     return STATUS_SUCCESS;
 }
 
@@ -8601,6 +8646,12 @@ NTSTATUS SwGpuEvtPrepareHardware(WDFDEVICE Device, WDFCMRESLIST Raw, WDFCMRESLIS
     Trace(L"E3InterruptCreateStatus", (ULONG)interruptStatus);
     Trace(L"E3HaveInterrupts", Dev->HaveInterruptResources ? 1u : 0u);
     E4ReservePool(Dev);
+    {
+        KIRQL oldIrql;
+        KeAcquireSpinLock(&Dev->PowerLock, &oldIrql);
+        Dev->PowerFinal = FALSE;
+        KeReleaseSpinLock(&Dev->PowerLock, oldIrql);
+    }
     return STATUS_SUCCESS;
 }
 
@@ -8608,8 +8659,11 @@ NTSTATUS SwGpuEvtReleaseHardware(WDFDEVICE Device, WDFCMRESLIST Translated)
 {
     PSWGPU_DEVICE Dev = SwGpuGetDevice(Device);
     UNREFERENCED_PARAMETER(Translated);
-    if (!SwGpuDrainBlit(Dev)) return STATUS_DEVICE_BUSY;
+    if (!G1Pause(Dev, TRUE)) return STATUS_DEVICE_BUSY;
+    if (!SwGpuDrainBlit(Dev, G1_DRAIN_MS)) return STATUS_DEVICE_BUSY;
     (VOID)B3eResidentShutdown(Dev, FALSE);
+    G1ReleaseIdleIfOff(Dev);
+    G1TraceState(Dev);
     E4ReleasePool(Dev);
     if (Dev->StallInterrupt != NULL) { WdfObjectDelete(Dev->StallInterrupt); Dev->StallInterrupt = NULL; }
     if (Dev->NonstallInterrupt != NULL) { WdfObjectDelete(Dev->NonstallInterrupt); Dev->NonstallInterrupt = NULL; }
@@ -8628,6 +8682,7 @@ NTSTATUS SwGpuEvtSelfManagedIoInit(WDFDEVICE Device)
     PSWGPU_DEVICE Dev = SwGpuGetDevice(Device);
     NTSTATUS st;
     ULONG mode;
+    BOOLEAN autoResident;
 
     g_Verbose = ReadParam(L"Verbose", 0u) != 0u;
     Trace(L"E5VerboseActive", g_Verbose ? 1u : 0u);
@@ -8651,41 +8706,35 @@ NTSTATUS SwGpuEvtSelfManagedIoInit(WDFDEVICE Device)
         TraceDurable(L"AutoResidentPending", 0u);
         TraceDurable(L"AutoResidentGuardTripped", 1u);
     }
-    if (mode == 6u || ReadParam(L"AutoResident", 0u) == 1u) {
+    autoResident = ReadParam(L"AutoResident", 0u) == 1u;
+    if (autoResident && ReadParam(L"IdlePowerOffMs", G1_DEFAULT_IDLE_MS) != 0u)
+        Dev->PowerDisabled = G1BootLatch(FALSE);
+    if (mode == 6u || (autoResident && !Dev->PowerDisabled)) {
         LARGE_INTEGER t0, t1, f;
+        ULONG bootUs;
         BOOLEAN autoStart = mode != 6u;
-        TraceDurable(L"PowerTest", 0);      /* once: a hang does not repeat at the next boot */
+        TraceDurable(L"PowerTest", 0);
         if (autoStart) TraceDurable(L"AutoResidentPending", 1u);
         Trace(L"Result", 0xFFFFFFFFu);
         TraceDetail(L"Boot0", 0);
         t0 = KeQueryPerformanceCounter(&f);
-        (VOID)StartResident(Dev);
-        /* Claude 0.12.5: the first F3 boot failed at the firmware read
-         * (E0000041) although the blobs were imported. Retry once after a
-         * bounded 3 s delay; StartResident already powered the GPU down. */
-        if (autoStart && !Dev->ResidentActive && ReadParam(L"E1Result", 0u) == 0xE0000041u) {
-            TraceDurable(L"AutoResidentRetry", 1u);
-            Ms(3000);
-            (VOID)StartResident(Dev);
-            TraceDurable(L"AutoResidentRetryResult", Dev->ResidentActive ? 0u : ReadParam(L"E1Result", 0u));
+        if (SwGpuDrainBlit(Dev, 200u)) {
+            st = B3eStartOnline(Dev, autoStart, FALSE);
+            t1 = KeQueryPerformanceCounter(NULL);
+            Snapshot(Dev, TRUE);
+            InterlockedExchange(&Dev->BlitGate, 0);
+        } else {
+            st = STATUS_DEVICE_BUSY;
+            TraceDurable(L"E1Result", (ULONG)st);
+            t1 = KeQueryPerformanceCounter(NULL);
         }
-        t1 = KeQueryPerformanceCounter(NULL);
-        Trace(L"TestUs", (ULONG)((t1.QuadPart - t0.QuadPart) * 1000000 / (f.QuadPart ? f.QuadPart : 1)));
-        if (Dev->ResidentActive) {
-            NTSTATUS idleStatus = WdfDeviceStopIdle(Device, FALSE);
-            TraceDurable(L"B3eIdleRefStatus", (ULONG)idleStatus);
-            if (NT_SUCCESS(idleStatus)) {
-                Dev->ResidentIdleRefHeld = TRUE;
-                InterlockedExchange(&Dev->BlitOnline, 1);
-            }
-            else {
-                TraceDurable(L"E1Result", (ULONG)idleStatus);
-                (VOID)B3eResidentShutdown(Dev, TRUE);
-            }
-        }
-        Snapshot(Dev, TRUE);
+        bootUs = (ULONG)((t1.QuadPart - t0.QuadPart) * 1000000 / (f.QuadPart ? f.QuadPart : 1));
+        Trace(L"TestUs", bootUs);
         Trace(L"TestRuns", ReadParam(L"TestRuns", 0) + 1);
-        if (autoStart) TraceDurable(L"AutoResidentPending", 0u);   /* finished, even if it failed */
+        if (autoStart) TraceDurable(L"AutoResidentPending", 0u);
+        G1StartPolicy(Dev, autoResident, st, bootUs);
+    } else {
+        G1StartPolicy(Dev, autoResident, STATUS_DEVICE_NOT_READY, 0u);
     }
     return STATUS_SUCCESS;      /* the device always starts: it only reports */
 }
@@ -8703,7 +8752,8 @@ NTSTATUS SwGpuEvtDeviceAdd(WDFDRIVER Driver, PWDFDEVICE_INIT DeviceInit)
     Pnp.EvtDeviceReleaseHardware = SwGpuEvtReleaseHardware;
     Pnp.EvtDeviceSelfManagedIoInit = SwGpuEvtSelfManagedIoInit;
     Pnp.EvtDeviceD0Exit = SwGpuEvtD0Exit;
-    Pnp.EvtDeviceD0Entry = SwGpuEvtD0Entry;
+    Pnp.EvtDeviceD0EntryPostInterruptsEnabled = SwGpuEvtD0Ready;
+    Pnp.EvtDeviceD0ExitPreInterruptsDisabled = SwGpuEvtD0Quiesce;
     WdfDeviceInitSetPnpPowerEventCallbacks(DeviceInit, &Pnp);
     WdfDeviceInitSetDeviceType(DeviceInit, FILE_DEVICE_UNKNOWN);
     /* Claude 0.5.1: an unnamed PnP FDO rejects WdfDeviceInitAssignSDDLString (0xC0000079).
@@ -8715,6 +8765,7 @@ NTSTATUS SwGpuEvtDeviceAdd(WDFDRIVER Driver, PWDFDEVICE_INIT DeviceInit)
     Status = WdfDeviceCreate(&DeviceInit, &Attributes, &Device);
     if (!NT_SUCCESS(Status)) return Status;
     SwGpuGetDevice(Device)->Device = Device;
+    G1CreateObjects(SwGpuGetDevice(Device));
     KeInitializeEvent(&SwGpuGetDevice(Device)->E3Event, SynchronizationEvent, FALSE);
     Status = WdfDeviceCreateDeviceInterface(Device, &SwGpuBlitDeviceInterface, NULL);
     if (!NT_SUCCESS(Status)) return Status;
