@@ -37,8 +37,9 @@
 #include <ntstrsafe.h>
 #include <wdf.h>
 #include <spb.h>
+#include "swgpu-blit.h"
 
-#define SWGPU_VERSION      0x00000A00u   /* 0.10.0 */
+#define SWGPU_VERSION      0x00000C04u   /* 0.12.4 */
 
 #define CAR_PHYS           0x60006000ull
 #define CAR_LEN            0x1000u
@@ -139,14 +140,13 @@
 /* E1 resident controls use a device interface rather than a PnP restart:
  * restarting the device invokes ReleaseHardware and intentionally shuts the
  * resident GPU down. The interface is restricted to SYSTEM and Administrators. */
-static const GUID GUID_DEVINTERFACE_SWGPU_RESIDENT =
-    { 0x2cc9cb4d, 0x6412, 0x4f31, { 0xa7, 0x81, 0x5d, 0x78, 0x1e, 0x09, 0x4b, 0x63 } };
 #define IOCTL_SWGPU_RESIDENT_STATUS CTL_CODE(FILE_DEVICE_UNKNOWN, 0x800, METHOD_BUFFERED, FILE_READ_ACCESS | FILE_WRITE_ACCESS)
 #define IOCTL_SWGPU_RESIDENT_STOP   CTL_CODE(FILE_DEVICE_UNKNOWN, 0x801, METHOD_BUFFERED, FILE_READ_ACCESS | FILE_WRITE_ACCESS)
 #define IOCTL_SWGPU_SUBMIT_TEST     CTL_CODE(FILE_DEVICE_UNKNOWN, 0x802, METHOD_BUFFERED, FILE_READ_ACCESS | FILE_WRITE_ACCESS)
 #define IOCTL_SWGPU_IRQ_TEST        CTL_CODE(FILE_DEVICE_UNKNOWN, 0x803, METHOD_BUFFERED, FILE_READ_ACCESS | FILE_WRITE_ACCESS)
 #define IOCTL_SWGPU_CYCLE_TEST      CTL_CODE(FILE_DEVICE_UNKNOWN, 0x804, METHOD_BUFFERED, FILE_READ_ACCESS | FILE_WRITE_ACCESS)
 #define IOCTL_SWGPU_COPY_TEST       CTL_CODE(FILE_DEVICE_UNKNOWN, 0x805, METHOD_BUFFERED, FILE_READ_ACCESS | FILE_WRITE_ACCESS)
+#define IOCTL_SWGPU_BLIT_TEST       CTL_CODE(FILE_DEVICE_UNKNOWN, 0x806, METHOD_BUFFERED, FILE_READ_ACCESS | FILE_WRITE_ACCESS)
 
 /* GM20B NV_PMC / PFIFO interrupt source registers (nvgpu hw_mc_gm20b.h). */
 #define PMC_INTR_STATUS_STALL       0x00000100u
@@ -249,6 +249,9 @@ typedef struct _SWGPU_DEVICE {
     ULONG          Bar1MapLen;
     volatile UCHAR *Bar1Cpu;
     volatile UCHAR *Car;
+    ULONG          GpcBootOut, GpcBootBypass;
+    BOOLEAN        GpcManaged;
+    ULONG          VoutOnRaw;    /* MAXULONG if the power-on read failed */
     volatile UCHAR *Pmc;
     volatile UCHAR *Mc;
     LARGE_INTEGER  VddId;
@@ -277,6 +280,11 @@ typedef struct _SWGPU_DEVICE {
     volatile LONG  E3FirstSet;
     KEVENT         E3Event;
     BOOLEAN        CopyInFlight;
+    volatile LONG  BlitGate;
+    volatile LONG  BlitOnline;
+    BOOLEAN        BlitReset;
+    BOOLEAN        BlitUnsafe;
+    ULONG          BlitLastWaitUs, BlitLastPolls;
     ULONG          ResidentRunlistEmptyValue;
     ULONG          ResidentChannelId;
     ULONG          ResidentShutdownResult;
@@ -660,10 +668,10 @@ static BOOLEAN PmuBindInst(volatile UCHAR *B, ULONGLONG instAddress,
 #define ACR_WPR_BYTES      0x00040000u
 #define ACR_GM20B_IOMMU_TAG (1ull << 34) /* nouveau_platform.c: gm20b iommu_bit */
 
-/* C2d owns a separate 2 MiB contiguous arena and GPU instance. The outer
+/* C2d owns a separate contiguous GR arena and GPU instance. The outer
  * SMMU directory may reference this arena, but the ACR arena and instance
  * block remain dedicated to the ACR/PMU path. */
-#define GR_VM_ARENA_SIZE   0x200000u
+#define GR_VM_ARENA_SIZE   0x248000u   /* 2 MiB + 256 KiB GPU PGT + 8 outer SMMU PGTs */
 #define GR_VM_CTX_OFF      0x000000u
 #define GR_VM_GLOBAL_OFF   0x020000u /* golden context image */
 #define GR_VM_BUNDLE_OFF   0x040000u
@@ -687,6 +695,10 @@ static BOOLEAN PmuBindInst(volatile UCHAR *B, ULONGLONG instAddress,
 #define GR_VM_F1_SRC_OFF     0x1E0000u /* 64 KiB, mapped by the existing arena PTEs */
 #define GR_VM_F1_DST_OFF     0x1F0000u /* 64 KiB, ends at the end of the arena */
 #define GR_VM_F1_BYTES       0x10000u
+#define GR_VM_BLIT_GPU_PGT  0x200000u
+#define GR_VM_BLIT_SMMU_PT  0x240000u
+#define GR_VM_BLIT_BASE     0x20000000u  /* 128 MiB GPU PDE boundary; same 32-bit outer IOVA */
+#define GR_VM_BLIT_PDES     8u           /* 32 MiB, 4 MiB per outer SMMU page table */
 #define GR_VM_GPU_PGT_BAR1_OFF 0x1A0000u /* spare 64 KiB-aligned segment within the PGT backing */
 #define GR_VM_GPU_VA       0x18000000u
 #define GR_VM_PAGE_COUNT   (GR_VM_ARENA_SIZE >> 12)
@@ -695,9 +707,12 @@ C_ASSERT(GR_VM_D2_RT_OFF + 64u * 64u * sizeof(ULONG) <= GR_VM_F1_PUSH_OFF);
 C_ASSERT(GR_VM_F1_PUSH_OFF + PAGE_SIZE <= GR_VM_F1_SRC_OFF);
 C_ASSERT(GR_VM_F1_SRC_OFF + GR_VM_F1_BYTES <= GR_VM_F1_DST_OFF);
 C_ASSERT(GR_VM_F1_DST_OFF + GR_VM_F1_BYTES <= GR_VM_ARENA_SIZE);
+C_ASSERT(GR_VM_F1_DST_OFF + GR_VM_F1_BYTES <= GR_VM_BLIT_GPU_PGT);
+C_ASSERT(GR_VM_BLIT_GPU_PGT + 0x40000u == GR_VM_BLIT_SMMU_PT);
+C_ASSERT(GR_VM_BLIT_SMMU_PT + GR_VM_BLIT_PDES * PAGE_SIZE == GR_VM_ARENA_SIZE);
 
 /* E4 DMA allocation inventory (Resident, Submit and Irq):
- * - GR: 2 MiB, page aligned, below 4 GiB, within one 4 MiB window,
+ * - GR: 0x248000 bytes, page aligned, below 4 GiB, within one 4 MiB window,
  *   MmNonCached. Contains GR/SMMU/BAR1 tables, instances, channel and golden
  *   contexts, global buffers, USERD, GPFIFO, runlist, pushbuffer/semaphores
  *   and the 16 KiB render target at the GR_VM_* offsets above.
@@ -7766,6 +7781,8 @@ done:
     TraceDurable(L"F1Result", Out->Result);
 }
 
+#include "swgpu-blit.inc"
+
 static ULONG B3ePowerDownGpu(PSWGPU_DEVICE Dev, PSWGPU_RESIDENT_POWER Power)
 {
     ULONG i, error = 0u;
@@ -7773,6 +7790,7 @@ static ULONG B3ePowerDownGpu(PSWGPU_DEVICE Dev, PSWGPU_RESIDENT_POWER Power)
     if (Power == NULL || !Power->Valid) return 0u;
     TraceDurable(L"B3ePowerDownBegin", 1u);
     if (Power->ClocksOn) {
+        if (Dev->GpcManaged && !Dev->BlitReset && !F2cPark(Dev)) error |= 0x20u;
         Wr(Dev->Mc, MC_HOTRESET_CTRL_1, Rd(Dev->Mc, MC_HOTRESET_CTRL_1) | MC_HOTRESET_GPU);
         for (i = 0; i < 500u && !(Rd(Dev->Mc, MC_HOTRESET_STAT_1) & MC_HOTRESET_GPU); ++i) Us(10);
         Trace(L"B3eMcFlushPolls", i);
@@ -7791,6 +7809,7 @@ static ULONG B3ePowerDownGpu(PSWGPU_DEVICE Dev, PSWGPU_RESIDENT_POWER Power)
         if (Power->OutcChanged) Wr(Dev->Car, CAR_PLLP_OUTC, Power->PllOutc);
         Us(10);
         Power->ClocksOn = FALSE;
+        Dev->GpcManaged = FALSE;
     }
     if (Power->RailOn) {
         writeStatus = I2cWrite(Dev->Pmic, MAX77620_GPIO6, Power->Gpio6);
@@ -7801,9 +7820,14 @@ static ULONG B3ePowerDownGpu(PSWGPU_DEVICE Dev, PSWGPU_RESIDENT_POWER Power)
         Trace(L"B3ePowerDownDvsStatus", (ULONG)writeStatus); if (!NT_SUCCESS(writeStatus)) error |= 8u;
         Power->RailOn = FALSE;
     }
-    GrVmCleanupAfterGpuReset(Dev);
-    AcrVmCleanupAfterGpuReset(Dev);
+    if (!Dev->BlitUnsafe) {
+        GrVmCleanupAfterGpuReset(Dev);
+        AcrVmCleanupAfterGpuReset(Dev);
+    } else {
+        error |= 16u; /* Quarantined backing stays reserved. */
+    }
     Dev->CopyInFlight = FALSE;
+    Dev->BlitReset = Dev->BlitUnsafe;
     E4TracePool(&Dev->DmaPool);
     Power->Valid = FALSE;
     Trace(L"B3ePowerDownError", error);
@@ -7923,7 +7947,7 @@ static NTSTATUS StartResident(PSWGPU_DEVICE Dev)
     BOOLEAN railOn = FALSE, clocksOn = FALSE, outcChanged = FALSE, fuseChanged = FALSE;
     NTSTATUS st;
 
-    if (g_ResidentOwner != NULL) {
+    if (g_ResidentOwner != NULL || Dev->BlitUnsafe || g_GrVm.Arena != NULL) {
         TraceDurable(L"E1Result", STATUS_DEVICE_BUSY);
         return STATUS_DEVICE_BUSY;
     }
@@ -7971,7 +7995,11 @@ static NTSTATUS StartResident(PSWGPU_DEVICE Dev)
     if (!NT_SUCCESS(st)) goto down;
     Ms(2);
     if (NT_SUCCESS(I2cRead(Dev->Pmic, MAX77620_GPIO6, &v))) TraceDetail(L"Gpio6On", v);
-    if (NT_SUCCESS(I2cRead(Dev->Vdd, MAX77621_VOUT, &v))) TraceDetail(L"VoutOn", v);
+    Dev->VoutOnRaw = MAXULONG;
+    if (NT_SUCCESS(I2cRead(Dev->Vdd, MAX77621_VOUT, &v))) {
+        Dev->VoutOnRaw = v;
+        TraceDetail(L"VoutOn", v);
+    }
 
     Step(3);    /* clocks */
     /* R410 test: the boot firmware leaves OUT5 enabled but undivided
@@ -8064,6 +8092,23 @@ static NTSTATUS StartResident(PSWGPU_DEVICE Dev)
         }
     }
     if (NT_SUCCESS(st) && Dev->ResidentActive) {
+        ULONG gpcKhz = ReadParam(L"GpcKhz", 0u);
+        F2C_STEP clock = {0};
+        clock.TargetKhz = gpcKhz;
+        if (gpcKhz != 0u) {
+            clock.Result = F2cProgram(Dev, F2cReadSpeedo(), &clock);
+            if (!NT_SUCCESS((NTSTATUS)clock.Result) && !F2cReturnToBypass(Dev)) {
+                TraceDurable(L"F2cResidentClockResult", clock.Result);
+                (VOID)B3eResidentShutdown(Dev, TRUE);
+                TraceDurable(L"E1Result", STATUS_DEVICE_HARDWARE_ERROR);
+                return STATUS_DEVICE_HARDWARE_ERROR;
+            }
+        }
+        Trace(L"F2cResidentClockKhz", gpcKhz);
+        Trace(L"F2cResidentClockCvbMv", clock.CvbMv);
+        Trace(L"F2cResidentLockPolls", clock.LockPolls);
+        Trace(L"F2cResidentRampPolls", clock.RampPolls);
+        TraceDurable(L"F2cResidentClockResult", clock.Result);
         {
             /* Claude 0.7.0: enable the GPU interrupt sources only once the GPU is
              * resident. A failure leaves them off (E3 then reports it); the
@@ -8115,13 +8160,19 @@ static ULONG B3eResidentShutdown(PSWGPU_DEVICE Dev, BOOLEAN DrainIsrs)
     }
     TraceDurable(L"B3eShutdownBegin", 1u);
     Step(111);
-    /* Stop GPU interrupt generation and drain ISR access before reset. */
-    (VOID)B3eDisableInterruptSources(Dev, DrainIsrs);
-    error = B3cD2CleanupPublishedState(Dev, writes, &writeCount,
-        Dev->ResidentChannelEnabled, Dev->ResidentRunlistSubmitted,
-        Dev->ResidentInstBound, Dev->ResidentChannelId,
-        Dev->ResidentRunlistEmptyValue, &preemptPolls, &preemptLast,
-        &runlistPolls, &runlistLast, TRUE, diagWrites, &diagWriteCount);
+    InterlockedExchange(&Dev->BlitOnline, 0);
+    if (!Dev->BlitReset) {
+        /* Stop GPU interrupt generation and drain ISR access before reset. */
+        (VOID)B3eDisableInterruptSources(Dev, DrainIsrs);
+        error = B3cD2CleanupPublishedState(Dev, writes, &writeCount,
+            Dev->ResidentChannelEnabled, Dev->ResidentRunlistSubmitted,
+            Dev->ResidentInstBound, Dev->ResidentChannelId,
+            Dev->ResidentRunlistEmptyValue, &preemptPolls, &preemptLast,
+            &runlistPolls, &runlistLast, TRUE, diagWrites, &diagWriteCount);
+    } else {
+        Dev->InterruptSourcesEnabled = FALSE;
+        g_D2Bar1Bound = g_D2UserdBar1Set = g_D2PbdmaMasksSaved = 0u;
+    }
     TraceBin(L"B3eShutdownWrites", writes, sizeof(writes));
     TraceBin(L"B3eShutdownDiagWrites", diagWrites, sizeof(diagWrites));
     B3cPrivRingTraceWriteLog(L"B3eShutdownPrivErrorCount",
@@ -8157,9 +8208,12 @@ static VOID B3eResidentStatus(PSWGPU_DEVICE Dev, PSWGPU_RESIDENT_STATUS Out)
     ULONG pmc = 0u, lo0 = 0u, lo1 = 0u, hi = 0u;
     RtlZeroMemory(Out, sizeof(*Out));
     Out->Version = SWGPU_VERSION;
-    Out->Resident = Dev->ResidentActive ? 1u : 0u;
+    Out->Resident = Dev->ResidentActive && !Dev->BlitReset ? 1u : 0u;
+    Trace(L"F3LastWaitUs", Dev->BlitLastWaitUs);
+    Trace(L"F3LastPolls", Dev->BlitLastPolls);
+    Trace(L"F3Reset", Dev->BlitReset);
     Out->ShutdownResult = Dev->ResidentShutdownResult;
-    if (B == NULL || !Dev->ResidentActive) {
+    if (B == NULL || Out->Resident == 0u) {
         Trace(L"B3eStatusResident", Out->Resident);
         return;
     }
@@ -8197,7 +8251,7 @@ static VOID B3eResidentStatus(PSWGPU_DEVICE Dev, PSWGPU_RESIDENT_STATUS Out)
 #undef STATUS_TRACE
 }
 
-VOID SwGpuEvtIoDeviceControl(WDFQUEUE Queue, WDFREQUEST Request,
+static VOID SwGpuDispatchIoctl(WDFQUEUE Queue, WDFREQUEST Request,
     size_t OutputBufferLength, size_t InputBufferLength, ULONG IoControlCode)
 {
     WDFDEVICE Device = WdfIoQueueGetDevice(Queue);
@@ -8207,6 +8261,26 @@ VOID SwGpuEvtIoDeviceControl(WDFQUEUE Queue, WDFREQUEST Request,
     PSWGPU_E3_RESULT e3Out = NULL;
     NTSTATUS status;
     UNREFERENCED_PARAMETER(InputBufferLength);
+    if (Dev->BlitReset && IoControlCode != IOCTL_SWGPU_RESIDENT_STATUS &&
+        IoControlCode != IOCTL_SWGPU_RESIDENT_STOP) {
+        WdfRequestComplete(Request, STATUS_DEVICE_NOT_READY);
+        return;
+    }
+    if (IoControlCode == IOCTL_SWGPU_BLIT_TEST) {
+        SWGPU_F2_RESULT *result = NULL;
+        if (!Dev->ResidentActive) {
+            WdfRequestComplete(Request, STATUS_DEVICE_NOT_READY);
+            return;
+        }
+        status = WdfRequestRetrieveOutputBuffer(Request, sizeof(*result), (PVOID *)&result, NULL);
+        if (!NT_SUCCESS(status)) {
+            WdfRequestComplete(Request, status);
+            return;
+        }
+        F2Benchmark(Dev, result);
+        WdfRequestCompleteWithInformation(Request, STATUS_SUCCESS, sizeof(*result));
+        return;
+    }
     if (IoControlCode == IOCTL_SWGPU_COPY_TEST) {
         PSWGPU_F1_RESULT copy = NULL;
         if (!Dev->ResidentActive || g_ResidentOwner != Dev) {
@@ -8327,7 +8401,7 @@ VOID SwGpuEvtIoDeviceControl(WDFQUEUE Queue, WDFREQUEST Request,
         Trace(L"B3eStatusShutdownResult", out->ShutdownResult);
     } else {
         Step(112);
-        if (Dev->ResidentActive && Dev->Bar0 != NULL) {
+        if (Dev->ResidentActive && !Dev->BlitReset && Dev->Bar0 != NULL) {
             ULONG timerBefore = Rd(Dev->Bar0, NV_PTIMER_TIME_0);
             KeStallExecutionProcessor(1000u);
             Trace(L"E5PtimerNsPer1ms", Rd(Dev->Bar0, NV_PTIMER_TIME_0) - timerBefore);
@@ -8338,11 +8412,73 @@ VOID SwGpuEvtIoDeviceControl(WDFQUEUE Queue, WDFREQUEST Request,
     WdfRequestCompleteWithInformation(Request, STATUS_SUCCESS, sizeof(*out));
 }
 
+VOID SwGpuEvtIoDeviceControl(WDFQUEUE Queue, WDFREQUEST Request,
+    size_t OutputBufferLength, size_t InputBufferLength, ULONG IoControlCode)
+{
+    PSWGPU_DEVICE dev = SwGpuGetDevice(WdfIoQueueGetDevice(Queue));
+    if (InterlockedCompareExchange(&dev->BlitGate, 1, 0) != 0) {
+        WdfRequestComplete(Request, STATUS_DEVICE_BUSY);
+        return;
+    }
+    SwGpuDispatchIoctl(Queue, Request, OutputBufferLength, InputBufferLength, IoControlCode);
+    InterlockedExchange(&dev->BlitGate, 0);
+}
+
+/* Complete this kernel-only IRP inline. A present must not queue behind a
+ * benchmark. Both dispatch paths share the same gate, including Stop. */
+static NTSTATUS SwGpuBlitInternal(WDFDEVICE Device, PIRP Irp)
+{
+    PSWGPU_DEVICE dev = SwGpuGetDevice(Device);
+    PIO_STACK_LOCATION stack = IoGetCurrentIrpStackLocation(Irp);
+    NTSTATUS status = STATUS_INVALID_DEVICE_REQUEST;
+    if (stack->Parameters.DeviceIoControl.IoControlCode == IOCTL_SWGPU_PRESENT_BLIT &&
+        Irp->RequestorMode == KernelMode && KeGetCurrentIrql() == PASSIVE_LEVEL &&
+        stack->Parameters.DeviceIoControl.InputBufferLength == sizeof(SWGPU_BLIT_REQUEST) &&
+        Irp->AssociatedIrp.SystemBuffer != NULL) {
+        status = STATUS_DEVICE_NOT_READY;
+        if (InterlockedCompareExchange(&dev->BlitOnline, 0, 0) != 0) {
+            status = STATUS_DEVICE_BUSY;
+            if (InterlockedCompareExchange(&dev->BlitGate, 1, 0) == 0) {
+                status = InterlockedCompareExchange(&dev->BlitOnline, 0, 0) != 0
+                    ? F3Present(dev, (const SWGPU_BLIT_REQUEST *)Irp->AssociatedIrp.SystemBuffer)
+                    : STATUS_DEVICE_NOT_READY;
+                InterlockedExchange(&dev->BlitGate, 0);
+            }
+        }
+    }
+    Irp->IoStatus.Status = status;
+    Irp->IoStatus.Information = 0u;
+    IoCompleteRequest(Irp, IO_NO_INCREMENT);
+    return status;
+}
+
+static BOOLEAN SwGpuDrainBlit(PSWGPU_DEVICE Dev)
+{
+    ULONG polls;
+    InterlockedExchange(&Dev->BlitOnline, 0);
+    for (polls = 0u; polls < 200u; ++polls) {
+        if (InterlockedCompareExchange(&Dev->BlitGate, 1, 0) == 0) break;
+        Ms(1);
+    }
+    Trace(L"F3DrainPolls", polls);
+    return polls != 200u;
+}
+
+static NTSTATUS SwGpuEvtD0Entry(WDFDEVICE Device, WDF_POWER_DEVICE_STATE PreviousState)
+{
+    PSWGPU_DEVICE dev = SwGpuGetDevice(Device);
+    UNREFERENCED_PARAMETER(PreviousState);
+    if (dev->ResidentActive && !dev->BlitReset) InterlockedExchange(&dev->BlitOnline, 1);
+    return STATUS_SUCCESS;
+}
+
 NTSTATUS SwGpuEvtD0Exit(WDFDEVICE Device, WDF_POWER_DEVICE_STATE TargetState)
 {
     PSWGPU_DEVICE Dev = SwGpuGetDevice(Device);
+    if (!SwGpuDrainBlit(Dev)) return STATUS_DEVICE_BUSY;
     if (TargetState == WdfPowerDeviceD3Final && Dev->ResidentActive)
         (VOID)B3eResidentShutdown(Dev, FALSE);
+    InterlockedExchange(&Dev->BlitGate, 0);
     return STATUS_SUCCESS;
 }
 
@@ -8451,6 +8587,7 @@ NTSTATUS SwGpuEvtReleaseHardware(WDFDEVICE Device, WDFCMRESLIST Translated)
 {
     PSWGPU_DEVICE Dev = SwGpuGetDevice(Device);
     UNREFERENCED_PARAMETER(Translated);
+    if (!SwGpuDrainBlit(Dev)) return STATUS_DEVICE_BUSY;
     (VOID)B3eResidentShutdown(Dev, FALSE);
     E4ReleasePool(Dev);
     if (Dev->StallInterrupt != NULL) { WdfObjectDelete(Dev->StallInterrupt); Dev->StallInterrupt = NULL; }
@@ -8461,6 +8598,7 @@ NTSTATUS SwGpuEvtReleaseHardware(WDFDEVICE Device, WDFCMRESLIST Translated)
     if (Dev->Car)  { MmUnmapIoSpace((PVOID)Dev->Car, CAR_LEN);       Dev->Car = NULL; }
     if (Dev->Pmc)  { MmUnmapIoSpace((PVOID)Dev->Pmc, PMC_LEN);       Dev->Pmc = NULL; }
     if (Dev->Mc)   { MmUnmapIoSpace((PVOID)Dev->Mc, MC_LEN);         Dev->Mc = NULL; }
+    InterlockedExchange(&Dev->BlitGate, 0);
     return STATUS_SUCCESS;
 }
 
@@ -8482,9 +8620,21 @@ NTSTATUS SwGpuEvtSelfManagedIoInit(WDFDEVICE Device)
     Snapshot(Dev, FALSE);
 
     mode = ReadParam(L"PowerTest", 0);
-    if (mode == 6u) {
+    /* Claude 0.12.4: boot guard for the persistent AutoResident (F3). If the
+     * previous auto start never finished (hang/reset during GPU bring-up),
+     * turn AutoResident and the clock request off instead of looping. */
+    if (mode != 6u && ReadParam(L"AutoResident", 0u) == 1u &&
+        ReadParam(L"AutoResidentPending", 0u) == 1u) {
+        TraceDurable(L"AutoResident", 0u);
+        TraceDurable(L"GpcKhz", 0u);
+        TraceDurable(L"AutoResidentPending", 0u);
+        TraceDurable(L"AutoResidentGuardTripped", 1u);
+    }
+    if (mode == 6u || ReadParam(L"AutoResident", 0u) == 1u) {
         LARGE_INTEGER t0, t1, f;
+        BOOLEAN autoStart = mode != 6u;
         TraceDurable(L"PowerTest", 0);      /* once: a hang does not repeat at the next boot */
+        if (autoStart) TraceDurable(L"AutoResidentPending", 1u);
         Trace(L"Result", 0xFFFFFFFFu);
         TraceDetail(L"Boot0", 0);
         t0 = KeQueryPerformanceCounter(&f);
@@ -8494,7 +8644,10 @@ NTSTATUS SwGpuEvtSelfManagedIoInit(WDFDEVICE Device)
         if (Dev->ResidentActive) {
             NTSTATUS idleStatus = WdfDeviceStopIdle(Device, FALSE);
             TraceDurable(L"B3eIdleRefStatus", (ULONG)idleStatus);
-            if (NT_SUCCESS(idleStatus)) Dev->ResidentIdleRefHeld = TRUE;
+            if (NT_SUCCESS(idleStatus)) {
+                Dev->ResidentIdleRefHeld = TRUE;
+                InterlockedExchange(&Dev->BlitOnline, 1);
+            }
             else {
                 TraceDurable(L"E1Result", (ULONG)idleStatus);
                 (VOID)B3eResidentShutdown(Dev, TRUE);
@@ -8502,6 +8655,7 @@ NTSTATUS SwGpuEvtSelfManagedIoInit(WDFDEVICE Device)
         }
         Snapshot(Dev, TRUE);
         Trace(L"TestRuns", ReadParam(L"TestRuns", 0) + 1);
+        if (autoStart) TraceDurable(L"AutoResidentPending", 0u);   /* finished, even if it failed */
     }
     return STATUS_SUCCESS;      /* the device always starts: it only reports */
 }
@@ -8519,16 +8673,20 @@ NTSTATUS SwGpuEvtDeviceAdd(WDFDRIVER Driver, PWDFDEVICE_INIT DeviceInit)
     Pnp.EvtDeviceReleaseHardware = SwGpuEvtReleaseHardware;
     Pnp.EvtDeviceSelfManagedIoInit = SwGpuEvtSelfManagedIoInit;
     Pnp.EvtDeviceD0Exit = SwGpuEvtD0Exit;
+    Pnp.EvtDeviceD0Entry = SwGpuEvtD0Entry;
     WdfDeviceInitSetPnpPowerEventCallbacks(DeviceInit, &Pnp);
     WdfDeviceInitSetDeviceType(DeviceInit, FILE_DEVICE_UNKNOWN);
     /* Claude 0.5.1: an unnamed PnP FDO rejects WdfDeviceInitAssignSDDLString (0xC0000079).
        Admin-only access now comes from the INF [SwGpu_Inst.NT.HW] Security value. */
+    Status = WdfDeviceInitAssignWdmIrpPreprocessCallback(DeviceInit, SwGpuBlitInternal,
+        IRP_MJ_INTERNAL_DEVICE_CONTROL, NULL, 0);
+    if (!NT_SUCCESS(Status)) return Status;
     WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&Attributes, SWGPU_DEVICE);
     Status = WdfDeviceCreate(&DeviceInit, &Attributes, &Device);
     if (!NT_SUCCESS(Status)) return Status;
     SwGpuGetDevice(Device)->Device = Device;
     KeInitializeEvent(&SwGpuGetDevice(Device)->E3Event, SynchronizationEvent, FALSE);
-    Status = WdfDeviceCreateDeviceInterface(Device, &GUID_DEVINTERFACE_SWGPU_RESIDENT, NULL);
+    Status = WdfDeviceCreateDeviceInterface(Device, &SwGpuBlitDeviceInterface, NULL);
     if (!NT_SUCCESS(Status)) return Status;
     {
         WDF_IO_QUEUE_CONFIG QueueConfig;

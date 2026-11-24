@@ -12,6 +12,8 @@
   -Mode Irq    : run 64 interrupt-driven clears on the resident channel (E3);
                  requires UEFI R447H or later and does not power up the GPU.
   -Mode Copy   : run 16 CE2 buffer copies on the resident channel.
+  -Mode Blit   : verify pitched rectangles and benchmark GPU vs CPU.
+  -Mode InstallDisplay / F3On / F3Off / F3Status : optional display test.
   -Mode Cycle  : five Resident / 8-clear / Stop cycles using one DMA pool.
   -Mode VerboseOn / VerboseOff : change driver logging at the next device start.
 
@@ -21,7 +23,8 @@
 param(
   [Parameter(Mandatory = $true)]
   [ValidateSet('Install', 'Status', 'Resident', 'ResidentStatus', 'ResidentStop',
-               'Submit', 'Irq', 'Copy', 'Cycle', 'Remove', 'VerboseOn', 'VerboseOff')]
+               'Submit', 'Irq', 'Copy', 'Blit', 'Cycle', 'InstallDisplay',
+               'F3On', 'F3Off', 'F3Status', 'Remove', 'VerboseOn', 'VerboseOff')]
   [string]$Mode,
   [switch]$Detail
 )
@@ -139,7 +142,7 @@ public static class SwGpuResidentControl {
       UInt32 size = (UInt32)Marshal.SizeOf(typeof(CycleResult));
       if (!DeviceIoControlCycle(h, 0x22E010u, IntPtr.Zero, 0, out r, size, out got, IntPtr.Zero))
         throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
-      if (got != size || r.Version != 0xA00u)
+      if (got != size || (r.Version & 0xFFFFFF00u) != 0xC00u)
         throw new InvalidOperationException("Unexpected SwitchGpu Cycle response");
       return r;
     });
@@ -157,8 +160,37 @@ public static class SwGpuResidentControl {
       UInt32 size = (UInt32)Marshal.SizeOf(typeof(CopyResult));
       if (!DeviceIoControlCopy(h, 0x22E014u, IntPtr.Zero, 0, out r, size, out got, IntPtr.Zero))
         throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
-      if (got != size || r.Version != 0xA00u)
+      if (got != size || (r.Version & 0xFFFFFF00u) != 0xC00u)
         throw new InvalidOperationException("Unexpected SwitchGpu Copy response");
+      return r;
+    });
+  }
+  [StructLayout(LayoutKind.Sequential)] public struct ClockStep {
+    public UInt32 TargetKhz, M, N, Pl, CvbMv, LockPolls, RampPolls, MeasuredKhz;
+    public UInt32 Result, Verified, CachedUs, WcUs, FailOffset, Stage;
+  }
+  [StructLayout(LayoutKind.Sequential)] public struct BlitResult {
+    public UInt32 Version, Result, Verified, GpuRounds, CpuRounds, GpuMBps, CpuMBps;
+    public UInt32 MaxWaitUs, MaxPolls, IrqWakes, MapPolls, UnmapPolls, AbortPolls;
+    public UInt32 GpuUs, CpuUs, FailOffset;
+    public UInt32 GpuBatchUs, GpuLinesUs, GpuWcUs, CpuWcUs, BenchStage;
+    public UInt32 PllCfg, PllCoeff, SelVco, Gpc2Out, BypassCtrl, Slowdown, RampStatus;
+    public UInt32 PllCfg2, Dvfs0, Dvfs1, CntrCfg, CntrValue;
+    public UInt32 OscCtrl, CarClkX, CarRstX, CarPllpOutc, RefKhz, Gpc2Khz, GpcKhz;
+    public UInt32 Bypass, VoutRaw, VoutMv, MeasuredKhz, CntrSamples, IdleSlowdown;
+    public UInt32 ClockSteps, RestoreResult;
+    [MarshalAs(UnmanagedType.ByValArray, SizeConst=5)] public ClockStep[] Clock;
+  }
+  [DllImport("kernel32.dll", EntryPoint="DeviceIoControl", SetLastError=true)]
+  static extern bool DeviceIoControlBlit(SafeFileHandle h, UInt32 code, IntPtr input, UInt32 inSize, out BlitResult output, UInt32 outSize, out UInt32 returned, IntPtr overlapped);
+  public static BlitResult RunBlit() {
+    return WithDevice<BlitResult>(delegate(SafeFileHandle h) {
+      BlitResult r; UInt32 got;
+      UInt32 size = (UInt32)Marshal.SizeOf(typeof(BlitResult));
+      if (!DeviceIoControlBlit(h, 0x22E018u, IntPtr.Zero, 0, out r, size, out got, IntPtr.Zero))
+        throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+      if (got != size || (r.Version & 0xFFFFFF00u) != 0xC00u)
+        throw new InvalidOperationException("Unexpected SwitchGpu Blit response");
       return r;
     });
   }
@@ -423,6 +455,86 @@ switch ($Mode) {
     try { Invoke-ResidentControl ($Mode -eq 'ResidentStop') }
     catch { Sum ('resident IOCTL failed: {0}' -f $_.Exception.Message) }
     Show-Device; Log ''; Show-Trace
+  }
+  'Blit' {
+    try {
+      Initialize-ResidentControl
+      Remove-ItemProperty -Path $Key -Name F2cFailOffset, F2cFailPrevious, F2cFailMask, F2cFailWanted, F2cFailReadback, F2cFailWritten, F2cSelV0Read, F2cSelV1Read, F2cSelV2Read, F2cSelVariant, F2cSelPolls, F2cCfgAtSelFail, F2cCoeffAtSelFail, F2cOutAtSelFail, F2cBypassAtSelFail, F2cCfgBeforeEnable, F2cCfgAfterEnable, F2cCfgAtLock -ErrorAction SilentlyContinue
+      $r = [SwGpuResidentControl]::RunBlit()
+      Sum ('F2 blit result {0}; verified {1}/4; GPU {2} MB/s ({3}/20, {4} us); CPU {5} MB/s ({6}/20, {7} us); max wait {8} us; IRQ wakes {9}' -f (Hex $r.Result), $r.Verified, $r.GpuMBps, $r.GpuRounds, $r.GpuUs, $r.CpuMBps, $r.CpuRounds, $r.CpuUs, $r.MaxWaitUs, $r.IrqWakes)
+      Sum ('F2 blit polls submit/map/unmap/abort {0}/{1}/{2}/{3}; mismatch offset {4}' -f $r.MaxPolls, $r.MapPolls, $r.UnmapPolls, $r.AbortPolls, (Hex $r.FailOffset))
+      if ($r.Bypass -ne [uint32]::MaxValue) {
+        $bypass = if ($r.Bypass -eq 1) { 'yes' } else { 'no' }
+        $vout = if ($r.VoutRaw -eq [uint32]::MaxValue) { 'n/a' } else { '{0} mV' -f $r.VoutMv }
+        $ref = if ($r.RefKhz -eq 0) { 'n/a' } else { $r.RefKhz }
+        $gpc = if ($r.GpcKhz -eq 0) { 'n/a' } else { $r.GpcKhz }
+        $gpc2 = if ($r.Gpc2Khz -eq 0) { 'n/a' } else { $r.Gpc2Khz }
+        Sum ('F2b clock ref/GPC2/GPC {0}/{1}/{2} kHz nominal; bypass {3}; VOUT {4} ({5}); CFG/COEFF/SEL/OUT/BYPASS {6}/{7}/{8}/{9}/{10}' -f $ref, $gpc2, $gpc, $bypass, (Hex $r.VoutRaw), $vout, (Hex $r.PllCfg), (Hex $r.PllCoeff), (Hex $r.SelVco), (Hex $r.Gpc2Out), (Hex $r.BypassCtrl))
+        $measured = if ($r.MeasuredKhz -eq 0) { 'n/a' } else { $r.MeasuredKhz }
+        Sum ('F2b clock slowdown/ramp {0}/{1}; CFG2/DVFS0/1 {2}/{3}/{4}; CAR OSC/CLK_X/RST_X/PLLP_OUTC {5}/{6}/{7}/{8}; idle slowdown {9}; TRIM cfg/count {10}/{11}, samples {12}; prior measured GPC {13} kHz' -f (Hex $r.Slowdown), (Hex $r.RampStatus), (Hex $r.PllCfg2), (Hex $r.Dvfs0), (Hex $r.Dvfs1), (Hex $r.OscCtrl), (Hex $r.CarClkX), (Hex $r.CarRstX), (Hex $r.CarPllpOutc), (Hex $r.IdleSlowdown), (Hex $r.CntrCfg), (Hex $r.CntrValue), $r.CntrSamples, $measured)
+      }
+      $mbps = {
+        param([long]$Bytes, [uint32]$Us)
+        if ($Us -eq 0) { 'n/a' } else { '{0:F1}' -f ($Bytes / $Us) }
+      }
+      $frameBytes = 1920 * 1080 * 4
+      $totalBytes = 20 * $frameBytes
+      Sum ('F2b bench MB/s (us) CPU cached/WC {0} ({1}) / {2} ({3}); GPU a/b/c/WC {4} ({5}) / {6} ({7}) / {8} ({9}) / {10} ({11}); stage {12}' -f (& $mbps $totalBytes $r.CpuUs), $r.CpuUs, (& $mbps $totalBytes $r.CpuWcUs), $r.CpuWcUs, (& $mbps $totalBytes $r.GpuUs), $r.GpuUs, (& $mbps $totalBytes $r.GpuBatchUs), $r.GpuBatchUs, (& $mbps $frameBytes $r.GpuLinesUs), $r.GpuLinesUs, (& $mbps $totalBytes $r.GpuWcUs), $r.GpuWcUs, $r.BenchStage)
+      $best = $null
+      for ($i = 0; $i -lt [Math]::Min([int]$r.ClockSteps, $r.Clock.Length); $i++) {
+        $step = $r.Clock[$i]
+        $label = if ($step.TargetKhz -eq 0) { '0 kHz (bypass)' } else { '{0} kHz' -f $step.TargetKhz }
+        $measured = if ($step.MeasuredKhz -eq 0) { 'n/a' } else { $step.MeasuredKhz }
+        $stepResult = if ((Hex $step.Result) -eq '0xC00000BB') { 'skipped' } else { Hex $step.Result }
+        Sum ('F2c step {0}; result {1}; CVB {2} mV; M/N/PL {3}/{4}/{5}; lock/ramp polls {6}/{7}; TRIM {8} kHz; verified {9}/4; cached/WC {10}/{11} MB/s ({12}/{13} us); stage {14}; mismatch {15}' -f $label, $stepResult, $step.CvbMv, $step.M, $step.N, $step.Pl, $step.LockPolls, $step.RampPolls, $measured, $step.Verified, (& $mbps $totalBytes $step.CachedUs), (& $mbps $totalBytes $step.WcUs), $step.CachedUs, $step.WcUs, $step.Stage, (Hex $step.FailOffset))
+        if ($step.Result -eq 0 -and $step.Verified -eq 4 -and $step.CachedUs -gt 0 -and $step.WcUs -gt 0 -and
+            ($null -eq $best -or $step.CachedUs -lt $best.CachedUs)) { $best = $step }
+      }
+      $pf = Get-ItemProperty $Key -ErrorAction SilentlyContinue
+      if ($pf -and $null -ne $pf.F2cFailOffset) {
+        Sum ('F2c failed write: offset {0}; previous {1}; mask {2}; wanted {3}; readback {4}; written {5}' -f (Hex $pf.F2cFailOffset), (Hex $pf.F2cFailPrevious), (Hex $pf.F2cFailMask), (Hex $pf.F2cFailWanted), (Hex $pf.F2cFailReadback), $pf.F2cFailWritten)
+      }
+      if ($pf -and $null -ne $pf.F2cCfgAtLock) {
+        Sum ('F2c diag CFG before/after enable/at lock {0}/{1}/{2}; SEL readback v0/v1/v2 {3}/{4}/{5}; SEL variant {6} polls {7}; at SEL fail CFG/COEFF/OUT/BYPASS {8}/{9}/{10}/{11}' -f (Hex $pf.F2cCfgBeforeEnable), (Hex $pf.F2cCfgAfterEnable), (Hex $pf.F2cCfgAtLock), (Hex $pf.F2cSelV0Read), (Hex $pf.F2cSelV1Read), (Hex $pf.F2cSelV2Read), (Hex $pf.F2cSelVariant), $pf.F2cSelPolls, (Hex $pf.F2cCfgAtSelFail), (Hex $pf.F2cCoeffAtSelFail), (Hex $pf.F2cOutAtSelFail), (Hex $pf.F2cBypassAtSelFail))
+      }
+      if ($null -eq $best) {
+        Sum ('F2c best n/a; bypass restore {0}' -f (Hex $r.RestoreResult))
+      } else {
+        $label = if ($best.TargetKhz -eq 0) { 'bypass' } else { '{0} kHz' -f $best.TargetKhz }
+        Sum ('F2c best {0}; cached/WC {1}/{2} MB/s; bypass restore {3}' -f $label, (& $mbps $totalBytes $best.CachedUs), (& $mbps $totalBytes $best.WcUs), (Hex $r.RestoreResult))
+      }
+    } catch {
+      Sum ('F2 blit IOCTL failed: {0}' -f $_.Exception.Message)
+    }
+    if ($Detail) { Show-Trace }
+  }
+  'InstallDisplay' {
+    $inf = Join-Path $Here 'display\switchdisplay.inf'
+    if (-not (Test-Path $inf)) { Sum "missing: $inf"; break }
+    (& $Pnputil /add-driver $inf /install 2>&1) | ForEach-Object { Log "  $_" }
+    Sum "switchdisplay pnputil exit=$LASTEXITCODE"
+  }
+  { $_ -eq 'F3On' -or $_ -eq 'F3Off' } {
+    $enable = [int]($Mode -eq 'F3On')
+    if ($enable -and -not (Import-GpuFirmware)) { break }
+    $displayKey = 'HKLM:\SYSTEM\CurrentControlSet\Services\switchdisplay\Parameters'
+    New-Item -Path $Key,$displayKey -Force -ErrorAction Stop | Out-Null
+    New-ItemProperty -Path $Key -Name AutoResident -PropertyType DWord -Value $enable -Force -ErrorAction Stop | Out-Null
+    New-ItemProperty -Path $displayKey -Name GpuPresent -PropertyType DWord -Value $enable -Force -ErrorAction Stop | Out-Null
+    # 0.12.4: F2c hardware showed 460.8 MHz gives ~5 GB/s (CVB 950 mV, same as
+    # 614.4 MHz which is memory bound); F3 runs the resident GPU there.
+    $khz = if ($enable) { 460800 } else { 0 }
+    New-ItemProperty -Path $Key -Name GpcKhz -PropertyType DWord -Value $khz -Force -ErrorAction Stop | Out-Null
+    New-ItemProperty -Path $Key -Name AutoResidentPending -PropertyType DWord -Value 0 -Force -ErrorAction Stop | Out-Null
+    New-ItemProperty -Path $Key -Name AutoResidentGuardTripped -PropertyType DWord -Value 0 -Force -ErrorAction Stop | Out-Null
+    Sum ('F3 AutoResident / GpuPresent = {0}; GpcKhz = {1}. Restart Windows to apply.' -f $enable, $khz)
+  }
+  'F3Status' {
+    $gpu = Get-ItemProperty $Key -ErrorAction SilentlyContinue
+    $d = Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Services\switchdisplay\Parameters' -ErrorAction SilentlyContinue
+    Sum ('F3 AutoResident {0}; GpuPresent {1}; display version {2}; connected {3}; disabled {4}' -f $gpu.AutoResident, $d.GpuPresent, (Hex $d.Version), $d.GpuConnected, $d.GpuDisabled)
+    Sum ('F3 GPU clock requested {0} kHz; resident clock result {1}; CVB {2} mV; resident active {3}; boot guard tripped {4}' -f $gpu.GpcKhz, (Hex $gpu.F2cResidentClockResult), $gpu.F2cResidentClockCvbMv, $gpu.B3eResidentActive, $gpu.AutoResidentGuardTripped)
+    Sum ('F3 GPU presents {0}; CPU fallbacks {1}; failures {2}; average GPU/CPU us {3}/{4}; last status {5}' -f $d.GpuPresents, $d.GpuFallbacks, $d.GpuFailures, $d.GpuAverageUs, $d.GpuCpuAverageUs, (Hex $d.GpuLastStatus))
   }
   'Copy' {
     try {
