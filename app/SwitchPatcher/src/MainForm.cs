@@ -63,8 +63,8 @@ namespace SwitchPatcher
             controlCenter.Text = T("コントロールセンター（ログインしたときに起動）", "Control center (starts at login)");
             firmwareBrowse.Text = T("選ぶ…", "Browse...");
             firmwareBrowse.Click += (_, _) => ChooseFirmware();
-            firmwareNote.Text = T("任意: 自分の Switchroot Linux からコピーしたファームウェアのフォルダー（tegra21x_xusb_firmware、brcmfmac4356A3-pcie.bin/.txt、BCM4356A3.hcd、wifi-mac.txt）。USB・Wi-Fi・Bluetooth に使います。",
-                                  "Optional: a folder with firmware copied from your own Switchroot Linux (tegra21x_xusb_firmware, brcmfmac4356A3-pcie.bin/.txt, BCM4356A3.hcd, wifi-mac.txt), for USB, Wi-Fi and Bluetooth.");
+            firmwareNote.Text = T("任意: 自分の Switchroot Linux からコピーしたファームウェアのフォルダー（tegra21x_xusb_firmware、brcmfmac4356A3-pcie.bin/.txt、BCM4356A3.hcd、wifi-mac.txt、nvidia\\gm20b）。USB・Wi-Fi・Bluetooth・GPU に使います。",
+                                  "Optional: a folder with firmware copied from your own Switchroot Linux (tegra21x_xusb_firmware, brcmfmac4356A3-pcie.bin/.txt, BCM4356A3.hcd, wifi-mac.txt, nvidia\\gm20b), for USB, Wi-Fi, Bluetooth and the GPU.");
             hekateBoot.Text = T("hekate から起動できるようにする（UEFI と hekate の起動項目を ESP に置く）", "Boot from hekate (put the UEFI and a hekate menu entry on the ESP)");
             hekateInstall.Text = T("hekate も入れる・新しくする（公式の最新リリースから）", "Also add or update hekate (latest official release)");
             hekateBoot.CheckedChanged += (_, _) => UpdateEnabled();
@@ -326,7 +326,7 @@ namespace SwitchPatcher
             if (o.Drivers) steps.Add(T("・Switch のドライバーを入れる", "- Add the Switch drivers"));
             if (o.TestMode) steps.Add(T("・テスト証明書を入れて、テストモードを有効にする（BCD は先に PC に保存する）", "- Add the test certificate and turn on test signing (the BCD is saved to the PC first)"));
             if (o.ControlCenter) steps.Add(T("・コントロールセンターを C:\\SwitchWOA\\SwitchCenter に置く", "- Put the control center in C:\\SwitchWOA\\SwitchCenter"));
-            if (o.FirmwareFolder != null) steps.Add(T("・フォルダーのファームウェアを入れる（USB は ESP、Wi-Fi・Bluetooth は Windows の中）", "- Add the firmware from the folder (USB on the ESP, Wi-Fi and Bluetooth inside Windows)"));
+            if (o.FirmwareFolder != null) steps.Add(T("・フォルダーのファームウェアを入れる（USB は ESP、Wi-Fi・Bluetooth・GPU は Windows の中）", "- Add the firmware from the folder (USB on the ESP, Wi-Fi, Bluetooth and GPU inside Windows)"));
             if (o.HekateInstall) steps.Add(T("・hekate の最新の公式リリースを ESP に入れる（bootloader フォルダー、ペイロード）", "- Put the latest official hekate release on the ESP (bootloader folder, payload)"));
             if (o.HekateBoot)
                 steps.Add(T($"・ESP の switchroot\\switchwoa に UEFI（bl33.bin{(o.Bl33 != null ? "、選んだファイル" : "、リリースのもの")}）{(o.Bl31 != null ? "と bl31.bin" : "")}を置き、hekate_ipl.ini に Windows の項目（id={Hekate.EntryId}）を足す",
