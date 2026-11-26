@@ -61,7 +61,7 @@ namespace SwitchCenter
                     throw new UnauthorizedAccessException(T("管理者として実行されていません。", "Not running as administrator."));
                 FirmwareSet f = SwitchFirmware.Find(source);
                 log.AddRange(SwitchFirmware.Describe(f, false));
-                if (!f.Wifi && f.BtHcd == null && f.Mac == null)
+                if (!f.Wifi && f.BtHcd == null && f.Mac == null && f.Gpu == null)
                     throw new FileNotFoundException(T("入れられるファイルがありません。Switchroot Linux の /lib/firmware/brcm から brcmfmac4356A3-pcie.bin、.txt、BCM4356A3.hcd をこのフォルダーにコピーしてください。",
                                                       "Nothing to add. Copy brcmfmac4356A3-pcie.bin, .txt and BCM4356A3.hcd from Switchroot Linux's /lib/firmware/brcm into this folder."));
                 log.Add("");
@@ -78,6 +78,8 @@ namespace SwitchCenter
                                                : T("Windows を再起動すると、Wi-Fi が新しいファイルで動きます。", "Restart Windows to use the new Wi-Fi files."));
                 if (f.BtHcd != null)
                     log.Add(T("Bluetooth のパッチは、Windows を再起動したときから使われます。", "The Bluetooth patch is used from the next Windows restart."));
+                if (f.Gpu != null)
+                    log.Add(T("GPU のファームウェアは、GPU キットのインストールで読み込まれます。", "The GPU firmware is read when the GPU kit is installed."));
             }
             catch (Exception e) when (e is IOException || e is UnauthorizedAccessException || e is ArgumentException)
             {
