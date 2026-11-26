@@ -14,8 +14,7 @@ Windows のイメージ（ARM64）を、SD に入れ直すこともできます�
 - 「ファームウェア」のフォルダーに linux-firmware の `nvidia\gm20b`（`acr`、`gr`、`pmu` の 14 ファイル）があれば、SD の `SwitchWOA\firmware\nvidia\gm20b` にコピーする。GPU キット（`kits\Switch-Gpu`）のインストールは、ここ（Switch では `C:\SwitchWOA\firmware\nvidia\gm20b`）から読み込む。NVIDIA のファイルなので、リリースやこのツールには入っていない。
 - 探す場所: フォルダーの中の `nvidia\gm20b`、`gm20b`、`firmware\nvidia\gm20b`、`lib\firmware\nvidia\gm20b`、フォルダーそのもの。ファイルが欠けていたら、「使えないもの」に足りない名前を出して、GPU の分はコピーしない。
 - switchgpu はリリースに入っていないので、ドライバーは今まで通り GPU キットで入れる。
-- 確認したこと（2026-11-26）: PC で、ユーザーのフォルダーから 14 ファイルを見つけて、一時フォルダーに同じ中身でコピーできた。実機: Windows 11 23H2（22631.7714）の新しい SD を 0.6.1 で作り、Switch で起動。`C:\SwitchWOAirmware
-vidia\gm20b` に `acr`、`gr`、`pmu` ができていて、GPU キットのインストールも通った。23H2 の SD を作ったのも、これが初めて。
+- 確認したこと（2026-11-26）: PC で、ユーザーのフォルダーから 14 ファイルを見つけて、一時フォルダーに同じ中身でコピーできた。実機: Windows 11 23H2（22631.7714）の新しい SD を 0.6.1 で作り、Switch で起動。`C:\SwitchWOA\firmware\nvidia\gm20b` に `acr`、`gr`、`pmu` ができていて、GPU キットのインストールも通った。23H2 の SD を作ったのも、これが初めて。
 
 ## v0.6.0（2026-11-18）: hekate からの起動
 
