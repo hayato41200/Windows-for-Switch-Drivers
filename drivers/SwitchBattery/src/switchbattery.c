@@ -48,6 +48,18 @@
  * USB-C -> HDMI adapters and hubs without their own power: 2 s after VBUS
  * is on (and at start when UEFI left VBUS on), the same steps run once per
  * plug-in. A partner without USB PD just fails Discover Identity (step 2).
+ *
+ * v9: every battery poll (10 s) also reads the gauge's Current (0x0A) and
+ * AvgCurrent (0x0B, signed, 0.3125 mA with the 5 mOhm sense resistor, + =
+ * charging) and writes them to Parameters as LastCurrentMa / LastAvgCurrentMa
+ * (REG_DWORD holding a signed value), and LastPowerMw = AvgCurrent x VCELL.
+ * Only for measuring standby power (sleep stage S4); Windows still gets an
+ * unknown rate, as before.
+ * v10: also LastQh (0x4D, the gauge's coulomb counter, signed, 1 mAh with
+ * 5 mOhm) and LastRepCapMah (0x05), with LastGaugeTick (100 ns, interrupt
+ * time) of the read: a test script compares two readings to get the average
+ * current over a stretch Windows spent in modern standby, when user-mode
+ * scripts are paused.
  */
 #include <ntddk.h>
 #include <ntstrsafe.h>
@@ -59,6 +71,9 @@
 #define GAUGE_TEMP     0x08
 #define GAUGE_VCELL    0x09
 #define GAUGE_CURRENT  0x0A
+#define GAUGE_AVGCURRENT 0x0B
+#define GAUGE_REPCAP   0x05
+#define GAUGE_QH       0x4D
 #define CHARGER_SYSSTAT 0x08
 #define BATTERY_TAG    1
 #define POLL_MS        10000
@@ -814,6 +829,33 @@ VOID SwBatEvtUsbcTimer(WDFTIMER Timer)
     }
 }
 
+/* v9: gauge current for standby measurements. Caller holds Dev->Lock. */
+static VOID SwBatTraceCurrent(PSWBAT_DEVICE Dev, ULONG VoltageMv)
+{
+    USHORT Cur = 0, Avg = 0, Qh = 0, RepCap = 0;
+    LONG CurMa, AvgMa;
+    ULONGLONG Tick;
+
+    if (!NT_SUCCESS(SwBatRead16(Dev->Gauge, GAUGE_CURRENT, &Cur)) ||
+        !NT_SUCCESS(SwBatRead16(Dev->Gauge, GAUGE_AVGCURRENT, &Avg))) {
+        return;
+    }
+    /* 1 LSB = 0.3125 mA = 5/16 mA */
+    CurMa = ((LONG)(SHORT)Cur * 5) / 16;
+    AvgMa = ((LONG)(SHORT)Avg * 5) / 16;
+    SwBatTrace(L"LastCurrentMa", (ULONG)CurMa);
+    SwBatTrace(L"LastAvgCurrentMa", (ULONG)AvgMa);
+    SwBatTrace(L"LastPowerMw", (ULONG)(LONG)(((LONGLONG)AvgMa * (LONGLONG)VoltageMv) / 1000));
+    /* v10: coulomb counter and remaining capacity, 1 mAh per LSB with 5 mOhm */
+    if (NT_SUCCESS(SwBatRead16(Dev->Gauge, GAUGE_QH, &Qh)) && NT_SUCCESS(SwBatRead16(Dev->Gauge, GAUGE_REPCAP, &RepCap))) {
+        Tick = KeQueryInterruptTime();
+        SwBatTrace(L"LastQh", (ULONG)(LONG)(SHORT)Qh);
+        SwBatTrace(L"LastRepCapMah", RepCap);
+        SwBatTrace(L"LastGaugeTickLo", (ULONG)Tick);
+        SwBatTrace(L"LastGaugeTickHi", (ULONG)(Tick >> 32));
+    }
+}
+
 /* Read gauge + charger into a BATTERY_STATUS. Caller holds Dev->Lock. */
 static NTSTATUS SwBatReadStatus(PSWBAT_DEVICE Dev, PBATTERY_STATUS Out)
 {
@@ -990,6 +1032,7 @@ VOID SwBatEvtTimer(WDFTIMER Timer)
         SwBatTrace(L"LastPowerState", Now.PowerState);
         SwBatTrace(L"LastCapacity", Now.Capacity);
         SwBatTrace(L"LastVoltage", Now.Voltage);
+        SwBatTraceCurrent(Dev, Now.Voltage);
     }
     WdfWaitLockRelease(Dev->Lock);
     SwBatTrace(L"TimerRuns", (ULONG)InterlockedIncrement(&Dev->TimerRuns));
@@ -1225,7 +1268,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
         RtlCopyMemory(&SwBatParamsPath[RegistryPath->Length / sizeof(WCHAR)], L"\\Parameters", sizeof(L"\\Parameters"));
         (VOID)RtlCreateRegistryKey(RTL_REGISTRY_ABSOLUTE, SwBatParamsPath);
     }
-    SwBatTrace(L"DriverVersion", 8);
+    SwBatTrace(L"DriverVersion", 10);
 
     WDF_DRIVER_CONFIG_INIT(&Config, SwBatEvtDeviceAdd);
     return WdfDriverCreate(DriverObject, RegistryPath, WDF_NO_OBJECT_ATTRIBUTES, &Config, WDF_NO_HANDLE);
