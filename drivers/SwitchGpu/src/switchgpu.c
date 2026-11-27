@@ -39,7 +39,7 @@
 #include <spb.h>
 #include "swgpu-blit.h"
 
-#define SWGPU_VERSION      0x00000E00u   /* 0.14.0 */
+#define SWGPU_VERSION      0x00000F02u   /* 0.15.2 */
 
 #define CAR_PHYS           0x60006000ull
 #define CAR_LEN            0x1000u
