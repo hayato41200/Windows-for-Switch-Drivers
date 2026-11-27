@@ -12,7 +12,8 @@ namespace SwitchCenter
         /// --install-drivers &lt;tag&gt; &lt;service,...&gt;: the elevated driver installer.
         /// --self-update &lt;folder&gt; &lt;pid&gt;: an unpacked new version replacing the one in folder.
         /// --wifi-firmware &lt;folder&gt;: the elevated copy of the user's Wi-Fi firmware files.
-        /// --update-uefi &lt;tag&gt;: the elevated UEFI (bl33.bin) update for the hekate chain.</param>
+        /// --update-uefi &lt;tag&gt;: the elevated UEFI (bl33.bin) update for the hekate chain.
+        /// --gpu on|off: the elevated GPU drawing switch (applies at the next restart).</param>
         [STAThread]
         static void Main(string[] args)
         {
@@ -45,6 +46,15 @@ namespace SwitchCenter
                 Application.SetHighDpiMode(HighDpiMode.SystemAware);
                 Lang.Load();
                 Environment.ExitCode = WifiFirmware.Apply(args[1]);
+                return;
+            }
+            if (args.Length == 2 && args[0] == "--gpu" && (args[1] == "on" || args[1] == "off"))
+            {
+                // Elevated GPU drawing switch (GpuAccel.RunElevatedAsync).
+                Application.EnableVisualStyles();
+                Application.SetHighDpiMode(HighDpiMode.SystemAware);
+                Lang.Load();
+                Environment.ExitCode = GpuAccel.Apply(args[1] == "on");
                 return;
             }
             if (args.Length == 3 && args[0] == "--self-update" && int.TryParse(args[2], out int pid))

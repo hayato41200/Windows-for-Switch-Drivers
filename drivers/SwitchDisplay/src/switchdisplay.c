@@ -73,7 +73,7 @@
 #include <stdarg.h>
 #include "../../SwitchGpu/src/swgpu-blit.h"
 
-#define SWD_VERSION        0x00010800u   /* 1.8.0 */
+#define SWD_VERSION        0x00010A01u   /* 1.10.1 */
 #define SWD_NOSRC          0xFFu         /* target not in the topology */
 #define SWD_TAG            'DwsS'
 
@@ -177,6 +177,11 @@ typedef struct _SWD_FLIP {
     PMDL Mdl;
     SIZE_T Bytes;
     BOOLEAN Mapped, Enabled;
+    /* 1.10.0 (G2c): panel only. When UEFI's framebuffer has no GPU MDL (outside
+     * the reserved range), an own first buffer replaces it as index 0. */
+    PUCHAR First;
+    PHYSICAL_ADDRESS FirstPhys;
+    PMDL FirstMdl;
     volatile LONG Front, Pending;
     ULONG Flips, Timeouts, MaxUs, Polls, GpuForward, CpuForward, Fallbacks, Retained, Status;
 } SWD_FLIP;
@@ -329,6 +334,7 @@ static ULONG RegGetDword(PCWSTR Name, ULONG Default)
 
 #include "swd-gpu-present.inc"
 #include "swd-flip.inc"
+#include "swd-g2a.inc"
 
 static VOID FlushCounters(PSWD_CONTEXT Ctx)
 {
@@ -407,6 +413,7 @@ static VOID GuardThread(PVOID Context)
         FlushCounters(ctx);
         if (st != STATUS_TIMEOUT) break;
         if (ctx->GpuPresent) SwdGpuConnect(ctx);
+        if (ctx->GpuPresent) G2aMaybeRun(ctx);      /* Claude 1.9.0: G2a test, once, when asked */
         elapsed += FLUSH_SECONDS;
         if (!cleared && elapsed >= GUARD_SECONDS) {
             RegPutDword(L"StartPending", 0);
@@ -2466,7 +2473,7 @@ static VOID SwdPresentForward(PSWD_CONTEXT Ctx, const DXGKARG_PRESENT_DISPLAYONL
 {
     SWD_FLIP *flip = Tv ? &Ctx->TvFlip : &Ctx->FbFlip;
     PUCHAR from = SwdFlipVa(Ctx, Tv, Index), to = SwdFlipVa(Ctx, Tv, 1 - Index);
-    PMDL primary = Tv ? Ctx->TvMdl : Ctx->FbMdl;
+    PMDL primary = SwdFlipMdl0(Ctx, Tv);
     PMDL srcMdl = Index ? flip->Mdl : primary;
     PMDL dstMdl = Index ? primary : flip->Mdl;
     ULONG pitch = Tv ? Ctx->TvPitch : Ctx->FbPitch;
@@ -2582,7 +2589,7 @@ NTSTATUS SwdPresentDisplayOnly(IN_CONST_HANDLE hAdapter, IN_CONST_PDXGKARG_PRESE
         if (toPanel && (!ctx->DoubleBuffer || panelLocked) && !ctx->FbDmaUnsafe) {
             LONG index = ctx->FbFlip.Second ? SwdFlipDrawIndex(ctx, FALSE) : 0;
             PUCHAR dest = SwdFlipVa(ctx, FALSE, index);
-            PMDL targetMdl = index ? ctx->FbFlip.Mdl : ctx->FbMdl;
+            PMDL targetMdl = index ? ctx->FbFlip.Mdl : SwdFlipMdl0(ctx, FALSE);
             BOOLEAN eligible = ctx->GpuPresent && rot == D3DKMDT_VPPR_IDENTITY &&
                 ws > 0 && hs > 0 && ws <= (LONG)ctx->FbWidth && hs <= (LONG)ctx->FbHeight;
             if (!eligible || !SwdGpuTry(ctx, pPresent, mdl, targetMdl,
