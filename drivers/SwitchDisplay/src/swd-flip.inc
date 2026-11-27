@@ -19,7 +19,20 @@ static VOID SwdFlipUnlock(PKEVENT Event)
 static PUCHAR SwdFlipVa(PSWD_CONTEXT Ctx, BOOLEAN Tv, LONG Index)
 {
     if (Tv) return Index ? Ctx->TvFlip.Second : Ctx->TvVa;
-    return Index ? Ctx->FbFlip.Second : Ctx->FbVa;
+    return Index ? Ctx->FbFlip.Second : (Ctx->FbFlip.First ? Ctx->FbFlip.First : Ctx->FbVa);
+}
+
+/* Index 0: the primary buffer, or the panel's own first buffer (G2c). */
+static ULONGLONG SwdFlipPhys0(PSWD_CONTEXT Ctx, BOOLEAN Tv)
+{
+    if (Tv) return (ULONGLONG)Ctx->TvPhys.QuadPart;
+    return (ULONGLONG)(Ctx->FbFlip.First ? Ctx->FbFlip.FirstPhys.QuadPart : Ctx->FbPhys.QuadPart);
+}
+
+static PMDL SwdFlipMdl0(PSWD_CONTEXT Ctx, BOOLEAN Tv)
+{
+    if (Tv) return Ctx->TvMdl;
+    return Ctx->FbFlip.First ? Ctx->FbFlip.FirstMdl : Ctx->FbMdl;
 }
 
 static VOID SwdCopyRows(PUCHAR To, PUCHAR From, ULONG Pitch, LONG L, LONG T, LONG R, LONG B)
@@ -81,8 +94,7 @@ static BOOLEAN SwdFlipRequest(PSWD_CONTEXT Ctx, BOOLEAN Tv, LONG Index)
 {
     SWD_FLIP *flip = Tv ? &Ctx->TvFlip : &Ctx->FbFlip;
     PUCHAR dc = Tv ? Ctx->TvDc : Ctx->DcVa;
-    ULONGLONG phys = Index ? (ULONGLONG)flip->Phys.QuadPart :
-                             (ULONGLONG)(Tv ? Ctx->TvPhys.QuadPart : Ctx->FbPhys.QuadPart);
+    ULONGLONG phys = Index ? (ULONGLONG)flip->Phys.QuadPart : SwdFlipPhys0(Ctx, Tv);
     ULONG hdr, access;
     InterlockedExchange(&flip->Pending, 1);
     KeMemoryBarrier();
@@ -165,6 +177,28 @@ static VOID SwdFlipAllocate(PSWD_CONTEXT Ctx, BOOLEAN Tv)
         SwdFlipFallback(flip, STATUS_INSUFFICIENT_RESOURCES);
         return;
     }
+    /* Claude 1.10.0 (G2c): F3 hardware showed half of the panel presents on the
+     * CPU as "no GPU destination": UEFI's framebuffer (0xF5A00000 here) is
+     * outside the reserve, so it has no GPU MDL. Give index 0 an own buffer as
+     * well and move scanout there; UEFI's framebuffer comes back at stop. */
+    if (!Tv && !Ctx->FbMdl && Ctx->GpuPresent) {
+        hi.QuadPart = 0xFFFFFFFFll;
+        flip->First = (PUCHAR)MmAllocateContiguousMemorySpecifyCache(bytes, lo, hi, skip, MmWriteCombined);
+        if (flip->First) {
+            flip->FirstPhys = MmGetPhysicalAddress(flip->First);
+            flip->FirstMdl = SwdOwnedScanoutMdl(flip->First, bytes);
+            if (!flip->FirstMdl) {
+                MmFreeContiguousMemorySpecifyCache(flip->First, bytes, MmWriteCombined);
+                flip->First = NULL;
+            }
+        }
+        if (flip->First) {
+            RtlCopyMemory(flip->First, Ctx->FbVa, bytes);
+            KeMemoryBarrier();
+            flip->Front = 0;
+            if (!SwdFlipRequest(Ctx, FALSE, 0)) flip->Status = STATUS_IO_TIMEOUT;   /* both hold the same picture */
+        }
+    }
     RtlCopyMemory(flip->Second, SwdFlipVa(Ctx, Tv, 0), bytes);
     KeMemoryBarrier();
     flip->Front = 0;
@@ -181,7 +215,12 @@ static VOID SwdFlipFree(SWD_FLIP *Flip, BOOLEAN Safe)
             if (Flip->Mapped) MmUnmapIoSpace(Flip->Second, Flip->Bytes);
             else MmFreeContiguousMemorySpecifyCache(Flip->Second, Flip->Bytes, MmWriteCombined);
         }
+        if (Flip->FirstMdl) IoFreeMdl(Flip->FirstMdl);
+        if (Flip->First) MmFreeContiguousMemorySpecifyCache(Flip->First, Flip->Bytes, MmWriteCombined);
     }
+    if (!Safe && Flip->First) ++Flip->Retained;
+    Flip->First = NULL;
+    Flip->FirstMdl = NULL;
     /* If scanout or DMA cannot be ruled out, retain the allocation and MDL. */
     if (!Safe && Flip->Second) ++Flip->Retained;
     Flip->Enabled = FALSE;
@@ -220,7 +259,7 @@ static LONG SwdFlipDrawIndex(PSWD_CONTEXT Ctx, BOOLEAN Tv)
         PUCHAR dc = Tv ? Ctx->TvDc : Ctx->DcVa;
         ULONG pending = READ_REGISTER_ULONG((PULONG)(dc + DC_CMD_STATE_CONTROL_REG));
         ULONGLONG active = SwdFlipActive(dc);
-        ULONGLONG primary = (ULONGLONG)(Tv ? Ctx->TvPhys.QuadPart : Ctx->FbPhys.QuadPart);
+        ULONGLONG primary = SwdFlipPhys0(Ctx, Tv);
         if (active == (ULONGLONG)flip->Phys.QuadPart || active == primary) {
             InterlockedExchange(&flip->Front, active == primary ? 0 : 1);
             if (!(pending & SWD_FLIP_REQ))
@@ -249,6 +288,18 @@ static BOOLEAN SwdPanelPrimary(PSWD_CONTEXT Ctx)
     if (!flip->Second) return TRUE;
     if (!Ctx->DcVa || Ctx->FbDmaUnsafe) return FALSE;
     index = flip->Enabled ? flip->Front : SwdFlipDrawIndex(Ctx, FALSE);
+    if (flip->First) {
+        /* G2c: hand scanout back to UEFI's framebuffer with the last picture.
+         * First stays allocated (SwdFlipFree releases it) but is not index 0 here. */
+        PUCHAR first = flip->First;
+        BOOLEAN ok;
+        RtlCopyMemory(Ctx->FbVa, SwdFlipVa(Ctx, FALSE, index), flip->Bytes);
+        KeMemoryBarrier();
+        flip->First = NULL;
+        ok = SwdFlipRequest(Ctx, FALSE, 0);
+        flip->First = first;
+        return ok;
+    }
     if (!index && !flip->Pending &&
         !(READ_REGISTER_ULONG((PULONG)(Ctx->DcVa + DC_CMD_STATE_CONTROL_REG)) & SWD_FLIP_REQ) &&
         SwdFlipActive(Ctx->DcVa) == (ULONGLONG)Ctx->FbPhys.QuadPart) return TRUE;
@@ -264,7 +315,7 @@ static VOID SwdFlipFlush(PSWD_CONTEXT Ctx)
     RegPutDword(L"F4Active", Ctx->Started);
     RegPutDword(L"F4LockTimeouts", Ctx->F4LockTimeouts);
     RegPutDword(L"F4PanelPrimaryLo", Ctx->FbPhys.LowPart);
-    RegPutDword(L"F4PanelPrimaryMdl", Ctx->FbMdl != NULL);
+    RegPutDword(L"F4PanelPrimaryMdl", Ctx->FbMdl != NULL ? 1u : p->First != NULL ? 2u : 0u);   /* 2 = own first buffer (G2c) */
 #define FLIP_STAT(Name, Field) \
     RegPutDword(L"F4Panel" L##Name, (ULONG)p->Field); \
     RegPutDword(L"F4Tv" L##Name, (ULONG)t->Field)
