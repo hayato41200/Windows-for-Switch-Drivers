@@ -103,6 +103,26 @@ static BOOLEAN F2RequestValid(const SWGPU_BLIT_REQUEST *Req)
         Req->SrcPitch == 0u || Req->DstPitch == 0u || !F2MdlValid(Req->Src) ||
         !F2MdlValid(Req->Dst) || (Req->Src->MdlFlags & MDL_IO_SPACE))
         return FALSE;
+    if (Req->DstLayout == SWGPU_BLIT_DST_BLOCK) {
+        /* Claude 0.14.0 (G2a): block-linear destination, origin in DstOffset. */
+        ULONG blockRows = 8u << Req->DstBlockHeightLog2;
+        if (Req->DstBlockHeightLog2 > 5u || (Req->DstPitch & 63u) || Req->DstPitch > 0xFFFFu ||
+            Req->DstHeight == 0u || Req->DstHeight > 0xFFFFu || (Req->DstHeight % blockRows) ||
+            (Req->DstKind != 0u && Req->DstKind != 0xFEu) ||
+            SWGPU_BL_BYTES(Req->DstPitch, Req->DstHeight) > MmGetMdlByteCount(Req->Dst))
+            return FALSE;
+        for (i = 0u; i < Req->Count; ++i) {
+            const SWGPU_BLIT_RECT *r = &Req->Rect[i];
+            ULONG x = r->DstOffset & 0xFFFFu, y = r->DstOffset >> 16;
+            if (!r->Rows || !r->RowBytes || r->RowBytes > Req->SrcPitch ||
+                x + r->RowBytes > Req->DstPitch || y + r->Rows > Req->DstHeight ||
+                (ULONGLONG)r->SrcOffset + (ULONGLONG)(r->Rows - 1u) * Req->SrcPitch +
+                    r->RowBytes > MmGetMdlByteCount(Req->Src))
+                return FALSE;
+        }
+        return TRUE;
+    }
+    if (Req->DstLayout != SWGPU_BLIT_DST_PITCH || Req->DstKind != 0u) return FALSE;
     for (i = 0u; i < Req->Count; ++i) {
         const SWGPU_BLIT_RECT *r = &Req->Rect[i];
         if (!r->Rows || r->Rows > 0xFFFFu || !r->RowBytes ||
@@ -153,7 +173,8 @@ static BOOLEAN F2Map(PSWGPU_DEVICE Dev, const SWGPU_BLIT_REQUEST *Req, F2_RUN *R
         for (i = 0u; i < count; ++i) {
             ULONGLONG iova = (GR_VM_BLIT_BASE + (ULONGLONG)(first + i) * PAGE_SIZE) | ACR_GM20B_IOMMU_TAG;
             outerPt[first + i] = (ULONG)pfns[i] | SMMU_ATTR_RWNS;
-            gpuPt[first + i] = (iova >> 8) | 1ull; /* GR arena's valid small PTE encoding */
+            /* GR arena's valid small PTE encoding; G2a: kind [43:36] of the destination. */
+            gpuPt[first + i] = (iova >> 8) | 1ull | (set == 1u ? (ULONGLONG)Req->DstKind << 36 : 0ull);
         }
     }
     KeMemoryBarrier();
@@ -261,8 +282,10 @@ static NTSTATUS F2SubmitPlan(PSWGPU_DEVICE Dev, const SWGPU_BLIT_REQUEST *Req,
         (Rd(Dev->Bar0, PMC_INTR_EN_NONSTALL) & 1u) &&
         (Rd(Dev->Bar0, FIFO_INTR_EN_1) & FIFO_INTR_0_CHANNEL_INTR);
     NTSTATUS status = STATUS_IO_TIMEOUT;
+    const BOOLEAN block = Req->DstLayout == SWGPU_BLIT_DST_BLOCK;
     if (Repeat == 0u || Repeat > F2_REPEATS || (SplitLines && Req->Count != 1u) ||
-        launchCount > ((pushBytes - 32u) / sizeof(ULONG) - 21u) / 11u)
+        (block && (Repeat != 1u || SplitLines)) ||
+        launchCount > ((pushBytes - 32u) / sizeof(ULONG) - 21u) / (block ? 18u : 11u))
         return STATUS_INVALID_PARAMETER;
     if (NeedIrq && !useIrq) return STATUS_DEVICE_NOT_READY;
     if (put >= ringEntries || Rd(Dev->Bar1Cpu, getOffset) != put) return STATUS_DEVICE_BUSY;
@@ -277,16 +300,25 @@ static NTSTATUS F2SubmitPlan(PSWGPU_DEVICE Dev, const SWGPU_BLIT_REQUEST *Req,
     for (i = 0u; i < launchCount; ++i) {
         const SWGPU_BLIT_RECT *r = &Req->Rect[SplitLines ? 0u : i % Req->Count];
         const ULONG row = SplitLines ? i : 0u;
+        if (block) {
+            /* clb0b5.h SET_DST_BLOCK_SIZE..SET_DST_ORIGIN: WIDTH ONE_GOB, HEIGHT
+             * log2 GOBs [7:4], DEPTH ONE_GOB, GOB_HEIGHT FERMI_8 [15:12] = 1. */
+            push[n++] = F1Method(F1_COPY_SUBCHANNEL, 0x070Cu, 6u);
+            push[n++] = (Req->DstBlockHeightLog2 << 4) | (1u << 12);
+            push[n++] = Req->DstPitch; push[n++] = Req->DstHeight; push[n++] = 1u; push[n++] = 0u;
+            push[n++] = r->DstOffset;               /* origin: Y [31:16], X bytes [15:0] */
+        }
         push[n++] = F1Method(F1_COPY_SUBCHANNEL, 0x0400u, 8u);
         push[n++] = 0u;
         push[n++] = GR_VM_BLIT_BASE + MmGetMdlByteOffset(Req->Src) + r->SrcOffset + row * Req->SrcPitch;
         push[n++] = 0u;
         push[n++] = GR_VM_BLIT_BASE + SWGPU_BLIT_WINDOW_BYTES + MmGetMdlByteOffset(Req->Dst) +
-            r->DstOffset + row * Req->DstPitch;
+            (block ? 0u : r->DstOffset + row * Req->DstPitch);
         push[n++] = Req->SrcPitch; push[n++] = Req->DstPitch;
         push[n++] = r->RowBytes; push[n++] = SplitLines ? 1u : r->Rows;
         push[n++] = F1Method(F1_COPY_SUBCHANNEL, 0x0300u, 1u);
-        push[n++] = i + 1u == launchCount ? 0x38Eu : 0x386u;
+        /* LAUNCH_DMA: bit 8 DST_MEMORY_LAYOUT 1 = pitch, 0 = block linear. */
+        push[n++] = (i + 1u == launchCount ? 0x38Eu : 0x386u) & (block ? ~0x100u : ~0u);
     }
     push[n++] = F1Method(0u, 0x0010u, 4u);
     push[n++] = 0u; push[n++] = ceSemVa; push[n++] = 0xF2000001u; push[n++] = 1u;

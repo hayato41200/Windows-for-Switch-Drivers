@@ -73,7 +73,7 @@
 #include <stdarg.h>
 #include "../../SwitchGpu/src/swgpu-blit.h"
 
-#define SWD_VERSION        0x00010800u   /* 1.8.0 */
+#define SWD_VERSION        0x00010900u   /* 1.9.0 */
 #define SWD_NOSRC          0xFFu         /* target not in the topology */
 #define SWD_TAG            'DwsS'
 
@@ -329,6 +329,7 @@ static ULONG RegGetDword(PCWSTR Name, ULONG Default)
 
 #include "swd-gpu-present.inc"
 #include "swd-flip.inc"
+#include "swd-g2a.inc"
 
 static VOID FlushCounters(PSWD_CONTEXT Ctx)
 {
@@ -407,6 +408,7 @@ static VOID GuardThread(PVOID Context)
         FlushCounters(ctx);
         if (st != STATUS_TIMEOUT) break;
         if (ctx->GpuPresent) SwdGpuConnect(ctx);
+        if (ctx->GpuPresent) G2aMaybeRun(ctx);      /* Claude 1.9.0: G2a test, once, when asked */
         elapsed += FLUSH_SECONDS;
         if (!cleared && elapsed >= GUARD_SECONDS) {
             RegPutDword(L"StartPending", 0);
