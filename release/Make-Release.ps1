@@ -101,6 +101,9 @@ $Drivers = @(
   # Display: WDDM display-only driver against the 10.0.26100 WDK, own build script. Replaced at the next
   # boot like GPIO/I2C: swapping the display driver live can leave the screen black until a restart.
   @{ Dir = 'SwitchDisplay';     Name = 'switchdisplay'; Build = 'drivers\SwitchDisplay\build.ps1';                                Kit = 'Switch-Display';     Hwid = 'ACPI\SWOA0E01'; MinUefi = 'R408'; Ja = '画面（表示専用ドライバー）'; En = 'Display (display-only)'; Boot = $true }
+  # GPU: idle unless the control center turns GPU drawing on (needs the user's own nvidia\gm20b firmware;
+  # no NVIDIA file is in the release). The kit keeps the test .cmd files of kits\Switch-Gpu.
+  @{ Dir = 'SwitchGpu';         Name = 'switchgpu';     Src = 'switchgpu.c';     Libs = @();                             Inc = $Spb; Kit = 'Switch-Gpu';         Hwid = 'ACPI\SWOA0F01'; MinUefi = 'R447'; Ja = 'GPU（実験的）'; En = 'GPU (experimental)'; Boot = $false }
   @{ Dir = 'SwoaDiag';          Name = 'swoadiag';      Src = 'swoadiag.c';      Libs = @();                             Inc = @();  Kit = 'Switch-UsbDiag';     Hwid = '';              MinUefi = '' }
   @{ Dir = 'SwoaHello';         Name = 'SwoaHello';     Src = 'hello.c';         Libs = @();                             Inc = @();  Kit = 'Switch-Stage0';      Hwid = '';              MinUefi = '' }
 )

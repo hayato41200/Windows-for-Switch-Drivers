@@ -346,6 +346,7 @@ namespace SwitchCenter
                 RefreshSensors();
             };
             rotateTurn.Click += (_, _) => { AutoScreen.TurnScreen(); RefreshSensors(); };
+            page.Controls.Add(BuildGpuBox());
             page.Controls.Add(sensorValues);
             page.Controls.Add(rotateBase);
             page.Controls.Add(rotateTurn);
@@ -357,6 +358,57 @@ namespace SwitchCenter
             page.Controls.Add(brightnessBar);
             page.Controls.Add(brightnessLabel);
             return page;
+        }
+
+        // 0.10.0: GPU drawing (switchgpu + switchdisplay GpuPresent/DoubleBuffer), from the next restart.
+        readonly CheckBox gpuOn = new CheckBox { Dock = DockStyle.Top, Height = 40 };
+        readonly Label gpuState = new Label { Dock = DockStyle.Top, Height = 64 };
+        bool updatingGpu, gpuBusy;
+
+        GroupBox BuildGpuBox()
+        {
+            var box = new GroupBox { Text = T("GPU（実験的）", "GPU (experimental)"), Dock = DockStyle.Top, Height = 230, Padding = new Padding(10) };
+            var gpuNote = new Label
+            {
+                Dock = DockStyle.Top, Height = 90,
+                Text = T("・画面の書き換えを GPU で行い、ちらつきを減らします（アプリの 3D 描画は速くなりません）。\n" +
+                         "・自分で用意した GPU のファームウェア（nvidia\\gm20b）が必要です。\n" +
+                         "・切り替えは Windows の再起動から有効です。",
+                         "- Screen updates are drawn by the GPU, with less tearing (apps' 3D drawing is not faster).\n" +
+                         "- Needs your own GPU firmware (nvidia\\gm20b).\n" +
+                         "- Changes apply from the next Windows restart."),
+            };
+            gpuOn.Text = T("GPU で画面を描く", "Draw the screen with the GPU");
+            gpuOn.CheckedChanged += async (_, _) =>
+            {
+                if (updatingGpu || gpuBusy) return;
+                bool want = gpuOn.Checked;
+                gpuBusy = true;
+                gpuOn.Enabled = false;
+                int? r = await GpuAccel.RunElevatedAsync(want);
+                gpuBusy = false;
+                if (r == null) gpuState.Text = T("管理者の確認がキャンセルされました。", "Administrator approval was cancelled.");
+                RefreshGpu();
+            };
+            box.Controls.Add(gpuNote);
+            box.Controls.Add(gpuState);
+            box.Controls.Add(gpuOn);
+            RefreshGpu();
+            return box;
+        }
+
+        void RefreshGpu()
+        {
+            if (gpuBusy) return;
+            bool driver = GpuAccel.DriverInstalled(), fw = GpuAccel.FirmwarePresent();
+            updatingGpu = true;
+            gpuOn.Checked = GpuAccel.Enabled;
+            updatingGpu = false;
+            gpuOn.Enabled = driver && (fw || gpuOn.Checked);
+            gpuState.Text = !driver ? T("GPU のドライバー（switchgpu）が入っていません。「ドライバー」タブから入れられます。", "The GPU driver (switchgpu) is not installed. It can be installed from the Drivers tab.")
+                          : !fw && !gpuOn.Checked ? T("GPU のファームウェアがありません。「ドライバー」タブのファームウェアの取り込みか SwitchPatcher で、nvidia\\gm20b を入れてください。",
+                                                    "The GPU firmware is missing. Add nvidia\\gm20b with the firmware import on the Drivers tab or with SwitchPatcher.")
+                          : GpuAccel.StatusLine() ?? (gpuOn.Checked ? T("オン（再起動すると動きます）", "On (runs after a restart)") : T("オフ", "Off"));
         }
 
         // ------------------------------------------------------- stage 3 tabs
@@ -844,6 +896,7 @@ namespace SwitchCenter
             try { fanStatus = FanControl.Get(); } catch (Win32Exception) { }
             if (fanStatus != null) fan = fanStatus.Percent;
             RefreshFan(fanStatus);
+            RefreshGpu();
 
             cpuValue.Text = cpu != null ? $"{cpu.Khz / 1000.0:0} MHz" : "—";
             tempValue.Text = cpu is { TempValid: true } ? $"{cpu.TempSoC}℃" : "—";
