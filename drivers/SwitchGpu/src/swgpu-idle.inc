@@ -6,6 +6,8 @@
 #define G1_D0_WAIT_MS 5000u
 #define G1_DRAIN_MS 20000u
 
+static BOOLEAN H2RecoverFromG1(PSWGPU_DEVICE Dev);   /* swgpu-h2.inc (0.18.0) */
+
 static BOOLEAN G1AllowedLocked(PSWGPU_DEVICE Dev)
 {
     return Dev->PowerPolicy && !Dev->PowerPaused && !Dev->PowerFinal &&
@@ -204,6 +206,9 @@ static VOID G1Worker(WDFWORKITEM WorkItem)
     KeReleaseSpinLock(&dev->PowerLock, oldIrql);
 
     if (allowed && (dev->BlitUnsafe || (dev->ResidentActive && dev->BlitReset))) {
+        /* 0.18.0 (H2c): a reset that DMA-stopped cleanly is recovered (GPU
+         * restart, user channels rebuilt); only an unsafe one switches G1 off. */
+        if (!dev->BlitUnsafe && H2RecoverFromG1(dev)) { G1TraceState(dev); goto unlock; }
         KeAcquireSpinLock(&dev->PowerLock, &oldIrql);
         dev->PowerDisabled = TRUE;
         dev->PowerWakeWanted = FALSE;
@@ -212,6 +217,7 @@ static VOID G1Worker(WDFWORKITEM WorkItem)
         goto unlock;
     }
     if (allowed && dev->ResidentActive && d0 && !dev->CopyInFlight && !dev->BlitReset &&
+        InterlockedCompareExchange(&dev->H2Channels, 0, 0) == 0 &&   /* 0.17.0: user channels hold power */
         InterlockedCompareExchange(&dev->BlitOnline, 0, 0) &&
         G1IdleMs(dev) >= dev->IdlePowerOffMs) {
         ULONG result;
