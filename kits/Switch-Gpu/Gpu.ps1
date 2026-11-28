@@ -17,6 +17,13 @@
   -Mode F4On / F4Off : choose display double buffering after restart.
   -Mode Cycle  : five Resident / 8-clear / Stop cycles using one DMA pool.
   -Mode VerboseOn / VerboseOff : change driver logging at the next device start.
+  -Mode Mem    : H1 (0.16.0). Two processes allocate GPU memory in their own GPU VA
+                 spaces, copy with CE2 and check; a third exits without FREE.
+                 Needs the resident GPU (Resident.cmd, or F3On + restart).
+  -Mode Chan   : H2a (0.17.0). Two processes each create a GPU channel in their own
+                 VA space, submit their own CE2 pushbuffers and wait on fences.
+  -Mode Fault  : H2c (0.18.0). One channel keeps copying while another causes an
+                 MMU fault and a third hangs; both are blamed and the GPU recovers.
 
   Log: C:\SwitchWOA-Gpu.txt
   This file must stay ASCII: Windows PowerShell 5.1 reads it as the ANSI code page.
@@ -25,9 +32,12 @@ param(
   [Parameter(Mandatory = $true)]
   [ValidateSet('Install', 'Status', 'Resident', 'ResidentStatus', 'ResidentStop',
                'Submit', 'Irq', 'Copy', 'Blit', 'Cycle', 'InstallDisplay',
-               'F3On', 'F3Off', 'F3Status', 'F4On', 'F4Off', 'Remove', 'VerboseOn', 'VerboseOff')]
+               'F3On', 'F3Off', 'F3Status', 'F4On', 'F4Off', 'Remove', 'VerboseOn', 'VerboseOff',
+               'Mem', 'MemWorker', 'Chan', 'ChanWorker', 'Fault', 'FaultWorker')]
   [string]$Mode,
-  [switch]$Detail
+  [switch]$Detail,
+  [int]$Seed = 0,
+  [switch]$Leak
 )
 
 $ErrorActionPreference = 'Continue'
@@ -42,8 +52,10 @@ function Sum([string]$s) { Log $s }
 $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 if (-not $isAdmin) { Write-Host 'Run this from an elevated (Administrator) prompt.'; exit 1 }
 try { [Console]::OutputEncoding = [Text.Encoding]::UTF8 } catch { }
-Log ''
-Log "=== Gpu $Mode  $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
+if ($Mode -notmatch 'Worker$') {   # H1 workers print to stdout; the parent writes the log
+  Log ''
+  Log "=== Gpu $Mode  $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
+}
 
 function Hex($v) { if ($null -eq $v) { 'n/a' } else { '0x' + (Key32 $v) } }
 function Key32($v) { if ($null -eq $v) { return '' }; $n = [long]$v; if ($n -lt 0) { $n += 4294967296 }; '{0:X8}' -f $n }
@@ -441,7 +453,585 @@ function Show-Trace([string]$AlreadyPrinted) {
   }
 }
 
+function Initialize-H1 {
+  # H1 (0.16.0): per-process GPU VA spaces. All logic in C# so a worker is fast.
+  $src = @'
+using System;
+using System.Collections.Generic;
+using System.Runtime.InteropServices;
+using System.Threading;
+using Microsoft.Win32.SafeHandles;
+public static class SwGpuH1 {
+  public const UInt32 IoAlloc = 0x22E020u, IoFree = 0x22E024u, IoCopy = 0x22E028u, IoInfo = 0x22E02Cu;
+  public const UInt32 StAccess = 0xC0000005u, StNotReady = 0xC00000A3u;
+  [StructLayout(LayoutKind.Sequential)] struct IfData { public Int32 cbSize; public Guid guid; public Int32 flags; public IntPtr reserved; }
+  [DllImport("setupapi.dll", CharSet=CharSet.Unicode, SetLastError=true)] static extern IntPtr SetupDiGetClassDevs(ref Guid g, IntPtr e, IntPtr w, UInt32 f);
+  [DllImport("setupapi.dll", SetLastError=true)] static extern bool SetupDiEnumDeviceInterfaces(IntPtr s, IntPtr d, ref Guid g, UInt32 i, ref IfData data);
+  [DllImport("setupapi.dll", CharSet=CharSet.Unicode, SetLastError=true)] static extern bool SetupDiGetDeviceInterfaceDetail(IntPtr s, ref IfData data, IntPtr detail, UInt32 size, out UInt32 required, IntPtr devinfo);
+  [DllImport("setupapi.dll", SetLastError=true)] static extern bool SetupDiDestroyDeviceInfoList(IntPtr s);
+  [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)] static extern SafeFileHandle CreateFile(string n, UInt32 a, UInt32 share, IntPtr sec, UInt32 disp, UInt32 flags, IntPtr template);
+  [DllImport("kernel32.dll", SetLastError=true)] static extern bool DeviceIoControl(SafeFileHandle h, UInt32 code, byte[] inBuf, UInt32 inSize, byte[] outBuf, UInt32 outSize, out UInt32 returned, IntPtr ov);
+  static SafeFileHandle keep;   // a leaking worker keeps its handle until process exit
+
+  public static SafeFileHandle Open() {
+    Guid g = new Guid("2cc9cb4d-6412-4f31-a781-5d781e094b63");
+    IntPtr set = SetupDiGetClassDevs(ref g, IntPtr.Zero, IntPtr.Zero, 0x12);
+    if (set == new IntPtr(-1)) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+    try {
+      for (UInt32 i = 0; i < 32; ++i) {
+        IfData d = new IfData(); d.cbSize = Marshal.SizeOf(typeof(IfData));
+        if (!SetupDiEnumDeviceInterfaces(set, IntPtr.Zero, ref g, i, ref d)) break;
+        UInt32 need; SetupDiGetDeviceInterfaceDetail(set, ref d, IntPtr.Zero, 0, out need, IntPtr.Zero);
+        if (need < 8) continue;
+        IntPtr b = Marshal.AllocHGlobal((int)need);
+        try {
+          Marshal.WriteInt32(b, IntPtr.Size == 8 ? 8 : 6);
+          if (!SetupDiGetDeviceInterfaceDetail(set, ref d, b, need, out need, IntPtr.Zero)) continue;
+          SafeFileHandle h = CreateFile(Marshal.PtrToStringUni(IntPtr.Add(b, 4)), 0xC0000000, 3, IntPtr.Zero, 3, 0, IntPtr.Zero);
+          if (!h.IsInvalid) return h;
+        } finally { Marshal.FreeHGlobal(b); }
+      }
+      throw new InvalidOperationException("SwitchGpu interface was not found");
+    } finally { SetupDiDestroyDeviceInfoList(set); }
+  }
+
+  // Returns the output words; Err is the Win32 error (0 = the IOCTL completed).
+  static UInt32[] Call(SafeFileHandle h, UInt32 code, UInt32[] input, int outWords, out int err) {
+    byte[] inb = new byte[input.Length * 4];
+    Buffer.BlockCopy(input, 0, inb, 0, inb.Length);
+    byte[] outb = new byte[Math.Max(outWords, 1) * 4];
+    UInt32 got;
+    err = 0;
+    if (!DeviceIoControl(h, code, inb, (UInt32)inb.Length, outb, (UInt32)(outWords * 4), out got, IntPtr.Zero))
+      err = Marshal.GetLastWin32Error();
+    UInt32[] w = new UInt32[Math.Max(outWords, 1)];
+    Buffer.BlockCopy(outb, 0, w, 0, outb.Length);
+    return w;
+  }
+
+  public class Buf { public UInt32 Handle, GpuVa, Bytes, Slot, Pages; public IntPtr Cpu; public int Err; }
+  public static Buf Alloc(SafeFileHandle h, UInt32 bytes) {
+    int err; UInt32[] w = Call(h, IoAlloc, new UInt32[] { 1u, bytes }, 8, out err);
+    Buf b = new Buf(); b.Err = err;
+    if (err == 0) {
+      b.Handle = w[1]; b.GpuVa = w[2]; b.Bytes = w[3]; b.Slot = w[4]; b.Pages = w[5];
+      b.Cpu = new IntPtr((long)(((UInt64)w[7] << 32) | w[6]));
+    }
+    return b;
+  }
+  public static int Free(SafeFileHandle h, UInt32 handle) { int err; Call(h, IoFree, new UInt32[] { 1u, handle }, 0, out err); return err; }
+  public static UInt32[] Info(SafeFileHandle h) {
+    int err; UInt32[] w = Call(h, IoInfo, new UInt32[0], 18, out err);
+    if (err != 0) throw new System.ComponentModel.Win32Exception(err);
+    return w;
+  }
+  // Copy with retries while the GPU wakes (G1) or a display present holds the gate.
+  public static UInt32[] Copy(SafeFileHandle h, UInt32 src, UInt32 dst, UInt32 bytes, out int err, out int retries) {
+    DateTime end = DateTime.Now.AddSeconds(20);
+    retries = 0;
+    while (true) {
+      UInt32[] w = Call(h, IoCopy, new UInt32[] { 1u, src, dst, bytes }, 16, out err);
+      bool again = (err == 170 || err == 21) || (err == 0 && w[1] == StNotReady);
+      if (!again || DateTime.Now > end) return w;
+      ++retries;
+      Thread.Sleep(err == 170 ? 2 : 100);
+    }
+  }
+  static string X(UInt32 v) { return "0x" + v.ToString("X8"); }
+  static void Fill(IntPtr p, int bytes, int seed, int round) {
+    UInt32[] w = new UInt32[bytes / 4];
+    for (int i = 0; i < w.Length; ++i) w[i] = ((UInt32)seed << 28) | ((UInt32)(round & 0xFF) << 20) | (UInt32)(i & 0xFFFFF);
+    byte[] b = new byte[bytes]; Buffer.BlockCopy(w, 0, b, 0, bytes);
+    Marshal.Copy(b, 0, p, bytes);
+  }
+  // -1 = equal; else first different byte offset.
+  static int Compare(IntPtr a, int aOff, IntPtr b, int bOff, int bytes) {
+    byte[] x = new byte[bytes], y = new byte[bytes];
+    Marshal.Copy(IntPtr.Add(a, aOff), x, 0, bytes);
+    Marshal.Copy(IntPtr.Add(b, bOff), y, 0, bytes);
+    for (int i = 0; i < bytes; ++i) if (x[i] != y[i]) return i;
+    return -1;
+  }
+  static int NonZero(IntPtr p, int off, int bytes) {
+    byte[] x = new byte[bytes]; Marshal.Copy(IntPtr.Add(p, off), x, 0, bytes);
+    for (int i = 0; i < bytes; ++i) if (x[i] != 0) return i;
+    return -1;
+  }
+  static string InfoLine(UInt32[] i) {
+    return String.Format("slot {0}; slots in use {1}; allocs {2}; pages {3}; GPU/SMMU PTEs {4}/{5}; foreign {6}; orphan {7}; isolation ok {8}; copies {9}; failures {10}; rejected {11}; pid {12}; quarantined {13}; resident {14}; online {15}",
+      i[1] == 0xFFFFFFFFu ? "-" : i[1].ToString(), i[2], i[3], i[4], i[5], i[6], i[7], i[8], i[9], i[10], i[11], i[12], i[13], i[14], i[16], i[17]);
+  }
+  public static string[] ParentInfo() {
+    using (SafeFileHandle h = Open()) { return new string[] { InfoLine(Info(h)) }; }
+  }
+
+  // seed 1: also allocates a third buffer; seed 2 tries to copy from that VA.
+  public static string[] Worker(int seed, int rounds, bool leak, string readyName, string goName) {
+    List<string> log = new List<string>();
+    string p = "W" + seed + ": ";
+    bool ok = true;
+    const int MiB = 1 << 20;
+    SafeFileHandle h = null;
+    try {
+      h = Open();
+      Buf a = Alloc(h, MiB), b = Alloc(h, MiB), c = null;
+      if (seed == 1 || leak) c = Alloc(h, 64 * 1024);
+      foreach (Buf x in new Buf[] { a, b, c }) {
+        if (x == null) continue;
+        if (x.Err != 0) { log.Add(p + "ALLOC failed, Win32 error " + x.Err); ok = false; }
+        else log.Add(p + String.Format("alloc handle {0}: GPU VA {1}, {2} bytes, slot {3}, CPU VA 0x{4:X}", x.Handle, X(x.GpuVa), x.Bytes, x.Slot, x.Cpu.ToInt64()));
+      }
+      if (!ok) { log.Add(p + "RESULT FAIL"); return log.ToArray(); }
+      if (a.GpuVa != 0x40000000u) { log.Add(p + "first buffer is not at GPU VA 0x40000000"); ok = false; }
+      log.Add(p + "info before start: " + InfoLine(Info(h)));
+      if (readyName != null && readyName.Length > 0) {
+        using (EventWaitHandle ready = new EventWaitHandle(false, EventResetMode.ManualReset, readyName)) ready.Set();
+        using (EventWaitHandle go = new EventWaitHandle(false, EventResetMode.ManualReset, goName)) {
+          if (!go.WaitOne(60000)) log.Add(p + "start signal not seen (continuing alone)");
+        }
+      }
+      UInt32[] inf = Info(h);
+      log.Add(p + "info at start: " + InfoLine(inf));
+      if (inf[9] != 1u) { log.Add(p + "isolation check FAILED"); ok = false; }
+
+      int err, retries, totalRetries = 0, done = 0;
+      UInt32 maxUs = 0;
+      for (int r = 0; r < rounds && ok; ++r) {
+        Fill(a.Cpu, MiB, seed, r);
+        UInt32[] cr = Copy(h, a.GpuVa, b.GpuVa, (UInt32)MiB, out err, out retries);
+        totalRetries += retries;
+        if (err != 0 || cr[1] != 0u) {
+          log.Add(p + String.Format("round {0}: copy failed, Win32 {1}, result {2}, fault {3}, PBDMA {4}, CE {5}", r, err, X(cr[1]), X(cr[12]), X(cr[13]), X(cr[14])));
+          if (cr[1] == StNotReady || err == 21) log.Add(p + "GPU is not resident: run Resident.cmd, or F3On.cmd and restart, then try again");
+          ok = false; break;
+        }
+        if (cr[3] > maxUs) maxUs = cr[3];
+        int bad = Compare(a.Cpu, 0, b.Cpu, 0, MiB);
+        if (bad >= 0) {
+          UInt32 got = (UInt32)Marshal.ReadInt32(b.Cpu, bad & ~3);
+          log.Add(p + String.Format("round {0}: MISMATCH at {1}: got {2} (seed in data {3})", r, bad, X(got), got >> 28));
+          ok = false; break;
+        }
+        ++done;
+      }
+      log.Add(p + String.Format("{0}/{1} rounds of 1 MiB copied and checked with this process's pattern (max wait {2} us, retries {3})", done, rounds, maxUs, totalRetries));
+
+      if (ok) {
+        // Sub-page copy: 1000 bytes, from offset 100 to offset 300, the rest of 8 KiB must stay zero.
+        Marshal.Copy(new byte[8192], 0, b.Cpu, 8192);
+        UInt32[] cr = Copy(h, a.GpuVa + 100u, b.GpuVa + 300u, 1000u, out err, out retries);
+        bool subOk = err == 0 && cr[1] == 0u && Compare(a.Cpu, 100, b.Cpu, 300, 1000) < 0 &&
+                     NonZero(b.Cpu, 0, 300) < 0 && NonZero(b.Cpu, 1300, 8192 - 1300) < 0;
+        log.Add(p + "sub-page copy (1000 bytes, offsets 100 -> 300): " + (subOk ? "OK" : "FAILED, result " + X(cr[1])));
+        ok &= subOk;
+      }
+      if (ok && c != null) {
+        Fill(a.Cpu, 64 * 1024, seed, 0xEE);
+        UInt32[] cr = Copy(h, a.GpuVa, c.GpuVa, 64u * 1024u, out err, out retries);
+        bool cOk = err == 0 && cr[1] == 0u && Compare(a.Cpu, 0, c.Cpu, 0, 64 * 1024) < 0;
+        log.Add(p + String.Format("copy into own third buffer at {0}: {1}", X(c.GpuVa), cOk ? "OK" : "FAILED, result " + X(cr[1])));
+        ok &= cOk;
+      }
+      if (ok) {
+        // Ranges this handle does not own must be refused.
+        UInt32 foreign = 0x40000000u + 514u * 4096u;   // seed 1's third buffer
+        var tests = new List<KeyValuePair<string, UInt32[]>>();
+        if (seed != 1 && c == null) tests.Add(new KeyValuePair<string, UInt32[]>("other process's buffer VA " + X(foreign), new UInt32[] { foreign, b.GpuVa, 4096u }));
+        tests.Add(new KeyValuePair<string, UInt32[]>("unallocated VA 0x41000000", new UInt32[] { 0x41000000u, b.GpuVa, 4096u }));
+        tests.Add(new KeyValuePair<string, UInt32[]>("past the end of a buffer", new UInt32[] { a.GpuVa + (UInt32)MiB - 4096u, b.GpuVa, 8192u }));
+        tests.Add(new KeyValuePair<string, UInt32[]>("below the user window", new UInt32[] { 0x20000000u, b.GpuVa, 4096u }));
+        foreach (var t in tests) {
+          UInt32[] cr = Copy(h, t.Value[0], t.Value[1], t.Value[2], out err, out retries);
+          bool refused = err == 0 && cr[1] == StAccess;
+          log.Add(p + "copy from " + t.Key + ": " + (refused ? "refused (OK)" : "NOT refused, result " + X(cr[1]) + ", Win32 " + err));
+          ok &= refused;
+        }
+      }
+      log.Add(p + "info at end: " + InfoLine(Info(h)));
+      if (leak) {
+        keep = h; h = null;
+        log.Add(p + "leaving without FREE: process exit must clean up");
+      } else {
+        foreach (Buf x in new Buf[] { a, b, c }) if (x != null && Free(h, x.Handle) != 0) { log.Add(p + "FREE failed"); ok = false; }
+        UInt32[] after = Info(h);
+        if (after[3] != 0u || after[4] != 0u) { log.Add(p + "allocations left after FREE"); ok = false; }
+      }
+    } catch (Exception e) {
+      log.Add(p + "error: " + e.Message);
+      ok = false;
+    } finally {
+      if (h != null) h.Dispose();
+    }
+    log.Add(p + "RESULT " + (ok ? "PASS" : "FAIL"));
+    return log.ToArray();
+  }
+  // ---- H2a (0.17.0): one channel per VA space, user pushbuffers, fences ----
+  public const UInt32 IoChannel = 0x22E030u, IoSubmit = 0x22E034u, IoWait = 0x22E038u;
+  public static UInt32[] Channel(SafeFileHandle h, UInt32 op, out int err) {
+    DateTime end = DateTime.Now.AddSeconds(20);
+    while (true) {
+      UInt32[] w = Call(h, IoChannel, new UInt32[] { 1u, op }, 16, out err);
+      bool again = err == 170 || err == 21 || (err == 0 && w[1] == StNotReady);
+      if (!again || DateTime.Now > end) return w;
+      Thread.Sleep(err == 170 ? 2 : 100);
+    }
+  }
+  public static UInt32[] Submit(SafeFileHandle h, UInt32 va, UInt32 dwords, out int err) {
+    DateTime end = DateTime.Now.AddSeconds(5);
+    while (true) {
+      UInt32[] w = Call(h, IoSubmit, new UInt32[] { 1u, va, dwords, 0u }, 16, out err);
+      bool again = err == 170 || (err == 0 && w[1] == 0x80000011u);   // gate busy / ring full
+      if (!again || DateTime.Now > end) return w;
+      Thread.Sleep(1);
+    }
+  }
+  public static UInt32[] Wait(SafeFileHandle h, UInt32 fence, UInt32 ms, out int err) {
+    return Call(h, IoWait, new UInt32[] { 1u, fence, ms }, 8, out err);   // 0.18.0: 8 words
+  }
+  static UInt32 M(UInt32 sub, UInt32 method, UInt32 count) { return 0x20000000u | (count << 16) | (sub << 13) | (method >> 2); }
+  // CE2 copy of bytes (multiple of 4 KiB) src -> dst, CE semaphore, host acquire of it.
+  static int BuildCopy(IntPtr push, UInt32 pushVa, UInt32 src, UInt32 dst, UInt32 bytes, UInt32 payload) {
+    UInt32 sem = pushVa + 0xF000u;
+    UInt32[] w = new UInt32[] {
+      0x60010000u | (4u << 13), 0xB0B5u,
+      M(4, 0x240, 3), 0u, sem, payload,
+      M(4, 0x400, 8), 0u, src, 0u, dst, 4096u, 4096u, 4096u, bytes / 4096u,
+      M(4, 0x300, 1), 0x38Eu,
+      M(0, 0x10, 4), 0u, sem, payload, 1u };
+    byte[] b = new byte[w.Length * 4]; Buffer.BlockCopy(w, 0, b, 0, b.Length);
+    Marshal.Copy(b, 0, push, b.Length);
+    Marshal.WriteInt32(push, 0xF000, 0);
+    return w.Length;
+  }
+  static string ChLine(UInt32[] c) {
+    return String.Format("result {0}, chid {1}, slot {2}, runlist {3} entries ({4} polls), preempt polls {5}, ccsr {6}/{7}, engine {8}, fifo intr {9}, PBDMA intr {10}, MMU fault {11}, ctx magic {12}, priv PTEs {13}",
+      X(c[1]), c[2], c[3], c[5], c[6], c[7], X(c[8]), X(c[9]), X(c[10]), X(c[11]), X(c[12]), X(c[13]), X(c[14]), c[15]);
+  }
+  static string SubLine(UInt32[] r) {
+    return String.Format("result {0}, fence {1}, completed {2}, put/get {3}/{4}, ccsr {5}, engine {6}, fifo intr {7}, PBDMA intr {8}, MMU fault {9}, GR intr {10}, FECS ctx {11}, CE intr {12}, lost {13}",
+      X(r[1]), r[2], r[3], r[4], r[5], X(r[7]), X(r[8]), X(r[9]), X(r[10]), X(r[11]), X(r[12]), X(r[13]), X(r[14]), r[15]);
+  }
+  public static string[] ChanWorker(int seed, int rounds, bool leak, string readyName, string goName) {
+    List<string> log = new List<string>();
+    string p = "C" + seed + ": ";
+    bool ok = true;
+    const int MiB = 1 << 20;
+    SafeFileHandle h = null;
+    try {
+      h = Open();
+      Buf a = Alloc(h, MiB), b = Alloc(h, MiB), pb = Alloc(h, 64 * 1024);
+      foreach (Buf x in new Buf[] { a, b, pb }) {
+        if (x.Err != 0) { log.Add(p + "ALLOC failed, Win32 error " + x.Err); ok = false; }
+        else log.Add(p + String.Format("alloc handle {0}: GPU VA {1}, {2} bytes, slot {3}", x.Handle, X(x.GpuVa), x.Bytes, x.Slot));
+      }
+      if (!ok) { log.Add(p + "RESULT FAIL"); return log.ToArray(); }
+      int err;
+      UInt32[] ch = Channel(h, 1u, out err);
+      log.Add(p + "channel create: " + (err != 0 ? "Win32 " + err : ChLine(ch)));
+      if (err != 0 || ch[1] != 0u) {
+        if (err == 0 && ch[1] == StNotReady) log.Add(p + "GPU is not resident: run Resident.cmd, or F3On.cmd and restart, then try again");
+        log.Add(p + "RESULT FAIL"); return log.ToArray();
+      }
+      log.Add(p + "info before start: " + InfoLine(Info(h)));
+      if (readyName != null && readyName.Length > 0) {
+        using (EventWaitHandle ready = new EventWaitHandle(false, EventResetMode.ManualReset, readyName)) ready.Set();
+        using (EventWaitHandle go = new EventWaitHandle(false, EventResetMode.ManualReset, goName)) {
+          if (!go.WaitOne(60000)) log.Add(p + "start signal not seen (continuing alone)");
+        }
+      }
+      log.Add(p + "info at start: " + InfoLine(Info(h)));
+      int done = 0; UInt32 maxUs = 0;
+      for (int r = 0; r < rounds && ok; ++r) {
+        Fill(a.Cpu, MiB, seed, r);
+        int n = BuildCopy(pb.Cpu, pb.GpuVa, a.GpuVa, b.GpuVa, (UInt32)MiB, 0xC1000000u | ((UInt32)seed << 16) | (UInt32)r);
+        UInt32[] sr = Submit(h, pb.GpuVa, (UInt32)n, out err);
+        if (err != 0 || sr[1] != 0u) { log.Add(p + String.Format("round {0}: submit failed, Win32 {1}: {2}", r, err, SubLine(sr))); ok = false; break; }
+        UInt32[] wr = Wait(h, sr[2], 2000u, out err);
+        if (err != 0 || wr[1] != 0u) {
+          log.Add(p + String.Format("round {0}: fence {1} not reached, Win32 {2}, result {3}, completed {4}, lost {5}", r, sr[2], err, X(wr[1]), wr[2], wr[5]));
+          UInt32[] st = Submit(h, 0x41000000u, 1u, out err);   // refused, but returns the current registers
+          log.Add(p + "registers: " + SubLine(st));
+          ok = false; break;
+        }
+        if (wr[3] > maxUs) maxUs = wr[3];
+        int bad = Compare(a.Cpu, 0, b.Cpu, 0, MiB);
+        if (bad >= 0) {
+          UInt32 got = (UInt32)Marshal.ReadInt32(b.Cpu, bad & ~3);
+          log.Add(p + String.Format("round {0}: MISMATCH at {1}: got {2} (seed in data {3})", r, bad, X(got), got >> 28));
+          ok = false; break;
+        }
+        ++done;
+      }
+      log.Add(p + String.Format("{0}/{1} rounds: own pushbuffer on own channel copied 1 MiB, fence reached, data checked (max wait {2} us)", done, rounds, maxUs));
+      if (ok) {
+        UInt32[] sr = Submit(h, 0x41000000u, 4u, out err);
+        bool refused = err == 0 && sr[1] == StAccess;
+        log.Add(p + "submit of a pushbuffer outside own memory: " + (refused ? "refused (OK)" : "NOT refused, " + SubLine(sr)));
+        ok &= refused;
+      }
+      log.Add(p + "info at end: " + InfoLine(Info(h)));
+      if (leak) {
+        keep = h; h = null;
+        log.Add(p + "leaving without destroying the channel or FREE: process exit must clean up");
+      } else {
+        UInt32[] dr = Channel(h, 2u, out err);
+        log.Add(p + "channel destroy: " + (err != 0 ? "Win32 " + err : ChLine(dr)));
+        if (err != 0 || dr[1] != 0u) ok = false;
+        foreach (Buf x in new Buf[] { a, b, pb }) if (Free(h, x.Handle) != 0) { log.Add(p + "FREE failed"); ok = false; }
+      }
+    } catch (Exception e) {
+      log.Add(p + "error: " + e.Message);
+      ok = false;
+    } finally {
+      if (h != null) h.Dispose();
+    }
+    log.Add(p + "RESULT " + (ok ? "PASS" : "FAIL"));
+    return log.ToArray();
+  }
+  // ---- H2c (0.18.0): fault and hang recovery ----
+  public const UInt32 StFaulted = 0xC0000185u;
+  // Copy + fence on an existing channel; true when the data matches.
+  static bool GoodRound(SafeFileHandle h, Buf a, Buf b, Buf pb, int seed, int r, List<string> log, string p, out UInt32 recovered) {
+    int err;
+    recovered = 0;
+    Fill(a.Cpu, 1 << 20, seed, r);
+    int n = BuildCopy(pb.Cpu, pb.GpuVa, a.GpuVa, b.GpuVa, 1u << 20, 0xC2000000u | ((UInt32)seed << 16) | (UInt32)(r & 0xFFFF));
+    UInt32[] sr = Submit(h, pb.GpuVa, (UInt32)n, out err);
+    if (err != 0 || sr[1] != 0u) { log.Add(p + String.Format("round {0}: submit failed, Win32 {1}: {2}", r, err, SubLine(sr))); return false; }
+    UInt32[] wr = Wait(h, sr[2], 10000u, out err);
+    recovered = wr[6];
+    if (err != 0 || wr[1] != 0u) {
+      log.Add(p + String.Format("round {0}: fence {1} not reached, Win32 {2}, result {3}, completed {4}, lost {5}", r, sr[2], err, X(wr[1]), wr[2], wr[5]));
+      return false;
+    }
+    int bad = Compare(a.Cpu, 0, b.Cpu, 0, 1 << 20);
+    if (bad >= 0) {
+      UInt32 got = (UInt32)Marshal.ReadInt32(b.Cpu, bad & ~3);
+      log.Add(p + String.Format("round {0}: MISMATCH at {1}: got {2} (seed in data {3})", r, bad, X(got), got >> 28));
+      return false;
+    }
+    return true;
+  }
+  // role 1 = innocent (copies until doneName is set), 2 = MMU fault, 3 = hang.
+  public static string[] FaultWorker(int role, string readyName, string goName, string doneName) {
+    List<string> log = new List<string>();
+    string p = "F" + role + ": ";
+    bool ok = true;
+    SafeFileHandle h = null;
+    int err;
+    try {
+      h = Open();
+      Buf a = Alloc(h, 1u << 20), b = Alloc(h, 1u << 20), pb = Alloc(h, 64 * 1024);
+      if (a.Err != 0 || b.Err != 0 || pb.Err != 0) { log.Add(p + "ALLOC failed"); log.Add(p + "RESULT FAIL"); return log.ToArray(); }
+      UInt32[] ch = Channel(h, 1u, out err);
+      log.Add(p + "channel create: " + (err != 0 ? "Win32 " + err : ChLine(ch)));
+      if (err != 0 || ch[1] != 0u) { log.Add(p + "RESULT FAIL"); return log.ToArray(); }
+      if (readyName != null && readyName.Length > 0) {
+        using (EventWaitHandle ready = new EventWaitHandle(false, EventResetMode.ManualReset, readyName)) ready.Set();
+        using (EventWaitHandle go = new EventWaitHandle(false, EventResetMode.ManualReset, goName)) go.WaitOne(60000);
+      }
+      UInt32 rec;
+      if (role == 1) {
+        int r = 0, recSeen = 0;
+        DateTime end = DateTime.Now.AddSeconds(150);
+        using (EventWaitHandle done = new EventWaitHandle(false, EventResetMode.ManualReset, doneName)) {
+          while (ok && DateTime.Now < end && !done.WaitOne(0)) {
+            ok = GoodRound(h, a, b, pb, 1, r, log, p, out rec);
+            if (rec != 0u) ++recSeen;
+            ++r;
+          }
+        }
+        log.Add(p + String.Format("innocent: {0} rounds of 1 MiB copied and checked while the others faulted (waits that saw a recovery: {1})", ok ? r : r - 1, recSeen));
+        if (r < 5) { log.Add(p + "too few rounds"); ok = false; }
+      } else {
+        for (int r = 0; r < 3 && ok; ++r) ok = GoodRound(h, a, b, pb, role, r, log, p, out rec);
+        log.Add(p + "3 good rounds before the bad one: " + (ok ? "OK" : "FAILED"));
+        if (ok) {
+          UInt32[] w;
+          if (role == 2) {
+            // CE2 copy from a VA this channel does not map: GMMU fault.
+            w = new UInt32[] { 0x60010000u | (4u << 13), 0xB0B5u,
+              M(4, 0x400, 8), 0u, 0x41000000u, 0u, b.GpuVa, 4096u, 4096u, 4096u, 1u,
+              M(4, 0x300, 1), 0x386u };
+          } else {
+            // Host semaphore acquire of a value that is never written: hang.
+            Marshal.WriteInt32(pb.Cpu, 0xF100, 0);
+            w = new UInt32[] { M(0, 0x10, 4), 0u, pb.GpuVa + 0xF100u, 0xDEADu, 1u };
+          }
+          byte[] bytes = new byte[w.Length * 4]; Buffer.BlockCopy(w, 0, bytes, 0, bytes.Length);
+          Marshal.Copy(bytes, 0, pb.Cpu, bytes.Length);
+          DateTime t0 = DateTime.Now;
+          UInt32[] sr = Submit(h, pb.GpuVa, (UInt32)w.Length, out err);
+          log.Add(p + (role == 2 ? "faulting" : "hanging") + " pushbuffer submitted: " + SubLine(sr));
+          UInt32[] wr = Wait(h, sr[2], 10000u, out err);
+          double sec = (DateTime.Now - t0).TotalSeconds;
+          bool faulted = err == 0 && wr[1] == StFaulted;
+          log.Add(p + String.Format("wait: result {0} after {1:F1} s, completed {2}, recovered here {3}: {4}", X(wr[1]), sec, wr[2], wr[6],
+            faulted ? "blamed as expected (OK)" : "NOT reported as faulted"));
+          ok &= faulted;
+          UInt32[] again = Submit(h, pb.GpuVa, 1u, out err);
+          bool refused = err == 0 && again[1] == StFaulted;
+          log.Add(p + "next submit on the blamed channel: " + (refused ? "refused as faulted (OK)" : "result " + X(again[1])));
+          ok &= refused;
+          UInt32[] dr = Channel(h, 2u, out err);
+          log.Add(p + "destroy blamed channel: " + (err != 0 ? "Win32 " + err : "result " + X(dr[1])));
+          UInt32[] nc = Channel(h, 1u, out err);
+          log.Add(p + "new channel: " + (err != 0 ? "Win32 " + err : ChLine(nc)));
+          if (err != 0 || nc[1] != 0u) ok = false;
+          for (int r = 10; r < 13 && ok; ++r) ok = GoodRound(h, a, b, pb, role, r, log, p, out rec);
+          log.Add(p + "3 good rounds on the new channel: " + (ok ? "OK" : "FAILED"));
+        }
+      }
+      Channel(h, 2u, out err);
+      foreach (Buf x in new Buf[] { a, b, pb }) Free(h, x.Handle);
+    } catch (Exception e) {
+      log.Add(p + "error: " + e.Message);
+      ok = false;
+    } finally {
+      if (h != null) h.Dispose();
+    }
+    log.Add(p + "RESULT " + (ok ? "PASS" : "FAIL"));
+    return log.ToArray();
+  }
+}
+'@
+  if (-not ('SwGpuH1' -as [type])) { Add-Type -TypeDefinition $src -Language CSharp }
+}
+
+function Invoke-H1Mem([string]$WorkerMode = 'MemWorker', [string]$Tag = 'H1') {
+  Initialize-H1
+  $ps = Join-Path $PSHOME 'powershell.exe'
+  $self = $MyInvocation.PSCommandPath
+  if (-not $self) { $self = Join-Path $Here 'Gpu.ps1' }
+  $tmp = Join-Path $env:TEMP ('swgpu-' + $Tag.ToLower())
+  New-Item -ItemType Directory -Force $tmp | Out-Null
+  try { Sum ($Tag + ' parent before: ' + ([SwGpuH1]::ParentInfo() -join ' ')) } catch { Sum ($Tag + ' IOCTL failed (switchgpu 0.16.0 or later required): ' + $_.Exception.Message); return }
+  $go = New-Object System.Threading.EventWaitHandle($false, [System.Threading.EventResetMode]::ManualReset, ('Local\SwGpu' + $Tag + 'Go'))
+  $go.Reset() | Out-Null
+  $ready = @()
+  $procs = @()
+  foreach ($seed in 1, 2) {
+    $ev = New-Object System.Threading.EventWaitHandle($false, [System.Threading.EventResetMode]::ManualReset, ('Local\SwGpu' + $Tag + 'Ready' + $seed))
+    $ev.Reset() | Out-Null
+    $ready += $ev
+    $out = Join-Path $tmp ('w' + $seed + '.txt')
+    Remove-Item $out -ErrorAction SilentlyContinue
+    $procs += Start-Process -FilePath $ps -PassThru -NoNewWindow -RedirectStandardOutput $out `
+      -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ('"' + $self + '"'), '-Mode', $WorkerMode, '-Seed', $seed)
+  }
+  # WaitAll is not allowed on the STA thread of Windows PowerShell: wait one by one.
+  $deadline = (Get-Date).AddSeconds(90)
+  $both = $true
+  foreach ($ev in $ready) {
+    $left = [int][Math]::Max(0, ($deadline - (Get-Date)).TotalMilliseconds)
+    if (-not $ev.WaitOne($left)) { $both = $false }
+  }
+  Sum ($Tag + ' both workers allocated before the start signal: ' + $(if ($both) { 'yes' } else { 'no (timeout)' }))
+  $go.Set() | Out-Null
+  foreach ($p in $procs) { if (-not $p.WaitForExit(240000)) { Sum ($Tag + ' worker pid {0} did not finish; stopping it' -f $p.Id); $p.Kill() } }
+  $pass = $both
+  $slots = @()
+  foreach ($seed in 1, 2) {
+    $lines = @(Get-Content (Join-Path $tmp ('w' + $seed + '.txt')) -ErrorAction SilentlyContinue)
+    if (-not $lines.Count) { Sum (('{0}: no output') -f $seed); $pass = $false }
+    foreach ($l in $lines) { Sum $l }
+    if (-not ($lines -match 'RESULT PASS')) { $pass = $false }
+    $m = $lines | Select-String -Pattern 'info at start: slot (\d+); slots in use (\d+)' | Select-Object -First 1
+    if ($m) {
+      $slots += [int]$m.Matches[0].Groups[1].Value
+      if ([int]$m.Matches[0].Groups[2].Value -lt 2) { Sum ('W{0}: fewer than 2 VA spaces were live at the start' -f $seed); $pass = $false }
+    }
+  }
+  if ($slots.Count -eq 2 -and $slots[0] -eq $slots[1]) { Sum ($Tag + ' both workers got the same VA space: FAIL'); $pass = $false }
+  # Third process: allocates and exits without FREE; its VA space must come back.
+  $out3 = Join-Path $tmp 'w3.txt'
+  Remove-Item $out3 -ErrorAction SilentlyContinue
+  $p3 = Start-Process -FilePath $ps -PassThru -NoNewWindow -RedirectStandardOutput $out3 `
+    -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ('"' + $self + '"'), '-Mode', $WorkerMode, '-Seed', 3, '-Leak')
+  if (-not $p3.WaitForExit(240000)) { $p3.Kill(); $pass = $false }
+  foreach ($l in @(Get-Content $out3 -ErrorAction SilentlyContinue)) { Sum $l }
+  Start-Sleep -Milliseconds 500
+  $after = [SwGpuH1]::ParentInfo() -join ' '
+  Sum ($Tag + ' parent after: ' + $after)
+  if ($after -notmatch 'slots in use 0;') { Sum ($Tag + ' a VA space was not returned after its process exited: FAIL'); $pass = $false }
+  $q = Get-ItemProperty $Key -ErrorAction SilentlyContinue
+  Sum ($Tag + ' driver: cleanups {0}; last copy result {1}; meta PA {2}; H2 cleanups {3}; last channel create/submit {4}/{5}' -f $q.H1Cleanups, (Hex $q.H1LastCopyResult), (Hex $q.H1MetaPa), $q.H2Cleanups, (Hex $q.H2LastCreateResult), (Hex $q.H2LastSubmitResult))
+  Sum ($Tag + ' RESULT ' + $(if ($pass) { $(if ($WorkerMode -eq 'ChanWorker') { 'PASS: two processes ran their own pushbuffers on their own channels in separate GPU VA spaces' } else { 'PASS: two processes copied with CE2 in separate GPU VA spaces and could not reach each other' }) } else { 'FAIL (see the lines above)' }))
+}
+
+function Invoke-H2Fault {
+  # H2c (0.18.0): one innocent channel keeps copying while a second channel
+  # causes an MMU fault and then a third one hangs. Both must be blamed and
+  # recovered without stopping the GPU for good.
+  Initialize-H1
+  $ps = Join-Path $PSHOME 'powershell.exe'
+  $self = $MyInvocation.PSCommandPath
+  if (-not $self) { $self = Join-Path $Here 'Gpu.ps1' }
+  $tmp = Join-Path $env:TEMP 'swgpu-h2c'
+  New-Item -ItemType Directory -Force $tmp | Out-Null
+  try { Sum ('H2c parent before: ' + ([SwGpuH1]::ParentInfo() -join ' ')) } catch { Sum ('H2c IOCTL failed (switchgpu 0.18.0 or later required): ' + $_.Exception.Message); return }
+  $q0 = Get-ItemProperty $Key -ErrorAction SilentlyContinue
+  $rec0 = if ($null -ne $q0.H2Recoveries) { [int]$q0.H2Recoveries } else { 0 }
+  $mk = { param($n) $e = New-Object System.Threading.EventWaitHandle($false, [System.Threading.EventResetMode]::ManualReset, $n); $e.Reset() | Out-Null; $e }
+  $go = & $mk 'Local\SwGpuH3Go'
+  $done = & $mk 'Local\SwGpuH3Done'
+  $r1 = & $mk 'Local\SwGpuH3Ready1'
+  $r2 = & $mk 'Local\SwGpuH3Ready2'
+  $start = {
+    param($role)
+    $out = Join-Path $tmp ('f' + $role + '.txt')
+    Remove-Item $out -ErrorAction SilentlyContinue
+    Start-Process -FilePath $ps -PassThru -NoNewWindow -RedirectStandardOutput $out `
+      -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ('"' + $self + '"'), '-Mode', 'FaultWorker', '-Seed', $role)
+  }
+  $p1 = & $start 1
+  $p2 = & $start 2
+  $both = $r1.WaitOne(90000) -and $r2.WaitOne(90000)
+  Sum ('H2c innocent and faulting workers ready: ' + $(if ($both) { 'yes' } else { 'no (timeout)' }))
+  $go.Set() | Out-Null
+  if (-not $p2.WaitForExit(240000)) { $p2.Kill() }
+  $p3 = & $start 3
+  if (-not $p3.WaitForExit(240000)) { $p3.Kill() }
+  $done.Set() | Out-Null
+  if (-not $p1.WaitForExit(240000)) { $p1.Kill() }
+  $pass = $both
+  foreach ($role in 1, 2, 3) {
+    $lines = @(Get-Content (Join-Path $tmp ('f' + $role + '.txt')) -ErrorAction SilentlyContinue)
+    if (-not $lines.Count) { Sum ('F{0}: no output' -f $role); $pass = $false }
+    foreach ($l in $lines) { Sum $l }
+    if (-not ($lines -match 'RESULT PASS')) { $pass = $false }
+  }
+  Start-Sleep -Milliseconds 500
+  $after = [SwGpuH1]::ParentInfo() -join ' '
+  Sum ('H2c parent after: ' + $after)
+  if ($after -notmatch 'slots in use 0;') { $pass = $false }
+  $q = Get-ItemProperty $Key -ErrorAction SilentlyContinue
+  $rec = if ($null -ne $q.H2Recoveries) { [int]$q.H2Recoveries } else { 0 }
+  Sum ('H2c recoveries this run {0} (refused {1}); last: reason {2} (1 fault 2 hang 3 reset 4 G1), culprit chid {3}, MMU fault {4}, fault inst {5}, engine {6}, PBDMA channel {7}, result {8}, {9} us, channels rebuilt {10}' -f `
+    ($rec - $rec0), $q.H2RecoverRefused, $q.H2LastReason, $q.H2LastCulprit, (Hex $q.H2LastMmuFault), (Hex $q.H2LastFaultInst), (Hex $q.H2LastEngineStatus), (Hex $q.H2LastPbdmaChannel), (Hex $q.H2LastRecoverResult), $q.H2LastRecoverUs, $q.H2LastRebuilt)
+  if (($rec - $rec0) -lt 2) { Sum 'H2c expected at least 2 recoveries'; $pass = $false }
+  Sum ('H2c RESULT ' + $(if ($pass) { 'PASS: a faulting and a hanging channel were blamed and recovered while another process kept its data correct' } else { 'FAIL (see the lines above)' }))
+}
+
 switch ($Mode) {
+  'Mem' { Invoke-H1Mem; Show-Device }
+  'Chan' { Invoke-H1Mem 'ChanWorker' 'H2'; Show-Device }
+  'Fault' { Invoke-H2Fault; Show-Device }
+  'FaultWorker' {
+    Initialize-H1
+    $readyName = if ($Seed -ge 1 -and $Seed -le 2) { 'Local\SwGpuH3Ready' + $Seed } else { '' }
+    [SwGpuH1]::FaultWorker($Seed, $readyName, 'Local\SwGpuH3Go', 'Local\SwGpuH3Done') | ForEach-Object { Write-Output $_ }
+  }
+  'ChanWorker' {
+    Initialize-H1
+    $readyName = if ($Seed -ge 1 -and $Seed -le 2) { 'Local\SwGpuH2Ready' + $Seed } else { '' }
+    [SwGpuH1]::ChanWorker($Seed, 40, [bool]$Leak, $readyName, 'Local\SwGpuH2Go') | ForEach-Object { Write-Output $_ }
+  }
+  'MemWorker' {
+    Initialize-H1
+    $readyName = if ($Seed -ge 1 -and $Seed -le 2) { 'Local\SwGpuH1Ready' + $Seed } else { '' }
+    [SwGpuH1]::Worker($Seed, 40, [bool]$Leak, $readyName, 'Local\SwGpuH1Go') | ForEach-Object { Write-Output $_ }
+  }
   'Install' {
     $inf = Join-Path $Here 'switchgpu.inf'
     if (-not (Test-Path $inf)) { Sum "missing: $inf"; break }

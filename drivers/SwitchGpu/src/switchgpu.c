@@ -39,7 +39,7 @@
 #include <spb.h>
 #include "swgpu-blit.h"
 
-#define SWGPU_VERSION      0x00000F02u   /* 0.15.2 */
+#define SWGPU_VERSION      0x00001200u   /* 0.18.0 */
 
 #define CAR_PHYS           0x60006000ull
 #define CAR_LEN            0x1000u
@@ -282,6 +282,10 @@ typedef struct _SWGPU_DEVICE {
     BOOLEAN        CopyInFlight;
     volatile LONG  BlitGate;
     volatile LONG  BlitOnline;
+    volatile LONG  H2Channels;   /* Claude 0.17.0: user channels alive; G1 keeps the GPU on */
+    ULONG          ResidentGen;  /* bumped by every resident shutdown: H2 channels are lost */
+    BOOLEAN        AbortValid;   /* 0.18.0: registers F2Abort saw before its reset (H2c culprit) */
+    ULONG          AbortMmu, AbortEngine, AbortInst, AbortPbdmaChan;
     /* G1 scheduler fields under PowerLock. Hardware state under BlitGate. */
     WDFTIMER       PowerTimer;
     WDFWORKITEM    PowerWork;
@@ -8221,6 +8225,7 @@ static ULONG B3eResidentShutdown(PSWGPU_DEVICE Dev, BOOLEAN DrainIsrs)
         Dev->ResidentIdleRefHeld = FALSE;
     }
     Dev->ResidentActive = FALSE;
+    ++Dev->ResidentGen;
     g_ResidentOwner = NULL;
     Dev->ResidentShutdownResult = error;
     TraceDurable(L"B3eShutdownResult", error);
@@ -8229,6 +8234,8 @@ static ULONG B3eResidentShutdown(PSWGPU_DEVICE Dev, BOOLEAN DrainIsrs)
 }
 
 #include "swgpu-idle.inc"
+#include "swgpu-h1.inc"
+#include "swgpu-h2.inc"
 
 static VOID B3eResidentStatus(PSWGPU_DEVICE Dev, PSWGPU_RESIDENT_STATUS Out)
 {
@@ -8292,6 +8299,57 @@ static VOID SwGpuDispatchIoctl(WDFQUEUE Queue, WDFREQUEST Request,
     if (Dev->BlitReset && IoControlCode != IOCTL_SWGPU_RESIDENT_STATUS &&
         IoControlCode != IOCTL_SWGPU_RESIDENT_STOP) {
         WdfRequestComplete(Request, STATUS_DEVICE_NOT_READY);
+        return;
+    }
+    if (IoControlCode == IOCTL_SWGPU_H1_COPY) {
+        /* Claude 0.16.0 (H1): CE2 copy inside the caller's own VA space. */
+        SWGPU_H1_COPY_IN copyIn;
+        PVOID in = NULL, outBuf = NULL;
+        WDFFILEOBJECT file = WdfRequestGetFileObject(Request);
+        status = file == NULL ? STATUS_INVALID_DEVICE_REQUEST :
+            WdfRequestRetrieveInputBuffer(Request, sizeof(SWGPU_H1_COPY_IN), &in, NULL);
+        if (NT_SUCCESS(status))
+            status = WdfRequestRetrieveOutputBuffer(Request, sizeof(SWGPU_H1_COPY_OUT), &outBuf, NULL);
+        if (!NT_SUCCESS(status)) { WdfRequestComplete(Request, status); return; }
+        copyIn = *(SWGPU_H1_COPY_IN *)in;
+        (VOID)H1Copy(Dev, SwGpuH1File(file), &copyIn, (SWGPU_H1_COPY_OUT *)outBuf);
+        /* The result is in the output; the IOCTL itself succeeds. */
+        WdfRequestCompleteWithInformation(Request, STATUS_SUCCESS, sizeof(SWGPU_H1_COPY_OUT));
+        return;
+    }
+    if (IoControlCode == IOCTL_SWGPU_H2_CHANNEL || IoControlCode == IOCTL_SWGPU_H2_SUBMIT) {
+        /* Claude 0.17.0 (H2a): user channel create/destroy and pushbuffer submit. */
+        PVOID in = NULL, outBuf = NULL;
+        WDFFILEOBJECT file = WdfRequestGetFileObject(Request);
+        BOOLEAN chan = IoControlCode == IOCTL_SWGPU_H2_CHANNEL;
+        status = file == NULL ? STATUS_INVALID_DEVICE_REQUEST :
+            WdfRequestRetrieveInputBuffer(Request, chan ? sizeof(SWGPU_H2_CHANNEL_IN) : sizeof(SWGPU_H2_SUBMIT_IN), &in, NULL);
+        if (NT_SUCCESS(status))
+            status = WdfRequestRetrieveOutputBuffer(Request, chan ? sizeof(SWGPU_H2_CHANNEL_OUT) : sizeof(SWGPU_H2_SUBMIT_OUT), &outBuf, NULL);
+        if (!NT_SUCCESS(status)) { WdfRequestComplete(Request, status); return; }
+        if (chan) {
+            SWGPU_H2_CHANNEL_IN ci = *(SWGPU_H2_CHANNEL_IN *)in;
+            SWGPU_H2_CHANNEL_OUT *co = (SWGPU_H2_CHANNEL_OUT *)outBuf;
+            RtlZeroMemory(co, sizeof(*co));
+            co->Version = SWGPU_VERSION;
+            if (ci.Version != SWGPU_H1_VERSION) co->Result = (ULONG)STATUS_INVALID_PARAMETER;
+            else if (ci.Op == 1u) (VOID)H2Create(Dev, SwGpuH1File(file), co);
+            else if (ci.Op == 2u) {
+                H1Lock();
+                co->Result = SwGpuH1File(file)->Channel == NULL ? (ULONG)STATUS_INVALID_DEVICE_STATE : 0u;
+                H2Destroy(Dev, SwGpuH1File(file), co, InterlockedCompareExchange(&Dev->BlitOnline, 0, 0) != 0);
+                H1Unlock();
+            } else co->Result = (ULONG)STATUS_INVALID_PARAMETER;
+            WdfRequestCompleteWithInformation(Request, STATUS_SUCCESS, sizeof(*co));
+        } else {
+            SWGPU_H2_SUBMIT_IN si = *(SWGPU_H2_SUBMIT_IN *)in;
+            SWGPU_H2_SUBMIT_OUT *so = (SWGPU_H2_SUBMIT_OUT *)outBuf;
+            RtlZeroMemory(so, sizeof(*so));
+            so->Version = SWGPU_VERSION;
+            if (si.Version != SWGPU_H1_VERSION) so->Result = (ULONG)STATUS_INVALID_PARAMETER;
+            else (VOID)H2Submit(Dev, SwGpuH1File(file), &si, so);
+            WdfRequestCompleteWithInformation(Request, STATUS_SUCCESS, sizeof(*so));
+        }
         return;
     }
     if (IoControlCode == IOCTL_SWGPU_BLIT_TEST) {
@@ -8756,12 +8814,23 @@ NTSTATUS SwGpuEvtDeviceAdd(WDFDRIVER Driver, PWDFDEVICE_INIT DeviceInit)
     Pnp.EvtDeviceD0ExitPreInterruptsDisabled = SwGpuEvtD0Quiesce;
     WdfDeviceInitSetPnpPowerEventCallbacks(DeviceInit, &Pnp);
     WdfDeviceInitSetDeviceType(DeviceInit, FILE_DEVICE_UNKNOWN);
+    {
+        /* Claude 0.16.0 (H1): per-handle VA spaces; ALLOC/FREE/INFO run in the caller. */
+        WDF_FILEOBJECT_CONFIG fileConfig;
+        WDF_OBJECT_ATTRIBUTES fileAttributes;
+        H1Init();
+        WDF_FILEOBJECT_CONFIG_INIT(&fileConfig, WDF_NO_EVENT_CALLBACK, WDF_NO_EVENT_CALLBACK, H1EvtFileCleanup);
+        WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&fileAttributes, SWGPU_H1_FILE);
+        WdfDeviceInitSetFileObjectConfig(DeviceInit, &fileConfig, &fileAttributes);
+        WdfDeviceInitSetIoInCallerContextCallback(DeviceInit, H1EvtIoInCallerContext);
+    }
     /* Claude 0.5.1: an unnamed PnP FDO rejects WdfDeviceInitAssignSDDLString (0xC0000079).
        Admin-only access now comes from the INF [SwGpu_Inst.NT.HW] Security value. */
     Status = WdfDeviceInitAssignWdmIrpPreprocessCallback(DeviceInit, SwGpuBlitInternal,
         IRP_MJ_INTERNAL_DEVICE_CONTROL, NULL, 0);
     if (!NT_SUCCESS(Status)) return Status;
     WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&Attributes, SWGPU_DEVICE);
+    Attributes.EvtCleanupCallback = H1EvtDeviceCleanup;
     Status = WdfDeviceCreate(&DeviceInit, &Attributes, &Device);
     if (!NT_SUCCESS(Status)) return Status;
     SwGpuGetDevice(Device)->Device = Device;

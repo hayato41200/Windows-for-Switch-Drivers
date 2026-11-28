@@ -282,6 +282,14 @@ static BOOLEAN F2Abort(PSWGPU_DEVICE Dev, F2_RUN *Run)
     ULONG writes[5][3], i;
     BOOLEAN reset;
     InterlockedExchange(&Dev->BlitOnline, 0);
+    /* Claude 0.18.0 (H2c): keep what the GPU was doing for the culprit search. */
+    if (!Dev->BlitReset && Dev->Bar0 != NULL) {
+        Dev->AbortMmu = Rd(Dev->Bar0, 0x0000259Cu);
+        Dev->AbortEngine = Rd(Dev->Bar0, 0x00002640u);
+        Dev->AbortInst = Dev->AbortMmu ? Rd(Dev->Bar0, 0x00002800u) : 0u;
+        Dev->AbortPbdmaChan = Rd(Dev->Bar0, 0x00040120u);
+        Dev->AbortValid = TRUE;
+    }
     InterlockedExchange(&Dev->E3IsrActive, 0);
     if (Dev->StallInterrupt != NULL)
         (VOID)WdfInterruptSynchronize(Dev->StallInterrupt, B3eIrqDrainBarrier, NULL);
